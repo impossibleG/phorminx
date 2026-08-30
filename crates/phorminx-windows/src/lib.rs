@@ -1,6 +1,8 @@
 //! Windows shell integration for Phorminx.
 
 #[cfg(windows)]
+mod dialog;
+#[cfg(windows)]
 mod file;
 #[cfg(windows)]
 mod hotkey;
@@ -9,10 +11,14 @@ mod insertion;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
+mod settings_window;
+#[cfg(windows)]
 mod target;
 #[cfg(windows)]
 mod tray;
 
+#[cfg(windows)]
+pub use dialog::show_error_dialog;
 #[cfg(windows)]
 pub use file::{AtomicReplaceError, atomic_replace_file};
 #[cfg(windows)]
@@ -21,6 +27,10 @@ pub use hotkey::{GlobalHoldHotkey, HoldEvent, HotkeyError};
 pub use insertion::{ClipboardOnlyReason, InsertionOutcome, copy_and_maybe_paste};
 #[cfg(windows)]
 pub use overlay::{OverlayError, OverlayStatus, StatusOverlay};
+#[cfg(windows)]
+pub use settings_window::{
+    SettingsForm, SettingsFormatting, SettingsWindow, SettingsWindowError, SettingsWindowEvent,
+};
 #[cfg(windows)]
 pub use target::TargetSnapshot;
 #[cfg(windows)]

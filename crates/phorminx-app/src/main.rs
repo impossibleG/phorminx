@@ -1,4 +1,7 @@
+#![cfg_attr(all(windows, feature = "desktop"), windows_subsystem = "windows")]
+
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -10,7 +13,7 @@ use clap::{Parser, ValueEnum};
 use phorminx_app::runtime::{
     AppIo, AppRuntime, FinishedAudio, InsertDisposition, RuntimeNotice, UiStatus,
 };
-use phorminx_app::settings::{FormattingStrength, RuntimeFormatting, SettingsStore};
+use phorminx_app::settings::{FormattingStrength, RuntimeFormatting, Settings, SettingsStore};
 use phorminx_audio::{ActiveRecording, start_default};
 use phorminx_core::{
     AudioClip, DictationId, RuntimeState, SpeechRecognizer, Transcript, TranscriptionOptions,
@@ -18,8 +21,12 @@ use phorminx_core::{
 use phorminx_whisper::WhisperRecognizer;
 use phorminx_windows::{
     ClipboardOnlyReason, GlobalHoldHotkey, HoldEvent, InsertionOutcome, OverlayStatus,
-    StatusOverlay, SystemTray, TargetSnapshot, TrayEvent, TrayStatus, copy_and_maybe_paste,
+    SettingsForm, SettingsFormatting, SettingsWindow, SettingsWindowEvent, StatusOverlay,
+    SystemTray, TargetSnapshot, TrayEvent, TrayStatus, copy_and_maybe_paste,
 };
+
+#[cfg(feature = "desktop")]
+use phorminx_windows::show_error_dialog;
 
 #[derive(Debug, Parser)]
 #[command(name = "phorminx")]
@@ -67,7 +74,22 @@ impl From<FormattingCli> for FormattingStrength {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = run() {
+        report_fatal_error(&error);
+        std::process::exit(1);
+    }
+}
+
+fn report_fatal_error(error: &anyhow::Error) {
+    #[cfg(feature = "desktop")]
+    show_error_dialog("Phorminx could not start", &format!("{error:#}"));
+
+    #[cfg(not(feature = "desktop"))]
+    eprintln!("Phorminx failed: {error:#}");
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let overlay = StatusOverlay::start().context("failed to start the status overlay")?;
     if cli.overlay_demo {
@@ -120,6 +142,13 @@ fn main() -> Result<()> {
         }
         None => settings.recognition.model_path.clone(),
     };
+    let model = if model.is_absolute() {
+        model
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve the model path from the current directory")?
+            .join(model)
+    };
 
     let tray = SystemTray::start().context("failed to start the system tray")?;
     show_shell_status(&overlay, &tray, OverlayStatus::Loading, TrayStatus::Loading);
@@ -127,9 +156,12 @@ fn main() -> Result<()> {
     let worker = TranscriptionWorker::start(&model)?;
 
     let shutting_down = Arc::new(AtomicBool::new(false));
-    let shutdown_flag = Arc::clone(&shutting_down);
-    ctrlc::set_handler(move || shutdown_flag.store(true, Ordering::Release))
-        .context("failed to install the Ctrl+C handler")?;
+    #[cfg(not(feature = "desktop"))]
+    {
+        let shutdown_flag = Arc::clone(&shutting_down);
+        ctrlc::set_handler(move || shutdown_flag.store(true, Ordering::Release))
+            .context("failed to install the Ctrl+C handler")?;
+    }
 
     let hotkey = GlobalHoldHotkey::start().context("failed to install the global hotkey")?;
     let mut runtime = AppRuntime::<TargetSnapshot, ActiveRecording>::new_with_formatting(
@@ -152,13 +184,27 @@ fn main() -> Result<()> {
         shutting_down.store(true, Ordering::Release);
     }
 
+    let mut settings_window = None;
+    let mut restart_requested = false;
+
     let run_result: Result<()> = 'event_loop: loop {
         if shutting_down.load(Ordering::Acquire) {
             break Ok(());
         }
-        match drain_tray_events(&tray, &overlay) {
-            Ok(true) => break Ok(()),
-            Ok(false) => {}
+        match poll_shell_events(
+            &tray,
+            &overlay,
+            &mut settings_window,
+            &settings_store,
+            &mut settings,
+            &model,
+        ) {
+            Ok(ShellAction::Quit) => break Ok(()),
+            Ok(ShellAction::Restart) => {
+                restart_requested = true;
+                break Ok(());
+            }
+            Ok(ShellAction::Continue) => {}
             Err(error) => break Err(error),
         }
 
@@ -166,9 +212,20 @@ fn main() -> Result<()> {
 
         // Tray Quit has priority over an activation or completed transcription that
         // arrived during the wait, preventing any new work or insertion after Quit.
-        match drain_tray_events(&tray, &overlay) {
-            Ok(true) => break Ok(()),
-            Ok(false) => {}
+        match poll_shell_events(
+            &tray,
+            &overlay,
+            &mut settings_window,
+            &settings_store,
+            &mut settings,
+            &model,
+        ) {
+            Ok(ShellAction::Quit) => break Ok(()),
+            Ok(ShellAction::Restart) => {
+                restart_requested = true;
+                break Ok(());
+            }
+            Ok(ShellAction::Continue) => {}
             Err(error) => break Err(error),
         }
 
@@ -209,9 +266,20 @@ fn main() -> Result<()> {
             }
         }
 
-        match drain_tray_events(&tray, &overlay) {
-            Ok(true) => break Ok(()),
-            Ok(false) => {}
+        match poll_shell_events(
+            &tray,
+            &overlay,
+            &mut settings_window,
+            &settings_store,
+            &mut settings,
+            &model,
+        ) {
+            Ok(ShellAction::Quit) => break Ok(()),
+            Ok(ShellAction::Restart) => {
+                restart_requested = true;
+                break Ok(());
+            }
+            Ok(ShellAction::Continue) => {}
             Err(error) => break Err(error),
         }
 
@@ -260,6 +328,14 @@ fn main() -> Result<()> {
     println!("Shutting down Phorminx.");
     let mut final_error = run_result.err();
     drop(runtime);
+    if let Some(window) = settings_window {
+        preserve_first_error(
+            &mut final_error,
+            window
+                .shutdown()
+                .context("failed to stop the settings window"),
+        );
+    }
     preserve_first_error(
         &mut final_error,
         hotkey
@@ -280,28 +356,165 @@ fn main() -> Result<()> {
             .shutdown()
             .context("failed to stop the status overlay"),
     );
+    if final_error.is_none() && restart_requested {
+        preserve_first_error(
+            &mut final_error,
+            restart_with_settings(settings_store.path()),
+        );
+    }
     match final_error {
         Some(error) => Err(error),
         None => Ok(()),
     }
 }
 
-fn drain_tray_events(tray: &SystemTray, overlay: &StatusOverlay) -> Result<bool> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellAction {
+    Continue,
+    Quit,
+    Restart,
+}
+
+fn poll_shell_events(
+    tray: &SystemTray,
+    overlay: &StatusOverlay,
+    settings_window: &mut Option<SettingsWindow>,
+    settings_store: &SettingsStore,
+    settings: &mut Settings,
+    effective_model: &Path,
+) -> Result<ShellAction> {
     loop {
         match tray.events().try_recv() {
-            Ok(TrayEvent::QuitRequested) => return Ok(true),
+            Ok(TrayEvent::QuitRequested) => return Ok(ShellAction::Quit),
             Ok(TrayEvent::OpenSettings) => {
-                // This command becomes the single-instance settings window in the
-                // next vertical slice. Give immediate visible feedback for now.
-                show_status(overlay, OverlayStatus::Ready);
-                println!("Settings UI is the next desktop-shell slice.");
+                if let Some(window) = settings_window {
+                    window.focus().context("failed to focus settings")?;
+                } else {
+                    *settings_window = Some(
+                        SettingsWindow::start(settings_form(settings, effective_model))
+                            .context("failed to open settings")?,
+                    );
+                }
             }
-            Err(TryRecvError::Empty) => return Ok(false),
+            Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
                 return Err(anyhow!("the system tray thread stopped unexpectedly"));
             }
         }
     }
+
+    let mut window_events = Vec::new();
+    if let Some(window) = settings_window.as_ref() {
+        loop {
+            match window.events().try_recv() {
+                Ok(event) => window_events.push(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !window_events
+                        .iter()
+                        .any(|event| matches!(event, SettingsWindowEvent::Closed))
+                    {
+                        window_events.push(SettingsWindowEvent::Closed);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    for event in window_events {
+        match event {
+            SettingsWindowEvent::Closed => {
+                if let Some(window) = settings_window.take() {
+                    window
+                        .shutdown()
+                        .context("failed to join the settings window")?;
+                }
+            }
+            SettingsWindowEvent::SaveAndRestart(form) => {
+                let save_result = apply_settings_form(settings_store, settings, form);
+                match save_result {
+                    Ok(()) => return Ok(ShellAction::Restart),
+                    Err(error) => {
+                        if let Some(window) = settings_window.as_ref() {
+                            window
+                                .show_error(format!("{error:#}"))
+                                .context("failed to display the settings error")?;
+                        }
+                        show_shell_status(overlay, tray, OverlayStatus::Error, TrayStatus::Error);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(ShellAction::Continue)
+}
+
+fn settings_form(settings: &Settings, effective_model: &Path) -> SettingsForm {
+    SettingsForm {
+        model_path: effective_model.display().to_string(),
+        language: settings.recognition.language.clone(),
+        minimum_rms: settings.recognition.minimum_rms.to_string(),
+        formatting: match settings.formatting.strength {
+            FormattingStrength::Raw => SettingsFormatting::Raw,
+            FormattingStrength::Light => SettingsFormatting::Light,
+            FormattingStrength::Balanced => SettingsFormatting::Balanced,
+            FormattingStrength::Strong => SettingsFormatting::Strong,
+            FormattingStrength::Custom => SettingsFormatting::Custom,
+        },
+        custom_instructions: settings
+            .formatting
+            .custom_instructions
+            .clone()
+            .unwrap_or_default(),
+    }
+}
+
+fn apply_settings_form(
+    store: &SettingsStore,
+    settings: &mut Settings,
+    form: SettingsForm,
+) -> Result<()> {
+    let mut candidate = settings.clone();
+    candidate.recognition.model_path = PathBuf::from(form.model_path.trim());
+    candidate.recognition.language = form.language;
+    candidate.recognition.minimum_rms = form
+        .minimum_rms
+        .trim()
+        .parse::<f32>()
+        .context("Minimum speech level must be a number between 0 and 1")?;
+    candidate.formatting.strength = match form.formatting {
+        SettingsFormatting::Raw => FormattingStrength::Raw,
+        SettingsFormatting::Light => FormattingStrength::Light,
+        SettingsFormatting::Balanced => FormattingStrength::Balanced,
+        SettingsFormatting::Strong => FormattingStrength::Strong,
+        SettingsFormatting::Custom => FormattingStrength::Custom,
+    };
+    candidate.formatting.custom_instructions = if form.custom_instructions.trim().is_empty() {
+        None
+    } else {
+        Some(form.custom_instructions)
+    };
+    candidate
+        .validate_and_normalize()
+        .context("The settings are not valid")?;
+    candidate
+        .ensure_runtime_supported()
+        .context("This formatting profile is not ready")?;
+    store.save(&candidate).context("Could not write settings")?;
+    *settings = candidate;
+    Ok(())
+}
+
+fn restart_with_settings(settings_path: &Path) -> Result<()> {
+    let executable = std::env::current_exe().context("failed to locate the Phorminx executable")?;
+    Command::new(executable)
+        .arg("--config")
+        .arg(settings_path)
+        .spawn()
+        .context("failed to restart Phorminx")?;
+    Ok(())
 }
 
 fn preserve_first_error(first: &mut Option<anyhow::Error>, result: Result<()>) {
