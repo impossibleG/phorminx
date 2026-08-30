@@ -47,3 +47,17 @@ cargo run --release -p phorminx-app --features vulkan -- `
 ```
 
 Manual insertion testing starts with classic Notepad. Browser and Electron controls are expected to fall back to `Ready to paste` until UI Automation and explicit sensitive-target policies are implemented.
+
+## Live validation
+
+On 2026-08-30, the reference machine completed a physical `Ctrl+Alt+Space` hold-to-talk cycle into classic Notepad:
+
+- The hook captured key-down and key-up without swallowing input.
+- The microphone recording remained usable after a recoverable WASAPI overrun notification.
+- Resident `base.en` inference on Vulkan completed in 542 ms.
+- The original focused Notepad edit control passed target and password-style revalidation.
+- Guarded paste was injected and the user confirmed that the dictated sentence appeared correctly.
+
+Earlier attempts also exercised the fail-closed paths for a held modifier, an unavailable target, a busy reactivation, and a recoverable audio backend warning. No uncertain attempt injected text.
+
+The walking skeleton is functionally validated. Phase 1 remains open until the status-feedback layer and 500-dictation stability/wrong-target soak are complete.
