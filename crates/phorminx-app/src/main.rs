@@ -92,18 +92,27 @@ fn main() -> Result<()> {
                 runtime.transition(RuntimeState::FinalizingAudio)?;
                 log_state(Some(id), runtime.state(), "recording_stopped");
 
-                let clip = match recording
+                let captured = match recording
                     .take()
                     .expect("listening state has a recorder")
-                    .finish()
+                    .finish_with_diagnostics()
                 {
-                    Ok(clip) => clip,
+                    Ok(captured) => captured,
                     Err(error) => {
                         fail_and_reset(&mut runtime, Some(id), "audio_finish_failed");
                         eprintln!("Could not finish the recording: {error}");
                         continue;
                     }
                 };
+                if !captured.warnings.is_empty() {
+                    eprintln!(
+                        "dictation_id={} state={:?} event=audio_backend_warning warning_count={}",
+                        id.0,
+                        runtime.state(),
+                        captured.warnings.len()
+                    );
+                }
+                let clip = captured.clip;
 
                 if clip.duration() < Duration::from_millis(200) || clip.rms() < cli.minimum_rms {
                     runtime.cancel()?;

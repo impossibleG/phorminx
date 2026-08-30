@@ -48,9 +48,21 @@ pub struct ActiveRecording {
     sample_rate: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct CapturedAudio {
+    pub clip: AudioClip,
+    /// Recoverable backend notifications observed while samples were captured.
+    pub warnings: Vec<String>,
+}
+
 impl ActiveRecording {
     /// Stops capture and converts the recording to Whisper's 16 kHz mono format.
     pub fn finish(self) -> Result<AudioClip, CaptureError> {
+        Ok(self.finish_with_diagnostics()?.clip)
+    }
+
+    /// Stops capture while retaining recoverable backend diagnostics.
+    pub fn finish_with_diagnostics(self) -> Result<CapturedAudio, CaptureError> {
         let Self {
             stream,
             captured,
@@ -59,17 +71,24 @@ impl ActiveRecording {
         } = self;
         drop(stream);
 
-        if let Some(error) = errors.lock().expect("audio error mutex poisoned").first() {
-            return Err(CaptureError::Stream(error.clone()));
-        }
+        let warnings = errors
+            .lock()
+            .map_err(|_| CaptureError::WarningBufferPoisoned)?
+            .clone();
 
         let native_samples = Arc::try_unwrap(captured)
             .map_err(|_| CaptureError::BufferStillShared)?
             .into_inner()
             .map_err(|_| CaptureError::BufferPoisoned)?;
+        if native_samples.is_empty()
+            && let Some(error) = warnings.first()
+        {
+            return Err(CaptureError::Stream(error.clone()));
+        }
 
         let samples = resample_linear(&native_samples, sample_rate, WHISPER_SAMPLE_RATE);
-        AudioClip::new(samples, WHISPER_SAMPLE_RATE).map_err(CaptureError::Audio)
+        let clip = AudioClip::new(samples, WHISPER_SAMPLE_RATE).map_err(CaptureError::Audio)?;
+        Ok(CapturedAudio { clip, warnings })
     }
 }
 
@@ -156,10 +175,10 @@ where
                 }));
             },
             move |error| {
-                errors
-                    .lock()
-                    .expect("audio error mutex poisoned")
-                    .push(error.to_string());
+                let mut errors = errors.lock().expect("audio error mutex poisoned");
+                if errors.len() < 16 {
+                    errors.push(error.to_string());
+                }
             },
             None,
         )
@@ -257,6 +276,8 @@ pub enum CaptureError {
     BufferStillShared,
     #[error("audio buffer lock was poisoned")]
     BufferPoisoned,
+    #[error("audio warning buffer lock was poisoned")]
+    WarningBufferPoisoned,
     #[error("invalid WAV file: {0}")]
     InvalidWav(&'static str),
     #[error("WAV must use 16-bit integer or 32-bit float samples")]
