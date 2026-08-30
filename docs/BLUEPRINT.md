@@ -1,8 +1,8 @@
-# Local Flow — Product and Engineering Blueprint
+# Phorminx — Product and Engineering Blueprint
 
 ## 1. Product thesis
 
-Local Flow should make voice input feel like a native input method while keeping the user's audio and text under their control. The essential loop is:
+Phorminx should make voice input feel like a native input method while keeping the user's audio and text under their control. The essential loop is:
 
 1. Hold a global shortcut.
 2. Speak.
@@ -20,7 +20,7 @@ The quality bar is not merely transcription accuracy. The product succeeds when 
 - Push-to-talk and toggle recording modes.
 - Default and selectable microphone support.
 - Local transcription using `whisper.cpp`.
-- English and Brazilian Portuguese as the first validated languages.
+- English as the first validated language; Brazilian Portuguese follows through the multilingual model path.
 - Fixed-language mode and optional automatic detection.
 - Optional local cleanup through an existing Ollama installation.
 - Automatic Ollama model discovery with explicit user selection.
@@ -73,7 +73,7 @@ Use a three-stage pipeline:
 2. Deterministic normalization: whitespace, punctuation spacing, explicit aliases, and explicit spoken commands.
 3. Optional Ollama transform: filler removal, false-start cleanup, punctuation, and profile formatting.
 
-Ollama is enhancement, not infrastructure. If it is unavailable, slow, invalid, or unsafe, Local Flow inserts the deterministic result and preserves the raw result.
+Ollama is enhancement, not infrastructure. If it is unavailable, slow, invalid, or unsafe, Phorminx inserts the deterministic result and preserves the raw result.
 
 The cleanup system prompt must say, in substance:
 
@@ -104,7 +104,7 @@ Reject or warn on cleanup output when it:
 
 ### Windows UI
 
-Use WPF for settings, history, onboarding, and the non-activating status overlay. Use `System.Windows.Forms.NotifyIcon` for the tray icon. Keep Win32 interoperability isolated in `Windows.Infrastructure`.
+Use native Rust with `egui`/`eframe` for settings, history, onboarding, and the non-activating status overlay. Use a Rust tray library and keep Win32 interoperability isolated in a Windows platform crate.
 
 One per-user process owns:
 
@@ -131,7 +131,7 @@ Default insertion sequence:
 2. Snapshot the clipboard with bounded retries.
 3. Put Unicode transcript text on the clipboard.
 4. Send `Ctrl+V` using `SendInput`.
-5. Restore the snapshot only if the clipboard still contains Local Flow's payload.
+5. Restore the snapshot only if the clipboard still contains Phorminx's payload.
 
 Clipboard restoration is inherently racy. Never overwrite clipboard content changed by another process. Provide an option to leave the dictated text on the clipboard.
 
@@ -201,13 +201,13 @@ docs/
 Primary contracts:
 
 ```csharp
-public interface IAudioCapture
+pub trait AudioCapture
 {
     Task StartAsync(TimeSpan preRoll, CancellationToken cancellationToken);
     Task<AudioClip> StopAsync(CancellationToken cancellationToken);
 }
 
-public interface ISpeechRecognizer
+pub trait SpeechRecognizer
 {
     Task LoadAsync(ModelSpec model, DeviceSpec device, IProgress<double> progress,
         CancellationToken cancellationToken);
@@ -216,13 +216,13 @@ public interface ISpeechRecognizer
     Task UnloadAsync(CancellationToken cancellationToken);
 }
 
-public interface ITextTransformer
+pub trait TextTransformer
 {
     Task<TransformResult> TransformAsync(string input, TransformContext context,
         CancellationToken cancellationToken);
 }
 
-public interface ITextInjector
+pub trait TextInjector
 {
     Task<InsertionResult> InsertAsync(TargetSnapshot target, string text,
         CancellationToken cancellationToken);
@@ -291,7 +291,7 @@ These are targets to validate, not promises. If hardware misses the latency targ
 Build a consented private corpus of approximately 300 clips covering:
 
 - 0.3–2 second commands, 2–10 second dictation, and 10–60 second paragraphs.
-- English and Brazilian Portuguese.
+- English for the v1 release corpus; Brazilian Portuguese in the subsequent multilingual corpus.
 - Multiple accents, quiet rooms, fans, music, laptop and headset microphones.
 - Names, technical terms, numbers, URLs, email addresses, code, and false starts.
 - At least 100 silence/noise-only clips for hallucination testing.
@@ -335,7 +335,7 @@ Primary threat scenarios are wrong-target disclosure, clipboard destruction, mal
 
 ## 11. Packaging and distribution
 
-Start with a self-contained x64 .NET publish and signed per-user installer under LocalAppData. WiX Toolset or Inno Setup can provide install/uninstall, Start Menu entry, and launch-at-login using HKCU. Do not require administrator privileges.
+Start with a self-contained x64 Rust release build and signed per-user installer under LocalAppData. WiX Toolset or Inno Setup can provide install/uninstall, Start Menu entry, and launch-at-login using HKCU. Do not require administrator privileges.
 
 Abstract updates from the start, but do not build auto-update in the first vertical slice. Production releases need code signing to reduce SmartScreen friction. Evaluate MSIX later if Store distribution or packaged identity becomes valuable.
 

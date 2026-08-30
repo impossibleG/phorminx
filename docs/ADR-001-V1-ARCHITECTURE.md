@@ -5,7 +5,7 @@
 
 ## Decision
 
-Build a Windows-first, per-user WPF tray application on the current supported .NET LTS. Use WASAPI/NAudio for capture, `whisper.cpp` plus Silero VAD for local transcription, deterministic normalization followed by optional Ollama cleanup, and guarded clipboard paste for broad text-field compatibility.
+uuild a Windows-first, per-user WPF tray application on the current supported .NET LTS. Use WASAPI/NAudio for capture, `whisper.cpp` plus Silero VAD for local transcription, deterministic normalization followed by optional Ollama cleanup, and guarded clipboard paste for broad text-field compatibility.
 
 Vosk is not part of v1. UI Automation is used for target inspection and safety signals, not as the default text-writing mechanism. Ollama is optional and warmed asynchronously.
 

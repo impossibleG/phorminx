@@ -1,6 +1,6 @@
-# Local Flow
+# Phorminx
 
-Local Flow is a privacy-first Windows dictation utility. Hold a shortcut, speak naturally, and insert a faithful, clean transcript into the application that had focus.
+Phorminx is a privacy-first Windows dictation utility. Hold a shortcut, speak naturally, and insert a faithful, clean transcript into the application that had focus.
 
 The product is local-first:
 
@@ -19,11 +19,11 @@ Planning complete; implementation has not started.
 ## Initial platform
 
 - Windows 10/11 x64
-- C# on the current supported .NET LTS
-- WPF settings/history UI and tray application
+- Rust on the current stable toolchain
+- Native Rust UI with `egui`/`eframe` and a lightweight tray application
 - Per-user installation
 
 ## Working name
 
-`Local Flow` is a temporary internal name. Product naming and trademark review are outside the MVP.
+`Phorminx` is a temporary internal name. Product naming and trademark review are outside the MVP.
 

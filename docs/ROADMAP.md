@@ -63,7 +63,7 @@ After Phase 0 contracts are frozen, development can run concurrently:
 
 | Workstream | Ownership | Dependencies |
 |---|---|---|
-| Windows shell | tray, WPF, hotkeys, overlay, lifecycle | Core state contracts |
+| Windows shell | tray, egui, hotkeys, overlay, lifecycle | Core state contracts |
 | Audio/STT | WASAPI, resampling, VAD, whisper adapter, models | Audio and recognizer contracts |
 | Insertion | target snapshot, sensitive-field rules, clipboard/SendInput | Target/injector contracts |
 | Cleanup | Ollama discovery, benchmark, prompts, validation | Transformer contract |
@@ -76,7 +76,7 @@ No two workstreams should edit the composition root or shared contracts without 
 
 ### P0
 
-- Establish solution/projects and CI.
+- Establish the Cargo workspace, crates, and CI.
 - Define domain contracts and state machine.
 - Build capture, pre-roll, VAD, and WAV diagnostic path.
 - Bind and benchmark `whisper.cpp`.
