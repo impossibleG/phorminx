@@ -23,6 +23,22 @@ cargo run --release -p phorminx-app --features vulkan -- `
 
 The model loads before `Ready` appears. Hold `Ctrl+Alt+Space` in the target application, speak, then release all three keys. Press `Ctrl+C` in the Phorminx console to exit.
 
+## Status feedback
+
+A small native overlay appears near the bottom center of the active monitor. It is topmost, click-through, and uses `WS_EX_NOACTIVATE` plus no-activate show/position calls, so displaying it cannot become the dictation target.
+
+It presents only fixed application states:
+
+- Loading and ready
+- Listening
+- Transcribing
+- Inserted
+- Ready to paste
+- No clear speech
+- Error
+
+No transcript or audio content is sent to or rendered by the overlay. Result and error states auto-hide; active work states remain visible until the runtime advances.
+
 ## Safety policy
 
 - Target identity is captured at key-down and checked again immediately before paste.
@@ -44,6 +60,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run --release -p phorminx-app --features vulkan -- `
   --model models/ggml-base.en.bin `
   --smoke-test
+
+# Visual overlay QA without loading a speech model:
+cargo run --release -p phorminx-app --features vulkan -- --overlay-demo
 ```
 
 Manual insertion testing starts with classic Notepad. Browser and Electron controls are expected to fall back to `Ready to paste` until UI Automation and explicit sensitive-target policies are implemented.
@@ -60,4 +79,4 @@ On 2026-08-30, the reference machine completed a physical `Ctrl+Alt+Space` hold-
 
 Earlier attempts also exercised the fail-closed paths for a held modifier, an unavailable target, a busy reactivation, and a recoverable audio backend warning. No uncertain attempt injected text.
 
-The walking skeleton is functionally validated. Phase 1 remains open until the status-feedback layer and 500-dictation stability/wrong-target soak are complete.
+The walking skeleton is functionally validated. Phase 1 remains open until a live dictation confirms that the new overlay never changes the original target and the 500-dictation stability/wrong-target soak is complete.

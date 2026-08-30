@@ -14,7 +14,7 @@ Start with [docs/BLUEPRINT.md](docs/BLUEPRINT.md), [docs/ROADMAP.md](docs/ROADMA
 
 ## Status
 
-Phase 0 is complete: microphone capture, local Whisper, CPU fallback, and Vulkan acceleration are validated on the reference machine. `base.en` is the initial English model. Phase 1 is building the end-to-end push-to-talk walking skeleton before the tray UI.
+Phase 0 is complete: microphone capture, local Whisper, CPU fallback, and Vulkan acceleration are validated on the reference machine. `base.en` is the initial English model. The Phase 1 walking skeleton now includes guarded push-to-talk insertion and a non-activating status overlay; stability hardening remains before the tray UI.
 
 ## Initial platform
 

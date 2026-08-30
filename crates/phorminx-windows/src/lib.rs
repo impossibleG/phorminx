@@ -5,12 +5,16 @@ mod hotkey;
 #[cfg(windows)]
 mod insertion;
 #[cfg(windows)]
+mod overlay;
+#[cfg(windows)]
 mod target;
 
 #[cfg(windows)]
 pub use hotkey::{GlobalHoldHotkey, HoldEvent, HotkeyError};
 #[cfg(windows)]
 pub use insertion::{ClipboardOnlyReason, InsertionOutcome, copy_and_maybe_paste};
+#[cfg(windows)]
+pub use overlay::{OverlayError, OverlayStatus, StatusOverlay};
 #[cfg(windows)]
 pub use target::TargetSnapshot;
 

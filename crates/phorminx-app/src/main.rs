@@ -14,7 +14,8 @@ use phorminx_core::{
 };
 use phorminx_whisper::WhisperRecognizer;
 use phorminx_windows::{
-    GlobalHoldHotkey, HoldEvent, InsertionOutcome, TargetSnapshot, copy_and_maybe_paste,
+    GlobalHoldHotkey, HoldEvent, InsertionOutcome, OverlayStatus, StatusOverlay, TargetSnapshot,
+    copy_and_maybe_paste,
 };
 
 #[derive(Debug, Parser)]
@@ -31,10 +32,32 @@ struct Cli {
     /// Start every service and then exit cleanly without accepting dictation.
     #[arg(long, hide = true)]
     smoke_test: bool,
+    /// Cycle through every fixed overlay state without loading speech recognition.
+    #[arg(long, hide = true)]
+    overlay_demo: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let overlay = StatusOverlay::start().context("failed to start the status overlay")?;
+    if cli.overlay_demo {
+        for status in [
+            OverlayStatus::Loading,
+            OverlayStatus::Ready,
+            OverlayStatus::Listening,
+            OverlayStatus::Transcribing,
+            OverlayStatus::Inserted,
+            OverlayStatus::ClipboardReady,
+            OverlayStatus::NoSpeech,
+            OverlayStatus::Error,
+        ] {
+            show_status(&overlay, status);
+            thread::sleep(Duration::from_millis(900));
+        }
+        overlay.shutdown()?;
+        return Ok(());
+    }
+    show_status(&overlay, OverlayStatus::Loading);
     println!("Phorminx is loading {}...", cli.model.display());
     let worker = TranscriptionWorker::start(&cli.model)?;
 
@@ -52,6 +75,7 @@ fn main() -> Result<()> {
 
     println!("Ready. Hold Ctrl+Alt+Space to dictate; press Ctrl+C here to exit.");
     log_state(None, runtime.state(), "ready");
+    show_status(&overlay, OverlayStatus::Ready);
     if cli.smoke_test {
         shutting_down.store(true, Ordering::Release);
     }
@@ -76,10 +100,12 @@ fn main() -> Result<()> {
                         recording = Some(active_recording);
                         target = activation_target;
                         println!("Listening...");
+                        show_status(&overlay, OverlayStatus::Listening);
                         log_state(Some(id), runtime.state(), "recording_started");
                     }
                     Err(error) => {
                         fail_and_reset(&mut runtime, Some(id), "audio_start_failed");
+                        show_status(&overlay, OverlayStatus::Error);
                         eprintln!("Could not start the microphone: {error}");
                     }
                 }
@@ -100,6 +126,7 @@ fn main() -> Result<()> {
                     Ok(captured) => captured,
                     Err(error) => {
                         fail_and_reset(&mut runtime, Some(id), "audio_finish_failed");
+                        show_status(&overlay, OverlayStatus::Error);
                         eprintln!("Could not finish the recording: {error}");
                         continue;
                     }
@@ -119,12 +146,14 @@ fn main() -> Result<()> {
                     log_state(Some(id), runtime.state(), "silence_rejected");
                     runtime.transition(RuntimeState::Idle)?;
                     target = None;
+                    show_status(&overlay, OverlayStatus::NoSpeech);
                     println!("No clear speech detected.");
                     continue;
                 }
 
                 let audio_context = recommended_audio_context(clip.duration());
                 runtime.transition(RuntimeState::Transcribing)?;
+                show_status(&overlay, OverlayStatus::Transcribing);
                 log_state(Some(id), runtime.state(), "transcription_started");
                 worker.transcribe(id, clip, cli.language.clone(), audio_context)?;
                 pending_id = Some(id);
@@ -151,6 +180,7 @@ fn main() -> Result<()> {
                 Err(message) => {
                     fail_and_reset(&mut runtime, Some(completed.id), "transcription_failed");
                     target = None;
+                    show_status(&overlay, OverlayStatus::Error);
                     eprintln!("Transcription failed: {message}");
                     continue;
                 }
@@ -167,6 +197,7 @@ fn main() -> Result<()> {
                 );
                 runtime.transition(RuntimeState::Idle)?;
                 target = None;
+                show_status(&overlay, OverlayStatus::NoSpeech);
                 continue;
             }
 
@@ -179,15 +210,18 @@ fn main() -> Result<()> {
                         transcript.inference_time.as_secs_f64() * 1_000.0
                     );
                     log_state(Some(completed.id), runtime.state(), "paste_injected");
+                    show_status(&overlay, OverlayStatus::Inserted);
                     runtime.transition(RuntimeState::Idle)?;
                 }
                 Ok(InsertionOutcome::ClipboardOnly(reason)) => {
                     println!("Ready to paste from the clipboard ({reason:?}).");
                     log_state(Some(completed.id), runtime.state(), "clipboard_only");
+                    show_status(&overlay, OverlayStatus::ClipboardReady);
                     runtime.transition(RuntimeState::Idle)?;
                 }
                 Err(error) => {
                     fail_and_reset(&mut runtime, Some(completed.id), "insertion_failed");
+                    show_status(&overlay, OverlayStatus::Error);
                     eprintln!("Could not prepare the transcript for insertion: {error}");
                 }
             }
@@ -197,7 +231,14 @@ fn main() -> Result<()> {
     println!("Shutting down Phorminx.");
     hotkey.shutdown()?;
     worker.shutdown()?;
+    overlay.shutdown()?;
     Ok(())
+}
+
+fn show_status(overlay: &StatusOverlay, status: OverlayStatus) {
+    if let Err(error) = overlay.set(status) {
+        eprintln!("dictation_id=0 state=Overlay event=status_update_failed error={error}");
+    }
 }
 
 fn fail_and_reset(runtime: &mut RuntimeStateMachine, id: Option<DictationId>, event: &'static str) {
