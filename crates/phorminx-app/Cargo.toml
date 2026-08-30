@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [features]
 default = []
+desktop = []
 vulkan = ["phorminx-whisper/vulkan"]
 
 [dependencies]

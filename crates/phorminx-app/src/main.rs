@@ -17,7 +17,7 @@ use phorminx_core::{
 use phorminx_whisper::WhisperRecognizer;
 use phorminx_windows::{
     ClipboardOnlyReason, GlobalHoldHotkey, HoldEvent, InsertionOutcome, OverlayStatus,
-    StatusOverlay, TargetSnapshot, copy_and_maybe_paste,
+    StatusOverlay, SystemTray, TargetSnapshot, TrayEvent, TrayStatus, copy_and_maybe_paste,
 };
 
 #[derive(Debug, Parser)]
@@ -59,7 +59,8 @@ fn main() -> Result<()> {
         overlay.shutdown()?;
         return Ok(());
     }
-    show_status(&overlay, OverlayStatus::Loading);
+    let tray = SystemTray::start().context("failed to start the system tray")?;
+    show_shell_status(&overlay, &tray, OverlayStatus::Loading, TrayStatus::Loading);
     println!("Phorminx is loading {}...", cli.model.display());
     let worker = TranscriptionWorker::start(&cli.model)?;
 
@@ -77,6 +78,7 @@ fn main() -> Result<()> {
     {
         let mut io = ProductionIo {
             overlay: &overlay,
+            tray: &tray,
             worker: &worker,
         };
         report_notices(runtime.announce_ready(&mut io));
@@ -85,17 +87,40 @@ fn main() -> Result<()> {
         shutting_down.store(true, Ordering::Release);
     }
 
-    while !shutting_down.load(Ordering::Acquire) {
-        match hotkey.events().recv_timeout(Duration::from_millis(25)) {
+    let run_result: Result<()> = 'event_loop: loop {
+        if shutting_down.load(Ordering::Acquire) {
+            break Ok(());
+        }
+        match drain_tray_events(&tray, &overlay) {
+            Ok(true) => break Ok(()),
+            Ok(false) => {}
+            Err(error) => break Err(error),
+        }
+
+        let hotkey_event = hotkey.events().recv_timeout(Duration::from_millis(25));
+
+        // Tray Quit has priority over an activation or completed transcription that
+        // arrived during the wait, preventing any new work or insertion after Quit.
+        match drain_tray_events(&tray, &overlay) {
+            Ok(true) => break Ok(()),
+            Ok(false) => {}
+            Err(error) => break Err(error),
+        }
+
+        match hotkey_event {
             Ok(HoldEvent::Started {
                 target: activation_target,
             }) => {
                 let notices = {
                     let mut io = ProductionIo {
                         overlay: &overlay,
+                        tray: &tray,
                         worker: &worker,
                     };
-                    runtime.hold_started(activation_target, &mut io)?
+                    match runtime.hold_started(activation_target, &mut io) {
+                        Ok(notices) => notices,
+                        Err(error) => break 'event_loop Err(error.into()),
+                    }
                 };
                 report_notices(notices);
             }
@@ -103,16 +128,26 @@ fn main() -> Result<()> {
                 let notices = {
                     let mut io = ProductionIo {
                         overlay: &overlay,
+                        tray: &tray,
                         worker: &worker,
                     };
-                    runtime.hold_ended(&mut io)?
+                    match runtime.hold_ended(&mut io) {
+                        Ok(notices) => notices,
+                        Err(error) => break 'event_loop Err(error.into()),
+                    }
                 };
                 report_notices(notices);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                return Err(anyhow!("the global hotkey thread stopped unexpectedly"));
+                break Err(anyhow!("the global hotkey thread stopped unexpectedly"));
             }
+        }
+
+        match drain_tray_events(&tray, &overlay) {
+            Ok(true) => break Ok(()),
+            Ok(false) => {}
+            Err(error) => break Err(error),
         }
 
         loop {
@@ -121,9 +156,17 @@ fn main() -> Result<()> {
                     let notices = {
                         let mut io = ProductionIo {
                             overlay: &overlay,
+                            tray: &tray,
                             worker: &worker,
                         };
-                        runtime.transcription_completed(completed.id, completed.result, &mut io)?
+                        match runtime.transcription_completed(
+                            completed.id,
+                            completed.result,
+                            &mut io,
+                        ) {
+                            Ok(notices) => notices,
+                            Err(error) => break 'event_loop Err(error.into()),
+                        }
                     };
                     report_notices(notices);
                 }
@@ -132,22 +175,88 @@ fn main() -> Result<()> {
                     let notices = {
                         let mut io = ProductionIo {
                             overlay: &overlay,
+                            tray: &tray,
                             worker: &worker,
                         };
-                        runtime.worker_disconnected(&mut io)?
+                        match runtime.worker_disconnected(&mut io) {
+                            Ok(notices) => notices,
+                            Err(error) => break 'event_loop Err(error.into()),
+                        }
                     };
                     report_notices(notices);
-                    return Err(anyhow!("the transcription worker stopped unexpectedly"));
+                    break 'event_loop Err(anyhow!(
+                        "the transcription worker stopped unexpectedly"
+                    ));
                 }
             }
         }
-    }
+    };
 
     println!("Shutting down Phorminx.");
-    hotkey.shutdown()?;
-    worker.shutdown()?;
-    overlay.shutdown()?;
-    Ok(())
+    let mut final_error = run_result.err();
+    drop(runtime);
+    preserve_first_error(
+        &mut final_error,
+        hotkey
+            .shutdown()
+            .context("failed to stop the global hotkey"),
+    );
+    preserve_first_error(
+        &mut final_error,
+        worker.shutdown().context("failed to stop transcription"),
+    );
+    preserve_first_error(
+        &mut final_error,
+        tray.shutdown().context("failed to stop the system tray"),
+    );
+    preserve_first_error(
+        &mut final_error,
+        overlay
+            .shutdown()
+            .context("failed to stop the status overlay"),
+    );
+    match final_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn drain_tray_events(tray: &SystemTray, overlay: &StatusOverlay) -> Result<bool> {
+    loop {
+        match tray.events().try_recv() {
+            Ok(TrayEvent::QuitRequested) => return Ok(true),
+            Ok(TrayEvent::OpenSettings) => {
+                // This command becomes the single-instance settings window in the
+                // next vertical slice. Give immediate visible feedback for now.
+                show_status(overlay, OverlayStatus::Ready);
+                println!("Settings UI is the next desktop-shell slice.");
+            }
+            Err(TryRecvError::Empty) => return Ok(false),
+            Err(TryRecvError::Disconnected) => {
+                return Err(anyhow!("the system tray thread stopped unexpectedly"));
+            }
+        }
+    }
+}
+
+fn preserve_first_error(first: &mut Option<anyhow::Error>, result: Result<()>) {
+    if let Err(error) = result
+        && first.is_none()
+    {
+        *first = Some(error);
+    }
+}
+
+fn show_shell_status(
+    overlay: &StatusOverlay,
+    tray: &SystemTray,
+    overlay_status: OverlayStatus,
+    tray_status: TrayStatus,
+) {
+    show_status(overlay, overlay_status);
+    if let Err(error) = tray.set_status(tray_status) {
+        eprintln!("dictation_id=0 state=Tray event=status_update_failed error={error}");
+    }
 }
 
 fn show_status(overlay: &StatusOverlay, status: OverlayStatus) {
@@ -158,6 +267,7 @@ fn show_status(overlay: &StatusOverlay, status: OverlayStatus) {
 
 struct ProductionIo<'a> {
     overlay: &'a StatusOverlay,
+    tray: &'a SystemTray,
     worker: &'a TranscriptionWorker,
 }
 
@@ -206,16 +316,24 @@ impl AppIo for ProductionIo<'_> {
     }
 
     fn show_status(&mut self, status: UiStatus) -> Result<(), String> {
-        let status = match status {
-            UiStatus::Ready => OverlayStatus::Ready,
-            UiStatus::Listening => OverlayStatus::Listening,
-            UiStatus::Transcribing => OverlayStatus::Transcribing,
-            UiStatus::Inserted => OverlayStatus::Inserted,
-            UiStatus::ClipboardReady => OverlayStatus::ClipboardReady,
-            UiStatus::NoSpeech => OverlayStatus::NoSpeech,
-            UiStatus::Error => OverlayStatus::Error,
+        let (overlay_status, tray_status) = match status {
+            UiStatus::Ready => (OverlayStatus::Ready, TrayStatus::Ready),
+            UiStatus::Listening => (OverlayStatus::Listening, TrayStatus::Listening),
+            UiStatus::Transcribing => (OverlayStatus::Transcribing, TrayStatus::Transcribing),
+            UiStatus::Inserted => (OverlayStatus::Inserted, TrayStatus::Ready),
+            UiStatus::ClipboardReady => (OverlayStatus::ClipboardReady, TrayStatus::Ready),
+            UiStatus::NoSpeech => (OverlayStatus::NoSpeech, TrayStatus::Ready),
+            UiStatus::Error => (OverlayStatus::Error, TrayStatus::Error),
         };
-        self.overlay.set(status).map_err(|error| error.to_string())
+        let overlay_result = self
+            .overlay
+            .set(overlay_status)
+            .map_err(|error| error.to_string());
+        let tray_result = self
+            .tray
+            .set_status(tray_status)
+            .map_err(|error| error.to_string());
+        overlay_result.and(tray_result)
     }
 }
 
