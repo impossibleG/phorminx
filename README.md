@@ -10,11 +10,11 @@ The product is local-first:
 - Raw audio is not retained by default.
 - Dictation remains usable when Ollama is missing or unavailable.
 
-This repository currently contains the implementation blueprint. Start with [docs/BLUEPRINT.md](docs/BLUEPRINT.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+Start with [docs/BLUEPRINT.md](docs/BLUEPRINT.md), [docs/ROADMAP.md](docs/ROADMAP.md), the [Phase 0 benchmark guide](docs/PHASE-0.md), and the current benchmark results.
 
 ## Status
 
-Planning complete; implementation has not started.
+Phase 0 is in progress. The first Rust workspace provides a command-line harness for microphone capture and local Whisper benchmarking before the tray application is built.
 
 ## Initial platform
 
@@ -23,7 +23,15 @@ Planning complete; implementation has not started.
 - Native Rust UI with `egui`/`eframe` and a lightweight tray application
 - Per-user installation
 
-## Working name
+## Development
 
-`Phorminx` is a temporary internal name. Product naming and trademark review are outside the MVP.
+```powershell
+cargo test --workspace
+cargo run --release -p phorminx-bench -- devices
+```
 
+Whisper models belong in `models/` and personal recordings in `test-data/`; neither directory is committed to Git. See the Phase 0 guide for capture and transcription commands.
+
+## Name
+
+The project and product are named Phorminx.

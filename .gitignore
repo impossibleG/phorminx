@@ -6,8 +6,10 @@ obj/
 *.suo
 artifacts/
 TestResults/
+target/
+target-vulkan/
 models/
+test-data/
 *.db
 *.db-shm
 *.db-wal
-

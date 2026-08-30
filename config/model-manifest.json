@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "sourceRevision": "c521a4b02f422512d734391fdf08bb08c0862f68",
+  "models": [
+    {
+      "id": "whisper-base-en-f16",
+      "fileName": "ggml-base.en.bin",
+      "language": "en",
+      "quantization": "f16",
+      "bytes": 147964211,
+      "sha256": "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/c521a4b02f422512d734391fdf08bb08c0862f68/ggml-base.en.bin?download=true",
+      "license": "MIT"
+    },
+    {
+      "id": "whisper-small-en-q5-1",
+      "fileName": "ggml-small.en-q5_1.bin",
+      "language": "en",
+      "quantization": "q5_1",
+      "bytes": 190098681,
+      "sha256": "bfdff4894dcb76bbf647d56263ea2a96645423f1669176f4844a1bf8e478ad30",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/c521a4b02f422512d734391fdf08bb08c0862f68/ggml-small.en-q5_1.bin?download=true",
+      "license": "MIT"
+    }
+  ]
+}

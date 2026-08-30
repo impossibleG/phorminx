@@ -1,0 +1,13 @@
+[package]
+name = "phorminx-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cpal.workspace = true
+hound.workspace = true
+phorminx-core = { path = "../phorminx-core" }
+thiserror.workspace = true

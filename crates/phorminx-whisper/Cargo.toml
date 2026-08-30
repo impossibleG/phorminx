@@ -1,0 +1,16 @@
+[package]
+name = "phorminx-whisper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+vulkan = ["whisper-rs/vulkan"]
+
+[dependencies]
+phorminx-core = { path = "../phorminx-core" }
+thiserror.workspace = true
+whisper-rs.workspace = true
