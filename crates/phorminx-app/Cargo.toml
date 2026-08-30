@@ -1,0 +1,20 @@
+[package]
+name = "phorminx-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+vulkan = ["phorminx-whisper/vulkan"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+phorminx-audio = { path = "../phorminx-audio" }
+phorminx-core = { path = "../phorminx-core" }
+phorminx-whisper = { path = "../phorminx-whisper" }
+phorminx-windows = { path = "../phorminx-windows" }

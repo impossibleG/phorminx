@@ -1,4 +1,4 @@
-//! Microphone capture and WAV utilities for the Phase 0 benchmark.
+//! Microphone capture and WAV utilities for Phorminx.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -36,11 +36,45 @@ pub fn input_devices() -> Result<Vec<InputDevice>, CaptureError> {
     Ok(devices)
 }
 
-/// Records from the default microphone for a fixed duration.
+/// An in-progress recording from the default microphone.
 ///
-/// This intentionally uses a mutex-backed buffer for the feasibility spike.
-/// The interactive product will replace it with a bounded SPSC ring buffer.
-pub fn record_default(duration: Duration) -> Result<AudioClip, CaptureError> {
+/// Phase 1 keeps the callback deliberately small and stores mono samples in a
+/// mutex-backed buffer. A bounded SPSC buffer can replace this without changing
+/// the public start/finish lifecycle.
+pub struct ActiveRecording {
+    stream: cpal::Stream,
+    captured: Arc<Mutex<Vec<f32>>>,
+    errors: Arc<Mutex<Vec<String>>>,
+    sample_rate: u32,
+}
+
+impl ActiveRecording {
+    /// Stops capture and converts the recording to Whisper's 16 kHz mono format.
+    pub fn finish(self) -> Result<AudioClip, CaptureError> {
+        let Self {
+            stream,
+            captured,
+            errors,
+            sample_rate,
+        } = self;
+        drop(stream);
+
+        if let Some(error) = errors.lock().expect("audio error mutex poisoned").first() {
+            return Err(CaptureError::Stream(error.clone()));
+        }
+
+        let native_samples = Arc::try_unwrap(captured)
+            .map_err(|_| CaptureError::BufferStillShared)?
+            .into_inner()
+            .map_err(|_| CaptureError::BufferPoisoned)?;
+
+        let samples = resample_linear(&native_samples, sample_rate, WHISPER_SAMPLE_RATE);
+        AudioClip::new(samples, WHISPER_SAMPLE_RATE).map_err(CaptureError::Audio)
+    }
+}
+
+/// Starts recording from the default microphone and returns immediately.
+pub fn start_default() -> Result<ActiveRecording, CaptureError> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -84,20 +118,20 @@ pub fn record_default(duration: Duration) -> Result<AudioClip, CaptureError> {
     }?;
 
     stream.play().map_err(CaptureError::PlayStream)?;
+
+    Ok(ActiveRecording {
+        stream,
+        captured,
+        errors,
+        sample_rate,
+    })
+}
+
+/// Records from the default microphone for a fixed duration.
+pub fn record_default(duration: Duration) -> Result<AudioClip, CaptureError> {
+    let recording = start_default()?;
     thread::sleep(duration);
-    drop(stream);
-
-    if let Some(error) = errors.lock().expect("audio error mutex poisoned").first() {
-        return Err(CaptureError::Stream(error.clone()));
-    }
-
-    let native_samples = Arc::try_unwrap(captured)
-        .map_err(|_| CaptureError::BufferStillShared)?
-        .into_inner()
-        .map_err(|_| CaptureError::BufferPoisoned)?;
-
-    let samples = resample_linear(&native_samples, sample_rate, WHISPER_SAMPLE_RATE);
-    AudioClip::new(samples, WHISPER_SAMPLE_RATE).map_err(CaptureError::Audio)
+    recording.finish()
 }
 
 fn build_stream<T, F>(

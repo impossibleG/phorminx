@@ -10,11 +10,11 @@ The product is local-first:
 - Raw audio is not retained by default.
 - Dictation remains usable when Ollama is missing or unavailable.
 
-Start with [docs/BLUEPRINT.md](docs/BLUEPRINT.md), [docs/ROADMAP.md](docs/ROADMAP.md), the [Phase 0 benchmark guide](docs/PHASE-0.md), and the current benchmark results.
+Start with [docs/BLUEPRINT.md](docs/BLUEPRINT.md), [docs/ROADMAP.md](docs/ROADMAP.md), the Phase 0 benchmark results, and the [Phase 1 walking-skeleton guide](docs/PHASE-1.md).
 
 ## Status
 
-Phase 0 is in progress. The first Rust workspace provides a command-line harness for microphone capture and local Whisper benchmarking before the tray application is built.
+Phase 0 is complete: microphone capture, local Whisper, CPU fallback, and Vulkan acceleration are validated on the reference machine. `base.en` is the initial English model. Phase 1 is building the end-to-end push-to-talk walking skeleton before the tray UI.
 
 ## Initial platform
 
@@ -28,9 +28,12 @@ Phase 0 is in progress. The first Rust workspace provides a command-line harness
 ```powershell
 cargo test --workspace
 cargo run --release -p phorminx-bench -- devices
+
+. .\scripts\Enter-PhorminxDevShell.ps1 -Vulkan
+cargo run --release -p phorminx-app --features vulkan
 ```
 
-Whisper models belong in `models/` and personal recordings in `test-data/`; neither directory is committed to Git. See the Phase 0 guide for capture and transcription commands.
+Whisper models belong in `models/` and personal recordings in `test-data/`; neither directory is committed to Git. The Phase 1 executable keeps the selected model resident and uses `Ctrl+Alt+Space` as its temporary hold-to-talk shortcut.
 
 ## Name
 
