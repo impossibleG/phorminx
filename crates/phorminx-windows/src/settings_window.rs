@@ -37,6 +37,7 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 const CLASS_NAME: PCWSTR = w!("PhorminxSettingsWindow");
 const WM_FOCUS_WINDOW: u32 = WM_APP + 40;
 const WM_SHOW_ERROR: u32 = WM_APP + 41;
+const WM_MODEL_UPDATE: u32 = WM_APP + 42;
 
 const ID_MODEL: usize = 101;
 const ID_LANGUAGE: usize = 102;
@@ -44,6 +45,7 @@ const ID_MINIMUM_RMS: usize = 103;
 const ID_FORMATTING: usize = 104;
 const ID_CUSTOM: usize = 105;
 const ID_BROWSE: usize = 106;
+const ID_DOWNLOAD: usize = 107;
 const ID_SAVE: usize = 201;
 const ID_CANCEL: usize = 202;
 
@@ -84,6 +86,7 @@ pub struct SettingsForm {
     pub model_path: String,
     pub model_status: String,
     pub microphone_status: String,
+    pub recommended_download_label: String,
     pub language: String,
     pub minimum_rms: String,
     pub formatting: SettingsFormatting,
@@ -93,12 +96,14 @@ pub struct SettingsForm {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SettingsWindowEvent {
     SaveAndRestart(SettingsForm),
+    DownloadRecommended,
     Closed,
 }
 
 pub struct SettingsWindow {
     events: Receiver<SettingsWindowEvent>,
     errors: Arc<Mutex<Option<String>>>,
+    model_updates: Arc<Mutex<Option<ModelUpdate>>>,
     window_bits: usize,
     thread_id: u32,
     thread: Option<JoinHandle<()>>,
@@ -115,11 +120,21 @@ impl SettingsWindow {
 
         let errors = Arc::new(Mutex::new(None));
         let thread_errors = Arc::clone(&errors);
+        let model_updates = Arc::new(Mutex::new(None));
+        let thread_model_updates = Arc::clone(&model_updates);
         let (event_tx, event_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("phorminx-settings".to_owned())
-            .spawn(move || run_window(form, event_tx, thread_errors, ready_tx))
+            .spawn(move || {
+                run_window(
+                    form,
+                    event_tx,
+                    thread_errors,
+                    thread_model_updates,
+                    ready_tx,
+                )
+            })
             .map_err(|error| {
                 ACTIVE.store(false, Ordering::Release);
                 SettingsWindowError::Spawn(error)
@@ -140,6 +155,7 @@ impl SettingsWindow {
         Ok(Self {
             events: event_rx,
             errors,
+            model_updates,
             window_bits,
             thread_id,
             thread: Some(thread),
@@ -176,6 +192,27 @@ impl SettingsWindow {
             )
         }
         .map_err(SettingsWindowError::PostError)
+    }
+
+    pub fn update_model(
+        &self,
+        path: Option<String>,
+        status: String,
+    ) -> Result<(), SettingsWindowError> {
+        *self
+            .model_updates
+            .lock()
+            .map_err(|_| SettingsWindowError::ModelUpdateLockPoisoned)? =
+            Some(ModelUpdate { path, status });
+        unsafe {
+            PostMessageW(
+                Some(window(self.window_bits)),
+                WM_MODEL_UPDATE,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        }
+        .map_err(SettingsWindowError::PostModelUpdate)
     }
 
     pub fn shutdown(mut self) -> Result<(), SettingsWindowError> {
@@ -221,20 +258,28 @@ struct WindowState {
     initial: SettingsForm,
     events: Sender<SettingsWindowEvent>,
     errors: Arc<Mutex<Option<String>>>,
+    model_updates: Arc<Mutex<Option<ModelUpdate>>>,
     model: HWND,
+    model_status: HWND,
     language: HWND,
     minimum_rms: HWND,
     formatting: HWND,
     custom: HWND,
 }
 
+struct ModelUpdate {
+    path: Option<String>,
+    status: String,
+}
+
 fn run_window(
     form: SettingsForm,
     events: Sender<SettingsWindowEvent>,
     errors: Arc<Mutex<Option<String>>>,
+    model_updates: Arc<Mutex<Option<ModelUpdate>>>,
     ready_tx: mpsc::SyncSender<Result<(usize, u32), String>>,
 ) {
-    let result = unsafe { create_and_run(form, events, errors, &ready_tx) };
+    let result = unsafe { create_and_run(form, events, errors, model_updates, &ready_tx) };
     if let Err(error) = result {
         let _ = ready_tx.try_send(Err(error.to_string()));
     }
@@ -245,6 +290,7 @@ unsafe fn create_and_run(
     form: SettingsForm,
     events: Sender<SettingsWindowEvent>,
     errors: Arc<Mutex<Option<String>>>,
+    model_updates: Arc<Mutex<Option<ModelUpdate>>>,
     ready_tx: &mpsc::SyncSender<Result<(usize, u32), String>>,
 ) -> windows::core::Result<()> {
     let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
@@ -266,7 +312,9 @@ unsafe fn create_and_run(
         initial: form,
         events,
         errors,
+        model_updates,
         model: HWND::default(),
+        model_status: HWND::default(),
         language: HWND::default(),
         minimum_rms: HWND::default(),
         formatting: HWND::default(),
@@ -275,7 +323,7 @@ unsafe fn create_and_run(
     let state_pointer = (&mut *state as *mut WindowState).cast();
     let system_dpi = unsafe { GetDpiForSystem() }.max(96) as i32;
     let width = 560 * system_dpi / 96;
-    let height = 580 * system_dpi / 96;
+    let height = 635 * system_dpi / 96;
     let x = (unsafe { GetSystemMetrics(SM_CXSCREEN) } - width).max(0) / 2;
     let y = (unsafe { GetSystemMetrics(SM_CYSCREEN) } - height).max(0) / 2;
     let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
@@ -379,6 +427,11 @@ unsafe extern "system" fn window_procedure(
                         let _ = unsafe { SetWindowTextW(state.model, PCWSTR(path.as_ptr())) };
                     }
                 }
+                ID_DOWNLOAD => {
+                    if let Some(state) = unsafe { window_state(hwnd) } {
+                        let _ = state.events.send(SettingsWindowEvent::DownloadRecommended);
+                    }
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -403,6 +456,20 @@ unsafe extern "system" fn window_procedure(
                         w!("Could not save settings"),
                         MB_OK | MB_ICONERROR,
                     );
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MODEL_UPDATE => {
+            if let Some(state) = unsafe { window_state(hwnd) }
+                && let Ok(mut update) = state.model_updates.lock()
+                && let Some(update) = update.take()
+            {
+                let status = wide(&update.status);
+                let _ = unsafe { SetWindowTextW(state.model_status, PCWSTR(status.as_ptr())) };
+                if let Some(path) = update.path {
+                    let path = wide(&path);
+                    let _ = unsafe { SetWindowTextW(state.model, PCWSTR(path.as_ptr())) };
                 }
             }
             LRESULT(0)
@@ -432,7 +499,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
     let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
 
     unsafe {
-        create_label(
+        state.model_status = create_label(
             hwnd,
             w!("Speech recognition model"),
             24,
@@ -577,12 +644,25 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             scale,
             font,
         )?;
+        let download_label = wide(&state.initial.recommended_download_label);
+        create_button(
+            hwnd,
+            ID_DOWNLOAD,
+            PCWSTR(download_label.as_ptr()),
+            24,
+            448,
+            500,
+            30,
+            false,
+            scale,
+            font,
+        )?;
         create_button(
             hwnd,
             ID_CANCEL,
             w!("Cancel"),
             296,
-            466,
+            510,
             92,
             30,
             false,
@@ -594,7 +674,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_SAVE,
             w!("Save and Restart"),
             398,
-            466,
+            510,
             126,
             30,
             true,
@@ -806,8 +886,9 @@ unsafe fn read_form(state: &WindowState) -> Option<SettingsForm> {
     let selected = unsafe { SendMessageW(state.formatting, CB_GETCURSEL, None, None) }.0;
     Some(SettingsForm {
         model_path: unsafe { read_text(state.model) },
-        model_status: state.initial.model_status.clone(),
+        model_status: unsafe { read_text(state.model_status) },
         microphone_status: state.initial.microphone_status.clone(),
+        recommended_download_label: state.initial.recommended_download_label.clone(),
         language: unsafe { read_text(state.language) },
         minimum_rms: unsafe { read_text(state.minimum_rms) },
         formatting: SettingsFormatting::from_index(selected)?,
@@ -876,6 +957,10 @@ pub enum SettingsWindowError {
     PostError(windows::core::Error),
     #[error("the settings error queue is poisoned")]
     ErrorLockPoisoned,
+    #[error("the model update queue is poisoned")]
+    ModelUpdateLockPoisoned,
+    #[error("failed to update model download status: {0}")]
+    PostModelUpdate(windows::core::Error),
     #[error("failed to close the settings window: {0}")]
     PostClose(windows::core::Error),
     #[error("the settings thread panicked")]

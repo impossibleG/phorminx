@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
+use phorminx_app::model::{ModelDownload, ModelDownloadEvent, recommended_model};
 use phorminx_app::runtime::{
     AppIo, AppRuntime, FinishedAudio, InsertDisposition, RuntimeNotice, UiStatus,
 };
@@ -199,6 +200,7 @@ fn run() -> Result<()> {
     }
 
     let mut settings_window = None;
+    let mut model_download = None;
     let mut restart_requested = false;
 
     let run_result: Result<()> = 'event_loop: loop {
@@ -209,6 +211,7 @@ fn run() -> Result<()> {
             &tray,
             &overlay,
             &mut settings_window,
+            &mut model_download,
             &settings_store,
             &mut settings,
             &model,
@@ -230,6 +233,7 @@ fn run() -> Result<()> {
             &tray,
             &overlay,
             &mut settings_window,
+            &mut model_download,
             &settings_store,
             &mut settings,
             &model,
@@ -284,6 +288,7 @@ fn run() -> Result<()> {
             &tray,
             &overlay,
             &mut settings_window,
+            &mut model_download,
             &settings_store,
             &mut settings,
             &model,
@@ -350,6 +355,14 @@ fn run() -> Result<()> {
                 .context("failed to stop the settings window"),
         );
     }
+    if let Some(download) = model_download {
+        preserve_first_error(
+            &mut final_error,
+            download
+                .shutdown()
+                .context("failed to stop the model download"),
+        );
+    }
     preserve_first_error(
         &mut final_error,
         hotkey
@@ -395,6 +408,7 @@ fn run_setup_mode(
         SettingsWindow::start(settings_form(&settings, &model))
             .context("failed to open first-run model setup")?,
     );
+    let mut model_download = None;
     let mut restart_requested = false;
     let run_result = loop {
         if shutting_down.load(Ordering::Acquire) {
@@ -404,6 +418,7 @@ fn run_setup_mode(
             &tray,
             &overlay,
             &mut settings_window,
+            &mut model_download,
             &settings_store,
             &mut settings,
             &model,
@@ -423,6 +438,14 @@ fn run_setup_mode(
         preserve_first_error(
             &mut final_error,
             window.shutdown().context("failed to stop the setup window"),
+        );
+    }
+    if let Some(download) = model_download {
+        preserve_first_error(
+            &mut final_error,
+            download
+                .shutdown()
+                .context("failed to stop the model download"),
         );
     }
     preserve_first_error(
@@ -458,6 +481,7 @@ fn poll_shell_events(
     tray: &SystemTray,
     overlay: &StatusOverlay,
     settings_window: &mut Option<SettingsWindow>,
+    model_download: &mut Option<ModelDownload>,
     settings_store: &SettingsStore,
     settings: &mut Settings,
     effective_model: &Path,
@@ -509,6 +533,11 @@ fn poll_shell_events(
                         .shutdown()
                         .context("failed to join the settings window")?;
                 }
+                if let Some(download) = model_download.take() {
+                    download
+                        .shutdown()
+                        .context("failed to cancel the model download")?;
+                }
             }
             SettingsWindowEvent::SaveAndRestart(form) => {
                 let save_result = apply_settings_form(settings_store, settings, form);
@@ -524,7 +553,125 @@ fn poll_shell_events(
                     }
                 }
             }
+            SettingsWindowEvent::DownloadRecommended => {
+                if model_download.is_some() {
+                    if let Some(window) = settings_window.as_ref() {
+                        window
+                            .update_model(None, "Model download is already running".to_owned())
+                            .context("failed to update download status")?;
+                    }
+                    continue;
+                }
+                let directory = settings_store
+                    .path()
+                    .parent()
+                    .ok_or_else(|| anyhow!("the settings path has no parent directory"))?
+                    .join("models");
+                match ModelDownload::start(&directory) {
+                    Ok(download) => {
+                        *model_download = Some(download);
+                        if let Some(window) = settings_window.as_ref() {
+                            window
+                                .update_model(
+                                    None,
+                                    "Starting verified model download...".to_owned(),
+                                )
+                                .context("failed to update download status")?;
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(window) = settings_window.as_ref() {
+                            window
+                                .show_error(format!("Could not start the model download: {error}"))
+                                .context("failed to display the download error")?;
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    let mut download_events = Vec::new();
+    if let Some(download) = model_download.as_ref() {
+        loop {
+            match download.events().try_recv() {
+                Ok(event) => download_events.push(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !download_events.iter().any(|event| {
+                        matches!(
+                            event,
+                            ModelDownloadEvent::Completed { .. }
+                                | ModelDownloadEvent::Cancelled
+                                | ModelDownloadEvent::Failed(_)
+                        )
+                    }) {
+                        download_events.push(ModelDownloadEvent::Failed(
+                            "the model download thread stopped unexpectedly".to_owned(),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut download_finished = false;
+    for event in download_events {
+        match event {
+            ModelDownloadEvent::Progress { downloaded, total } => {
+                let percent = downloaded.saturating_mul(100) / total.max(1);
+                if let Some(window) = settings_window.as_ref() {
+                    window
+                        .update_model(
+                            None,
+                            format!("Downloading and verifying model... {percent}%"),
+                        )
+                        .context("failed to update download progress")?;
+                }
+            }
+            ModelDownloadEvent::Completed { path } => {
+                if let Some(window) = settings_window.as_ref() {
+                    let size = std::fs::metadata(&path)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0);
+                    window
+                        .update_model(
+                            Some(path.display().to_string()),
+                            format!(
+                                "Model downloaded and verified ({:.1} MiB)",
+                                size as f64 / (1024.0 * 1024.0)
+                            ),
+                        )
+                        .context("failed to show the downloaded model")?;
+                }
+                download_finished = true;
+            }
+            ModelDownloadEvent::Cancelled => {
+                if let Some(window) = settings_window.as_ref() {
+                    window
+                        .update_model(None, "Model download cancelled".to_owned())
+                        .context("failed to update download status")?;
+                }
+                download_finished = true;
+            }
+            ModelDownloadEvent::Failed(message) => {
+                if let Some(window) = settings_window.as_ref() {
+                    window
+                        .update_model(None, "Model download failed".to_owned())
+                        .context("failed to update download status")?;
+                    window
+                        .show_error(message)
+                        .context("failed to display the download failure")?;
+                }
+                download_finished = true;
+            }
+        }
+    }
+    if download_finished && let Some(download) = model_download.take() {
+        download
+            .shutdown()
+            .context("failed to join the model download")?;
     }
 
     Ok(ShellAction::Continue)
@@ -560,6 +707,14 @@ fn settings_form(settings: &Settings, effective_model: &Path) -> SettingsForm {
         model_path: effective_model.display().to_string(),
         model_status,
         microphone_status,
+        recommended_download_label: recommended_model()
+            .map(|model| {
+                format!(
+                    "Download recommended English model ({:.0} MiB)",
+                    model.bytes as f64 / (1024.0 * 1024.0)
+                )
+            })
+            .unwrap_or_else(|_| "Recommended model download unavailable".to_owned()),
         language: settings.recognition.language.clone(),
         minimum_rms: settings.recognition.minimum_rms.to_string(),
         formatting: match settings.formatting.strength {

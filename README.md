@@ -14,7 +14,7 @@ Start with [docs/BLUEPRINT.md](docs/BLUEPRINT.md), [docs/ROADMAP.md](docs/ROADMA
 
 ## Status
 
-The end-to-end walking skeleton and its stability gate are complete: microphone capture, resident local Whisper, guarded insertion, the non-activating overlay, 500-cycle safety soaks, and a native tray lifecycle are validated on the reference machine. Product-shell work is in progress; the native settings window, atomic versioned settings, clean restart flow, and Raw/Light formatting behavior are implemented. Onboarding and model management remain.
+The end-to-end walking skeleton and its stability gate are complete: microphone capture, resident local Whisper, guarded insertion, the non-activating overlay, 500-cycle safety soaks, and a native tray lifecycle are validated on the reference machine. Product-shell work is in progress; the native settings window, atomic versioned settings, clean restart flow, verified model download, and Raw/Light formatting behavior are implemented. Broader onboarding and automatic hardware recommendations remain.
 
 ## Initial platform
 
@@ -36,7 +36,7 @@ cargo run --release -p phorminx-app --features vulkan
 cargo build --release -p phorminx-app --features desktop
 ```
 
-Runtime settings load from `%LOCALAPPDATA%\Phorminx\settings.toml`. A missing file uses the current defaults without creating anything. Open the native settings window from the tray; it reports model and default-microphone readiness and includes a native model picker. Saving validates and atomically persists the form, then restarts Phorminx so recognition changes take effect cleanly. If the selected model is missing at startup, Phorminx stays in setup mode and opens this window instead of terminating. Command-line values such as `--model`, `--language`, `--minimum-rms`, and `--formatting raw|light` override settings for one run; `--config PATH` selects a development/test settings file.
+Runtime settings load from `%LOCALAPPDATA%\Phorminx\settings.toml`. A missing file uses the current defaults without creating anything. Open the native settings window from the tray; it reports model and default-microphone readiness, includes a native model picker, and offers an explicit download for the pinned recommended English model. Downloads stream to a temporary file and must match both the manifest size and SHA-256 before atomic promotion. Saving validates and atomically persists the form, then restarts Phorminx so recognition changes take effect cleanly. If the selected model is missing at startup, Phorminx stays in setup mode and opens this window instead of terminating. Command-line values such as `--model`, `--language`, `--minimum-rms`, and `--formatting raw|light` override settings for one run; `--config PATH` selects a development/test settings file.
 
 Whisper models belong in `models/` and personal recordings in `test-data/`; neither directory is committed to Git. The Phase 1 executable keeps the selected model resident and uses `Ctrl+Alt+Space` as its temporary hold-to-talk shortcut.
 
