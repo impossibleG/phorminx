@@ -6,10 +6,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use phorminx_app::runtime::{
     AppIo, AppRuntime, FinishedAudio, InsertDisposition, RuntimeNotice, UiStatus,
 };
+use phorminx_app::settings::{FormattingStrength, RuntimeFormatting, SettingsStore};
 use phorminx_audio::{ActiveRecording, start_default};
 use phorminx_core::{
     AudioClip, DictationId, RuntimeState, SpeechRecognizer, Transcript, TranscriptionOptions,
@@ -24,19 +25,46 @@ use phorminx_windows::{
 #[command(name = "phorminx")]
 #[command(about = "Local-first Windows push-to-talk dictation")]
 struct Cli {
-    #[arg(long, default_value = "models/ggml-base.en.bin")]
-    model: PathBuf,
-    #[arg(long, default_value = "en")]
-    language: String,
+    /// Override the settings file for this run (relative paths use the current directory).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    model: Option<PathBuf>,
+    #[arg(long)]
+    language: Option<String>,
     /// Recordings quieter than this RMS value are treated as silence.
-    #[arg(long, default_value_t = 0.003)]
-    minimum_rms: f32,
+    #[arg(long)]
+    minimum_rms: Option<f32>,
+    /// Override transcript formatting for this run.
+    #[arg(long, value_enum)]
+    formatting: Option<FormattingCli>,
     /// Start every service and then exit cleanly without accepting dictation.
     #[arg(long, hide = true)]
     smoke_test: bool,
     /// Cycle through every fixed overlay state without loading speech recognition.
     #[arg(long, hide = true)]
     overlay_demo: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FormattingCli {
+    Raw,
+    Light,
+    Balanced,
+    Strong,
+    Custom,
+}
+
+impl From<FormattingCli> for FormattingStrength {
+    fn from(value: FormattingCli) -> Self {
+        match value {
+            FormattingCli::Raw => Self::Raw,
+            FormattingCli::Light => Self::Light,
+            FormattingCli::Balanced => Self::Balanced,
+            FormattingCli::Strong => Self::Strong,
+            FormattingCli::Custom => Self::Custom,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -59,10 +87,44 @@ fn main() -> Result<()> {
         overlay.shutdown()?;
         return Ok(());
     }
+
+    let settings_store = match cli.config.clone() {
+        Some(path) => SettingsStore::new(path),
+        None => SettingsStore::default_for_current_user(),
+    }
+    .context("failed to resolve the settings file")?;
+    let settings_file_exists = settings_store.path().is_file();
+    let mut settings = settings_store.load().with_context(|| {
+        format!(
+            "failed to load settings from {}",
+            settings_store.path().display()
+        )
+    })?;
+    if let Some(language) = cli.language {
+        settings.recognition.language = language;
+    }
+    if let Some(minimum_rms) = cli.minimum_rms {
+        settings.recognition.minimum_rms = minimum_rms;
+    }
+    if let Some(formatting) = cli.formatting {
+        settings.formatting.strength = formatting.into();
+    }
+    settings
+        .validate_and_normalize()
+        .context("invalid effective settings")?;
+    let formatting = RuntimeFormatting::try_from(settings.formatting.strength)?;
+    let model = match cli.model {
+        Some(model) => model,
+        None if settings_file_exists => {
+            settings_store.resolve_model_path(&settings.recognition.model_path)
+        }
+        None => settings.recognition.model_path.clone(),
+    };
+
     let tray = SystemTray::start().context("failed to start the system tray")?;
     show_shell_status(&overlay, &tray, OverlayStatus::Loading, TrayStatus::Loading);
-    println!("Phorminx is loading {}...", cli.model.display());
-    let worker = TranscriptionWorker::start(&cli.model)?;
+    println!("Phorminx is loading {}...", model.display());
+    let worker = TranscriptionWorker::start(&model)?;
 
     let shutting_down = Arc::new(AtomicBool::new(false));
     let shutdown_flag = Arc::clone(&shutting_down);
@@ -70,8 +132,11 @@ fn main() -> Result<()> {
         .context("failed to install the Ctrl+C handler")?;
 
     let hotkey = GlobalHoldHotkey::start().context("failed to install the global hotkey")?;
-    let mut runtime =
-        AppRuntime::<TargetSnapshot, ActiveRecording>::new(cli.minimum_rms, cli.language.clone())?;
+    let mut runtime = AppRuntime::<TargetSnapshot, ActiveRecording>::new_with_formatting(
+        settings.recognition.minimum_rms,
+        settings.recognition.language.clone(),
+        formatting,
+    )?;
 
     println!("Ready. Hold Ctrl+Alt+Space to dictate; press Ctrl+C here to exit.");
     log_state(None, runtime.state(), "ready");

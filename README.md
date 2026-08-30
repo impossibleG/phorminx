@@ -14,13 +14,13 @@ Start with [docs/BLUEPRINT.md](docs/BLUEPRINT.md), [docs/ROADMAP.md](docs/ROADMA
 
 ## Status
 
-Phase 0 is complete: microphone capture, local Whisper, CPU fallback, and Vulkan acceleration are validated on the reference machine. `base.en` is the initial English model. The Phase 1 walking skeleton now includes guarded push-to-talk insertion and a non-activating status overlay; stability hardening remains before the tray UI.
+The end-to-end walking skeleton and its stability gate are complete: microphone capture, resident local Whisper, guarded insertion, the non-activating overlay, 500-cycle safety soaks, and a native tray lifecycle are validated on the reference machine. Product-shell work is in progress; versioned settings and Raw/Light formatting behavior are implemented, while the settings window and onboarding still remain.
 
 ## Initial platform
 
 - Windows 10/11 x64
 - Rust on the current stable toolchain
-- Native Rust UI with `egui`/`eframe` and a lightweight tray application
+- Lightweight native Win32 shell written in Rust
 - Per-user installation
 
 ## Development
@@ -32,6 +32,8 @@ cargo run --release -p phorminx-bench -- devices
 . .\scripts\Enter-PhorminxDevShell.ps1 -Vulkan
 cargo run --release -p phorminx-app --features vulkan
 ```
+
+Runtime settings load from `%LOCALAPPDATA%\Phorminx\settings.toml`. A missing file uses the current defaults without creating anything. Command-line values such as `--model`, `--language`, `--minimum-rms`, and `--formatting raw|light` override settings for one run; `--config PATH` selects a development/test settings file.
 
 Whisper models belong in `models/` and personal recordings in `test-data/`; neither directory is committed to Git. The Phase 1 executable keeps the selected model resident and uses `Ctrl+Alt+Space` as its temporary hold-to-talk shortcut.
 

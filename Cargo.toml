@@ -25,7 +25,9 @@ ctrlc = "=3.5.1"
 hound = "=3.5.1"
 ringbuf = { version = "=0.5.1", default-features = false, features = ["alloc"] }
 rubato = { version = "=5.0.0", default-features = false, features = ["fft_resampler"] }
+serde = { version = "=1.0.229", features = ["derive"] }
 thiserror = "=2.0.16"
+toml = "=1.1.4"
 whisper-rs = { version = "=0.16.0", default-features = false, features = ["tracing_backend"] }
 windows = "=0.62.2"
 

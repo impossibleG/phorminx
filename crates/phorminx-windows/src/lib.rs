@@ -1,6 +1,8 @@
 //! Windows shell integration for Phorminx.
 
 #[cfg(windows)]
+mod file;
+#[cfg(windows)]
 mod hotkey;
 #[cfg(windows)]
 mod insertion;
@@ -11,6 +13,8 @@ mod target;
 #[cfg(windows)]
 mod tray;
 
+#[cfg(windows)]
+pub use file::{AtomicReplaceError, atomic_replace_file};
 #[cfg(windows)]
 pub use hotkey::{GlobalHoldHotkey, HoldEvent, HotkeyError};
 #[cfg(windows)]

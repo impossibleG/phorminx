@@ -19,3 +19,6 @@ phorminx-audio = { path = "../phorminx-audio" }
 phorminx-core = { path = "../phorminx-core" }
 phorminx-whisper = { path = "../phorminx-whisper" }
 phorminx-windows = { path = "../phorminx-windows" }
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true

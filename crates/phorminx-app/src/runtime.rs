@@ -5,6 +5,8 @@ use phorminx_core::{
     normalize_transcript, recommended_audio_context,
 };
 
+use crate::settings::RuntimeFormatting;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiStatus {
     Ready,
@@ -103,10 +105,19 @@ pub struct AppRuntime<Target, Recording> {
     pending_id: Option<DictationId>,
     minimum_rms: f32,
     language: String,
+    formatting: RuntimeFormatting,
 }
 
 impl<Target, Recording> AppRuntime<Target, Recording> {
     pub fn new(minimum_rms: f32, language: String) -> Result<Self, StateError> {
+        Self::new_with_formatting(minimum_rms, language, RuntimeFormatting::Light)
+    }
+
+    pub fn new_with_formatting(
+        minimum_rms: f32,
+        language: String,
+        formatting: RuntimeFormatting,
+    ) -> Result<Self, StateError> {
         let mut machine = RuntimeStateMachine::default();
         machine.mark_ready()?;
         Ok(Self {
@@ -116,6 +127,7 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
             pending_id: None,
             minimum_rms,
             language,
+            formatting,
         })
     }
 
@@ -312,7 +324,10 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
         };
 
         self.machine.transition(RuntimeState::Normalizing)?;
-        let normalized = normalize_transcript(&transcript.text);
+        let normalized = match self.formatting {
+            RuntimeFormatting::Raw => transcript.text,
+            RuntimeFormatting::Light => normalize_transcript(&transcript.text),
+        };
         if normalized.is_empty() {
             self.machine.cancel()?;
             notices.push(RuntimeNotice::NoSpeech {
@@ -470,6 +485,7 @@ mod tests {
         starts: usize,
         insertions: usize,
         pasted_targets: Vec<u64>,
+        inserted_texts: Vec<String>,
         submitted: VecDeque<DictationId>,
         max_outstanding: usize,
         statuses: Vec<UiStatus>,
@@ -489,6 +505,7 @@ mod tests {
                 starts: 0,
                 insertions: 0,
                 pasted_targets: Vec::new(),
+                inserted_texts: Vec::new(),
                 submitted: VecDeque::new(),
                 max_outstanding: 0,
                 statuses: Vec::new(),
@@ -569,9 +586,10 @@ mod tests {
         fn insert(
             &mut self,
             target: Option<Self::Target>,
-            _text: &str,
+            text: &str,
         ) -> Result<InsertDisposition<Self::ClipboardReason>, String> {
             self.insertions += 1;
+            self.inserted_texts.push(text.to_owned());
             if self.insertion_fails {
                 return Err("insert failed".to_owned());
             }
@@ -807,5 +825,26 @@ mod tests {
         assert_eq!(runtime.state(), RuntimeState::Listening);
         drop(runtime);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn raw_preserves_transcript_and_light_normalizes_spacing() {
+        for (formatting, expected) in [
+            (RuntimeFormatting::Raw, "  Hello   world ,  "),
+            (RuntimeFormatting::Light, "Hello world,"),
+        ] {
+            let mut runtime = AppRuntime::<u64, FakeRecording>::new_with_formatting(
+                0.003,
+                "en".to_owned(),
+                formatting,
+            )
+            .unwrap();
+            let mut io = FakeIo::default();
+            let id = advance_to_transcribing(&mut runtime, &mut io, 1);
+            runtime
+                .transcription_completed(id, Ok(transcript("  Hello   world ,  ")), &mut io)
+                .unwrap();
+            assert_eq!(io.inserted_texts, [expected]);
+        }
     }
 }
