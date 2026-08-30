@@ -1,3 +1,4 @@
+use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -7,6 +8,10 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
+    OPENFILENAMEW,
+};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
     SetThreadDpiAwarenessContext,
@@ -19,13 +24,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, IsWindow, LoadCursorW, MB_ICONERROR,
     MB_OK, MSG, MessageBoxW, PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW,
     SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SW_SHOWNORMAL, SendMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, ShowWindow, TranslateMessage, UnregisterClassW, WINDOW_STYLE, WM_APP,
-    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_NCDESTROY, WM_QUIT, WM_SETFONT,
-    WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE,
-    WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
-    WS_VSCROLL,
+    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, UnregisterClassW,
+    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_NCDESTROY,
+    WM_QUIT, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
+    WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
-use windows::core::{PCWSTR, w};
+use windows::core::{PCWSTR, PWSTR, w};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -38,6 +43,7 @@ const ID_LANGUAGE: usize = 102;
 const ID_MINIMUM_RMS: usize = 103;
 const ID_FORMATTING: usize = 104;
 const ID_CUSTOM: usize = 105;
+const ID_BROWSE: usize = 106;
 const ID_SAVE: usize = 201;
 const ID_CANCEL: usize = 202;
 
@@ -76,6 +82,8 @@ impl SettingsFormatting {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsForm {
     pub model_path: String,
+    pub model_status: String,
+    pub microphone_status: String,
     pub language: String,
     pub minimum_rms: String,
     pub formatting: SettingsFormatting,
@@ -267,7 +275,7 @@ unsafe fn create_and_run(
     let state_pointer = (&mut *state as *mut WindowState).cast();
     let system_dpi = unsafe { GetDpiForSystem() }.max(96) as i32;
     let width = 560 * system_dpi / 96;
-    let height = 520 * system_dpi / 96;
+    let height = 580 * system_dpi / 96;
     let x = (unsafe { GetSystemMetrics(SM_CXSCREEN) } - width).max(0) / 2;
     let y = (unsafe { GetSystemMetrics(SM_CYSCREEN) } - height).max(0) / 2;
     let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
@@ -363,6 +371,14 @@ unsafe extern "system" fn window_procedure(
                 ID_CANCEL => {
                     let _ = unsafe { DestroyWindow(hwnd) };
                 }
+                ID_BROWSE => {
+                    if let Some(state) = unsafe { window_state(hwnd) }
+                        && let Some(path) = unsafe { choose_model_file(hwnd, state.model) }
+                    {
+                        let path = wide(&path);
+                        let _ = unsafe { SetWindowTextW(state.model, PCWSTR(path.as_ptr())) };
+                    }
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -432,18 +448,41 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             &state.initial.model_path,
             24,
             46,
-            500,
+            400,
             25,
             false,
             scale,
             font,
         )?;
-        create_label(hwnd, w!("Language"), 24, 88, 220, 20, scale, font)?;
+        create_button(
+            hwnd,
+            ID_BROWSE,
+            w!("Browse..."),
+            434,
+            46,
+            90,
+            25,
+            false,
+            scale,
+            font,
+        )?;
+        let model_status = wide(&state.initial.model_status);
+        create_label(
+            hwnd,
+            PCWSTR(model_status.as_ptr()),
+            24,
+            77,
+            500,
+            20,
+            scale,
+            font,
+        )?;
+        create_label(hwnd, w!("Language"), 24, 108, 220, 20, scale, font)?;
         create_label(
             hwnd,
             w!("Minimum speech level (RMS)"),
             284,
-            88,
+            108,
             240,
             20,
             scale,
@@ -454,7 +493,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_LANGUAGE,
             &state.initial.language,
             24,
-            112,
+            132,
             220,
             25,
             false,
@@ -466,7 +505,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_MINIMUM_RMS,
             &state.initial.minimum_rms,
             284,
-            112,
+            132,
             240,
             25,
             false,
@@ -477,7 +516,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             hwnd,
             w!("Formatting strength"),
             24,
-            154,
+            174,
             500,
             20,
             scale,
@@ -487,7 +526,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             hwnd,
             state.initial.formatting,
             24,
-            178,
+            198,
             500,
             180,
             scale,
@@ -497,7 +536,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             hwnd,
             w!("Custom instructions (used by Custom formatting)"),
             24,
-            220,
+            240,
             500,
             20,
             scale,
@@ -508,7 +547,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_CUSTOM,
             &state.initial.custom_instructions,
             24,
-            244,
+            264,
             500,
             105,
             true,
@@ -521,9 +560,20 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
                 "Balanced, Strong, and Custom will activate after a compatible local Ollama model is configured."
             ),
             24,
-            360,
+            380,
             500,
-            34,
+            30,
+            scale,
+            font,
+        )?;
+        let microphone_status = wide(&state.initial.microphone_status);
+        create_label(
+            hwnd,
+            PCWSTR(microphone_status.as_ptr()),
+            24,
+            418,
+            500,
+            20,
             scale,
             font,
         )?;
@@ -532,7 +582,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_CANCEL,
             w!("Cancel"),
             296,
-            408,
+            466,
             92,
             30,
             false,
@@ -544,7 +594,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_SAVE,
             w!("Save and Restart"),
             398,
-            408,
+            466,
             126,
             30,
             true,
@@ -756,11 +806,38 @@ unsafe fn read_form(state: &WindowState) -> Option<SettingsForm> {
     let selected = unsafe { SendMessageW(state.formatting, CB_GETCURSEL, None, None) }.0;
     Some(SettingsForm {
         model_path: unsafe { read_text(state.model) },
+        model_status: state.initial.model_status.clone(),
+        microphone_status: state.initial.microphone_status.clone(),
         language: unsafe { read_text(state.language) },
         minimum_rms: unsafe { read_text(state.minimum_rms) },
         formatting: SettingsFormatting::from_index(selected)?,
         custom_instructions: unsafe { read_text(state.custom) },
     })
+}
+
+unsafe fn choose_model_file(owner: HWND, model_edit: HWND) -> Option<String> {
+    const MAX_PATH_CHARS: usize = 32_768;
+    let current = unsafe { read_text(model_edit) };
+    let mut path = vec![0_u16; MAX_PATH_CHARS];
+    for (destination, source) in path.iter_mut().zip(current.encode_utf16()) {
+        *destination = source;
+    }
+    let filter = wide("Whisper GGML models (*.bin)\0*.bin\0All files (*.*)\0*.*\0");
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(path.as_mut_ptr()),
+        nMaxFile: MAX_PATH_CHARS as u32,
+        lpstrTitle: w!("Choose a Whisper model"),
+        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    if !unsafe { GetOpenFileNameW(&mut dialog) }.as_bool() {
+        return None;
+    }
+    let length = path.iter().position(|code_unit| *code_unit == 0)?;
+    Some(String::from_utf16_lossy(&path[..length]))
 }
 
 unsafe fn read_text(hwnd: HWND) -> String {

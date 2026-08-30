@@ -14,7 +14,7 @@ use phorminx_app::runtime::{
     AppIo, AppRuntime, FinishedAudio, InsertDisposition, RuntimeNotice, UiStatus,
 };
 use phorminx_app::settings::{FormattingStrength, RuntimeFormatting, Settings, SettingsStore};
-use phorminx_audio::{ActiveRecording, start_default};
+use phorminx_audio::{ActiveRecording, input_devices, start_default};
 use phorminx_core::{
     AudioClip, DictationId, RuntimeState, SpeechRecognizer, Transcript, TranscriptionOptions,
 };
@@ -452,8 +452,35 @@ fn poll_shell_events(
 }
 
 fn settings_form(settings: &Settings, effective_model: &Path) -> SettingsForm {
+    let model_status = match std::fs::metadata(effective_model) {
+        Ok(metadata) if metadata.is_file() => format!(
+            "Model ready ({:.1} MiB)",
+            metadata.len() as f64 / (1024.0 * 1024.0)
+        ),
+        Ok(_) => "The selected model path is not a file".to_owned(),
+        Err(_) => "Model not found - choose a local .bin file".to_owned(),
+    };
+    let microphone_status = match input_devices() {
+        Ok(devices) => devices
+            .iter()
+            .find(|device| device.is_default)
+            .map(|device| format!("Default microphone: {}", device.name))
+            .unwrap_or_else(|| {
+                if devices.is_empty() {
+                    "No microphone input devices were found".to_owned()
+                } else {
+                    format!(
+                        "{} microphone(s) found; Windows has no default",
+                        devices.len()
+                    )
+                }
+            }),
+        Err(error) => format!("Microphone check failed: {error}"),
+    };
     SettingsForm {
         model_path: effective_model.display().to_string(),
+        model_status,
+        microphone_status,
         language: settings.recognition.language.clone(),
         minimum_rms: settings.recognition.minimum_rms.to_string(),
         formatting: match settings.formatting.strength {
