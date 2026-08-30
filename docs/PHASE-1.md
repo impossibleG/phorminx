@@ -45,6 +45,8 @@ No transcript or audio content is sent to or rendered by the overlay. Result and
 - Injected keyboard events are ignored by the global hook.
 - A busy runtime rejects new activations instead of queuing them.
 - Quiet or shorter-than-200-ms recordings are rejected.
+- Capture uses a preallocated, callback-safe ring buffer and rejects recordings beyond 120 seconds rather than using truncated audio.
+- Native microphone audio is converted to 16 kHz with a band-limited FFT resampler after capture stops.
 - Automatic paste is limited to conventional writable, visible, unmasked Win32 `Edit` controls.
 - Every other target receives a clipboard-only result.
 - Clipboard contents are deliberately not restored yet, avoiding a concurrent-copy overwrite race.
@@ -87,3 +89,5 @@ After the overlay milestone, a second physical Notepad dictation validated the c
 - Resident Vulkan inference completed in 922 ms.
 
 The walking skeleton and its status-feedback layer are functionally validated. Phase 1 remains open until the 500-dictation stability/wrong-target soak is complete.
+
+The audio-hardening milestone then replaced callback mutexes and unbounded growth with a preallocated SPSC ring, replaced linear interpolation with band-limited FFT resampling, and expanded capture to every PCM format exposed by CPAL 0.18. Automated tests cover bounded-buffer overflow accounting, passband preservation from 8–192 kHz sources, and rejection of above-Nyquist energy. Three consecutive physical default-microphone capture lifecycles completed successfully after the change, each producing a valid 16 kHz mono clip.

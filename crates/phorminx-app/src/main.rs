@@ -131,12 +131,12 @@ fn main() -> Result<()> {
                         continue;
                     }
                 };
-                if !captured.warnings.is_empty() {
+                if captured.backend_warning_count != 0 {
                     eprintln!(
                         "dictation_id={} state={:?} event=audio_backend_warning warning_count={}",
                         id.0,
                         runtime.state(),
-                        captured.warnings.len()
+                        captured.backend_warning_count
                     );
                 }
                 let clip = captured.clip;

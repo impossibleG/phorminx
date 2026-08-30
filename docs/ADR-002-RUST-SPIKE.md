@@ -20,5 +20,5 @@ Rust keeps the application core portable and memory-conscious while still provid
 - CPU-only Whisper build.
 - Default microphone only.
 - Fixed-duration capture instead of push-to-talk.
-- Simple linear resampling, which must be replaced with a band-limited resampler before accuracy results become a release gate.
+- Simple linear resampling in the Phase 0 harness. This was replaced by the band-limited design in ADR-005.
 - No VAD, Ollama, UI, persistence, or automatic model download.

@@ -23,6 +23,8 @@ clap = { version = "=4.5.48", features = ["derive"] }
 cpal = "=0.18.2"
 ctrlc = "=3.5.1"
 hound = "=3.5.1"
+ringbuf = { version = "=0.5.1", default-features = false, features = ["alloc"] }
+rubato = { version = "=5.0.0", default-features = false, features = ["fft_resampler"] }
 thiserror = "=2.0.16"
 whisper-rs = { version = "=0.16.0", default-features = false, features = ["tracing_backend"] }
 windows = "=0.62.2"
