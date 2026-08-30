@@ -36,7 +36,7 @@ cargo run --release -p phorminx-app --features vulkan
 cargo build --release -p phorminx-app --features desktop
 ```
 
-Runtime settings load from `%LOCALAPPDATA%\Phorminx\settings.toml`. A missing file uses the current defaults without creating anything. Open the native settings window from the tray; saving validates and atomically persists the form, then restarts Phorminx so recognition changes take effect cleanly. Command-line values such as `--model`, `--language`, `--minimum-rms`, and `--formatting raw|light` override settings for one run; `--config PATH` selects a development/test settings file.
+Runtime settings load from `%LOCALAPPDATA%\Phorminx\settings.toml`. A missing file uses the current defaults without creating anything. Open the native settings window from the tray; it reports model and default-microphone readiness and includes a native model picker. Saving validates and atomically persists the form, then restarts Phorminx so recognition changes take effect cleanly. If the selected model is missing at startup, Phorminx stays in setup mode and opens this window instead of terminating. Command-line values such as `--model`, `--language`, `--minimum-rms`, and `--formatting raw|light` override settings for one run; `--config PATH` selects a development/test settings file.
 
 Whisper models belong in `models/` and personal recordings in `test-data/`; neither directory is committed to Git. The Phase 1 executable keeps the selected model resident and uses `Ctrl+Alt+Space` as its temporary hold-to-talk shortcut.
 

@@ -152,9 +152,6 @@ fn run() -> Result<()> {
 
     let tray = SystemTray::start().context("failed to start the system tray")?;
     show_shell_status(&overlay, &tray, OverlayStatus::Loading, TrayStatus::Loading);
-    println!("Phorminx is loading {}...", model.display());
-    let worker = TranscriptionWorker::start(&model)?;
-
     let shutting_down = Arc::new(AtomicBool::new(false));
     #[cfg(not(feature = "desktop"))]
     {
@@ -162,6 +159,23 @@ fn run() -> Result<()> {
         ctrlc::set_handler(move || shutdown_flag.store(true, Ordering::Release))
             .context("failed to install the Ctrl+C handler")?;
     }
+
+    if !model.is_file() {
+        if cli.smoke_test {
+            return Err(anyhow!("Whisper model was not found: {}", model.display()));
+        }
+        return run_setup_mode(
+            overlay,
+            tray,
+            settings_store,
+            settings,
+            model,
+            shutting_down,
+        );
+    }
+
+    println!("Phorminx is loading {}...", model.display());
+    let worker = TranscriptionWorker::start(&model)?;
 
     let hotkey = GlobalHoldHotkey::start().context("failed to install the global hotkey")?;
     let mut runtime = AppRuntime::<TargetSnapshot, ActiveRecording>::new_with_formatting(
@@ -368,6 +382,71 @@ fn run() -> Result<()> {
     }
 }
 
+fn run_setup_mode(
+    overlay: StatusOverlay,
+    tray: SystemTray,
+    settings_store: SettingsStore,
+    mut settings: Settings,
+    model: PathBuf,
+    shutting_down: Arc<AtomicBool>,
+) -> Result<()> {
+    show_shell_status(&overlay, &tray, OverlayStatus::Error, TrayStatus::Error);
+    let mut settings_window = Some(
+        SettingsWindow::start(settings_form(&settings, &model))
+            .context("failed to open first-run model setup")?,
+    );
+    let mut restart_requested = false;
+    let run_result = loop {
+        if shutting_down.load(Ordering::Acquire) {
+            break Ok(());
+        }
+        match poll_shell_events(
+            &tray,
+            &overlay,
+            &mut settings_window,
+            &settings_store,
+            &mut settings,
+            &model,
+        ) {
+            Ok(ShellAction::Quit) => break Ok(()),
+            Ok(ShellAction::Restart) => {
+                restart_requested = true;
+                break Ok(());
+            }
+            Ok(ShellAction::Continue) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => break Err(error),
+        }
+    };
+
+    let mut final_error = run_result.err();
+    if let Some(window) = settings_window {
+        preserve_first_error(
+            &mut final_error,
+            window.shutdown().context("failed to stop the setup window"),
+        );
+    }
+    preserve_first_error(
+        &mut final_error,
+        tray.shutdown().context("failed to stop the system tray"),
+    );
+    preserve_first_error(
+        &mut final_error,
+        overlay
+            .shutdown()
+            .context("failed to stop the status overlay"),
+    );
+    if final_error.is_none() && restart_requested {
+        preserve_first_error(
+            &mut final_error,
+            restart_with_settings(settings_store.path()),
+        );
+    }
+    match final_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShellAction {
     Continue,
@@ -529,6 +608,13 @@ fn apply_settings_form(
     candidate
         .ensure_runtime_supported()
         .context("This formatting profile is not ready")?;
+    let resolved_model = store.resolve_model_path(&candidate.recognition.model_path);
+    if !resolved_model.is_file() {
+        return Err(anyhow!(
+            "The selected Whisper model does not exist or is not a file: {}",
+            resolved_model.display()
+        ));
+    }
     store.save(&candidate).context("Could not write settings")?;
     *settings = candidate;
     Ok(())
