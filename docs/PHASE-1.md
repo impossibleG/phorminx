@@ -79,4 +79,11 @@ On 2026-08-30, the reference machine completed a physical `Ctrl+Alt+Space` hold-
 
 Earlier attempts also exercised the fail-closed paths for a held modifier, an unavailable target, a busy reactivation, and a recoverable audio backend warning. No uncertain attempt injected text.
 
-The walking skeleton is functionally validated. Phase 1 remains open until a live dictation confirms that the new overlay never changes the original target and the 500-dictation stability/wrong-target soak is complete.
+After the overlay milestone, a second physical Notepad dictation validated the combined UI path:
+
+- Listening, transcribing, and inserted states were visible in the native overlay.
+- The user confirmed the overlay never stole focus and the sentence appeared correctly.
+- Guarded insertion still targeted the original Notepad edit control.
+- Resident Vulkan inference completed in 922 ms.
+
+The walking skeleton and its status-feedback layer are functionally validated. Phase 1 remains open until the 500-dictation stability/wrong-target soak is complete.
