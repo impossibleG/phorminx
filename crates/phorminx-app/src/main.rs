@@ -1,21 +1,23 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use phorminx_app::runtime::{
+    AppIo, AppRuntime, FinishedAudio, InsertDisposition, RuntimeNotice, UiStatus,
+};
 use phorminx_audio::{ActiveRecording, start_default};
 use phorminx_core::{
-    AudioClip, DictationId, RuntimeState, RuntimeStateMachine, SpeechRecognizer, Transcript,
-    TranscriptionOptions, normalize_transcript, recommended_audio_context,
+    AudioClip, DictationId, RuntimeState, SpeechRecognizer, Transcript, TranscriptionOptions,
 };
 use phorminx_whisper::WhisperRecognizer;
 use phorminx_windows::{
-    GlobalHoldHotkey, HoldEvent, InsertionOutcome, OverlayStatus, StatusOverlay, TargetSnapshot,
-    copy_and_maybe_paste,
+    ClipboardOnlyReason, GlobalHoldHotkey, HoldEvent, InsertionOutcome, OverlayStatus,
+    StatusOverlay, TargetSnapshot, copy_and_maybe_paste,
 };
 
 #[derive(Debug, Parser)]
@@ -67,15 +69,18 @@ fn main() -> Result<()> {
         .context("failed to install the Ctrl+C handler")?;
 
     let hotkey = GlobalHoldHotkey::start().context("failed to install the global hotkey")?;
-    let mut runtime = RuntimeStateMachine::default();
-    runtime.mark_ready()?;
-    let mut recording: Option<ActiveRecording> = None;
-    let mut target: Option<TargetSnapshot> = None;
-    let mut pending_id: Option<DictationId> = None;
+    let mut runtime =
+        AppRuntime::<TargetSnapshot, ActiveRecording>::new(cli.minimum_rms, cli.language.clone())?;
 
     println!("Ready. Hold Ctrl+Alt+Space to dictate; press Ctrl+C here to exit.");
     log_state(None, runtime.state(), "ready");
-    show_status(&overlay, OverlayStatus::Ready);
+    {
+        let mut io = ProductionIo {
+            overlay: &overlay,
+            worker: &worker,
+        };
+        report_notices(runtime.announce_ready(&mut io));
+    }
     if cli.smoke_test {
         shutting_down.store(true, Ordering::Release);
     }
@@ -85,78 +90,24 @@ fn main() -> Result<()> {
             Ok(HoldEvent::Started {
                 target: activation_target,
             }) => {
-                if runtime.state() != RuntimeState::Idle {
-                    log_state(
-                        runtime.active_id(),
-                        runtime.state(),
-                        "activation_rejected_busy",
-                    );
-                    continue;
-                }
-
-                let id = runtime.begin_dictation()?;
-                match start_default() {
-                    Ok(active_recording) => {
-                        recording = Some(active_recording);
-                        target = activation_target;
-                        println!("Listening...");
-                        show_status(&overlay, OverlayStatus::Listening);
-                        log_state(Some(id), runtime.state(), "recording_started");
-                    }
-                    Err(error) => {
-                        fail_and_reset(&mut runtime, Some(id), "audio_start_failed");
-                        show_status(&overlay, OverlayStatus::Error);
-                        eprintln!("Could not start the microphone: {error}");
-                    }
-                }
+                let notices = {
+                    let mut io = ProductionIo {
+                        overlay: &overlay,
+                        worker: &worker,
+                    };
+                    runtime.hold_started(activation_target, &mut io)?
+                };
+                report_notices(notices);
             }
             Ok(HoldEvent::Ended) => {
-                if runtime.state() != RuntimeState::Listening {
-                    continue;
-                }
-                let id = runtime.active_id().expect("listening state has an id");
-                runtime.transition(RuntimeState::FinalizingAudio)?;
-                log_state(Some(id), runtime.state(), "recording_stopped");
-
-                let captured = match recording
-                    .take()
-                    .expect("listening state has a recorder")
-                    .finish_with_diagnostics()
-                {
-                    Ok(captured) => captured,
-                    Err(error) => {
-                        fail_and_reset(&mut runtime, Some(id), "audio_finish_failed");
-                        show_status(&overlay, OverlayStatus::Error);
-                        eprintln!("Could not finish the recording: {error}");
-                        continue;
-                    }
+                let notices = {
+                    let mut io = ProductionIo {
+                        overlay: &overlay,
+                        worker: &worker,
+                    };
+                    runtime.hold_ended(&mut io)?
                 };
-                if captured.backend_warning_count != 0 {
-                    eprintln!(
-                        "dictation_id={} state={:?} event=audio_backend_warning warning_count={}",
-                        id.0,
-                        runtime.state(),
-                        captured.backend_warning_count
-                    );
-                }
-                let clip = captured.clip;
-
-                if clip.duration() < Duration::from_millis(200) || clip.rms() < cli.minimum_rms {
-                    runtime.cancel()?;
-                    log_state(Some(id), runtime.state(), "silence_rejected");
-                    runtime.transition(RuntimeState::Idle)?;
-                    target = None;
-                    show_status(&overlay, OverlayStatus::NoSpeech);
-                    println!("No clear speech detected.");
-                    continue;
-                }
-
-                let audio_context = recommended_audio_context(clip.duration());
-                runtime.transition(RuntimeState::Transcribing)?;
-                show_status(&overlay, OverlayStatus::Transcribing);
-                log_state(Some(id), runtime.state(), "transcription_started");
-                worker.transcribe(id, clip, cli.language.clone(), audio_context)?;
-                pending_id = Some(id);
+                report_notices(notices);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -164,65 +115,29 @@ fn main() -> Result<()> {
             }
         }
 
-        while let Ok(completed) = worker.results.try_recv() {
-            if pending_id != Some(completed.id) || runtime.state() != RuntimeState::Transcribing {
-                log_state(
-                    Some(completed.id),
-                    runtime.state(),
-                    "stale_transcription_discarded",
-                );
-                continue;
-            }
-            pending_id = None;
-
-            let transcript = match completed.result {
-                Ok(transcript) => transcript,
-                Err(message) => {
-                    fail_and_reset(&mut runtime, Some(completed.id), "transcription_failed");
-                    target = None;
-                    show_status(&overlay, OverlayStatus::Error);
-                    eprintln!("Transcription failed: {message}");
-                    continue;
+        loop {
+            match worker.results.try_recv() {
+                Ok(completed) => {
+                    let notices = {
+                        let mut io = ProductionIo {
+                            overlay: &overlay,
+                            worker: &worker,
+                        };
+                        runtime.transcription_completed(completed.id, completed.result, &mut io)?
+                    };
+                    report_notices(notices);
                 }
-            };
-
-            runtime.transition(RuntimeState::Normalizing)?;
-            let normalized = normalize_transcript(&transcript.text);
-            if normalized.is_empty() {
-                runtime.cancel()?;
-                log_state(
-                    Some(completed.id),
-                    runtime.state(),
-                    "empty_transcript_rejected",
-                );
-                runtime.transition(RuntimeState::Idle)?;
-                target = None;
-                show_status(&overlay, OverlayStatus::NoSpeech);
-                continue;
-            }
-
-            runtime.transition(RuntimeState::ReadyToInsert)?;
-            runtime.transition(RuntimeState::Inserting)?;
-            match copy_and_maybe_paste(target.take(), &normalized) {
-                Ok(InsertionOutcome::Pasted) => {
-                    println!(
-                        "Inserted in {:.0} ms.",
-                        transcript.inference_time.as_secs_f64() * 1_000.0
-                    );
-                    log_state(Some(completed.id), runtime.state(), "paste_injected");
-                    show_status(&overlay, OverlayStatus::Inserted);
-                    runtime.transition(RuntimeState::Idle)?;
-                }
-                Ok(InsertionOutcome::ClipboardOnly(reason)) => {
-                    println!("Ready to paste from the clipboard ({reason:?}).");
-                    log_state(Some(completed.id), runtime.state(), "clipboard_only");
-                    show_status(&overlay, OverlayStatus::ClipboardReady);
-                    runtime.transition(RuntimeState::Idle)?;
-                }
-                Err(error) => {
-                    fail_and_reset(&mut runtime, Some(completed.id), "insertion_failed");
-                    show_status(&overlay, OverlayStatus::Error);
-                    eprintln!("Could not prepare the transcript for insertion: {error}");
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    let notices = {
+                        let mut io = ProductionIo {
+                            overlay: &overlay,
+                            worker: &worker,
+                        };
+                        runtime.worker_disconnected(&mut io)?
+                    };
+                    report_notices(notices);
+                    return Err(anyhow!("the transcription worker stopped unexpectedly"));
                 }
             }
         }
@@ -241,10 +156,140 @@ fn show_status(overlay: &StatusOverlay, status: OverlayStatus) {
     }
 }
 
-fn fail_and_reset(runtime: &mut RuntimeStateMachine, id: Option<DictationId>, event: &'static str) {
-    if runtime.fault().is_ok() {
-        log_state(id, runtime.state(), event);
-        let _ = runtime.transition(RuntimeState::Idle);
+struct ProductionIo<'a> {
+    overlay: &'a StatusOverlay,
+    worker: &'a TranscriptionWorker,
+}
+
+impl AppIo for ProductionIo<'_> {
+    type Target = TargetSnapshot;
+    type Recording = ActiveRecording;
+    type ClipboardReason = ClipboardOnlyReason;
+
+    fn start_recording(&mut self) -> Result<Self::Recording, String> {
+        start_default().map_err(|error| error.to_string())
+    }
+
+    fn finish_recording(&mut self, recording: Self::Recording) -> Result<FinishedAudio, String> {
+        recording
+            .finish_with_diagnostics()
+            .map(|captured| FinishedAudio {
+                clip: captured.clip,
+                backend_warning_count: captured.backend_warning_count,
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn submit_transcription(
+        &mut self,
+        id: DictationId,
+        clip: AudioClip,
+        language: &str,
+        audio_context: u32,
+    ) -> Result<(), String> {
+        self.worker
+            .transcribe(id, clip, language.to_owned(), audio_context)
+            .map_err(|error| error.to_string())
+    }
+
+    fn insert(
+        &mut self,
+        target: Option<Self::Target>,
+        text: &str,
+    ) -> Result<InsertDisposition<Self::ClipboardReason>, String> {
+        copy_and_maybe_paste(target, text)
+            .map(|outcome| match outcome {
+                InsertionOutcome::Pasted => InsertDisposition::Pasted,
+                InsertionOutcome::ClipboardOnly(reason) => InsertDisposition::ClipboardOnly(reason),
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn show_status(&mut self, status: UiStatus) -> Result<(), String> {
+        let status = match status {
+            UiStatus::Ready => OverlayStatus::Ready,
+            UiStatus::Listening => OverlayStatus::Listening,
+            UiStatus::Transcribing => OverlayStatus::Transcribing,
+            UiStatus::Inserted => OverlayStatus::Inserted,
+            UiStatus::ClipboardReady => OverlayStatus::ClipboardReady,
+            UiStatus::NoSpeech => OverlayStatus::NoSpeech,
+            UiStatus::Error => OverlayStatus::Error,
+        };
+        self.overlay.set(status).map_err(|error| error.to_string())
+    }
+}
+
+fn report_notices(notices: Vec<RuntimeNotice<ClipboardOnlyReason>>) {
+    for notice in notices {
+        match notice {
+            RuntimeNotice::BusyRejected { id, state } => {
+                log_state(id, state, "activation_rejected_busy");
+            }
+            RuntimeNotice::RecordingStarted { id } => {
+                println!("Listening...");
+                log_state(Some(id), RuntimeState::Listening, "recording_started");
+            }
+            RuntimeNotice::RecordingStopped { id } => {
+                log_state(Some(id), RuntimeState::FinalizingAudio, "recording_stopped");
+            }
+            RuntimeNotice::AudioBackendWarning { id, state, count } => {
+                eprintln!(
+                    "dictation_id={} state={state:?} event=audio_backend_warning warning_count={count}",
+                    id.0
+                );
+            }
+            RuntimeNotice::NoSpeech { id, event } => {
+                log_state(Some(id), RuntimeState::Cancelled, event);
+                if event == "silence_rejected" {
+                    println!("No clear speech detected.");
+                }
+            }
+            RuntimeNotice::TranscriptionStarted { id } => {
+                log_state(
+                    Some(id),
+                    RuntimeState::Transcribing,
+                    "transcription_started",
+                );
+            }
+            RuntimeNotice::StaleTranscription { id, state } => {
+                log_state(Some(id), state, "stale_transcription_discarded");
+            }
+            RuntimeNotice::Inserted { id, inference_time } => {
+                println!(
+                    "Inserted in {:.0} ms.",
+                    inference_time.as_secs_f64() * 1_000.0
+                );
+                log_state(Some(id), RuntimeState::Inserting, "paste_injected");
+            }
+            RuntimeNotice::ClipboardReady { id, reason } => {
+                println!("Ready to paste from the clipboard ({reason:?}).");
+                log_state(Some(id), RuntimeState::Inserting, "clipboard_only");
+            }
+            RuntimeNotice::Failure { id, event, message } => {
+                log_state(id, RuntimeState::Faulted, event);
+                match event {
+                    "audio_start_failed" => {
+                        eprintln!("Could not start the microphone: {message}");
+                    }
+                    "audio_finish_failed" => {
+                        eprintln!("Could not finish the recording: {message}");
+                    }
+                    "transcription_failed" => eprintln!("Transcription failed: {message}"),
+                    "transcription_submit_failed" => {
+                        eprintln!("Could not submit the transcription: {message}");
+                    }
+                    "insertion_failed" => {
+                        eprintln!("Could not prepare the transcript for insertion: {message}");
+                    }
+                    _ => eprintln!("Phorminx runtime failure: {message}"),
+                }
+            }
+            RuntimeNotice::StatusUpdateFailed { message } => {
+                eprintln!(
+                    "dictation_id=0 state=Overlay event=status_update_failed error={message}"
+                );
+            }
+        }
     }
 }
 
