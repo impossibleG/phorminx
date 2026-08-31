@@ -21,9 +21,10 @@ $installer = Get-Content -LiteralPath $installerPath -Raw
 Assert-True ($installer -match '(?m)^PrivilegesRequired=lowest$') "Installer must be per-user."
 Assert-True ($installer -match '(?m)^DefaultDirName=\{localappdata\}\\Programs\\Phorminx$') "Installer must target LocalAppData."
 Assert-True ($installer -match '(?m)^Root: HKCU;.*CurrentVersion\\Run') "Autostart must use HKCU."
-Assert-True ($installer -match '(?m)^Root: HKCU;.*ValueType: none;.*Flags: uninsdeletevalue$') "Uninstall must remove runtime-enabled autostart even when the install task was initially unchecked."
+Assert-True ($installer -match '(?m)^Root: HKCU;.*ValueType: none;.*Flags: dontcreatekey uninsdeletevalue$') "Uninstall must remove runtime-enabled autostart without creating the Run key."
 Assert-True ($installer -notmatch '(?im)runas|PrivilegesRequiredOverridesAllowed') "Installer must not request or offer elevation."
 Assert-True ($installer -notmatch '(?im)^.*models[\\/].*\.bin') "Installer must not bundle speech models."
+Assert-True ($installer -match '(?ms)#ifdef SignToolName.*^SignTool=\{#SignToolName\}.*^SignedUninstaller=yes') "Installer must support externally configured signing for release builds."
 
 $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("phorminx-release-test-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null

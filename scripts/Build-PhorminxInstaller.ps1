@@ -2,6 +2,7 @@
 param(
     [string] $Version = "0.1.0",
     [string] $IsccPath,
+    [string] $InnoSignToolName,
     [string] $OutputDirectory,
     [switch] $SkipBuild,
     [switch] $RequireSignedBinary
@@ -46,6 +47,12 @@ if ($RequireSignedBinary -and $signature.Status -ne [System.Management.Automatio
 if (-not $RequireSignedBinary -and $signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
     Write-Warning "Building a development installer around an unsigned binary. Do not distribute it publicly."
 }
+if ($RequireSignedBinary -and [string]::IsNullOrWhiteSpace($InnoSignToolName)) {
+    throw "RequireSignedBinary also requires -InnoSignToolName naming an Inno Setup signing tool configured outside this repository."
+}
+if (-not [string]::IsNullOrWhiteSpace($InnoSignToolName) -and $InnoSignToolName -notmatch '^[A-Za-z0-9_.-]+$') {
+    throw "InnoSignToolName may contain only letters, digits, dots, underscores, and hyphens."
+}
 
 if ([string]::IsNullOrWhiteSpace($IsccPath)) {
     $command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
@@ -75,6 +82,9 @@ $compilerArguments = @(
     "/DOutputDir=$resolvedOutput",
     $installerScript
 )
+if (-not [string]::IsNullOrWhiteSpace($InnoSignToolName)) {
+    $compilerArguments = @("/DSignToolName=$InnoSignToolName") + $compilerArguments
+}
 & $IsccPath @compilerArguments
 if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup failed with exit code $LASTEXITCODE."
