@@ -40,6 +40,7 @@ WizardStyle=modern
 CloseApplications=yes
 RestartApplications=no
 SetupLogging=yes
+SetupIconFile=..\design\brand\phorminx.ico
 UninstallDisplayIcon={app}\phorminx-app.exe
 VersionInfoVersion={#NumericVersion}
 VersionInfoCompany={#AppPublisher}
@@ -52,6 +53,7 @@ SignedUninstaller=yes
 #endif
 
 [Tasks]
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: checkedonce
 Name: "startup"; Description: "Launch Phorminx when I sign in"; GroupDescription: "Startup:"; Flags: unchecked
 
 [Files]
@@ -59,11 +61,12 @@ Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "phorminx-app.exe"; Flags: i
 
 [Icons]
 Name: "{group}\Phorminx"; Filename: "{app}\phorminx-app.exe"; WorkingDir: "{app}"
+Name: "{autodesktop}\Phorminx"; Filename: "{app}\phorminx-app.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 Name: "{group}\Uninstall Phorminx"; Filename: "{uninstallexe}"
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Phorminx"; Flags: dontcreatekey uninsdeletevalue
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Phorminx"; ValueData: """{app}\phorminx-app.exe"""; Flags: uninsdeletevalue; Tasks: startup
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Phorminx"; ValueData: """{app}\phorminx-app.exe"" --background"; Flags: uninsdeletevalue; Tasks: startup
 
 [Run]
 Filename: "{app}\phorminx-app.exe"; Description: "Launch Phorminx"; Flags: nowait postinstall skipifsilent unchecked

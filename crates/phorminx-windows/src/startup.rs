@@ -101,7 +101,7 @@ fn command_for_executable(executable_path: &Path) -> Result<String, LaunchAtLogi
     if path.contains('"') {
         return Err(LaunchAtLoginError::QuoteInExecutablePath);
     }
-    Ok(format!("\"{path}\""))
+    Ok(format!("\"{path}\" --background"))
 }
 
 struct RegistryKey(HKEY);
@@ -267,7 +267,10 @@ mod tests {
         let command =
             command_for_executable(Path::new(r"C:\Users\A User\Phorminx\phorminx-app.exe"))
                 .expect("command should be valid");
-        assert_eq!(command, r#""C:\Users\A User\Phorminx\phorminx-app.exe""#);
+        assert_eq!(
+            command,
+            r#""C:\Users\A User\Phorminx\phorminx-app.exe" --background"#
+        );
     }
 
     #[test]

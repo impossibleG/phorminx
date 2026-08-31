@@ -177,7 +177,7 @@ pub struct LexiconEntry {
     pub written: String,
     pub language: String,
     pub scope: String,
-    pub preserve_case: bool,
+    pub case_policy: LexiconCasePolicy,
     pub enabled: bool,
 }
 
@@ -188,7 +188,7 @@ pub struct LexiconDraft {
     pub written: String,
     pub language: String,
     pub scope: String,
-    pub preserve_case: bool,
+    pub case_policy: LexiconCasePolicy,
     pub enabled: bool,
 }
 
@@ -200,8 +200,29 @@ impl Default for LexiconDraft {
             written: String::new(),
             language: String::new(),
             scope: String::new(),
-            preserve_case: true,
+            case_policy: LexiconCasePolicy::UseCanonical,
             enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LexiconCasePolicy {
+    PreserveInput,
+    #[default]
+    UseCanonical,
+    Lowercase,
+    Uppercase,
+}
+
+impl LexiconCasePolicy {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PreserveInput => "Preserve spoken case",
+            Self::UseCanonical => "Use written case",
+            Self::Lowercase => "Lowercase",
+            Self::Uppercase => "Uppercase",
         }
     }
 }
@@ -310,7 +331,6 @@ pub struct SettingsSnapshot {
     pub model_path: String,
     pub history_retention: String,
     pub launch_at_login: bool,
-    pub reduced_motion: bool,
 }
 
 impl Default for SettingsSnapshot {
@@ -327,7 +347,6 @@ impl Default for SettingsSnapshot {
             model_path: "models/ggml-base.en.bin".into(),
             history_retention: "7 days".into(),
             launch_at_login: false,
-            reduced_motion: false,
         }
     }
 }
@@ -434,7 +453,7 @@ impl ShellSnapshot {
                     written: "Phorminx".into(),
                     language: "English".into(),
                     scope: "Everywhere".into(),
-                    preserve_case: true,
+                    case_policy: LexiconCasePolicy::UseCanonical,
                     enabled: true,
                 },
                 LexiconEntry {
@@ -443,7 +462,7 @@ impl ShellSnapshot {
                     written: "egui".into(),
                     language: "English".into(),
                     scope: "code.exe".into(),
-                    preserve_case: false,
+                    case_policy: LexiconCasePolicy::PreserveInput,
                     enabled: true,
                 },
             ]

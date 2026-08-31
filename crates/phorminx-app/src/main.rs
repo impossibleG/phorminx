@@ -41,8 +41,8 @@ use phorminx_windows::{
     LexiconWindowEvent, OverlayStatus, ProfileFormatting, ProfileInsertion, ProfileItem,
     ProfileWindow, ProfileWindowEvent, SettingsForm, SettingsFormatting, SettingsHistoryRetention,
     SettingsOllamaLifecycle, SettingsRecordingMode, SettingsWindow, SettingsWindowEvent,
-    SingleInstance, StatusOverlay, SystemTray, TargetSnapshot, TrayEvent, TrayStatus,
-    copy_and_maybe_paste, set_launch_at_login,
+    SingleInstance, SingleInstanceError, StatusOverlay, SystemTray, TargetSnapshot, TrayEvent,
+    TrayStatus, activate_existing_window, copy_and_maybe_paste, set_launch_at_login,
 };
 
 #[cfg(feature = "desktop")]
@@ -71,6 +71,9 @@ struct Cli {
     /// Cycle through every fixed overlay state without loading speech recognition.
     #[arg(long, hide = true)]
     overlay_demo: bool,
+    /// Start ready in the tray without showing the product shell.
+    #[arg(long, hide = true)]
+    background: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -111,8 +114,21 @@ fn report_fatal_error(error: &anyhow::Error) {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let _instance =
-        SingleInstance::acquire().context("failed to acquire the Phorminx process slot")?;
+    let instance = match SingleInstance::acquire() {
+        Ok(instance) => instance,
+        Err(SingleInstanceError::AlreadyRunning) => {
+            for _ in 0..20 {
+                if activate_existing_window() {
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error).context("failed to acquire the Phorminx process slot");
+        }
+    };
     let overlay = StatusOverlay::start().context("failed to start the status overlay")?;
     if cli.overlay_demo {
         for status in [
@@ -196,6 +212,7 @@ fn run() -> Result<()> {
             settings,
             model,
             shutting_down,
+            instance,
         );
     }
 
@@ -276,6 +293,7 @@ fn run() -> Result<()> {
                 database_path.clone(),
                 route,
                 UiRuntimeStatus::Ready,
+                !cli.background,
             )
             .map_err(|error| anyhow!(error))
             .context("failed to start the product shell")?,
@@ -681,6 +699,9 @@ fn run() -> Result<()> {
             .context("failed to stop the status overlay"),
     );
     if final_error.is_none() && restart_requested {
+        // The replacement process acquires this same mutex during startup. Release
+        // our guard before spawning it so a settings restart cannot reject itself.
+        drop(instance);
         preserve_first_error(
             &mut final_error,
             restart_with_settings(settings_store.path()),
@@ -711,6 +732,7 @@ fn run_setup_mode(
     mut settings: Settings,
     model: PathBuf,
     shutting_down: Arc<AtomicBool>,
+    instance: SingleInstance,
 ) -> Result<()> {
     show_shell_status(&overlay, &tray, OverlayStatus::Error, TrayStatus::Error);
     let database_path = settings_store
@@ -724,6 +746,7 @@ fn run_setup_mode(
             database_path,
             UiRoute::Models,
             UiRuntimeStatus::NeedsAttention,
+            true,
         )
         .map_err(|error| anyhow!(error))
         .context("failed to open first-run model setup")?,
@@ -827,6 +850,7 @@ fn run_setup_mode(
             .context("failed to stop the status overlay"),
     );
     if final_error.is_none() && restart_requested {
+        drop(instance);
         preserve_first_error(
             &mut final_error,
             restart_with_settings(settings_store.path()),
@@ -1024,6 +1048,11 @@ fn poll_shell_events(
                                 let _ = shell.send(ProductShellControl::ModelDownloadFailed);
                             }
                         }
+                    }
+                }
+                Ok(ProductShellEvent::CancelWhisperModelDownload) => {
+                    if let Some(download) = model_download.as_ref() {
+                        download.cancel();
                     }
                 }
                 Ok(ProductShellEvent::RuntimeReloadRequested(mutation)) => match mutation {

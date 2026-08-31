@@ -159,10 +159,19 @@ impl UiReadinessSnapshot {
                         family: model.details.family.clone(),
                     })
                     .collect::<Vec<_>>();
+                let selected = settings.formatting.ollama_model.clone();
+                let selected_missing = selected
+                    .as_ref()
+                    .is_some_and(|name| !models.iter().any(|model| &model.name == name));
                 let (state, message) = if models.is_empty() {
                     (
                         UiReadinessState::NeedsAttention,
                         "Ollama is running but has no installed models.",
+                    )
+                } else if selected_missing {
+                    (
+                        UiReadinessState::NeedsAttention,
+                        "The selected Ollama model is not installed. Choose an available model.",
                     )
                 } else {
                     (UiReadinessState::Ready, "Ollama ready.")
@@ -170,7 +179,7 @@ impl UiReadinessSnapshot {
                 UiOllamaReadiness {
                     state,
                     models,
-                    selected: settings.formatting.ollama_model.clone(),
+                    selected,
                     message: message.to_owned(),
                 }
             }

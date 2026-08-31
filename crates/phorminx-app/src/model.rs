@@ -86,6 +86,10 @@ impl ModelDownload {
         &self.events
     }
 
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+
     pub fn shutdown(mut self) -> Result<(), ModelError> {
         self.stop()
     }

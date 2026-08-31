@@ -55,7 +55,7 @@ pub use settings_window::{
     SettingsRecordingMode, SettingsWindow, SettingsWindowError, SettingsWindowEvent,
 };
 #[cfg(windows)]
-pub use single_instance::{SingleInstance, SingleInstanceError};
+pub use single_instance::{SingleInstance, SingleInstanceError, activate_existing_window};
 #[cfg(windows)]
 pub use startup::{
     LaunchAtLoginError, LaunchAtLoginState, launch_at_login_state, set_launch_at_login,

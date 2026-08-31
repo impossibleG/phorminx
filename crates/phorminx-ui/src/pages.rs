@@ -7,8 +7,9 @@ use crate::components::{
     section_title, segmented,
 };
 use crate::model::{
-    FormattingStrength, HistoryVariant, LexiconDraft, OllamaLifecycle, ProfileDraft,
-    ProfileInsertion, RecordingMode, Route, SettingsSnapshot, ShellEvent, ShellSnapshot,
+    FormattingStrength, HistoryVariant, LexiconCasePolicy, LexiconDraft, OllamaLifecycle,
+    ProfileDraft, ProfileInsertion, RecordingMode, Route, SettingsSnapshot, ShellEvent,
+    ShellSnapshot,
 };
 use crate::theme::{Colors, Space};
 
@@ -25,6 +26,7 @@ pub(crate) struct PageState {
     pub confirm_profile_delete: Option<String>,
     pub settings: SettingsSnapshot,
     pub settings_dirty: bool,
+    pub confirm_model_download: bool,
 }
 
 impl PageState {
@@ -44,6 +46,7 @@ impl PageState {
             confirm_profile_delete: None,
             settings: snapshot.settings.clone(),
             settings_dirty: false,
+            confirm_model_download: false,
         }
     }
 
@@ -92,7 +95,7 @@ pub(crate) fn show(
         Route::History => history(ui, snapshot, state, outbox),
         Route::Lexicon => lexicon(ui, snapshot, state, outbox),
         Route::Profiles => profiles(ui, snapshot, state, outbox),
-        Route::Models => models(ui, snapshot, outbox),
+        Route::Models => models(ui, snapshot, state, outbox),
         Route::Settings => settings(ui, snapshot, state, outbox),
     }
 }
@@ -162,22 +165,30 @@ fn history(
     state: &mut PageState,
     outbox: &mut Vec<ShellEvent>,
 ) {
-    if page_header(
-        ui,
-        Route::History.title(),
-        Route::History.context(),
-        (!snapshot.history.is_empty()).then_some(if state.confirm_clear_history {
-            "Confirm clear"
-        } else {
-            "Clear history"
-        }),
-    ) {
-        if state.confirm_clear_history {
-            outbox.push(ShellEvent::ClearHistory);
-            state.confirm_clear_history = false;
-        } else {
-            state.confirm_clear_history = true;
-        }
+    page_header(ui, Route::History.title(), Route::History.context(), None);
+    if !snapshot.history.is_empty() {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let label = if state.confirm_clear_history {
+                "Delete every retained dictation"
+            } else {
+                "Clear history"
+            };
+            if action(ui, label, ActionTone::Destructive).clicked() {
+                if state.confirm_clear_history {
+                    outbox.push(ShellEvent::ClearHistory);
+                    state.confirm_clear_history = false;
+                } else {
+                    state.confirm_clear_history = true;
+                }
+            }
+            if state.confirm_clear_history {
+                ui.label(
+                    RichText::new("This permanently removes all retained transcripts.")
+                        .color(Colors::ASH),
+                );
+            }
+        });
+        ui.add_space(Space::MD);
     }
     if snapshot.history.is_empty() {
         empty_state(
@@ -263,7 +274,7 @@ fn history(
                 if action(ui, "Copy output", ActionTone::Primary).clicked() {
                     outbox.push(ShellEvent::CopyHistory {
                         id: item.id,
-                        variant: state.history_variant,
+                        variant: HistoryVariant::Output,
                     });
                 }
                 if item.raw.is_some() && action(ui, "Copy raw", ActionTone::Quiet).clicked() {
@@ -306,7 +317,9 @@ fn lexicon(
         outbox.push(ShellEvent::NewLexiconEntry);
     }
     if snapshot.lexicon.is_empty() {
-        if empty_state(
+        if let Some(draft) = state.lexicon_draft.as_mut() {
+            lexicon_editor(ui, draft, outbox);
+        } else if empty_state(
             ui,
             "No private vocabulary",
             "Teach exact replacements without training a model.",
@@ -361,6 +374,7 @@ fn lexicon(
             labeled_value(&mut columns[1], "Written form", &entry.written, false);
             labeled_value(&mut columns[1], "Language", &entry.language, false);
             labeled_value(&mut columns[1], "Scope", &entry.scope, true);
+            labeled_value(&mut columns[1], "Case", entry.case_policy.label(), false);
             columns[1].add_space(Space::MD);
             columns[1].label(
                 RichText::new(format!(
@@ -386,7 +400,7 @@ fn lexicon(
                         } else {
                             String::new()
                         },
-                        preserve_case: entry.preserve_case,
+                        case_policy: entry.case_policy,
                         enabled: entry.enabled,
                     });
                     outbox.push(ShellEvent::EditLexicon(entry.id));
@@ -425,7 +439,9 @@ fn profiles(
         outbox.push(ShellEvent::NewProfile);
     }
     if snapshot.profiles.is_empty() {
-        if empty_state(
+        if let Some(draft) = state.profile_draft.as_mut() {
+            profile_editor(ui, draft, outbox);
+        } else if empty_state(
             ui,
             "No contextual policy",
             "Global settings apply everywhere that dictation is allowed.",
@@ -564,7 +580,19 @@ fn lexicon_editor(ui: &mut Ui, draft: &mut LexiconDraft, outbox: &mut Vec<ShellE
     ui.add(TextEdit::singleline(&mut draft.language).hint_text("en or pt-br"));
     ui.label(RichText::new("Application basename · optional").color(Colors::ASH));
     ui.add(TextEdit::singleline(&mut draft.scope).hint_text("code.exe"));
-    ui.checkbox(&mut draft.preserve_case, "Preserve written form");
+    ui.label(RichText::new("Case policy").color(Colors::ASH));
+    ComboBox::from_id_salt("lexicon-case-policy")
+        .selected_text(draft.case_policy.label())
+        .show_ui(ui, |ui| {
+            for value in [
+                LexiconCasePolicy::PreserveInput,
+                LexiconCasePolicy::UseCanonical,
+                LexiconCasePolicy::Lowercase,
+                LexiconCasePolicy::Uppercase,
+            ] {
+                ui.selectable_value(&mut draft.case_policy, value, value.label());
+            }
+        });
     ui.checkbox(&mut draft.enabled, "Enabled");
     ui.add_space(Space::LG);
     ui.horizontal(|ui| {
@@ -665,7 +693,12 @@ const fn insertion_label(value: ProfileInsertion) -> &'static str {
     }
 }
 
-fn models(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
+fn models(
+    ui: &mut Ui,
+    snapshot: &ShellSnapshot,
+    state: &mut PageState,
+    outbox: &mut Vec<ShellEvent>,
+) {
     if page_header(
         ui,
         Route::Models.title(),
@@ -674,11 +707,30 @@ fn models(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
     ) {
         outbox.push(ShellEvent::VerifyModels);
     }
-    model_system(ui, "01", &snapshot.whisper, true, outbox);
+    model_system(ui, "01", &snapshot.whisper, true, state, outbox);
+    if state.confirm_model_download {
+        ui.add_space(Space::MD);
+        ui.label(
+            RichText::new(
+                "Download the pinned 141 MiB English Whisper model. The file stays local and replaces the active model only after SHA-256 verification.",
+            )
+            .color(Colors::ASH),
+        );
+        ui.add_space(Space::SM);
+        ui.horizontal(|ui| {
+            if action(ui, "Download and verify", ActionTone::Primary).clicked() {
+                state.confirm_model_download = false;
+                outbox.push(ShellEvent::ChangeWhisperModel);
+            }
+            if action(ui, "Cancel", ActionTone::Quiet).clicked() {
+                state.confirm_model_download = false;
+            }
+        });
+    }
     ui.add_space(Space::XL);
     hairline(ui);
     ui.add_space(Space::XL);
-    model_system(ui, "02", &snapshot.ollama, false, outbox);
+    model_system(ui, "02", &snapshot.ollama, false, state, outbox);
 }
 
 fn model_system(
@@ -686,6 +738,7 @@ fn model_system(
     index: &str,
     system: &crate::model::ModelSystem,
     whisper: bool,
+    state: &mut PageState,
     outbox: &mut Vec<ShellEvent>,
 ) {
     ui.horizontal(|ui| {
@@ -724,7 +777,7 @@ fn model_system(
                 )
                 .clicked()
                 {
-                    outbox.push(ShellEvent::ChangeWhisperModel);
+                    state.confirm_model_download = true;
                 }
             } else {
                 for model in &system.installed {
@@ -739,10 +792,18 @@ fn model_system(
 
 fn settings(
     ui: &mut Ui,
-    _snapshot: &ShellSnapshot,
+    snapshot: &ShellSnapshot,
     state: &mut PageState,
     outbox: &mut Vec<ShellEvent>,
 ) {
+    let ollama_ready = snapshot.ollama.state == crate::model::Readiness::Ready
+        && snapshot.ollama.selected.as_ref().is_some_and(|selected| {
+            snapshot
+                .ollama
+                .installed
+                .iter()
+                .any(|installed| installed == selected)
+        });
     if page_header(
         ui,
         Route::Settings.title(),
@@ -822,14 +883,33 @@ fn settings(
                             FormattingStrength::Strong,
                             FormattingStrength::Custom,
                         ] {
-                            ui.selectable_value(
-                                &mut state.settings.formatting,
+                            let available = matches!(
                                 value,
-                                formatting_label(value),
-                            );
+                                FormattingStrength::Raw | FormattingStrength::Light
+                            ) || ollama_ready;
+                            ui.add_enabled_ui(available, |ui| {
+                                ui.selectable_value(
+                                    &mut state.settings.formatting,
+                                    value,
+                                    formatting_label(value),
+                                );
+                            });
                         }
                     });
             });
+            if !ollama_ready
+                && !matches!(
+                    state.settings.formatting,
+                    FormattingStrength::Raw | FormattingStrength::Light
+                )
+            {
+                ui.label(
+                    RichText::new(
+                        "Select an installed Ollama model before saving this formatting strength.",
+                    )
+                    .color(Colors::BRONZE_LIGHT),
+                );
+            }
             if state.settings.formatting == FormattingStrength::Custom {
                 ui.add(
                     TextEdit::multiline(&mut state.settings.custom_instruction)
@@ -883,14 +963,6 @@ fn settings(
                 "Ready before the first word.",
                 |ui| {
                     ui.checkbox(&mut state.settings.launch_at_login, "Enabled");
-                },
-            );
-            setting_row(
-                ui,
-                "Reduced motion",
-                "Make state changes immediate.",
-                |ui| {
-                    ui.checkbox(&mut state.settings.reduced_motion, "Enabled");
                 },
             );
         });
@@ -1001,5 +1073,21 @@ mod tests {
         assert_eq!(state.history_id, None);
         assert_eq!(state.lexicon_id, None);
         assert_eq!(state.profile_name, None);
+    }
+
+    #[test]
+    fn empty_collections_render_active_creation_editors() {
+        let snapshot = ShellSnapshot::gallery(GalleryScenario::Empty);
+        egui::__run_test_ui(|ui| {
+            let mut state = PageState::from_snapshot(&snapshot);
+            state.lexicon_draft = Some(LexiconDraft::default());
+            let mut events = Vec::new();
+            lexicon(ui, &snapshot, &mut state, &mut events);
+            assert!(state.lexicon_draft.is_some());
+
+            state.profile_draft = Some(ProfileDraft::default());
+            profiles(ui, &snapshot, &mut state, &mut events);
+            assert!(state.profile_draft.is_some());
+        });
     }
 }

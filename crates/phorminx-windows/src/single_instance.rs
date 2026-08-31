@@ -1,5 +1,8 @@
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, IsIconic, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
+};
 use windows::core::PCWSTR;
 
 const INSTANCE_NAME: &str = "Local\\Phorminx.v1";
@@ -15,6 +18,27 @@ impl SingleInstance {
     pub fn acquire() -> Result<Self, SingleInstanceError> {
         acquire_named(INSTANCE_NAME)
     }
+}
+
+/// Shows and focuses the durable product shell owned by an existing process.
+/// Returns false while that process is still starting or no shell is available.
+pub fn activate_existing_window() -> bool {
+    let title = wide("Phorminx");
+    let Ok(window) = (unsafe { FindWindowW(None, PCWSTR(title.as_ptr())) }) else {
+        return false;
+    };
+    unsafe {
+        let _ = ShowWindow(
+            window,
+            if IsIconic(window).as_bool() {
+                SW_RESTORE
+            } else {
+                SW_SHOW
+            },
+        );
+        let _ = SetForegroundWindow(window);
+    }
+    true
 }
 
 fn acquire_named(name: &str) -> Result<SingleInstance, SingleInstanceError> {

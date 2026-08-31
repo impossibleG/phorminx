@@ -39,6 +39,8 @@ tempfile = "=3.23.0"
 ureq = { version = "=3.4.0", default-features = false, features = ["rustls"] }
 whisper-rs = { version = "=0.16.0", default-features = false, features = ["tracing_backend"] }
 windows = "=0.62.2"
+winresource = "=0.1.31"
+winit = { version = "=0.30.13", default-features = false }
 
 [profile.release]
 lto = "thin"

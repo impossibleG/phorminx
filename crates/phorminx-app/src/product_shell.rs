@@ -10,8 +10,8 @@ use phorminx_ollama::OllamaClient;
 use phorminx_persistence::{CasePolicy, FormattingStyle, InsertionPreference};
 use phorminx_ui::{
     ApplicationProfile, FormattingStrength as ShellFormatting, HistoryItem, InlineNotice,
-    LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle as ShellLifecycle, PhorminxUi,
-    ProfileInsertion, Readiness, RecordingMode as ShellRecording, Route, RuntimeStatus,
+    LexiconCasePolicy, LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle as ShellLifecycle,
+    PhorminxUi, ProfileInsertion, Readiness, RecordingMode as ShellRecording, Route, RuntimeStatus,
     SettingsSnapshot, ShellEvent, ShellSnapshot, SystemReadiness,
 };
 
@@ -22,6 +22,9 @@ use crate::ui_bridge::{
     DEFAULT_HISTORY_LIMIT, UiBridge, UiCommand, UiEffect, UiLexiconDraft, UiMutation,
     UiProfileDraft, UiReadinessSnapshot, UiReadinessState, UiRoute, UiRuntimeStatus, UiSnapshot,
 };
+
+#[cfg(windows)]
+use winit::platform::windows::EventLoopBuilderExtWindows;
 
 #[derive(Clone, Debug)]
 pub enum ProductShellControl {
@@ -38,6 +41,7 @@ pub enum ProductShellControl {
 pub enum ProductShellEvent {
     TestDictation,
     ChangeWhisperModel,
+    CancelWhisperModelDownload,
     RuntimeReloadRequested(UiMutation),
     ApplyLaunchAtLogin(bool),
     Hidden,
@@ -57,6 +61,7 @@ impl ProductShell {
         database_path: PathBuf,
         initial_route: UiRoute,
         initial_status: UiRuntimeStatus,
+        initially_visible: bool,
     ) -> Result<Self, String> {
         let (control_tx, control_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
@@ -69,6 +74,7 @@ impl ProductShell {
                     database_path,
                     initial_route,
                     initial_status,
+                    initially_visible,
                     control_rx,
                     event_tx.clone(),
                     ready_tx,
@@ -132,6 +138,7 @@ fn run_shell(
     database_path: PathBuf,
     initial_route: UiRoute,
     initial_status: UiRuntimeStatus,
+    initially_visible: bool,
     controls: Receiver<ProductShellControl>,
     events: Sender<ProductShellEvent>,
     ready: mpsc::SyncSender<Result<egui::Context, String>>,
@@ -144,15 +151,28 @@ fn run_shell(
     let (readiness_tx, readiness_rx) = mpsc::channel();
     probe_readiness(bridge.settings().clone(), store.clone(), readiness_tx);
 
-    let native_options = eframe::NativeOptions {
+    let mut native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Phorminx")
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!(
+                    "../../../design/brand/png/app/phorminx-app-256.png"
+                ))
+                .map_err(|error| format!("failed to decode the embedded window icon: {error}"))?,
+            )
+            .with_visible(initially_visible)
             .with_inner_size(Vec2::new(1120.0, 760.0))
             .with_min_inner_size(Vec2::new(900.0, 620.0))
             .with_resizable(true),
         centered: true,
         ..Default::default()
     };
+    #[cfg(windows)]
+    {
+        native_options.event_loop_builder = Some(Box::new(|builder| {
+            builder.with_any_thread(true);
+        }));
+    }
     let app = ProductShellApp::new(
         bridge,
         readiness,
@@ -195,6 +215,7 @@ struct ProductShellApp {
     readiness_rx: Receiver<UiReadinessSnapshot>,
     store: SettingsStore,
     notice: Option<InlineNotice>,
+    download_active: bool,
     quitting: bool,
 }
 
@@ -222,6 +243,7 @@ impl ProductShellApp {
             readiness_rx,
             store,
             notice: None,
+            download_active: false,
             quitting: false,
         }
     }
@@ -288,15 +310,23 @@ impl ProductShellApp {
                 let _ = self.events.send(ProductShellEvent::TestDictation);
             }
             ShellEvent::CopyHistory { id, variant } => {
-                if let Some(item) = self
+                let text = self
                     .shell
                     .snapshot()
                     .history
                     .iter()
                     .find(|item| item.id == id)
-                    && let Some(text) = item.text_for(variant)
-                {
-                    ctx.copy_text(text.to_owned());
+                    .and_then(|item| item.text_for(variant))
+                    .map(str::to_owned);
+                if let Some(text) = text {
+                    ctx.copy_text(text);
+                    self.notice = Some(InlineNotice {
+                        kind: NoticeKind::Information,
+                        title: "Copied.".to_owned(),
+                        detail: "The selected transcript text is on the clipboard.".to_owned(),
+                        action: None,
+                    });
+                    self.refresh();
                 }
             }
             ShellEvent::ClearHistory => {
@@ -309,11 +339,7 @@ impl ProductShellApp {
                     alias: draft.spoken,
                     language: optional(draft.language),
                     app_executable: optional(draft.scope),
-                    case_policy: if draft.preserve_case {
-                        CasePolicy::UseCanonical
-                    } else {
-                        CasePolicy::PreserveInput
-                    },
+                    case_policy: unmap_case_policy(draft.case_policy),
                     enabled: draft.enabled,
                 })) {
                     self.shell.close_lexicon_editor();
@@ -324,8 +350,8 @@ impl ProductShellApp {
             }
             ShellEvent::SaveProfile(draft) => {
                 let original = draft.original_executable.clone();
-                let executable = draft.executable.clone();
                 if self.execute(UiCommand::SaveProfile(UiProfileDraft {
+                    original_executable: original,
                     executable: draft.executable,
                     formatting_style: map_profile_formatting(draft.formatting),
                     custom_instructions: optional(draft.custom_instruction),
@@ -333,18 +359,25 @@ impl ProductShellApp {
                     insertion_preference: map_profile_insertion(draft.insertion),
                     deny: draft.blocked,
                 })) {
-                    if let Some(original) = original
-                        && original != executable
-                    {
-                        self.execute(UiCommand::DeleteProfile(original));
-                    }
                     self.shell.close_profile_editor();
                 }
             }
             ShellEvent::RemoveProfile(executable) => {
                 self.execute(UiCommand::DeleteProfile(executable));
             }
-            ShellEvent::VerifyModels | ShellEvent::NoticeAction => {
+            ShellEvent::VerifyModels => {
+                self.readiness = UiReadinessSnapshot::checking(self.bridge.settings(), &self.store);
+                let (sender, receiver) = mpsc::channel();
+                self.readiness_rx = receiver;
+                probe_readiness(self.bridge.settings().clone(), self.store.clone(), sender);
+                self.refresh();
+            }
+            ShellEvent::NoticeAction if self.download_active => {
+                let _ = self
+                    .events
+                    .send(ProductShellEvent::CancelWhisperModelDownload);
+            }
+            ShellEvent::NoticeAction => {
                 self.readiness = UiReadinessSnapshot::checking(self.bridge.settings(), &self.store);
                 let (sender, receiver) = mpsc::channel();
                 self.readiness_rx = receiver;
@@ -367,8 +400,8 @@ impl ProductShellApp {
                 self.notice = None;
                 self.refresh();
             }
-            ShellEvent::SelectHistory(_)
-            | ShellEvent::SelectHistoryVariant(_)
+            ShellEvent::SelectHistory(id) => self.shell.select_history(id),
+            ShellEvent::SelectHistoryVariant(_)
             | ShellEvent::NewLexiconEntry
             | ShellEvent::EditLexicon(_)
             | ShellEvent::NewProfile
@@ -396,21 +429,24 @@ impl eframe::App for ProductShellApp {
                 }
                 ProductShellControl::Refresh => self.refresh(),
                 ProductShellControl::ModelDownloadProgress(percent) => {
+                    self.download_active = true;
                     self.notice = Some(InlineNotice {
                         kind: NoticeKind::Information,
                         title: "Acquiring the local instrument".to_owned(),
                         detail: format!("Downloading and verifying the pinned model · {percent}%"),
-                        action: None,
+                        action: Some("Cancel download".to_owned()),
                     });
                     self.refresh();
                 }
                 ProductShellControl::ModelDownloaded(path) => {
+                    self.download_active = false;
                     let mut settings = self.bridge.settings().clone();
                     settings.recognition.model_path = path;
                     settings.startup.onboarding_complete = true;
                     self.execute(UiCommand::SaveSettings(settings));
                 }
                 ProductShellControl::ModelDownloadFailed => {
+                    self.download_active = false;
                     self.set_error("The verified model could not be downloaded. Your previous model was not changed.".to_owned());
                     self.refresh();
                 }
@@ -454,7 +490,7 @@ fn map_snapshot(
         .into_iter()
         .map(|item| HistoryItem {
             id: item.id,
-            time: format!("record {}", item.id),
+            time: format_timestamp(item.created_at_ms),
             application: item
                 .target_executable
                 .unwrap_or_else(|| "Unknown application".to_owned()),
@@ -482,7 +518,7 @@ fn map_snapshot(
             scope: item
                 .app_executable
                 .unwrap_or_else(|| "Everywhere".to_owned()),
-            preserve_case: item.case_policy == CasePolicy::UseCanonical,
+            case_policy: map_case_policy(item.case_policy),
             enabled: item.enabled,
         })
         .collect();
@@ -595,7 +631,6 @@ fn map_settings(
         model_path: settings.recognition.model_path.display().to_string(),
         history_retention: history_label(settings.privacy.history_retention).to_owned(),
         launch_at_login: settings.startup.launch_at_login,
-        reduced_motion: false,
     }
 }
 
@@ -706,6 +741,22 @@ fn map_profile_formatting(value: ShellFormatting) -> FormattingStyle {
         ShellFormatting::Custom => FormattingStyle::Custom,
     }
 }
+fn map_case_policy(value: CasePolicy) -> LexiconCasePolicy {
+    match value {
+        CasePolicy::PreserveInput => LexiconCasePolicy::PreserveInput,
+        CasePolicy::UseCanonical => LexiconCasePolicy::UseCanonical,
+        CasePolicy::Lowercase => LexiconCasePolicy::Lowercase,
+        CasePolicy::Uppercase => LexiconCasePolicy::Uppercase,
+    }
+}
+fn unmap_case_policy(value: LexiconCasePolicy) -> CasePolicy {
+    match value {
+        LexiconCasePolicy::PreserveInput => CasePolicy::PreserveInput,
+        LexiconCasePolicy::UseCanonical => CasePolicy::UseCanonical,
+        LexiconCasePolicy::Lowercase => CasePolicy::Lowercase,
+        LexiconCasePolicy::Uppercase => CasePolicy::Uppercase,
+    }
+}
 fn map_profile_insertion(value: ProfileInsertion) -> InsertionPreference {
     match value {
         ProfileInsertion::Automatic => InsertionPreference::Automatic,
@@ -745,6 +796,34 @@ fn format_duration(stt: Option<u64>, formatting: Option<u64>, insertion: Option<
             .saturating_add(formatting.unwrap_or(0))
             .saturating_add(insertion.unwrap_or(0))
     )
+}
+fn format_timestamp(created_at_ms: i64) -> String {
+    let seconds = created_at_ms.div_euclid(1_000);
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    format!("{year:04}-{month:02}-{day:02}  {hour:02}:{minute:02} UTC")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let shifted = days_since_epoch + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
 }
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -794,5 +873,11 @@ mod tests {
     #[test]
     fn history_duration_is_saturating_and_content_free() {
         assert_eq!(format_duration(Some(100), Some(20), None), "120 ms");
+    }
+
+    #[test]
+    fn history_timestamp_uses_stable_utc_civil_time() {
+        assert_eq!(format_timestamp(0), "1970-01-01  00:00 UTC");
+        assert_eq!(format_timestamp(1_704_164_645_000), "2024-01-02  03:04 UTC");
     }
 }

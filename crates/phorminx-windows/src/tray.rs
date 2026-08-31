@@ -222,7 +222,10 @@ unsafe fn create_and_run(
         return Err(TrayThreadError::Api(windows::core::Error::from_thread()));
     }
 
-    let icon = match unsafe { LoadIconW(None, IDI_APPLICATION) } {
+    let resource_name = PCWSTR(ICON_ID as usize as *const u16);
+    let icon = match unsafe { LoadIconW(Some(instance), resource_name) }
+        .or_else(|_| unsafe { LoadIconW(None, IDI_APPLICATION) })
+    {
         Ok(icon) => icon,
         Err(error) => {
             let _ = unsafe { UnregisterClassW(CLASS_NAME, Some(instance)) };
@@ -242,7 +245,7 @@ unsafe fn create_and_run(
         CreateWindowExW(
             WS_EX_TOOLWINDOW,
             CLASS_NAME,
-            w!("Phorminx"),
+            w!("PhorminxTrayHost"),
             WS_OVERLAPPED,
             0,
             0,

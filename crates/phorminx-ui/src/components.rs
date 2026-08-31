@@ -1,8 +1,8 @@
 //! Reusable, product-specific egui components.
 
 use eframe::egui::{
-    self, Align, Button, Color32, CornerRadius, FontId, Layout, Margin, Rect, Response, RichText,
-    Sense, Stroke, StrokeKind, Ui, Vec2,
+    self, Align, Button, Color32, CornerRadius, FontId, Image, Layout, Margin, Rect, Response,
+    RichText, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2,
 };
 
 use crate::model::{InlineNotice, NoticeKind, Readiness, RuntimeStatus};
@@ -39,49 +39,38 @@ pub fn action(ui: &mut Ui, label: &str, tone: ActionTone) -> Response {
 }
 
 pub fn tensioned_p(ui: &mut Ui, size: f32) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        let bronze = Colors::BRONZE;
-        let edge = Colors::LIMESTONE;
-        let stem_x = rect.left() + size * 0.24;
-        let yoke_y = rect.top() + size * 0.20;
-        let bowl_right = rect.right() - size * 0.14;
-        let bowl_bottom = rect.top() + size * 0.60;
-        painter.line_segment(
-            [
-                egui::pos2(stem_x, rect.bottom() - size * 0.12),
-                egui::pos2(stem_x, yoke_y),
-            ],
-            Stroke::new((size * 0.13).max(2.0), edge),
-        );
-        painter.line_segment(
-            [egui::pos2(stem_x, yoke_y), egui::pos2(bowl_right, yoke_y)],
-            Stroke::new((size * 0.11).max(2.0), edge),
-        );
-        painter.line_segment(
-            [
-                egui::pos2(bowl_right, yoke_y),
-                egui::pos2(bowl_right - size * 0.04, bowl_bottom),
-            ],
-            Stroke::new((size * 0.10).max(2.0), edge),
-        );
-        painter.line_segment(
-            [
-                egui::pos2(stem_x, bowl_bottom),
-                egui::pos2(bowl_right - size * 0.04, bowl_bottom),
-            ],
-            Stroke::new((size * 0.08).max(1.5), edge),
-        );
-        for fraction in [0.46_f32, 0.61, 0.76] {
-            let x = rect.left() + size * fraction;
-            painter.line_segment(
-                [egui::pos2(x, yoke_y), egui::pos2(x, bowl_bottom)],
-                Stroke::new((size * 0.025).max(1.0), bronze),
-            );
-        }
+    let texture = mark_texture(ui);
+    ui.add(
+        Image::new(&texture)
+            .fit_to_exact_size(Vec2::splat(size))
+            .sense(Sense::hover()),
+    )
+    .on_hover_text("Phorminx · Voice, disciplined.")
+}
+
+fn mark_texture(ui: &Ui) -> TextureHandle {
+    let texture_id = egui::Id::new("phorminx-production-mark");
+    if let Some(texture) = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<TextureHandle>(texture_id))
+    {
+        return texture;
     }
-    response.on_hover_text("Phorminx · Voice, disciplined.")
+
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!(
+        "../../../design/brand/png/mark/phorminx-mark-white-48.png"
+    ))
+    .expect("the embedded Phorminx mark must be a valid PNG");
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [icon.width as usize, icon.height as usize],
+        &icon.rgba,
+    );
+    let texture = ui
+        .ctx()
+        .load_texture("phorminx-production-mark", image, TextureOptions::LINEAR);
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(texture_id, texture.clone()));
+    texture
 }
 
 #[must_use]

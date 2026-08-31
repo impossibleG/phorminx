@@ -80,6 +80,13 @@ impl PhorminxUi {
         self.pages.profile_draft = None;
     }
 
+    pub fn select_history(&mut self, id: i64) {
+        if self.snapshot.history.iter().any(|item| item.id == id) {
+            self.pages.history_id = Some(id);
+            self.pages.history_variant = crate::model::HistoryVariant::Output;
+        }
+    }
+
     #[must_use]
     pub fn take_events(&mut self) -> Vec<ShellEvent> {
         std::mem::take(&mut self.outbox)
@@ -219,6 +226,20 @@ mod tests {
         app.apply_snapshot(snapshot);
         assert_eq!(app.route(), Route::Models);
         assert_eq!(app.snapshot().status, RuntimeStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn home_history_selection_survives_route_navigation() {
+        let snapshot = ShellSnapshot::gallery(GalleryScenario::Populated);
+        let id = snapshot.history[1].id;
+        let mut app = PhorminxUi::new(snapshot);
+        app.select_history(id);
+        app.navigate(Route::History);
+        assert_eq!(app.pages.history_id, Some(id));
+        assert_eq!(
+            app.pages.history_variant,
+            crate::model::HistoryVariant::Output
+        );
     }
 
     #[test]
