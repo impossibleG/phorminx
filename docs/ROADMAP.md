@@ -63,6 +63,19 @@ Implementation status: engineering complete. Release tooling and automated polic
 
 Exit criteria: all MVP definition-of-done items in the blueprint are satisfied.
 
+## Phase 5 — Unified product experience and identity
+
+Status: planned in `UI-BRAND-BLUEPRINT.md`; implementation has not started.
+
+- Replace the separate Settings, History, Lexicon, and Profiles windows with one routed application shell.
+- Establish the Phorminx mark, wordmark, color, type, geometry, iconography, copy, and motion systems.
+- Route tray commands into the relevant shell page.
+- Rebuild first-run commissioning, operational settings, model readiness, and local-data workspaces inside the same design language.
+- Produce multi-resolution application, tray, installer, and overlay assets.
+- Validate keyboard navigation, DPI scaling, reduced motion, contrast, empty/error states, and long content.
+
+Exit criteria: every current product capability remains available in one coherent, branded, keyboard-accessible shell, and no content route creates an independent native window.
+
 ## Parallel workstreams
 
 After Phase 0 contracts are frozen, development can run concurrently:
