@@ -21,6 +21,7 @@ $installer = Get-Content -LiteralPath $installerPath -Raw
 Assert-True ($installer -match '(?m)^PrivilegesRequired=lowest$') "Installer must be per-user."
 Assert-True ($installer -match '(?m)^DefaultDirName=\{localappdata\}\\Programs\\Phorminx$') "Installer must target LocalAppData."
 Assert-True ($installer -match '(?m)^Root: HKCU;.*CurrentVersion\\Run') "Autostart must use HKCU."
+Assert-True ($installer -match '(?m)^Root: HKCU;.*ValueType: none;.*Flags: uninsdeletevalue$') "Uninstall must remove runtime-enabled autostart even when the install task was initially unchecked."
 Assert-True ($installer -notmatch '(?im)runas|PrivilegesRequiredOverridesAllowed') "Installer must not request or offer elevation."
 Assert-True ($installer -notmatch '(?im)^.*models[\\/].*\.bin') "Installer must not bundle speech models."
 
@@ -60,4 +61,3 @@ if ($failures.Count -gt 0) {
 }
 
 Write-Host "Release asset validations passed."
-

@@ -30,6 +30,8 @@ pub enum LaunchAtLoginError {
     EmptyExecutablePath,
     #[error("the executable path contains a NUL character")]
     NulInExecutablePath,
+    #[error("the executable path contains a quotation mark")]
+    QuoteInExecutablePath,
     #[error("the executable path must be absolute")]
     RelativeExecutablePath,
     #[error("the executable path is not valid Unicode")]
@@ -95,6 +97,9 @@ fn command_for_executable(executable_path: &Path) -> Result<String, LaunchAtLogi
         .ok_or(LaunchAtLoginError::NonUnicodeExecutablePath)?;
     if path.contains('\0') {
         return Err(LaunchAtLoginError::NulInExecutablePath);
+    }
+    if path.contains('"') {
+        return Err(LaunchAtLoginError::QuoteInExecutablePath);
     }
     Ok(format!("\"{path}\""))
 }
@@ -278,6 +283,14 @@ mod tests {
         assert!(matches!(
             command_for_executable(Path::new("phorminx-app.exe")),
             Err(LaunchAtLoginError::RelativeExecutablePath)
+        ));
+    }
+
+    #[test]
+    fn quotation_mark_in_executable_path_is_rejected() {
+        assert!(matches!(
+            command_for_executable(Path::new(r#"C:\Phorminx\bad"name.exe"#)),
+            Err(LaunchAtLoginError::QuoteInExecutablePath)
         ));
     }
 

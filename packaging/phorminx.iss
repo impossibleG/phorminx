@@ -58,6 +58,7 @@ Name: "{group}\Phorminx"; Filename: "{app}\phorminx-app.exe"; WorkingDir: "{app}
 Name: "{group}\Uninstall Phorminx"; Filename: "{uninstallexe}"
 
 [Registry]
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Phorminx"; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Phorminx"; ValueData: """{app}\phorminx-app.exe"""; Flags: uninsdeletevalue; Tasks: startup
 
 [Run]
