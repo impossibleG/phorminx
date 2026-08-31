@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <title>Phorminx Tensioned P / Laconic cut</title>
+  <desc>One-color master. Three size-dependent string apertures and one internal asymmetric tension cut.</desc>
+  <path fill="#000000" fill-rule="evenodd" d="M 2.000,1 L 8.200,1 L 9.540,1.092 L 10.709,1.359 L 11.705,1.791 L 12.525,2.375 L 13.167,3.1 L 13.628,3.953 L 13.907,4.924 L 14.000,6 L 13.899,7.125 L 13.606,8.103 L 13.135,8.936 L 12.500,9.625 L 11.715,10.174 L 10.794,10.584 L 9.751,10.859 L 8.600,11 L 7.794,11.014 L 7.045,10.941 L 6.339,10.791 L 5.662,10.574 L 5.000,10.3 L 5.000,15 L 2.000,15 Z M 10.000,3.5 L 11.300,3.5 L 12.000,4.5 L 12.000,6 L 12.000,7.5 L 11.200,8.5 L 10.000,8.6 Z M 6.000,3 L 8.000,3 L 8.000,9 L 6.000,9 Z M 9.200,9.2 L 8.000,10.1 L 6.100,11.5 L 6.100,10.2 L 7.400,10 L 8.300,9.5 Z"/>
+</svg>
