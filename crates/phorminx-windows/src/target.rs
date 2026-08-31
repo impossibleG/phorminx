@@ -1,7 +1,13 @@
 use std::mem::size_of;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use windows::Win32::Foundation::{ERROR_SUCCESS, GetLastError, HWND, LPARAM, SetLastError, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_SUCCESS, GetLastError, HANDLE, HWND, LPARAM, SetLastError, WPARAM,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
 use windows::Win32::UI::Controls::EM_GETPASSWORDCHAR;
 use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -9,6 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetGUIThreadInfo, GetWindowLongPtrW, GetWindowThreadProcessId, IsChild, IsWindowVisible,
     SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, SendMessageTimeoutW,
 };
+use windows::core::PWSTR;
 
 /// Identity of the foreground window and focused child at activation time.
 /// Raw handle values keep this type safe to send across the hook channel.
@@ -33,6 +40,28 @@ impl TargetSnapshot {
 
     pub(crate) fn is_current(self) -> bool {
         Self::capture() == Some(self)
+    }
+
+    /// Resolves only the executable basename for privacy-safe app profiles and
+    /// history metadata. Full image paths never leave this function.
+    pub fn executable_name(self) -> Option<String> {
+        let process =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, self.process_id) }
+                .ok()?;
+        let process = ProcessHandle(process);
+        let mut image = vec![0_u16; 32_768];
+        let mut length = image.len() as u32;
+        unsafe {
+            QueryFullProcessImageNameW(
+                process.0,
+                PROCESS_NAME_WIN32,
+                PWSTR(image.as_mut_ptr()),
+                &mut length,
+            )
+        }
+        .ok()?;
+        image.truncate(length as usize);
+        basename_from_image_path(&String::from_utf16(image.as_slice()).ok()?)
     }
 
     pub(crate) fn is_classic_writable_edit(self) -> bool {
@@ -83,6 +112,30 @@ impl TargetSnapshot {
 
         sent.0 != 0 && password_character == 0 && self.is_current()
     }
+}
+
+struct ProcessHandle(HANDLE);
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+fn basename_from_image_path(image_path: &str) -> Option<String> {
+    if image_path.ends_with(['/', '\\']) {
+        return None;
+    }
+    let basename = Path::new(image_path).file_name()?.to_str()?;
+    if basename.is_empty()
+        || basename.contains(['/', '\\', ':'])
+        || basename.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(basename.to_owned())
 }
 
 pub(crate) fn capture_activation_target() {
@@ -165,4 +218,20 @@ unsafe fn capture_target() -> Option<TargetSnapshot> {
 
 fn hwnd(bits: usize) -> HWND {
     HWND(bits as *mut core::ffi::c_void)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::basename_from_image_path;
+
+    #[test]
+    fn image_paths_are_reduced_to_safe_basenames() {
+        assert_eq!(
+            basename_from_image_path(r"C:\Program Files\Editor\editor.exe").as_deref(),
+            Some("editor.exe")
+        );
+        assert_eq!(basename_from_image_path(""), None);
+        assert_eq!(basename_from_image_path(r"C:\folder\"), None);
+        assert_eq!(basename_from_image_path("bad\0name.exe"), None);
+    }
 }

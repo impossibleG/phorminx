@@ -15,11 +15,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW,
     HICON, IDI_APPLICATION, IsWindow, KillTimer, LoadIconW, MF_SEPARATOR, MF_STRING, MSG,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL, PBT_APMRESUMESTANDBY, PBT_APMRESUMESUSPEND,
     PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     TrackPopupMenu, TranslateMessage, UnregisterClassW, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
-    WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_QUIT, WM_TIMER, WNDCLASSW,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_POWERBROADCAST, WM_QUIT,
+    WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -33,11 +34,18 @@ const RETRY_TIMER_ID: usize = 1;
 const RETRY_INTERVAL_MS: u32 = 2_000;
 const COMMAND_SETTINGS: usize = 1;
 const COMMAND_QUIT: usize = 2;
+const COMMAND_HISTORY: usize = 3;
+const COMMAND_LEXICON: usize = 4;
+const COMMAND_PROFILES: usize = 5;
 const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrayEvent {
     OpenSettings,
+    OpenHistory,
+    OpenLexicon,
+    OpenProfiles,
+    SystemResumed,
     QuitRequested,
 }
 
@@ -49,6 +57,7 @@ pub enum TrayStatus {
     Listening = 2,
     Transcribing = 3,
     Error = 4,
+    Cleaning = 5,
 }
 
 impl TrayStatus {
@@ -59,6 +68,7 @@ impl TrayStatus {
             2 => Some(Self::Listening),
             3 => Some(Self::Transcribing),
             4 => Some(Self::Error),
+            5 => Some(Self::Cleaning),
             _ => None,
         }
     }
@@ -70,6 +80,7 @@ impl TrayStatus {
             Self::Listening => "Phorminx - Listening",
             Self::Transcribing => "Phorminx - Transcribing",
             Self::Error => "Phorminx - Attention needed",
+            Self::Cleaning => "Phorminx - Cleaning locally",
         }
     }
 }
@@ -339,6 +350,19 @@ unsafe extern "system" fn window_procedure(
             }
             LRESULT(0)
         }
+        WM_POWERBROADCAST => {
+            if matches!(
+                wparam.0 as u32,
+                PBT_APMRESUMEAUTOMATIC
+                    | PBT_APMRESUMECRITICAL
+                    | PBT_APMRESUMESTANDBY
+                    | PBT_APMRESUMESUSPEND
+            ) && let Some(state) = unsafe { window_state(hwnd) }
+            {
+                let _ = state.events.send(TrayEvent::SystemResumed);
+            }
+            LRESULT(1)
+        }
         WM_CLOSE => {
             if let Some(state) = unsafe { window_state(hwnd) } {
                 if state.retry_timer != 0 {
@@ -399,6 +423,17 @@ unsafe fn show_context_menu(hwnd: HWND, point: POINT) -> Option<TrayEvent> {
     let menu = unsafe { CreatePopupMenu() }.ok()?;
     let selected = (|| {
         unsafe { AppendMenuW(menu, MF_STRING, COMMAND_SETTINGS, w!("Settings...")) }.ok()?;
+        unsafe { AppendMenuW(menu, MF_STRING, COMMAND_HISTORY, w!("History...")) }.ok()?;
+        unsafe { AppendMenuW(menu, MF_STRING, COMMAND_LEXICON, w!("Personal lexicon...")) }.ok()?;
+        unsafe {
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                COMMAND_PROFILES,
+                w!("Application profiles..."),
+            )
+        }
+        .ok()?;
         unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) }.ok()?;
         unsafe { AppendMenuW(menu, MF_STRING, COMMAND_QUIT, w!("Quit Phorminx")) }.ok()?;
         let _ = unsafe { SetForegroundWindow(hwnd) };
@@ -416,6 +451,9 @@ unsafe fn show_context_menu(hwnd: HWND, point: POINT) -> Option<TrayEvent> {
         let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
         match command.0 as usize {
             COMMAND_SETTINGS => Some(TrayEvent::OpenSettings),
+            COMMAND_HISTORY => Some(TrayEvent::OpenHistory),
+            COMMAND_LEXICON => Some(TrayEvent::OpenLexicon),
+            COMMAND_PROFILES => Some(TrayEvent::OpenProfiles),
             COMMAND_QUIT => Some(TrayEvent::QuitRequested),
             _ => None,
         }
@@ -567,6 +605,7 @@ mod tests {
     #[test]
     fn statuses_have_stable_message_values() {
         assert_eq!(TrayStatus::from_message(2), Some(TrayStatus::Listening));
+        assert_eq!(TrayStatus::from_message(5), Some(TrayStatus::Cleaning));
         assert_eq!(TrayStatus::from_message(99), None);
     }
 }

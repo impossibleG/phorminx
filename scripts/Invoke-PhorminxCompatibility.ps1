@@ -39,6 +39,12 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+function Write-Utf8NoBom {
+    param([string] $Path, [string] $Content)
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $encoding)
+}
+
 $scenarioDefinitions = @(
     [ordered]@{ id = "sleep_resume"; category = "lifecycle"; requires_physical_test = $true },
     [ordered]@{ id = "microphone_hotplug"; category = "audio"; requires_physical_test = $true },
@@ -64,7 +70,7 @@ function Read-RunFile {
 function Write-RunFile {
     param([object] $Run, [string] $Path)
     $temporaryPath = "$Path.tmp"
-    $Run | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporaryPath -Encoding utf8NoBOM
+    Write-Utf8NoBom -Path $temporaryPath -Content ($Run | ConvertTo-Json -Depth 8)
     Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
 }
 
@@ -130,4 +136,3 @@ switch ($PSCmdlet.ParameterSetName) {
         }
     }
 }
-

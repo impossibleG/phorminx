@@ -8,6 +8,7 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Controls::BST_CHECKED;
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
     OPENFILENAMEW,
@@ -18,17 +19,17 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BS_DEFPUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CREATESTRUCTW,
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL,
-    ES_AUTOVSCROLL, ES_MULTILINE, GWLP_USERDATA, GetMessageW, GetSystemMetrics, GetWindowLongPtrW,
-    GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, IsWindow, LoadCursorW, MB_ICONERROR,
-    MB_OK, MSG, MessageBoxW, PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW,
-    SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SW_SHOWNORMAL, SendMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, UnregisterClassW,
-    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_NCDESTROY,
-    WM_QUIT, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
-    WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
-    WS_VISIBLE, WS_VSCROLL,
+    BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL,
+    CB_SETCURSEL, CBS_DROPDOWNLIST, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, GWLP_USERDATA, GetMessageW,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW,
+    IsWindow, LoadCursorW, MB_ICONERROR, MB_OK, MSG, MessageBoxW, PostMessageW, PostQuitMessage,
+    PostThreadMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SW_SHOWNORMAL,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+    TranslateMessage, UnregisterClassW, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE,
+    WM_DESTROY, WM_NCCREATE, WM_NCDESTROY, WM_QUIT, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION,
+    WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX,
+    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -46,6 +47,12 @@ const ID_FORMATTING: usize = 104;
 const ID_CUSTOM: usize = 105;
 const ID_BROWSE: usize = 106;
 const ID_DOWNLOAD: usize = 107;
+const ID_MICROPHONE: usize = 108;
+const ID_OLLAMA_MODEL: usize = 109;
+const ID_OLLAMA_LIFECYCLE: usize = 110;
+const ID_RECORDING_MODE: usize = 111;
+const ID_RETENTION: usize = 112;
+const ID_LAUNCH_AT_LOGIN: usize = 113;
 const ID_SAVE: usize = 201;
 const ID_CANCEL: usize = 202;
 
@@ -56,6 +63,28 @@ pub enum SettingsFormatting {
     Balanced,
     Strong,
     Custom,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingsOllamaLifecycle {
+    Instant,
+    Balanced,
+    MemorySaver,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingsRecordingMode {
+    Hold,
+    Toggle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingsHistoryRetention {
+    Disabled,
+    OneDay,
+    SevenDays,
+    ThirtyDays,
+    Indefinite,
 }
 
 impl SettingsFormatting {
@@ -81,21 +110,70 @@ impl SettingsFormatting {
     }
 }
 
+macro_rules! indexed_setting {
+    ($type:ty, [$($variant:path),+ $(,)?]) => {
+        impl $type {
+            fn index(self) -> usize {
+                [$($variant),+]
+                    .iter()
+                    .position(|value| *value == self)
+                    .expect("setting variant is in its stable index table")
+            }
+
+            fn from_index(index: isize) -> Option<Self> {
+                [$($variant),+].get(usize::try_from(index).ok()?).copied()
+            }
+        }
+    };
+}
+
+indexed_setting!(
+    SettingsOllamaLifecycle,
+    [
+        SettingsOllamaLifecycle::Instant,
+        SettingsOllamaLifecycle::Balanced,
+        SettingsOllamaLifecycle::MemorySaver,
+    ]
+);
+indexed_setting!(
+    SettingsRecordingMode,
+    [SettingsRecordingMode::Hold, SettingsRecordingMode::Toggle,]
+);
+indexed_setting!(
+    SettingsHistoryRetention,
+    [
+        SettingsHistoryRetention::Disabled,
+        SettingsHistoryRetention::OneDay,
+        SettingsHistoryRetention::SevenDays,
+        SettingsHistoryRetention::ThirtyDays,
+        SettingsHistoryRetention::Indefinite,
+    ]
+);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsForm {
     pub model_path: String,
     pub model_status: String,
     pub microphone_status: String,
+    pub microphones: Vec<String>,
+    pub microphone: Option<String>,
     pub recommended_download_label: String,
     pub language: String,
     pub minimum_rms: String,
     pub formatting: SettingsFormatting,
     pub custom_instructions: String,
+    pub ollama_models: Vec<String>,
+    pub ollama_model: Option<String>,
+    pub ollama_status: String,
+    pub ollama_lifecycle: SettingsOllamaLifecycle,
+    pub recording_mode: SettingsRecordingMode,
+    pub history_retention: SettingsHistoryRetention,
+    pub launch_at_login: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SettingsWindowEvent {
-    SaveAndRestart(SettingsForm),
+    SaveAndRestart(Box<SettingsForm>),
     DownloadRecommended,
     Closed,
 }
@@ -263,8 +341,14 @@ struct WindowState {
     model_status: HWND,
     language: HWND,
     minimum_rms: HWND,
+    microphone: HWND,
     formatting: HWND,
     custom: HWND,
+    ollama_model: HWND,
+    ollama_lifecycle: HWND,
+    recording_mode: HWND,
+    history_retention: HWND,
+    launch_at_login: HWND,
 }
 
 struct ModelUpdate {
@@ -317,13 +401,19 @@ unsafe fn create_and_run(
         model_status: HWND::default(),
         language: HWND::default(),
         minimum_rms: HWND::default(),
+        microphone: HWND::default(),
         formatting: HWND::default(),
         custom: HWND::default(),
+        ollama_model: HWND::default(),
+        ollama_lifecycle: HWND::default(),
+        recording_mode: HWND::default(),
+        history_retention: HWND::default(),
+        launch_at_login: HWND::default(),
     });
     let state_pointer = (&mut *state as *mut WindowState).cast();
     let system_dpi = unsafe { GetDpiForSystem() }.max(96) as i32;
     let width = 560 * system_dpi / 96;
-    let height = 635 * system_dpi / 96;
+    let height = 790 * system_dpi / 96;
     let x = (unsafe { GetSystemMetrics(SM_CXSCREEN) } - width).max(0) / 2;
     let y = (unsafe { GetSystemMetrics(SM_CYSCREEN) } - height).max(0) / 2;
     let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
@@ -413,7 +503,9 @@ unsafe extern "system" fn window_procedure(
                     if let Some(state) = unsafe { window_state(hwnd) }
                         && let Some(form) = unsafe { read_form(state) }
                     {
-                        let _ = state.events.send(SettingsWindowEvent::SaveAndRestart(form));
+                        let _ = state
+                            .events
+                            .send(SettingsWindowEvent::SaveAndRestart(Box::new(form)));
                     }
                 }
                 ID_CANCEL => {
@@ -579,12 +671,48 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             scale,
             font,
         )?;
+        create_label(hwnd, w!("Microphone"), 24, 174, 500, 20, scale, font)?;
+        let mut microphone_choices = vec!["Windows default".to_owned()];
+        microphone_choices.extend(state.initial.microphones.iter().cloned());
+        let microphone_index = state
+            .initial
+            .microphone
+            .as_ref()
+            .and_then(|selected| {
+                microphone_choices
+                    .iter()
+                    .position(|candidate| candidate == selected)
+            })
+            .unwrap_or(0);
+        state.microphone = create_choice_combo(
+            hwnd,
+            ID_MICROPHONE,
+            &microphone_choices,
+            microphone_index,
+            24,
+            198,
+            500,
+            160,
+            scale,
+            font,
+        )?;
+        let microphone_status = wide(&state.initial.microphone_status);
+        create_label(
+            hwnd,
+            PCWSTR(microphone_status.as_ptr()),
+            24,
+            230,
+            500,
+            20,
+            scale,
+            font,
+        )?;
         create_label(
             hwnd,
             w!("Formatting strength"),
             24,
-            174,
-            500,
+            260,
+            240,
             20,
             scale,
             font,
@@ -593,9 +721,71 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             hwnd,
             state.initial.formatting,
             24,
-            198,
+            284,
+            240,
+            180,
+            scale,
+            font,
+        )?;
+        create_label(hwnd, w!("Ollama lifecycle"), 284, 260, 240, 20, scale, font)?;
+        state.ollama_lifecycle = create_choice_combo(
+            hwnd,
+            ID_OLLAMA_LIFECYCLE,
+            &[
+                "Instant".to_owned(),
+                "Balanced".to_owned(),
+                "Memory saver".to_owned(),
+            ],
+            state.initial.ollama_lifecycle.index(),
+            284,
+            284,
+            240,
+            120,
+            scale,
+            font,
+        )?;
+        create_label(
+            hwnd,
+            w!("Local Ollama model"),
+            24,
+            326,
+            500,
+            20,
+            scale,
+            font,
+        )?;
+        let mut ollama_choices = vec!["None (deterministic formatting only)".to_owned()];
+        ollama_choices.extend(state.initial.ollama_models.iter().cloned());
+        let ollama_index = state
+            .initial
+            .ollama_model
+            .as_ref()
+            .and_then(|selected| {
+                ollama_choices
+                    .iter()
+                    .position(|candidate| candidate == selected)
+            })
+            .unwrap_or(0);
+        state.ollama_model = create_choice_combo(
+            hwnd,
+            ID_OLLAMA_MODEL,
+            &ollama_choices,
+            ollama_index,
+            24,
+            350,
             500,
             180,
+            scale,
+            font,
+        )?;
+        let ollama_status = wide(&state.initial.ollama_status);
+        create_label(
+            hwnd,
+            PCWSTR(ollama_status.as_ptr()),
+            24,
+            382,
+            500,
+            20,
             scale,
             font,
         )?;
@@ -603,7 +793,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             hwnd,
             w!("Custom instructions (used by Custom formatting)"),
             24,
-            240,
+            412,
             500,
             20,
             scale,
@@ -614,33 +804,63 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_CUSTOM,
             &state.initial.custom_instructions,
             24,
-            264,
+            436,
             500,
-            105,
+            74,
             true,
             scale,
             font,
         )?;
-        create_label(
+        create_label(hwnd, w!("Recording mode"), 24, 526, 240, 20, scale, font)?;
+        state.recording_mode = create_choice_combo(
             hwnd,
-            w!(
-                "Balanced, Strong, and Custom will activate after a compatible local Ollama model is configured."
-            ),
+            ID_RECORDING_MODE,
+            &["Hold to talk".to_owned(), "Toggle".to_owned()],
+            state.initial.recording_mode.index(),
             24,
-            380,
-            500,
-            30,
+            550,
+            240,
+            100,
             scale,
             font,
         )?;
-        let microphone_status = wide(&state.initial.microphone_status);
         create_label(
             hwnd,
-            PCWSTR(microphone_status.as_ptr()),
-            24,
-            418,
-            500,
+            w!("History retention"),
+            284,
+            526,
+            240,
             20,
+            scale,
+            font,
+        )?;
+        state.history_retention = create_choice_combo(
+            hwnd,
+            ID_RETENTION,
+            &[
+                "Disabled".to_owned(),
+                "24 hours".to_owned(),
+                "7 days".to_owned(),
+                "30 days".to_owned(),
+                "Indefinite".to_owned(),
+            ],
+            state.initial.history_retention.index(),
+            284,
+            550,
+            240,
+            140,
+            scale,
+            font,
+        )?;
+        state.launch_at_login = create_checkbox(
+            hwnd,
+            ID_LAUNCH_AT_LOGIN,
+            w!("Launch Phorminx when I sign in"),
+            state.initial.launch_at_login,
+            24,
+            590,
+            500,
+            24,
             scale,
             font,
         )?;
@@ -650,7 +870,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_DOWNLOAD,
             PCWSTR(download_label.as_ptr()),
             24,
-            448,
+            626,
             500,
             30,
             false,
@@ -662,7 +882,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_CANCEL,
             w!("Cancel"),
             296,
-            510,
+            678,
             92,
             30,
             false,
@@ -674,7 +894,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_SAVE,
             w!("Save and Restart"),
             398,
-            510,
+            678,
             126,
             30,
             true,
@@ -803,6 +1023,94 @@ unsafe fn create_combo(
 }
 
 #[allow(clippy::too_many_arguments)]
+unsafe fn create_choice_combo(
+    parent: HWND,
+    id: usize,
+    choices: &[String],
+    selected: usize,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    scale: impl Fn(i32) -> i32,
+    font: windows::Win32::Graphics::Gdi::HGDIOBJ,
+) -> windows::core::Result<HWND> {
+    let style =
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32);
+    let combo = unsafe {
+        create_control(
+            parent,
+            w!("COMBOBOX"),
+            PCWSTR::null(),
+            style,
+            Some(id),
+            x,
+            y,
+            width,
+            height,
+            scale,
+            font,
+        )?
+    };
+    for choice in choices {
+        let choice = wide(choice);
+        unsafe {
+            SendMessageW(
+                combo,
+                CB_ADDSTRING,
+                None,
+                Some(LPARAM(choice.as_ptr() as isize)),
+            );
+        }
+    }
+    unsafe {
+        SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(selected)), None);
+    }
+    Ok(combo)
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_checkbox(
+    parent: HWND,
+    id: usize,
+    text: PCWSTR,
+    checked: bool,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    scale: impl Fn(i32) -> i32,
+    font: windows::Win32::Graphics::Gdi::HGDIOBJ,
+) -> windows::core::Result<HWND> {
+    let checkbox = unsafe {
+        create_control(
+            parent,
+            w!("BUTTON"),
+            text,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+            Some(id),
+            x,
+            y,
+            width,
+            height,
+            scale,
+            font,
+        )?
+    };
+    if checked {
+        unsafe {
+            SendMessageW(
+                checkbox,
+                BM_SETCHECK,
+                Some(WPARAM(BST_CHECKED.0 as usize)),
+                None,
+            );
+        }
+    }
+    Ok(checkbox)
+}
+
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_button(
     parent: HWND,
     id: usize,
@@ -884,15 +1192,33 @@ unsafe fn create_control(
 
 unsafe fn read_form(state: &WindowState) -> Option<SettingsForm> {
     let selected = unsafe { SendMessageW(state.formatting, CB_GETCURSEL, None, None) }.0;
+    let microphone_index = unsafe { SendMessageW(state.microphone, CB_GETCURSEL, None, None) }.0;
+    let ollama_index = unsafe { SendMessageW(state.ollama_model, CB_GETCURSEL, None, None) }.0;
+    let lifecycle_index =
+        unsafe { SendMessageW(state.ollama_lifecycle, CB_GETCURSEL, None, None) }.0;
+    let recording_index = unsafe { SendMessageW(state.recording_mode, CB_GETCURSEL, None, None) }.0;
+    let retention_index =
+        unsafe { SendMessageW(state.history_retention, CB_GETCURSEL, None, None) }.0;
+    let launch_at_login = unsafe { SendMessageW(state.launch_at_login, BM_GETCHECK, None, None) }.0
+        == BST_CHECKED.0 as isize;
     Some(SettingsForm {
         model_path: unsafe { read_text(state.model) },
         model_status: unsafe { read_text(state.model_status) },
         microphone_status: state.initial.microphone_status.clone(),
+        microphones: state.initial.microphones.clone(),
+        microphone: (microphone_index > 0).then(|| unsafe { read_text(state.microphone) }),
         recommended_download_label: state.initial.recommended_download_label.clone(),
         language: unsafe { read_text(state.language) },
         minimum_rms: unsafe { read_text(state.minimum_rms) },
         formatting: SettingsFormatting::from_index(selected)?,
         custom_instructions: unsafe { read_text(state.custom) },
+        ollama_models: state.initial.ollama_models.clone(),
+        ollama_model: (ollama_index > 0).then(|| unsafe { read_text(state.ollama_model) }),
+        ollama_status: state.initial.ollama_status.clone(),
+        ollama_lifecycle: SettingsOllamaLifecycle::from_index(lifecycle_index)?,
+        recording_mode: SettingsRecordingMode::from_index(recording_index)?,
+        history_retention: SettingsHistoryRetention::from_index(retention_index)?,
+        launch_at_login,
     })
 }
 
@@ -990,6 +1316,53 @@ mod tests {
             );
         }
         assert_eq!(SettingsFormatting::from_index(-1), None);
+    }
+
+    #[test]
+    fn product_setting_indices_are_stable_and_reject_invalid_values() {
+        for (index, value) in [
+            SettingsOllamaLifecycle::Instant,
+            SettingsOllamaLifecycle::Balanced,
+            SettingsOllamaLifecycle::MemorySaver,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(value.index(), index);
+            assert_eq!(
+                SettingsOllamaLifecycle::from_index(index as isize),
+                Some(value)
+            );
+        }
+        for (index, value) in [SettingsRecordingMode::Hold, SettingsRecordingMode::Toggle]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(value.index(), index);
+            assert_eq!(
+                SettingsRecordingMode::from_index(index as isize),
+                Some(value)
+            );
+        }
+        for (index, value) in [
+            SettingsHistoryRetention::Disabled,
+            SettingsHistoryRetention::OneDay,
+            SettingsHistoryRetention::SevenDays,
+            SettingsHistoryRetention::ThirtyDays,
+            SettingsHistoryRetention::Indefinite,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(value.index(), index);
+            assert_eq!(
+                SettingsHistoryRetention::from_index(index as isize),
+                Some(value)
+            );
+        }
+        assert_eq!(SettingsOllamaLifecycle::from_index(-1), None);
+        assert_eq!(SettingsRecordingMode::from_index(99), None);
+        assert_eq!(SettingsHistoryRetention::from_index(99), None);
     }
 
     #[test]

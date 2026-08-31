@@ -114,6 +114,7 @@ pub enum RuntimeState {
     FinalizingAudio,
     Transcribing,
     Normalizing,
+    Cleaning,
     ReadyToInsert,
     Inserting,
     Cancelled,
@@ -196,6 +197,8 @@ fn valid_transition(from: RuntimeState, to: RuntimeState) -> bool {
             | (RuntimeState::Listening, RuntimeState::FinalizingAudio)
             | (RuntimeState::FinalizingAudio, RuntimeState::Transcribing)
             | (RuntimeState::Transcribing, RuntimeState::Normalizing)
+            | (RuntimeState::Normalizing, RuntimeState::Cleaning)
+            | (RuntimeState::Cleaning, RuntimeState::ReadyToInsert)
             | (RuntimeState::Normalizing, RuntimeState::ReadyToInsert)
             | (RuntimeState::ReadyToInsert, RuntimeState::Inserting)
             | (RuntimeState::Inserting, RuntimeState::Idle)
@@ -205,12 +208,14 @@ fn valid_transition(from: RuntimeState, to: RuntimeState) -> bool {
             | (RuntimeState::FinalizingAudio, RuntimeState::Cancelled)
             | (RuntimeState::Transcribing, RuntimeState::Cancelled)
             | (RuntimeState::Normalizing, RuntimeState::Cancelled)
+            | (RuntimeState::Cleaning, RuntimeState::Cancelled)
             | (RuntimeState::ReadyToInsert, RuntimeState::Cancelled)
             | (RuntimeState::Inserting, RuntimeState::Cancelled)
             | (RuntimeState::Listening, RuntimeState::Faulted)
             | (RuntimeState::FinalizingAudio, RuntimeState::Faulted)
             | (RuntimeState::Transcribing, RuntimeState::Faulted)
             | (RuntimeState::Normalizing, RuntimeState::Faulted)
+            | (RuntimeState::Cleaning, RuntimeState::Faulted)
             | (RuntimeState::ReadyToInsert, RuntimeState::Faulted)
             | (RuntimeState::Inserting, RuntimeState::Faulted)
     )
@@ -292,6 +297,7 @@ mod tests {
             RuntimeState::FinalizingAudio,
             RuntimeState::Transcribing,
             RuntimeState::Normalizing,
+            RuntimeState::Cleaning,
             RuntimeState::ReadyToInsert,
             RuntimeState::Inserting,
             RuntimeState::Idle,

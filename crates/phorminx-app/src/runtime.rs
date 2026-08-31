@@ -12,6 +12,7 @@ pub enum UiStatus {
     Ready,
     Listening,
     Transcribing,
+    Cleaning,
     Inserted,
     ClipboardReady,
     NoSpeech,
@@ -75,6 +76,12 @@ pub enum RuntimeNotice<R> {
     },
     TranscriptionStarted {
         id: DictationId,
+    },
+    CleanupStarted {
+        id: DictationId,
+    },
+    RecoveredAfterResume {
+        cancelled_id: Option<DictationId>,
     },
     StaleTranscription {
         id: DictationId,
@@ -149,6 +156,19 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
             && self.recording.is_none()
             && self.target.is_none()
             && self.pending_id.is_none()
+    }
+
+    pub fn configure_next_dictation(
+        &mut self,
+        language: String,
+        formatting: RuntimeFormatting,
+    ) -> Result<(), StateError> {
+        if self.machine.state() != RuntimeState::Idle {
+            return Err(StateError::Busy(self.machine.state()));
+        }
+        self.language = language;
+        self.formatting = formatting;
+        Ok(())
     }
 
     pub fn announce_ready<I>(&mut self, io: &mut I) -> Vec<RuntimeNotice<I::ClipboardReason>>
@@ -299,7 +319,12 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
         I: AppIo<Target = Target, Recording = Recording>,
     {
         let mut notices = Vec::new();
-        if self.pending_id != Some(id) || self.machine.state() != RuntimeState::Transcribing {
+        if self.pending_id != Some(id)
+            || !matches!(
+                self.machine.state(),
+                RuntimeState::Transcribing | RuntimeState::Cleaning
+            )
+        {
             notices.push(RuntimeNotice::StaleTranscription {
                 id,
                 state: self.machine.state(),
@@ -323,10 +348,19 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
             }
         };
 
-        self.machine.transition(RuntimeState::Normalizing)?;
+        if self.machine.state() == RuntimeState::Transcribing {
+            self.machine.transition(RuntimeState::Normalizing)?;
+        }
         let normalized = match self.formatting {
             RuntimeFormatting::Raw => transcript.text,
             RuntimeFormatting::Light => normalize_transcript(&transcript.text),
+            RuntimeFormatting::Balanced | RuntimeFormatting::Strong | RuntimeFormatting::Custom => {
+                if self.machine.state() == RuntimeState::Normalizing {
+                    self.machine.transition(RuntimeState::Cleaning)?;
+                    Self::show_status(io, UiStatus::Cleaning, &mut notices);
+                }
+                normalize_transcript(&transcript.text)
+            }
         };
         if normalized.is_empty() {
             self.machine.cancel()?;
@@ -371,6 +405,29 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
         Ok(notices)
     }
 
+    pub fn cleanup_started<I>(
+        &mut self,
+        id: DictationId,
+        io: &mut I,
+    ) -> Result<Vec<RuntimeNotice<I::ClipboardReason>>, StateError>
+    where
+        I: AppIo<Target = Target, Recording = Recording>,
+    {
+        let mut notices = Vec::new();
+        if self.pending_id != Some(id) || self.machine.state() != RuntimeState::Transcribing {
+            notices.push(RuntimeNotice::StaleTranscription {
+                id,
+                state: self.machine.state(),
+            });
+            return Ok(notices);
+        }
+        self.machine.transition(RuntimeState::Normalizing)?;
+        self.machine.transition(RuntimeState::Cleaning)?;
+        Self::show_status(io, UiStatus::Cleaning, &mut notices);
+        notices.push(RuntimeNotice::CleanupStarted { id });
+        Ok(notices)
+    }
+
     pub fn worker_disconnected<I>(
         &mut self,
         io: &mut I,
@@ -391,6 +448,27 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
             event: "transcription_worker_disconnected",
             message: "the transcription worker stopped unexpectedly".to_owned(),
         });
+        self.debug_assert_invariants();
+        Ok(notices)
+    }
+
+    pub fn recover_after_system_resume<I>(
+        &mut self,
+        io: &mut I,
+    ) -> Result<Vec<RuntimeNotice<I::ClipboardReason>>, StateError>
+    where
+        I: AppIo<Target = Target, Recording = Recording>,
+    {
+        let cancelled_id = self.machine.active_id();
+        if self.machine.state() != RuntimeState::Idle {
+            self.machine.cancel()?;
+            self.clear_owned_state();
+            self.machine.transition(RuntimeState::Idle)?;
+        } else {
+            self.clear_owned_state();
+        }
+        let mut notices = vec![RuntimeNotice::RecoveredAfterResume { cancelled_id }];
+        Self::show_status(io, UiStatus::Ready, &mut notices);
         self.debug_assert_invariants();
         Ok(notices)
     }
@@ -769,6 +847,46 @@ mod tests {
     }
 
     #[test]
+    fn system_resume_cancels_owned_work_and_discards_late_completion() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut io = FakeIo {
+            recording_drops: Arc::clone(&drops),
+            ..FakeIo::default()
+        };
+        let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".to_owned()).unwrap();
+
+        io.reset_plan(1);
+        let notices = runtime.hold_started(Some(1), &mut io).unwrap();
+        let listening_id = notice_id(&notices);
+        let notices = runtime.recover_after_system_resume(&mut io).unwrap();
+        assert!(runtime.is_clean_idle());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(notices.iter().any(|notice| matches!(
+            notice,
+            RuntimeNotice::RecoveredAfterResume {
+                cancelled_id: Some(id)
+            } if *id == listening_id
+        )));
+
+        let transcribing_id = advance_to_transcribing(&mut runtime, &mut io, 2);
+        runtime.recover_after_system_resume(&mut io).unwrap();
+        let notices = runtime
+            .transcription_completed(
+                transcribing_id,
+                Ok(transcript("must not be inserted")),
+                &mut io,
+            )
+            .unwrap();
+        assert!(runtime.is_clean_idle());
+        assert!(io.inserted_texts.is_empty());
+        assert!(notices.iter().any(|notice| matches!(
+            notice,
+            RuntimeNotice::StaleTranscription { id, state: RuntimeState::Idle }
+                if *id == transcribing_id
+        )));
+    }
+
+    #[test]
     fn boundary_failures_clear_owned_state_and_allow_the_next_activation() {
         let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".to_owned()).unwrap();
         let mut io = FakeIo::default();
@@ -846,5 +964,29 @@ mod tests {
                 .unwrap();
             assert_eq!(io.inserted_texts, [expected]);
         }
+    }
+
+    #[test]
+    fn cleanup_has_an_explicit_sticky_state_before_insertion() {
+        let mut runtime = AppRuntime::<u64, FakeRecording>::new_with_formatting(
+            0.003,
+            "en".to_owned(),
+            RuntimeFormatting::Balanced,
+        )
+        .unwrap();
+        let mut io = FakeIo::default();
+        let id = advance_to_transcribing(&mut runtime, &mut io, 1);
+
+        let notices = runtime.cleanup_started(id, &mut io).unwrap();
+        assert_eq!(runtime.state(), RuntimeState::Cleaning);
+        assert!(notices.iter().any(
+            |notice| matches!(notice, RuntimeNotice::CleanupStarted { id: found } if *found == id)
+        ));
+
+        runtime
+            .transcription_completed(id, Ok(transcript("Cleaned output.")), &mut io)
+            .unwrap();
+        assert_eq!(io.inserted_texts, ["Cleaned output."]);
+        assert!(runtime.is_clean_idle());
     }
 }

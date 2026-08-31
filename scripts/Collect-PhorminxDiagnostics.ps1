@@ -9,6 +9,12 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+function Write-Utf8NoBom {
+    param([string] $Path, [string] $Content)
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $encoding)
+}
+
 function Get-SafeApplicationSummary {
     param([string] $Path)
 
@@ -102,9 +108,9 @@ try {
         )
     }
 
-    $system | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $temporaryRoot "system.json") -Encoding utf8NoBOM
-    $runtime | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $temporaryRoot "runtime.json") -Encoding utf8NoBOM
-    $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $temporaryRoot "manifest.json") -Encoding utf8NoBOM
+    Write-Utf8NoBom -Path (Join-Path $temporaryRoot "system.json") -Content ($system | ConvertTo-Json -Depth 6)
+    Write-Utf8NoBom -Path (Join-Path $temporaryRoot "runtime.json") -Content ($runtime | ConvertTo-Json -Depth 6)
+    Write-Utf8NoBom -Path (Join-Path $temporaryRoot "manifest.json") -Content ($manifest | ConvertTo-Json -Depth 6)
 
     Compress-Archive -LiteralPath (Join-Path $temporaryRoot "system.json"), (Join-Path $temporaryRoot "runtime.json"), (Join-Path $temporaryRoot "manifest.json") -DestinationPath $resolvedOutput -CompressionLevel Optimal
     $bundle = Get-Item -LiteralPath $resolvedOutput
@@ -120,4 +126,3 @@ try {
         Remove-Item -LiteralPath $temporaryRoot -Recurse -Force
     }
 }
-

@@ -5,6 +5,8 @@ members = [
     "crates/phorminx-app",
     "crates/phorminx-bench",
     "crates/phorminx-core",
+    "crates/phorminx-ollama",
+    "crates/phorminx-persistence",
     "crates/phorminx-windows",
     "crates/phorminx-whisper",
 ]
@@ -24,12 +26,14 @@ cpal = "=0.18.2"
 ctrlc = "=3.5.1"
 hound = "=3.5.1"
 ringbuf = { version = "=0.5.1", default-features = false, features = ["alloc"] }
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
 rubato = { version = "=5.0.0", default-features = false, features = ["fft_resampler"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"
 thiserror = "=2.0.16"
 toml = "=1.1.4"
+tempfile = "=3.23.0"
 ureq = { version = "=3.4.0", default-features = false, features = ["rustls"] }
 whisper-rs = { version = "=0.16.0", default-features = false, features = ["tracing_backend"] }
 windows = "=0.62.2"

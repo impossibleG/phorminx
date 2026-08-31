@@ -109,10 +109,27 @@ impl ActiveRecording {
 
 /// Starts recording from the default microphone and returns immediately.
 pub fn start_default() -> Result<ActiveRecording, CaptureError> {
+    start_input(None)
+}
+
+/// Starts recording from an explicitly selected microphone, or the Windows
+/// default when `device_name` is `None`.
+///
+/// Device names are the stable identifiers exposed by CPAL on Windows. The
+/// caller may recover a missing saved device by retrying with `None`; this
+/// function never silently changes the requested input.
+pub fn start_input(device_name: Option<&str>) -> Result<ActiveRecording, CaptureError> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or(CaptureError::NoDefaultInputDevice)?;
+    let device = match device_name {
+        Some(name) => host
+            .input_devices()
+            .map_err(CaptureError::EnumerateDevices)?
+            .find(|device| device.to_string() == name)
+            .ok_or_else(|| CaptureError::InputDeviceNotFound(name.to_owned()))?,
+        None => host
+            .default_input_device()
+            .ok_or(CaptureError::NoDefaultInputDevice)?,
+    };
     let supported = device
         .default_input_config()
         .map_err(CaptureError::DefaultConfig)?;
@@ -393,6 +410,8 @@ pub fn read_wav(path: &Path) -> Result<AudioClip, CaptureError> {
 pub enum CaptureError {
     #[error("no default microphone is configured")]
     NoDefaultInputDevice,
+    #[error("the selected microphone is no longer available: {0}")]
+    InputDeviceNotFound(String),
     #[error("failed to enumerate input devices: {0}")]
     EnumerateDevices(cpal::Error),
     #[error("failed to read the default microphone configuration: {0}")]

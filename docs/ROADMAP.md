@@ -27,6 +27,8 @@ Exit criteria: 500 repeated dictations without a crash or wrong-target insertion
 
 ## Phase 2 — Local product MVP (2–3 weeks)
 
+Implementation status: complete. The clean-machine install/uninstall and non-developer onboarding exit gate remains part of private-alpha qualification.
+
 - Tray, non-activating overlay, settings, onboarding, and model download.
 - Microphone selection and recovery.
 - History and retention controls.
@@ -38,6 +40,8 @@ Exit criteria: a non-developer can install, configure, dictate, recover raw text
 
 ## Phase 3 — Ollama enhancement (1–2 weeks)
 
+Implementation status: complete. Fake loopback-service conformance and failure-mode tests pass; qualifying at least one real installed Ollama model remains an external alpha gate.
+
 - Installed-model discovery and capability test.
 - Explicit model selection and lifecycle modes.
 - Conservative cleanup profiles.
@@ -48,6 +52,8 @@ Exit criteria: a non-developer can install, configure, dictate, recover raw text
 Exit criteria: dictation behavior is unchanged when Ollama is removed, and supported cleanup models pass the conformance suite.
 
 ## Phase 4 — Hardening and private alpha (2–3 weeks)
+
+Implementation status: engineering complete. Release tooling and automated policy checks pass. Signing and the physical compatibility/performance matrices are still required before calling the private-alpha exit gate complete.
 
 - Full application compatibility matrix.
 - Sleep/resume, device hotplug, clipboard race, focus-change, and elevated-target tests.
@@ -112,4 +118,3 @@ No two workstreams should edit the composition root or shared contracts without 
 3. **Cleanup gate:** no model is recommended until it passes protected-token tests.
 4. **Distribution gate:** do not publicly distribute unsigned binaries.
 5. **Vosk gate:** add only if user testing demonstrates material benefit from partial text.
-

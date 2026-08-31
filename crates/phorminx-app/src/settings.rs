@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use phorminx_windows::atomic_replace_file;
 use serde::{Deserialize, Serialize};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 pub const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 pub const MAX_CUSTOM_INSTRUCTIONS_CHARS: usize = 4_096;
 
@@ -23,6 +23,12 @@ pub struct Settings {
     pub recognition: RecognitionSettings,
     #[serde(default)]
     pub formatting: FormattingSettings,
+    #[serde(default)]
+    pub interaction: InteractionSettings,
+    #[serde(default)]
+    pub privacy: PrivacySettings,
+    #[serde(default)]
+    pub startup: StartupSettings,
 }
 
 impl Default for Settings {
@@ -31,6 +37,9 @@ impl Default for Settings {
             schema_version: CURRENT_SCHEMA_VERSION,
             recognition: RecognitionSettings::default(),
             formatting: FormattingSettings::default(),
+            interaction: InteractionSettings::default(),
+            privacy: PrivacySettings::default(),
+            startup: StartupSettings::default(),
         }
     }
 }
@@ -39,6 +48,7 @@ impl Settings {
     pub fn validate_and_normalize(&mut self) -> Result<(), SettingsError> {
         match self.schema_version {
             CURRENT_SCHEMA_VERSION => {}
+            1 => self.schema_version = CURRENT_SCHEMA_VERSION,
             0 => return Err(SettingsError::MissingOrInvalidVersion),
             version if version > CURRENT_SCHEMA_VERSION => {
                 return Err(SettingsError::FutureVersion {
@@ -72,6 +82,17 @@ impl Settings {
         }
         self.recognition.language = language;
 
+        if let Some(microphone) = &mut self.recognition.microphone {
+            let normalized = microphone.trim();
+            if normalized.is_empty() {
+                self.recognition.microphone = None;
+            } else if normalized.chars().count() > 512 {
+                return Err(SettingsError::MicrophoneNameTooLong);
+            } else if normalized.len() != microphone.len() {
+                *microphone = normalized.to_owned();
+            }
+        }
+
         if let Some(instructions) = &self.formatting.custom_instructions
             && instructions.chars().count() > MAX_CUSTOM_INSTRUCTIONS_CHARS
         {
@@ -87,13 +108,25 @@ impl Settings {
             return Err(SettingsError::MissingCustomInstructions);
         }
 
+        if let Some(model) = &mut self.formatting.ollama_model {
+            let normalized = model.trim();
+            if normalized.is_empty() {
+                self.formatting.ollama_model = None;
+            } else if normalized.chars().count() > 256 {
+                return Err(SettingsError::OllamaModelNameTooLong);
+            } else if normalized.len() != model.len() {
+                *model = normalized.to_owned();
+            }
+        }
+
         Ok(())
     }
 
     pub fn ensure_runtime_supported(&self) -> Result<(), SettingsError> {
         match self.formatting.strength {
             FormattingStrength::Raw | FormattingStrength::Light => Ok(()),
-            strength => Err(SettingsError::FormattingNotAvailable(strength)),
+            _ if self.formatting.ollama_model.is_some() => Ok(()),
+            strength => Err(SettingsError::FormattingModelRequired(strength)),
         }
     }
 }
@@ -104,6 +137,8 @@ pub struct RecognitionSettings {
     pub model_path: PathBuf,
     pub language: String,
     pub minimum_rms: f32,
+    /// Exact CPAL/Windows input-device name. `None` follows the system default.
+    pub microphone: Option<String>,
 }
 
 impl Default for RecognitionSettings {
@@ -112,6 +147,7 @@ impl Default for RecognitionSettings {
             model_path: PathBuf::from("models/ggml-base.en.bin"),
             language: "en".to_owned(),
             minimum_rms: 0.003,
+            microphone: None,
         }
     }
 }
@@ -122,6 +158,10 @@ pub struct FormattingSettings {
     pub strength: FormattingStrength,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_instructions: Option<String>,
+    /// Explicitly selected installed Ollama model. Never chosen implicitly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ollama_model: Option<String>,
+    pub ollama_lifecycle: OllamaLifecycle,
 }
 
 impl Default for FormattingSettings {
@@ -129,8 +169,65 @@ impl Default for FormattingSettings {
         Self {
             strength: FormattingStrength::Light,
             custom_instructions: None,
+            ollama_model: None,
+            ollama_lifecycle: OllamaLifecycle::Balanced,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OllamaLifecycle {
+    Instant,
+    #[default]
+    Balanced,
+    MemorySaver,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InteractionSettings {
+    pub recording_mode: RecordingMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingMode {
+    #[default]
+    Hold,
+    Toggle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrivacySettings {
+    pub history_retention: HistoryRetention,
+}
+
+impl Default for PrivacySettings {
+    fn default() -> Self {
+        Self {
+            history_retention: HistoryRetention::SevenDays,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryRetention {
+    Disabled,
+    OneDay,
+    #[default]
+    SevenDays,
+    ThirtyDays,
+    Indefinite,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StartupSettings {
+    pub launch_at_login: bool,
+    pub onboarding_complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -161,6 +258,9 @@ impl std::fmt::Display for FormattingStrength {
 pub enum RuntimeFormatting {
     Raw,
     Light,
+    Balanced,
+    Strong,
+    Custom,
 }
 
 impl TryFrom<FormattingStrength> for RuntimeFormatting {
@@ -170,7 +270,9 @@ impl TryFrom<FormattingStrength> for RuntimeFormatting {
         match strength {
             FormattingStrength::Raw => Ok(Self::Raw),
             FormattingStrength::Light => Ok(Self::Light),
-            other => Err(SettingsError::FormattingNotAvailable(other)),
+            FormattingStrength::Balanced => Ok(Self::Balanced),
+            FormattingStrength::Strong => Ok(Self::Strong),
+            FormattingStrength::Custom => Ok(Self::Custom),
         }
     }
 }
@@ -359,12 +461,16 @@ pub enum SettingsError {
     InvalidMinimumRms(f32),
     #[error("recognition.language must contain 2-16 ASCII letters or hyphens, got {0:?}")]
     InvalidLanguage(String),
+    #[error("recognition.microphone must not exceed 512 characters")]
+    MicrophoneNameTooLong,
     #[error("formatting.custom_instructions must not exceed 4096 characters")]
     CustomInstructionsTooLong,
     #[error("custom formatting requires nonblank custom_instructions")]
     MissingCustomInstructions,
-    #[error("{0} formatting requires the local AI phase and is not available yet")]
-    FormattingNotAvailable(FormattingStrength),
+    #[error("formatting.ollama_model must not exceed 256 characters")]
+    OllamaModelNameTooLong,
+    #[error("{0} formatting requires an explicitly selected installed Ollama model")]
+    FormattingModelRequired(FormattingStrength),
     #[error("failed to open settings file {path}: {source}")]
     Open {
         path: PathBuf,
@@ -441,14 +547,19 @@ mod tests {
     #[test]
     fn defaults_preserve_current_runtime_behavior() {
         let settings = Settings::default();
-        assert_eq!(settings.schema_version, 1);
+        assert_eq!(settings.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(
             settings.recognition.model_path,
             PathBuf::from("models/ggml-base.en.bin")
         );
         assert_eq!(settings.recognition.language, "en");
         assert_eq!(settings.recognition.minimum_rms, 0.003);
+        assert_eq!(settings.recognition.microphone, None);
         assert_eq!(settings.formatting.strength, FormattingStrength::Light);
+        assert_eq!(
+            settings.privacy.history_retention,
+            HistoryRetention::SevenDays
+        );
     }
 
     #[test]
@@ -494,6 +605,49 @@ language = "pt-BR"
         assert_eq!(decoded.recognition.language, "pt-BR");
         assert_eq!(decoded.recognition.minimum_rms, 0.003);
         assert_eq!(decoded.formatting, FormattingSettings::default());
+    }
+
+    #[test]
+    fn version_one_files_migrate_in_memory_with_private_defaults() {
+        let directory = TestDirectory::new("migrate-v1");
+        let path = directory.0.join("settings.toml");
+        fs::write(
+            &path,
+            "schema_version = 1\n[recognition]\nlanguage = \"pt-BR\"\n",
+        )
+        .unwrap();
+
+        let loaded = SettingsStore::new(path).unwrap().load().unwrap();
+
+        assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(loaded.recognition.language, "pt-br");
+        assert_eq!(loaded.recognition.microphone, None);
+        assert_eq!(
+            loaded.privacy.history_retention,
+            HistoryRetention::SevenDays
+        );
+        assert!(!loaded.startup.launch_at_login);
+    }
+
+    #[test]
+    fn ai_profiles_require_explicit_model_selection() {
+        for strength in [
+            FormattingStrength::Balanced,
+            FormattingStrength::Strong,
+            FormattingStrength::Custom,
+        ] {
+            let mut settings = Settings::default();
+            settings.formatting.strength = strength;
+            if strength == FormattingStrength::Custom {
+                settings.formatting.custom_instructions = Some("Use bullets.".to_owned());
+            }
+            assert!(matches!(
+                settings.ensure_runtime_supported(),
+                Err(SettingsError::FormattingModelRequired(found)) if found == strength
+            ));
+            settings.formatting.ollama_model = Some("qwen2.5:3b".to_owned());
+            assert!(settings.ensure_runtime_supported().is_ok());
+        }
     }
 
     #[test]

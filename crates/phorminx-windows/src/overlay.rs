@@ -44,6 +44,7 @@ pub enum OverlayStatus {
     ClipboardReady = 6,
     NoSpeech = 7,
     Error = 8,
+    Cleaning = 9,
 }
 
 impl OverlayStatus {
@@ -58,6 +59,7 @@ impl OverlayStatus {
             6 => Some(Self::ClipboardReady),
             7 => Some(Self::NoSpeech),
             8 => Some(Self::Error),
+            9 => Some(Self::Cleaning),
             _ => None,
         }
     }
@@ -69,6 +71,7 @@ impl OverlayStatus {
             Self::Ready => "Phorminx is ready",
             Self::Listening => "Listening...",
             Self::Transcribing => "Transcribing...",
+            Self::Cleaning => "Cleaning locally...",
             Self::Inserted => "Inserted",
             Self::ClipboardReady => "Ready to paste",
             Self::NoSpeech => "No clear speech detected",
@@ -83,7 +86,11 @@ impl OverlayStatus {
             Self::ClipboardReady => Some(4_000),
             Self::NoSpeech => Some(2_500),
             Self::Error => Some(5_000),
-            Self::Hidden | Self::Loading | Self::Listening | Self::Transcribing => None,
+            Self::Hidden
+            | Self::Loading
+            | Self::Listening
+            | Self::Transcribing
+            | Self::Cleaning => None,
         }
     }
 }
@@ -462,6 +469,7 @@ mod tests {
     fn active_statuses_are_sticky_and_results_auto_hide() {
         assert_eq!(OverlayStatus::Listening.hide_after_ms(), None);
         assert_eq!(OverlayStatus::Transcribing.hide_after_ms(), None);
+        assert_eq!(OverlayStatus::Cleaning.hide_after_ms(), None);
         assert!(OverlayStatus::Inserted.hide_after_ms().is_some());
         assert!(OverlayStatus::ClipboardReady.hide_after_ms().is_some());
     }
