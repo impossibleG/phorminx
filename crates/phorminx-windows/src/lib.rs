@@ -1,6 +1,8 @@
 //! Windows shell integration for Phorminx.
 
 #[cfg(windows)]
+mod appearance;
+#[cfg(windows)]
 mod dialog;
 #[cfg(windows)]
 mod file;
@@ -27,6 +29,8 @@ mod target;
 #[cfg(windows)]
 mod tray;
 
+#[cfg(windows)]
+pub use appearance::{SystemAppearance, system_appearance};
 #[cfg(windows)]
 pub use dialog::show_error_dialog;
 #[cfg(windows)]

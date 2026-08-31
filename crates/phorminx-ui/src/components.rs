@@ -78,7 +78,8 @@ fn mark_texture(ui: &Ui) -> TextureHandle {
 pub fn nav_item(ui: &mut Ui, label: &str, selected: bool) -> Response {
     let tokens = ui.tokens();
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 40.0), Sense::click());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 40.0), Sense::hover());
+    let response = ui.interact(rect, nav_id(ui, label), Sense::click());
     response.widget_info(|| nav_widget_info(label, selected));
     if ui.is_rect_visible(rect) {
         let fill = if selected || response.hovered() {
@@ -123,6 +124,11 @@ pub fn nav_item(ui: &mut Ui, label: &str, selected: bool) -> Response {
     response
 }
 
+#[must_use]
+pub fn nav_id(ui: &Ui, label: &str) -> egui::Id {
+    ui.make_persistent_id(("phorminx-nav", label))
+}
+
 fn nav_widget_info(label: &str, selected: bool) -> egui::WidgetInfo {
     egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label)
 }
@@ -132,7 +138,18 @@ pub fn page_header(ui: &mut Ui, title: &str, context: &str, action_label: Option
     let mut clicked = false;
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.label(RichText::new(title).size(28.0).color(tokens.text));
+            let heading = ui.add(
+                egui::Label::new(RichText::new(title).size(28.0).color(tokens.text))
+                    .sense(Sense::focusable_noninteractive()),
+            );
+            heading.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, title));
+            if ui
+                .ctx()
+                .data_mut(|data| data.remove_temp::<bool>(page_header_focus_id()))
+                .unwrap_or(false)
+            {
+                heading.request_focus();
+            }
             ui.add_space(Space::XXS);
             ui.label(
                 RichText::new(context)
@@ -150,6 +167,14 @@ pub fn page_header(ui: &mut Ui, title: &str, context: &str, action_label: Option
     hairline(ui);
     ui.add_space(Space::LG);
     clicked
+}
+
+pub fn request_page_header_focus(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.insert_temp(page_header_focus_id(), true));
+}
+
+fn page_header_focus_id() -> egui::Id {
+    egui::Id::new("phorminx-page-header-focus")
 }
 
 pub fn hairline(ui: &mut Ui) {

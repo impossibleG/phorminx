@@ -8,12 +8,14 @@ use std::time::Duration;
 use eframe::egui::{self, Vec2, ViewportCommand};
 use phorminx_ollama::OllamaClient;
 use phorminx_persistence::{CasePolicy, FormattingStyle, InsertionPreference};
+use phorminx_ui::theme::ThemeMode;
 use phorminx_ui::{
     ApplicationProfile, FormattingStrength as ShellFormatting, HistoryItem, InlineNotice,
     LexiconCasePolicy, LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle as ShellLifecycle,
     PhorminxUi, ProfileInsertion, Readiness, RecordingMode as ShellRecording, Route, RuntimeStatus,
     SettingsSnapshot, ShellEvent, ShellSnapshot, SystemReadiness,
 };
+use phorminx_windows::system_appearance;
 
 use crate::settings::{
     FormattingStrength, HistoryRetention, OllamaLifecycle, RecordingMode, Settings, SettingsStore,
@@ -75,9 +77,11 @@ impl ProductShell {
                     initial_route,
                     initial_status,
                     initially_visible,
-                    control_rx,
-                    event_tx.clone(),
-                    ready_tx,
+                    ShellChannels {
+                        controls: control_rx,
+                        events: event_tx.clone(),
+                        ready: ready_tx,
+                    },
                 );
                 if let Err(message) = result {
                     let _ = event_tx.send(ProductShellEvent::Failed(message));
@@ -139,10 +143,13 @@ fn run_shell(
     initial_route: UiRoute,
     initial_status: UiRuntimeStatus,
     initially_visible: bool,
-    controls: Receiver<ProductShellControl>,
-    events: Sender<ProductShellEvent>,
-    ready: mpsc::SyncSender<Result<egui::Context, String>>,
+    channels: ShellChannels,
 ) -> Result<(), String> {
+    let ShellChannels {
+        controls,
+        events,
+        ready,
+    } = channels;
     let bridge = UiBridge::open(store.clone(), database_path).map_err(|error| error.to_string())?;
     let readiness = UiReadinessSnapshot::checking(bridge.settings(), &store);
     let snapshot = bridge
@@ -193,6 +200,12 @@ fn run_shell(
         }),
     )
     .map_err(|error| error.to_string())
+}
+
+struct ShellChannels {
+    controls: Receiver<ProductShellControl>,
+    events: Sender<ProductShellEvent>,
+    ready: mpsc::SyncSender<Result<egui::Context, String>>,
 }
 
 fn probe_readiness(settings: Settings, store: SettingsStore, sender: Sender<UiReadinessSnapshot>) {
@@ -414,10 +427,21 @@ impl ProductShellApp {
 
 impl eframe::App for ProductShellApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let appearance = system_appearance();
+        let prefers_dark = if appearance.high_contrast {
+            appearance.contrast_theme_is_dark
+        } else {
+            !matches!(ctx.system_theme(), Some(egui::Theme::Light))
+        };
+        self.shell.set_theme(ThemeMode::from_system(
+            prefers_dark,
+            appearance.high_contrast,
+        ));
         while let Ok(control) = self.controls.try_recv() {
             match control {
                 ProductShellControl::Focus(route) => {
                     self.route = route;
+                    self.shell.request_route_focus();
                     ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(ViewportCommand::Focus);

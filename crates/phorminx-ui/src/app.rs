@@ -1,7 +1,8 @@
 use eframe::egui::{self, Align, Color32, Layout, Margin, RichText, ScrollArea, Stroke, Ui, Vec2};
 
 use crate::components::{
-    hairline, inline_notice, nav_item, shortcut_chord, status_seal, tensioned_p,
+    hairline, inline_notice, nav_id, nav_item, request_page_header_focus, shortcut_chord,
+    status_seal, tensioned_p,
 };
 use crate::model::{Route, ShellEvent, ShellSnapshot};
 use crate::pages::{self, PageState};
@@ -19,6 +20,7 @@ pub struct PhorminxUi {
     outbox: Vec<ShellEvent>,
     theme: ThemeMode,
     theme_applied: bool,
+    route_focus_requested: bool,
 }
 
 impl Default for PhorminxUi {
@@ -39,6 +41,7 @@ impl PhorminxUi {
             outbox: Vec::new(),
             theme: ThemeMode::AuthoredDark,
             theme_applied: false,
+            route_focus_requested: false,
         }
     }
 
@@ -70,6 +73,13 @@ impl PhorminxUi {
             self.theme = theme;
             self.theme_applied = false;
         }
+    }
+
+    /// Moves keyboard focus into the destination route on the next paint.
+    /// Hosts use this after tray/deep-link navigation so focus does not remain
+    /// on the window chrome or on a control from the previous route.
+    pub fn request_route_focus(&mut self) {
+        self.route_focus_requested = true;
     }
 
     #[must_use]
@@ -138,6 +148,10 @@ impl PhorminxUi {
                                         }
                                         ui.add_space(Space::LG);
                                     }
+                                    if self.route_focus_requested {
+                                        request_page_header_focus(ui.ctx());
+                                        self.route_focus_requested = false;
+                                    }
                                     pages::show(
                                         ui,
                                         self.route,
@@ -186,6 +200,26 @@ impl PhorminxUi {
                 ui.set_max_width(180.0);
                 ui.set_min_height(ui.available_height());
                 ui.vertical(|ui| {
+                    if let Some(index) = Route::ALL.iter().position(|route| {
+                        ui.memory(|memory| memory.has_focus(nav_id(ui, route.label())))
+                    }) {
+                        let delta = ui.input_mut(|input| {
+                            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                                1
+                            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                                -1
+                            } else {
+                                0
+                            }
+                        });
+                        if delta != 0 {
+                            let target = adjacent_route(index, delta);
+                            ui.memory_mut(|memory| {
+                                memory.request_focus(nav_id(ui, target.label()));
+                            });
+                            self.navigate(target);
+                        }
+                    }
                     for route in Route::ALL {
                         if nav_item(ui, route.label(), route == self.route).clicked() {
                             self.navigate(route);
@@ -203,6 +237,11 @@ impl PhorminxUi {
                 });
             });
     }
+}
+
+fn adjacent_route(index: usize, delta: isize) -> Route {
+    let last = Route::ALL.len().saturating_sub(1);
+    Route::ALL[(index as isize + delta).clamp(0, last as isize) as usize]
 }
 
 impl eframe::App for PhorminxUi {
@@ -227,6 +266,23 @@ mod tests {
         assert!(app.take_events().is_empty());
         app.navigate(Route::Models);
         assert_eq!(app.take_events(), vec![ShellEvent::Navigate(Route::Models)]);
+    }
+
+    #[test]
+    fn sidebar_arrow_navigation_clamps_at_both_ends() {
+        assert_eq!(adjacent_route(0, -1), Route::Home);
+        assert_eq!(adjacent_route(0, 1), Route::History);
+        let last = Route::ALL.len() - 1;
+        assert_eq!(adjacent_route(last, 1), Route::Settings);
+        assert_eq!(adjacent_route(last, -1), Route::Models);
+    }
+
+    #[test]
+    fn requested_route_focus_is_consumed_by_the_next_paint() {
+        let mut app = PhorminxUi::default();
+        app.request_route_focus();
+        egui::__run_test_ui(|ui| app.show(ui));
+        assert!(!app.route_focus_requested);
     }
 
     #[test]

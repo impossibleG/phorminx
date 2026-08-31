@@ -104,12 +104,17 @@ fn main() {
     }
 }
 
+const FATAL_STARTUP_MESSAGE: &str = "Phorminx could not initialize its local services. Your settings and recordings were not changed. Restart Phorminx; if the problem continues, reinstall the current release.";
+
 fn report_fatal_error(error: &anyhow::Error) {
+    // Fatal startup surfaces are intentionally content-free. The underlying
+    // error chain may contain a user name, model path, or settings path.
+    let _ = error;
     #[cfg(feature = "desktop")]
-    show_error_dialog("Phorminx could not start", &format!("{error:#}"));
+    show_error_dialog("Phorminx could not start", FATAL_STARTUP_MESSAGE);
 
     #[cfg(not(feature = "desktop"))]
-    eprintln!("Phorminx failed: {error:#}");
+    eprintln!("{FATAL_STARTUP_MESSAGE}");
 }
 
 fn run() -> Result<()> {
@@ -1071,7 +1076,18 @@ fn poll_shell_events(
                         .context("failed to resolve the Phorminx executable")?;
                     if let Err(error) = set_launch_at_login(&executable, enabled) {
                         eprintln!("launch_at_login_update_failed error={error}");
+                        // The UI bridge has already persisted the candidate. Restore only
+                        // the external preference while preserving every other saved field.
+                        let mut persisted = settings_store.load().context(
+                            "failed to reload settings after startup registration failure",
+                        )?;
+                        persisted.startup.launch_at_login = settings.startup.launch_at_login;
+                        settings_store
+                            .save(&persisted)
+                            .context("failed to restore launch-at-login preference")?;
                         show_shell_status(overlay, tray, OverlayStatus::Error, TrayStatus::Error);
+                    } else {
+                        settings.startup.launch_at_login = enabled;
                     }
                 }
                 Ok(ProductShellEvent::Hidden) => {}
@@ -2606,5 +2622,14 @@ mod composition_tests {
             retention_policy(HistoryRetention::Indefinite),
             RetentionPolicy::Indefinite
         );
+    }
+
+    #[test]
+    fn fatal_startup_message_is_content_free() {
+        assert!(!FATAL_STARTUP_MESSAGE.contains('\\'));
+        assert!(!FATAL_STARTUP_MESSAGE.contains('/'));
+        assert!(!FATAL_STARTUP_MESSAGE.contains("error="));
+        assert!(!FATAL_STARTUP_MESSAGE.contains("model"));
+        assert!(!FATAL_STARTUP_MESSAGE.contains("transcript"));
     }
 }
