@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
 use phorminx_app::model::{ModelDownload, ModelDownloadEvent, recommended_model};
+use phorminx_app::product_shell::{ProductShell, ProductShellControl, ProductShellEvent};
 use phorminx_app::runtime::{
     AppIo, AppRuntime, FinishedAudio, InsertDisposition, RuntimeNotice, UiStatus,
 };
@@ -18,6 +19,7 @@ use phorminx_app::settings::{
     FormattingStrength, HistoryRetention, OllamaLifecycle, RecordingMode, RuntimeFormatting,
     Settings, SettingsStore,
 };
+use phorminx_app::ui_bridge::{UiMutation, UiRoute, UiRuntimeStatus};
 use phorminx_audio::{ActiveRecording, input_devices, start_input};
 use phorminx_core::{
     AudioClip, DictationId, RuntimeState, SpeechRecognizer, Transcript, TranscriptionOptions,
@@ -260,19 +262,32 @@ fn run() -> Result<()> {
         shutting_down.store(true, Ordering::Release);
     }
 
-    let mut settings_window = if !cli.smoke_test && !settings.startup.onboarding_complete {
-        Some(
-            SettingsWindow::start(settings_form(&settings, &model))
-                .context("failed to open first-run onboarding")?,
-        )
-    } else {
+    let mut product_shell = if cli.smoke_test {
         None
+    } else {
+        let route = if settings.startup.onboarding_complete {
+            UiRoute::Home
+        } else {
+            UiRoute::Settings
+        };
+        Some(
+            ProductShell::start(
+                settings_store.clone(),
+                database_path.clone(),
+                route,
+                UiRuntimeStatus::Ready,
+            )
+            .map_err(|error| anyhow!(error))
+            .context("failed to start the product shell")?,
+        )
     };
+    let mut settings_window = None;
     let mut history_window = None;
     let mut lexicon_window = None;
     let mut profile_window = None;
     let mut model_download = None;
     let mut restart_requested = false;
+    let mut last_shell_status = UiRuntimeStatus::Ready;
 
     let run_result: Result<()> = 'event_loop: loop {
         if shutting_down.load(Ordering::Acquire) {
@@ -282,6 +297,7 @@ fn run() -> Result<()> {
             &tray,
             &overlay,
             ShellPoll {
+                product_shell: product_shell.as_ref(),
                 settings_window: &mut settings_window,
                 history_window: &mut history_window,
                 lexicon_window: &mut lexicon_window,
@@ -310,6 +326,25 @@ fn run() -> Result<()> {
                     break Err(error);
                 }
                 continue 'event_loop;
+            }
+            Ok(ShellAction::TestDictation) => {
+                handle_test_dictation(
+                    &mut runtime,
+                    &overlay,
+                    &tray,
+                    &worker,
+                    effective_microphone.as_deref(),
+                    &mut dictation_context,
+                    &settings,
+                )?;
+            }
+            Ok(ShellAction::ReloadAliases) => {
+                worker.reload_aliases(
+                    persistence
+                        .lexicon()
+                        .list()
+                        .context("failed to reload the personal lexicon")?,
+                )?;
             }
             Ok(ShellAction::Continue) => {}
             Err(error) => break Err(error),
@@ -323,6 +358,7 @@ fn run() -> Result<()> {
             &tray,
             &overlay,
             ShellPoll {
+                product_shell: product_shell.as_ref(),
                 settings_window: &mut settings_window,
                 history_window: &mut history_window,
                 lexicon_window: &mut lexicon_window,
@@ -351,6 +387,25 @@ fn run() -> Result<()> {
                     break Err(error);
                 }
                 continue 'event_loop;
+            }
+            Ok(ShellAction::TestDictation) => {
+                handle_test_dictation(
+                    &mut runtime,
+                    &overlay,
+                    &tray,
+                    &worker,
+                    effective_microphone.as_deref(),
+                    &mut dictation_context,
+                    &settings,
+                )?;
+            }
+            Ok(ShellAction::ReloadAliases) => {
+                worker.reload_aliases(
+                    persistence
+                        .lexicon()
+                        .list()
+                        .context("failed to reload the personal lexicon")?,
+                )?;
             }
             Ok(ShellAction::Continue) => {}
             Err(error) => break Err(error),
@@ -425,6 +480,7 @@ fn run() -> Result<()> {
             &tray,
             &overlay,
             ShellPoll {
+                product_shell: product_shell.as_ref(),
                 settings_window: &mut settings_window,
                 history_window: &mut history_window,
                 lexicon_window: &mut lexicon_window,
@@ -453,6 +509,25 @@ fn run() -> Result<()> {
                     break Err(error);
                 }
                 continue 'event_loop;
+            }
+            Ok(ShellAction::TestDictation) => {
+                handle_test_dictation(
+                    &mut runtime,
+                    &overlay,
+                    &tray,
+                    &worker,
+                    effective_microphone.as_deref(),
+                    &mut dictation_context,
+                    &settings,
+                )?;
+            }
+            Ok(ShellAction::ReloadAliases) => {
+                worker.reload_aliases(
+                    persistence
+                        .lexicon()
+                        .list()
+                        .context("failed to reload the personal lexicon")?,
+                )?;
             }
             Ok(ShellAction::Continue) => {}
             Err(error) => break Err(error),
@@ -501,6 +576,9 @@ fn run() -> Result<()> {
                         }
                     };
                     report_notices(notices);
+                    if let Some(shell) = product_shell.as_ref() {
+                        let _ = shell.send(ProductShellControl::Refresh);
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -524,11 +602,24 @@ fn run() -> Result<()> {
                 }
             }
         }
+        let shell_status = runtime_shell_status(runtime.state());
+        if shell_status != last_shell_status {
+            if let Some(shell) = product_shell.as_ref() {
+                let _ = shell.send(ProductShellControl::SetRuntimeStatus(shell_status));
+            }
+            last_shell_status = shell_status;
+        }
     };
 
     println!("Shutting down Phorminx.");
     let mut final_error = run_result.err();
     drop(runtime);
+    if let Some(shell) = product_shell.take() {
+        preserve_first_error(
+            &mut final_error,
+            shell.shutdown().map_err(|error| anyhow!(error)),
+        );
+    }
     if let Some(window) = history_window {
         preserve_first_error(
             &mut final_error,
@@ -601,6 +692,18 @@ fn run() -> Result<()> {
     }
 }
 
+fn runtime_shell_status(state: RuntimeState) -> UiRuntimeStatus {
+    match state {
+        RuntimeState::Starting => UiRuntimeStatus::Starting,
+        RuntimeState::Idle | RuntimeState::Cancelled => UiRuntimeStatus::Ready,
+        RuntimeState::Listening | RuntimeState::FinalizingAudio => UiRuntimeStatus::Listening,
+        RuntimeState::Transcribing | RuntimeState::Normalizing => UiRuntimeStatus::Transcribing,
+        RuntimeState::Cleaning | RuntimeState::ReadyToInsert => UiRuntimeStatus::Refining,
+        RuntimeState::Inserting => UiRuntimeStatus::Inserted,
+        RuntimeState::Faulted => UiRuntimeStatus::NeedsAttention,
+    }
+}
+
 fn run_setup_mode(
     overlay: StatusOverlay,
     tray: SystemTray,
@@ -610,10 +713,22 @@ fn run_setup_mode(
     shutting_down: Arc<AtomicBool>,
 ) -> Result<()> {
     show_shell_status(&overlay, &tray, OverlayStatus::Error, TrayStatus::Error);
-    let mut settings_window = Some(
-        SettingsWindow::start(settings_form(&settings, &model))
-            .context("failed to open first-run model setup")?,
+    let database_path = settings_store
+        .path()
+        .parent()
+        .context("settings path has no parent directory")?
+        .join("phorminx.db");
+    let mut product_shell = Some(
+        ProductShell::start(
+            settings_store.clone(),
+            database_path,
+            UiRoute::Models,
+            UiRuntimeStatus::NeedsAttention,
+        )
+        .map_err(|error| anyhow!(error))
+        .context("failed to open first-run model setup")?,
     );
+    let mut settings_window = None;
     let mut history_window = None;
     let mut lexicon_window = None;
     let mut profile_window = None;
@@ -627,6 +742,7 @@ fn run_setup_mode(
             &tray,
             &overlay,
             ShellPoll {
+                product_shell: product_shell.as_ref(),
                 settings_window: &mut settings_window,
                 history_window: &mut history_window,
                 lexicon_window: &mut lexicon_window,
@@ -643,7 +759,12 @@ fn run_setup_mode(
                 restart_requested = true;
                 break Ok(());
             }
-            Ok(ShellAction::Continue | ShellAction::Resume) => {
+            Ok(
+                ShellAction::Continue
+                | ShellAction::Resume
+                | ShellAction::TestDictation
+                | ShellAction::ReloadAliases,
+            ) => {
                 thread::sleep(Duration::from_millis(25));
             }
             Err(error) => break Err(error),
@@ -651,6 +772,12 @@ fn run_setup_mode(
     };
 
     let mut final_error = run_result.err();
+    if let Some(shell) = product_shell.take() {
+        preserve_first_error(
+            &mut final_error,
+            shell.shutdown().map_err(|error| anyhow!(error)),
+        );
+    }
     if let Some(window) = history_window {
         preserve_first_error(
             &mut final_error,
@@ -717,9 +844,12 @@ enum ShellAction {
     Quit,
     Restart,
     Resume,
+    TestDictation,
+    ReloadAliases,
 }
 
 struct ShellPoll<'a> {
+    product_shell: Option<&'a ProductShell>,
     settings_window: &'a mut Option<SettingsWindow>,
     history_window: &'a mut Option<HistoryWindow>,
     lexicon_window: &'a mut Option<LexiconWindow>,
@@ -737,6 +867,7 @@ fn poll_shell_events(
     poll: ShellPoll<'_>,
 ) -> Result<ShellAction> {
     let ShellPoll {
+        product_shell,
         settings_window,
         history_window,
         lexicon_window,
@@ -752,6 +883,12 @@ fn poll_shell_events(
             Ok(TrayEvent::QuitRequested) => return Ok(ShellAction::Quit),
             Ok(TrayEvent::SystemResumed) => return Ok(ShellAction::Resume),
             Ok(TrayEvent::OpenSettings) => {
+                if let Some(shell) = product_shell {
+                    shell
+                        .focus(UiRoute::Settings)
+                        .map_err(|error| anyhow!(error))?;
+                    continue;
+                }
                 if let Some(window) = settings_window {
                     window.focus().context("failed to focus settings")?;
                 } else {
@@ -762,6 +899,12 @@ fn poll_shell_events(
                 }
             }
             Ok(TrayEvent::OpenHistory) => {
+                if let Some(shell) = product_shell {
+                    shell
+                        .focus(UiRoute::History)
+                        .map_err(|error| anyhow!(error))?;
+                    continue;
+                }
                 let Some(persistence) = persistence else {
                     show_shell_status(overlay, tray, OverlayStatus::Error, TrayStatus::Error);
                     continue;
@@ -791,6 +934,12 @@ fn poll_shell_events(
                 }
             }
             Ok(TrayEvent::OpenLexicon) => {
+                if let Some(shell) = product_shell {
+                    shell
+                        .focus(UiRoute::Lexicon)
+                        .map_err(|error| anyhow!(error))?;
+                    continue;
+                }
                 let Some(persistence) = persistence else {
                     show_shell_status(overlay, tray, OverlayStatus::Error, TrayStatus::Error);
                     continue;
@@ -820,6 +969,12 @@ fn poll_shell_events(
                 }
             }
             Ok(TrayEvent::OpenProfiles) => {
+                if let Some(shell) = product_shell {
+                    shell
+                        .focus(UiRoute::Profiles)
+                        .map_err(|error| anyhow!(error))?;
+                    continue;
+                }
                 let Some(persistence) = persistence else {
                     show_shell_status(overlay, tray, OverlayStatus::Error, TrayStatus::Error);
                     continue;
@@ -845,6 +1000,58 @@ fn poll_shell_events(
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
                 return Err(anyhow!("the system tray thread stopped unexpectedly"));
+            }
+        }
+    }
+
+    if let Some(shell) = product_shell {
+        loop {
+            match shell.events().try_recv() {
+                Ok(ProductShellEvent::TestDictation) => {
+                    return Ok(ShellAction::TestDictation);
+                }
+                Ok(ProductShellEvent::ChangeWhisperModel) => {
+                    if model_download.is_none() {
+                        let directory = settings_store
+                            .path()
+                            .parent()
+                            .context("the settings path has no parent directory")?
+                            .join("models");
+                        match ModelDownload::start(&directory) {
+                            Ok(download) => *model_download = Some(download),
+                            Err(error) => {
+                                eprintln!("model_download_failed error={error}");
+                                let _ = shell.send(ProductShellControl::ModelDownloadFailed);
+                            }
+                        }
+                    }
+                }
+                Ok(ProductShellEvent::RuntimeReloadRequested(mutation)) => match mutation {
+                    UiMutation::SettingsSaved => return Ok(ShellAction::Restart),
+                    UiMutation::LexiconSaved { .. }
+                    | UiMutation::LexiconDeleted { .. }
+                    | UiMutation::LexiconEnabled { .. } => {
+                        return Ok(ShellAction::ReloadAliases);
+                    }
+                    UiMutation::HistoryCleared { .. }
+                    | UiMutation::ProfileSaved { .. }
+                    | UiMutation::ProfileDeleted { .. } => {}
+                },
+                Ok(ProductShellEvent::ApplyLaunchAtLogin(enabled)) => {
+                    let executable = std::env::current_exe()
+                        .context("failed to resolve the Phorminx executable")?;
+                    if let Err(error) = set_launch_at_login(&executable, enabled) {
+                        eprintln!("launch_at_login_update_failed error={error}");
+                        show_shell_status(overlay, tray, OverlayStatus::Error, TrayStatus::Error);
+                    }
+                }
+                Ok(ProductShellEvent::Hidden) => {}
+                Ok(ProductShellEvent::Failed(message)) => {
+                    eprintln!("product_shell_failed error={message}");
+                    show_shell_status(overlay, tray, OverlayStatus::Error, TrayStatus::Error);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
             }
         }
     }
@@ -1153,6 +1360,9 @@ fn poll_shell_events(
         match event {
             ModelDownloadEvent::Progress { downloaded, total } => {
                 let percent = downloaded.saturating_mul(100) / total.max(1);
+                if let Some(shell) = product_shell {
+                    let _ = shell.send(ProductShellControl::ModelDownloadProgress(percent));
+                }
                 if let Some(window) = settings_window.as_ref() {
                     window
                         .update_model(
@@ -1163,6 +1373,9 @@ fn poll_shell_events(
                 }
             }
             ModelDownloadEvent::Completed { path } => {
+                if let Some(shell) = product_shell {
+                    let _ = shell.send(ProductShellControl::ModelDownloaded(path.clone()));
+                }
                 if let Some(window) = settings_window.as_ref() {
                     let size = std::fs::metadata(&path)
                         .map(|metadata| metadata.len())
@@ -1180,6 +1393,9 @@ fn poll_shell_events(
                 download_finished = true;
             }
             ModelDownloadEvent::Cancelled => {
+                if let Some(shell) = product_shell {
+                    let _ = shell.send(ProductShellControl::ModelDownloadFailed);
+                }
                 if let Some(window) = settings_window.as_ref() {
                     window
                         .update_model(None, "Model download cancelled".to_owned())
@@ -1188,6 +1404,9 @@ fn poll_shell_events(
                 download_finished = true;
             }
             ModelDownloadEvent::Failed(message) => {
+                if let Some(shell) = product_shell {
+                    let _ = shell.send(ProductShellControl::ModelDownloadFailed);
+                }
                 if let Some(window) = settings_window.as_ref() {
                     window
                         .update_model(None, "Model download failed".to_owned())
@@ -1650,6 +1869,35 @@ fn recover_runtime_after_resume(
     Ok(())
 }
 
+fn handle_test_dictation(
+    runtime: &mut AppRuntime<TargetSnapshot, ActiveRecording>,
+    overlay: &StatusOverlay,
+    tray: &SystemTray,
+    worker: &TranscriptionWorker,
+    microphone: Option<&str>,
+    context: &mut DictationContext,
+    settings: &Settings,
+) -> Result<()> {
+    if runtime.state() == RuntimeState::Idle {
+        *context = DictationContext::global(settings)?;
+        runtime.configure_next_dictation(context.language.clone(), context.runtime_formatting)?;
+    }
+    let mut io = ProductionIo {
+        overlay,
+        tray,
+        worker,
+        microphone,
+        context,
+    };
+    let notices = match runtime.state() {
+        RuntimeState::Idle => runtime.hold_started(None, &mut io)?,
+        RuntimeState::Listening => runtime.hold_ended(&mut io)?,
+        _ => Vec::new(),
+    };
+    report_notices(notices);
+    Ok(())
+}
+
 fn report_notices(notices: Vec<RuntimeNotice<ClipboardOnlyReason>>) {
     for notice in notices {
         match notice {
@@ -1770,6 +2018,7 @@ impl TranscriptionWorker {
                 }
 
                 let ollama = formatting.model.as_ref().map(|_| production_ollama_client());
+                let mut aliases = aliases;
                 if let (Some(client), Some(model)) = (&ollama, &formatting.model) {
                     let cancel = CancellationToken::new();
                     if let Err(error) = client.warm_up(model, formatting.keep_alive.clone(), &cancel)
@@ -1822,6 +2071,7 @@ impl TranscriptionWorker {
                                 break;
                             }
                         }
+                        WorkerCommand::ReloadAliases(updated) => aliases = updated,
                         WorkerCommand::Shutdown => break,
                     }
                 }
@@ -1869,6 +2119,12 @@ impl TranscriptionWorker {
         self.stop()
     }
 
+    fn reload_aliases(&self, aliases: Vec<LexiconEntry>) -> Result<()> {
+        self.commands
+            .send(WorkerCommand::ReloadAliases(aliases))
+            .context("transcription worker is unavailable")
+    }
+
     fn stop(&mut self) -> Result<()> {
         if self.thread.is_none() {
             return Ok(());
@@ -1898,6 +2154,7 @@ enum WorkerCommand {
         formatting: WorkerFormatting,
         app_executable: Option<String>,
     },
+    ReloadAliases(Vec<LexiconEntry>),
     Shutdown,
 }
 

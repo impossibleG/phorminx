@@ -15,6 +15,7 @@ pub use app::PhorminxUi;
 pub use gallery::ComponentGallery;
 pub use model::{
     ApplicationProfile, FormattingStrength, GalleryScenario, HistoryItem, HistoryVariant,
-    InlineNotice, LexiconEntry, ModelSystem, NoticeKind, Readiness, RecordingMode, Route,
-    RuntimeStatus, SettingsSnapshot, ShellEvent, ShellSnapshot, SystemReadiness,
+    InlineNotice, LexiconDraft, LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle,
+    ProfileDraft, ProfileInsertion, Readiness, RecordingMode, Route, RuntimeStatus,
+    SettingsSnapshot, ShellEvent, ShellSnapshot, SystemReadiness,
 };

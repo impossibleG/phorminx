@@ -182,12 +182,71 @@ pub struct LexiconEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LexiconDraft {
+    pub id: Option<i64>,
+    pub spoken: String,
+    pub written: String,
+    pub language: String,
+    pub scope: String,
+    pub preserve_case: bool,
+    pub enabled: bool,
+}
+
+impl Default for LexiconDraft {
+    fn default() -> Self {
+        Self {
+            id: None,
+            spoken: String::new(),
+            written: String::new(),
+            language: String::new(),
+            scope: String::new(),
+            preserve_case: true,
+            enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplicationProfile {
     pub executable: String,
     pub formatting: String,
     pub language: String,
     pub insertion: String,
     pub blocked: bool,
+    pub custom_instruction: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileDraft {
+    pub original_executable: Option<String>,
+    pub executable: String,
+    pub formatting: FormattingStrength,
+    pub custom_instruction: String,
+    pub language: String,
+    pub insertion: ProfileInsertion,
+    pub blocked: bool,
+}
+
+impl Default for ProfileDraft {
+    fn default() -> Self {
+        Self {
+            original_executable: None,
+            executable: String::new(),
+            formatting: FormattingStrength::Balanced,
+            custom_instruction: String::new(),
+            language: String::new(),
+            insertion: ProfileInsertion::Automatic,
+            blocked: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProfileInsertion {
+    #[default]
+    Automatic,
+    Direct,
+    Clipboard,
 }
 
 impl ApplicationProfile {
@@ -230,6 +289,14 @@ pub enum FormattingStrength {
     Custom,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OllamaLifecycle {
+    Instant,
+    #[default]
+    Balanced,
+    MemorySaver,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsSnapshot {
     pub microphone: String,
@@ -238,6 +305,9 @@ pub struct SettingsSnapshot {
     pub language: String,
     pub formatting: FormattingStrength,
     pub custom_instruction: String,
+    pub minimum_rms: String,
+    pub ollama_lifecycle: OllamaLifecycle,
+    pub model_path: String,
     pub history_retention: String,
     pub launch_at_login: bool,
     pub reduced_motion: bool,
@@ -252,6 +322,9 @@ impl Default for SettingsSnapshot {
             language: "English".into(),
             formatting: FormattingStrength::Balanced,
             custom_instruction: String::new(),
+            minimum_rms: "0.003".into(),
+            ollama_lifecycle: OllamaLifecycle::Balanced,
+            model_path: "models/ggml-base.en.bin".into(),
             history_retention: "7 days".into(),
             launch_at_login: false,
             reduced_motion: false,
@@ -386,6 +459,7 @@ impl ShellSnapshot {
                     language: "English".into(),
                     insertion: "Clipboard only".into(),
                     blocked: false,
+                    custom_instruction: String::new(),
                 },
                 ApplicationProfile {
                     executable: "keepass.exe".into(),
@@ -393,6 +467,7 @@ impl ShellSnapshot {
                     language: "English".into(),
                     insertion: "Never".into(),
                     blocked: true,
+                    custom_instruction: String::new(),
                 },
             ]
         } else {
@@ -488,9 +563,13 @@ pub enum ShellEvent {
     ClearHistory,
     NewLexiconEntry,
     EditLexicon(i64),
+    SaveLexicon(LexiconDraft),
+    CancelLexiconEdit,
     DeleteLexicon(i64),
     NewProfile,
     EditProfile(String),
+    SaveProfile(ProfileDraft),
+    CancelProfileEdit,
     RemoveProfile(String),
     VerifyModels,
     ChangeWhisperModel,

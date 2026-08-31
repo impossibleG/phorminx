@@ -15,10 +15,12 @@ vulkan = ["phorminx-whisper/vulkan"]
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+eframe.workspace = true
 phorminx-audio = { path = "../phorminx-audio" }
 phorminx-core = { path = "../phorminx-core" }
 phorminx-ollama = { path = "../phorminx-ollama" }
 phorminx-persistence = { path = "../phorminx-persistence" }
+phorminx-ui = { path = "../phorminx-ui" }
 phorminx-whisper = { path = "../phorminx-whisper" }
 phorminx-windows = { path = "../phorminx-windows" }
 serde.workspace = true

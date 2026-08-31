@@ -72,6 +72,14 @@ impl PhorminxUi {
         }
     }
 
+    pub fn close_lexicon_editor(&mut self) {
+        self.pages.lexicon_draft = None;
+    }
+
+    pub fn close_profile_editor(&mut self) {
+        self.pages.profile_draft = None;
+    }
+
     #[must_use]
     pub fn take_events(&mut self) -> Vec<ShellEvent> {
         std::mem::take(&mut self.outbox)
@@ -87,7 +95,7 @@ impl PhorminxUi {
             .fill(Colors::ABYSS)
             .inner_margin(Margin::ZERO)
             .show(ui, |ui| {
-                self.title_bar(ui);
+                self.brand_header(ui);
                 hairline(ui);
                 ui.horizontal_top(|ui| {
                     self.navigation(ui);
@@ -130,7 +138,9 @@ impl PhorminxUi {
             });
     }
 
-    fn title_bar(&self, ui: &mut Ui) {
+    // This is intentionally an in-content brand/status header. The native Windows
+    // frame remains responsible for drag, resize, snap, system menu, and controls.
+    fn brand_header(&self, ui: &mut Ui) {
         egui::Frame::new()
             .fill(Colors::IRON)
             .inner_margin(Margin::symmetric(20, 10))
