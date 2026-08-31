@@ -11,7 +11,7 @@ use crate::model::{
     ProfileDraft, ProfileInsertion, RecordingMode, Route, SettingsSnapshot, ShellEvent,
     ShellSnapshot,
 };
-use crate::theme::{Colors, Space};
+use crate::theme::{Space, UiThemeExt};
 
 #[derive(Clone, Debug)]
 pub(crate) struct PageState {
@@ -101,6 +101,7 @@ pub(crate) fn show(
 }
 
 fn home(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
+    let tokens = ui.tokens();
     page_header(ui, Route::Home.title(), Route::Home.context(), None);
     ui.add_space(Space::LG);
     ui.horizontal(|ui| {
@@ -110,7 +111,7 @@ fn home(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
             ui.label(
                 RichText::new(snapshot.status.label())
                     .size(56.0)
-                    .color(Colors::LIMESTONE),
+                    .color(tokens.text),
             );
             ui.add_space(Space::XS);
             components::shortcut_chord(ui, &snapshot.shortcut);
@@ -135,16 +136,23 @@ fn home(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
     metadata(ui, "Recently held");
     ui.add_space(Space::SM);
     if !snapshot.history_enabled {
-        ui.label(RichText::new("History is off. Nothing spoken is retained.").color(Colors::ASH));
+        ui.label(
+            RichText::new("History is off. Nothing spoken is retained.")
+                .color(tokens.secondary_text),
+        );
     } else if snapshot.history.is_empty() {
-        ui.label(RichText::new("No dictations held yet.").color(Colors::ASH));
+        ui.label(RichText::new("No dictations held yet.").color(tokens.secondary_text));
     } else {
         for item in snapshot.history.iter().take(3) {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(&item.time).monospace().color(Colors::ASH));
+                ui.label(
+                    RichText::new(&item.time)
+                        .monospace()
+                        .color(tokens.secondary_text),
+                );
                 if ui
                     .add(
-                        Button::new(RichText::new(&item.output).color(Colors::LIMESTONE))
+                        Button::new(RichText::new(&item.output).color(tokens.text))
                             .fill(egui::Color32::TRANSPARENT)
                             .stroke(Stroke::NONE),
                     )
@@ -165,6 +173,7 @@ fn history(
     state: &mut PageState,
     outbox: &mut Vec<ShellEvent>,
 ) {
+    let tokens = ui.tokens();
     page_header(ui, Route::History.title(), Route::History.context(), None);
     if !snapshot.history.is_empty() {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -184,7 +193,7 @@ fn history(
             if state.confirm_clear_history {
                 ui.label(
                     RichText::new("This permanently removes all retained transcripts.")
-                        .color(Colors::ASH),
+                        .color(tokens.secondary_text),
                 );
             }
         });
@@ -220,16 +229,16 @@ fn history(
                                 item.time, item.application, item.output
                             ))
                             .color(if selected {
-                                Colors::LIMESTONE
+                                tokens.text
                             } else {
-                                Colors::ASH
+                                tokens.secondary_text
                             }),
                         )
                         .selected(selected)
                         .fill(if selected {
-                            Colors::TEMPERED
+                            tokens.raised
                         } else {
-                            Colors::IRON
+                            tokens.surface
                         })
                         .stroke(Stroke::NONE)
                         .min_size(Vec2::new(ui.available_width(), 68.0)),
@@ -265,7 +274,7 @@ fn history(
                 RichText::new(text)
                     .size(21.0)
                     .line_height(Some(29.0))
-                    .color(Colors::LIMESTONE),
+                    .color(tokens.text),
             );
             columns[1].add_space(Space::XL);
             hairline(&mut columns[1]);
@@ -292,10 +301,10 @@ fn history(
                     item.application, item.language, item.latency
                 ))
                 .monospace()
-                .color(Colors::ASH),
+                .color(tokens.secondary_text),
             );
             if let Some(warning) = &item.warning {
-                columns[1].label(RichText::new(warning).color(Colors::BRONZE_LIGHT));
+                columns[1].label(RichText::new(warning).color(tokens.accent_focus));
             }
         }
     });
@@ -307,6 +316,7 @@ fn lexicon(
     state: &mut PageState,
     outbox: &mut Vec<ShellEvent>,
 ) {
+    let tokens = ui.tokens();
     if page_header(
         ui,
         Route::Lexicon.title(),
@@ -340,17 +350,17 @@ fn lexicon(
                 Button::new(
                     RichText::new(format!("{}  →  {}", entry.spoken, entry.written)).color(
                         if selected {
-                            Colors::LIMESTONE
+                            tokens.text
                         } else {
-                            Colors::ASH
+                            tokens.secondary_text
                         },
                     ),
                 )
                 .selected(selected)
                 .fill(if selected {
-                    Colors::TEMPERED
+                    tokens.raised
                 } else {
-                    Colors::IRON
+                    tokens.surface
                 })
                 .stroke(Stroke::NONE)
                 .min_size(Vec2::new(columns[0].available_width(), 44.0)),
@@ -381,7 +391,7 @@ fn lexicon(
                     "Preview: I said “{}”; Phorminx kept “{}”.",
                     entry.spoken, entry.written
                 ))
-                .color(Colors::ASH),
+                .color(tokens.secondary_text),
             );
             columns[1].add_space(Space::LG);
             columns[1].horizontal(|ui| {
@@ -429,6 +439,7 @@ fn profiles(
     state: &mut PageState,
     outbox: &mut Vec<ShellEvent>,
 ) {
+    let tokens = ui.tokens();
     if page_header(
         ui,
         Route::Profiles.title(),
@@ -462,16 +473,16 @@ fn profiles(
                 .add(
                     Button::new(RichText::new(&profile.executable).monospace().color(
                         if selected {
-                            Colors::LIMESTONE
+                            tokens.text
                         } else {
-                            Colors::ASH
+                            tokens.secondary_text
                         },
                     ))
                     .selected(selected)
                     .fill(if selected {
-                        Colors::TEMPERED
+                        tokens.raised
                     } else {
-                        Colors::IRON
+                        tokens.surface
                     })
                     .stroke(Stroke::NONE)
                     .min_size(Vec2::new(columns[0].available_width(), 44.0)),
@@ -497,7 +508,7 @@ fn profiles(
             columns[1].label(
                 RichText::new(profile.summary())
                     .size(19.0)
-                    .color(Colors::LIMESTONE),
+                    .color(tokens.text),
             );
             columns[1].add_space(Space::XL);
             section_title(
@@ -522,7 +533,7 @@ fn profiles(
                 columns[1].add_space(Space::XL);
                 columns[1].label(
                     RichText::new("Dictation is blocked in this application.")
-                        .color(Colors::OXBLOOD),
+                        .color(tokens.destructive),
                 );
             }
             columns[1].add_space(Space::XL);
@@ -563,6 +574,7 @@ fn profiles(
 }
 
 fn lexicon_editor(ui: &mut Ui, draft: &mut LexiconDraft, outbox: &mut Vec<ShellEvent>) {
+    let tokens = ui.tokens();
     metadata(
         ui,
         if draft.id.is_some() {
@@ -572,15 +584,15 @@ fn lexicon_editor(ui: &mut Ui, draft: &mut LexiconDraft, outbox: &mut Vec<ShellE
         },
     );
     ui.add_space(Space::SM);
-    ui.label(RichText::new("Spoken alias").color(Colors::ASH));
+    ui.label(RichText::new("Spoken alias").color(tokens.secondary_text));
     ui.add(TextEdit::singleline(&mut draft.spoken).desired_width(f32::INFINITY));
-    ui.label(RichText::new("Written form").color(Colors::ASH));
+    ui.label(RichText::new("Written form").color(tokens.secondary_text));
     ui.add(TextEdit::singleline(&mut draft.written).desired_width(f32::INFINITY));
-    ui.label(RichText::new("Language tag · optional").color(Colors::ASH));
+    ui.label(RichText::new("Language tag · optional").color(tokens.secondary_text));
     ui.add(TextEdit::singleline(&mut draft.language).hint_text("en or pt-br"));
-    ui.label(RichText::new("Application basename · optional").color(Colors::ASH));
+    ui.label(RichText::new("Application basename · optional").color(tokens.secondary_text));
     ui.add(TextEdit::singleline(&mut draft.scope).hint_text("code.exe"));
-    ui.label(RichText::new("Case policy").color(Colors::ASH));
+    ui.label(RichText::new("Case policy").color(tokens.secondary_text));
     ComboBox::from_id_salt("lexicon-case-policy")
         .selected_text(draft.case_policy.label())
         .show_ui(ui, |ui| {
@@ -606,6 +618,7 @@ fn lexicon_editor(ui: &mut Ui, draft: &mut LexiconDraft, outbox: &mut Vec<ShellE
 }
 
 fn profile_editor(ui: &mut Ui, draft: &mut ProfileDraft, outbox: &mut Vec<ShellEvent>) {
+    let tokens = ui.tokens();
     metadata(
         ui,
         if draft.original_executable.is_some() {
@@ -615,9 +628,9 @@ fn profile_editor(ui: &mut Ui, draft: &mut ProfileDraft, outbox: &mut Vec<ShellE
         },
     );
     ui.add_space(Space::SM);
-    ui.label(RichText::new("Application basename").color(Colors::ASH));
+    ui.label(RichText::new("Application basename").color(tokens.secondary_text));
     ui.add(TextEdit::singleline(&mut draft.executable).hint_text("code.exe"));
-    ui.label(RichText::new("Formatting").color(Colors::ASH));
+    ui.label(RichText::new("Formatting").color(tokens.secondary_text));
     ComboBox::from_id_salt("profile-formatting")
         .selected_text(formatting_label(draft.formatting))
         .show_ui(ui, |ui| {
@@ -639,9 +652,9 @@ fn profile_editor(ui: &mut Ui, draft: &mut ProfileDraft, outbox: &mut Vec<ShellE
                 .desired_width(f32::INFINITY),
         );
     }
-    ui.label(RichText::new("Language tag · optional").color(Colors::ASH));
+    ui.label(RichText::new("Language tag · optional").color(tokens.secondary_text));
     ui.add(TextEdit::singleline(&mut draft.language).hint_text("en or pt-br"));
-    ui.label(RichText::new("Insertion").color(Colors::ASH));
+    ui.label(RichText::new("Insertion").color(tokens.secondary_text));
     ComboBox::from_id_salt("profile-insertion")
         .selected_text(insertion_label(draft.insertion))
         .show_ui(ui, |ui| {
@@ -707,6 +720,7 @@ fn models(
     ) {
         outbox.push(ShellEvent::VerifyModels);
     }
+    let tokens = ui.tokens();
     model_system(ui, "01", &snapshot.whisper, true, state, outbox);
     if state.confirm_model_download {
         ui.add_space(Space::MD);
@@ -714,7 +728,7 @@ fn models(
             RichText::new(
                 "Download the pinned 141 MiB English Whisper model. The file stays local and replaces the active model only after SHA-256 verification.",
             )
-            .color(Colors::ASH),
+            .color(tokens.secondary_text),
         );
         ui.add_space(Space::SM);
         ui.horizontal(|ui| {
@@ -741,20 +755,17 @@ fn model_system(
     state: &mut PageState,
     outbox: &mut Vec<ShellEvent>,
 ) {
+    let tokens = ui.tokens();
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(index)
                 .monospace()
                 .size(12.0)
-                .color(Colors::BRONZE_LIGHT),
+                .color(tokens.accent_focus),
         );
         ui.vertical(|ui| {
-            ui.label(
-                RichText::new(&system.name)
-                    .size(24.0)
-                    .color(Colors::LIMESTONE),
-            );
-            ui.label(RichText::new(&system.detail).color(Colors::ASH));
+            ui.label(RichText::new(&system.name).size(24.0).color(tokens.text));
+            ui.label(RichText::new(&system.detail).color(tokens.secondary_text));
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             readiness_row(ui, "", "", system.state);
@@ -762,11 +773,11 @@ fn model_system(
     });
     ui.add_space(Space::LG);
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Selected").color(Colors::ASH));
+        ui.label(RichText::new("Selected").color(tokens.secondary_text));
         ui.label(
             RichText::new(system.selected.as_deref().unwrap_or("None"))
                 .monospace()
-                .color(Colors::LIMESTONE),
+                .color(tokens.text),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if whisper {
@@ -796,6 +807,7 @@ fn settings(
     state: &mut PageState,
     outbox: &mut Vec<ShellEvent>,
 ) {
+    let tokens = ui.tokens();
     let ollama_ready = snapshot.ollama.state == crate::model::Readiness::Ready
         && snapshot.ollama.selected.as_ref().is_some_and(|selected| {
             snapshot
@@ -907,7 +919,7 @@ fn settings(
                     RichText::new(
                         "Select an installed Ollama model before saving this formatting strength.",
                     )
-                    .color(Colors::BRONZE_LIGHT),
+                    .color(tokens.accent_focus),
                 );
             }
             if state.settings.formatting == FormattingStrength::Custom {
@@ -993,10 +1005,11 @@ fn settings(
 }
 
 fn setting_section(ui: &mut Ui, index: &str, title: &str, content: impl FnOnce(&mut Ui)) {
+    let tokens = ui.tokens();
     ui.horizontal(|ui| {
         ui.set_min_width(130.0);
-        ui.label(RichText::new(index).monospace().color(Colors::BRONZE_LIGHT));
-        ui.label(RichText::new(title).size(18.0).color(Colors::LIMESTONE));
+        ui.label(RichText::new(index).monospace().color(tokens.accent_focus));
+        ui.label(RichText::new(title).size(18.0).color(tokens.text));
     });
     ui.add_space(Space::SM);
     content(ui);
@@ -1006,24 +1019,30 @@ fn setting_section(ui: &mut Ui, index: &str, title: &str, content: impl FnOnce(&
 }
 
 fn setting_row(ui: &mut Ui, title: &str, detail: &str, control: impl FnOnce(&mut Ui)) {
+    let tokens = ui.tokens();
     ui.horizontal(|ui| {
         ui.set_min_height(52.0);
         ui.vertical(|ui| {
-            ui.label(RichText::new(title).color(Colors::LIMESTONE));
-            ui.label(RichText::new(detail).size(12.0).color(Colors::ASH));
+            ui.label(RichText::new(title).color(tokens.text));
+            ui.label(
+                RichText::new(detail)
+                    .size(12.0)
+                    .color(tokens.secondary_text),
+            );
         });
         ui.with_layout(Layout::right_to_left(Align::Center), control);
     });
 }
 
 fn labeled_value(ui: &mut Ui, label: &str, value: &str, monospace: bool) {
+    let tokens = ui.tokens();
     metadata(ui, label);
     let text = if monospace {
         RichText::new(value).monospace()
     } else {
         RichText::new(value)
     };
-    ui.label(text.color(Colors::LIMESTONE));
+    ui.label(text.color(tokens.text));
     ui.add_space(Space::MD);
 }
 

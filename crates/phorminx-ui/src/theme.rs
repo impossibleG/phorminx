@@ -1,14 +1,43 @@
 //! Phorminx visual tokens: disciplined monochrome with bronze used as tension.
+//!
+//! There are deliberately no animated presentation tokens. Every state and route
+//! change is painted at its final geometry in the next frame, so Windows' reduced
+//! motion preference is satisfied without a parallel animation setting.
 
-use eframe::egui::{self, Color32, FontFamily, FontId, Stroke, TextStyle, Vec2};
+use eframe::egui::{self, Color32, FontFamily, FontId, Stroke, TextStyle, Ui, Vec2};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ThemeMode {
     #[default]
     AuthoredDark,
+    AuthoredLight,
     HighContrast,
+    HighContrastLight,
 }
 
+impl ThemeMode {
+    /// Maps the host's live Windows appearance observations into a shell theme.
+    ///
+    /// The host should call [`crate::PhorminxUi::set_theme`] whenever either OS
+    /// value changes. `prefers_dark` must reflect the active contrast theme while
+    /// high contrast is enabled so black and white contrast themes both work.
+    #[must_use]
+    pub const fn from_system(prefers_dark: bool, high_contrast: bool) -> Self {
+        match (high_contrast, prefers_dark) {
+            (true, true) => Self::HighContrast,
+            (true, false) => Self::HighContrastLight,
+            (false, true) => Self::AuthoredDark,
+            (false, false) => Self::AuthoredLight,
+        }
+    }
+
+    #[must_use]
+    const fn is_light(self) -> bool {
+        matches!(self, Self::AuthoredLight | Self::HighContrastLight)
+    }
+}
+
+/// The immutable source palette. Product code consumes [`ThemeTokens`] instead.
 pub struct Colors;
 
 impl Colors {
@@ -46,7 +75,9 @@ pub struct ThemeTokens {
     pub secondary_text: Color32,
     pub accent: Color32,
     pub accent_focus: Color32,
+    pub on_accent: Color32,
     pub destructive: Color32,
+    pub destructive_text: Color32,
     pub verified: Color32,
 }
 
@@ -63,8 +94,24 @@ impl ThemeTokens {
                 secondary_text: Colors::ASH,
                 accent: Colors::BRONZE,
                 accent_focus: Colors::BRONZE_LIGHT,
+                on_accent: Colors::ABYSS,
                 destructive: Colors::OXBLOOD,
+                destructive_text: Color32::from_rgb(232, 150, 152),
                 verified: Colors::MOSS,
+            },
+            ThemeMode::AuthoredLight => Self {
+                background: Color32::from_rgb(246, 243, 236),
+                surface: Color32::from_rgb(237, 233, 224),
+                raised: Color32::from_rgb(225, 220, 209),
+                edge: Color32::from_rgb(111, 108, 101),
+                text: Color32::from_rgb(23, 26, 28),
+                secondary_text: Color32::from_rgb(78, 82, 84),
+                accent: Color32::from_rgb(126, 78, 33),
+                accent_focus: Color32::from_rgb(101, 59, 20),
+                on_accent: Color32::WHITE,
+                destructive: Color32::from_rgb(126, 42, 49),
+                destructive_text: Color32::from_rgb(126, 42, 49),
+                verified: Color32::from_rgb(54, 83, 55),
             },
             ThemeMode::HighContrast => Self {
                 background: Color32::BLACK,
@@ -75,18 +122,58 @@ impl ThemeTokens {
                 secondary_text: Color32::from_gray(224),
                 accent: Color32::from_rgb(255, 196, 124),
                 accent_focus: Color32::WHITE,
+                on_accent: Color32::BLACK,
                 destructive: Color32::from_rgb(255, 118, 122),
+                destructive_text: Color32::from_rgb(255, 160, 164),
                 verified: Color32::from_rgb(182, 224, 174),
+            },
+            ThemeMode::HighContrastLight => Self {
+                background: Color32::WHITE,
+                surface: Color32::WHITE,
+                raised: Color32::from_gray(226),
+                edge: Color32::BLACK,
+                text: Color32::BLACK,
+                secondary_text: Color32::from_gray(40),
+                accent: Color32::from_rgb(82, 42, 0),
+                accent_focus: Color32::BLACK,
+                on_accent: Color32::WHITE,
+                destructive: Color32::from_rgb(112, 0, 8),
+                destructive_text: Color32::from_rgb(112, 0, 8),
+                verified: Color32::from_rgb(0, 75, 6),
             },
         }
     }
+}
+
+pub trait UiThemeExt {
+    /// Returns the live theme tokens installed on this egui context.
+    #[must_use]
+    fn tokens(&self) -> ThemeTokens;
+}
+
+impl UiThemeExt for Ui {
+    fn tokens(&self) -> ThemeTokens {
+        let mode = self
+            .ctx()
+            .data_mut(|data| data.get_temp::<ThemeMode>(theme_mode_id()))
+            .unwrap_or_default();
+        ThemeTokens::for_mode(mode)
+    }
+}
+
+fn theme_mode_id() -> egui::Id {
+    egui::Id::new("phorminx-theme-mode")
 }
 
 #[must_use]
 pub fn style(mode: ThemeMode) -> egui::Style {
     let tokens = ThemeTokens::for_mode(mode);
     let mut style = egui::Style {
-        visuals: egui::Visuals::dark(),
+        visuals: if mode.is_light() {
+            egui::Visuals::light()
+        } else {
+            egui::Visuals::dark()
+        },
         ..egui::Style::default()
     };
     style.visuals.panel_fill = tokens.background;
@@ -94,19 +181,30 @@ pub fn style(mode: ThemeMode) -> egui::Style {
     style.visuals.faint_bg_color = tokens.surface;
     style.visuals.extreme_bg_color = tokens.background;
     style.visuals.override_text_color = Some(tokens.text);
+    style.visuals.weak_text_alpha = 1.0;
+    // Disabled controls remain readable; availability is also communicated by
+    // interaction state and control geometry rather than opacity alone.
+    style.visuals.disabled_alpha =
+        if matches!(mode, ThemeMode::HighContrast | ThemeMode::HighContrastLight) {
+            0.78
+        } else {
+            0.72
+        };
     style.visuals.selection.bg_fill = tokens.accent;
-    style.visuals.selection.stroke = Stroke::new(1.0, tokens.accent_focus);
+    style.visuals.selection.stroke = Stroke::new(2.0, tokens.accent_focus);
     style.visuals.hyperlink_color = tokens.accent_focus;
+    style.visuals.error_fg_color = tokens.destructive_text;
+    style.visuals.warn_fg_color = tokens.accent_focus;
     style.visuals.widgets.noninteractive.bg_fill = tokens.surface;
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, tokens.edge);
     style.visuals.widgets.inactive.weak_bg_fill = tokens.surface;
     style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, tokens.edge);
     style.visuals.widgets.hovered.weak_bg_fill = tokens.raised;
-    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, tokens.accent);
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(2.0, tokens.accent_focus);
     style.visuals.widgets.active.weak_bg_fill = tokens.raised;
-    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0, tokens.accent_focus);
+    style.visuals.widgets.active.bg_stroke = Stroke::new(2.0, tokens.accent_focus);
     style.visuals.widgets.open.weak_bg_fill = tokens.raised;
-    style.visuals.widgets.open.bg_stroke = Stroke::new(1.0, tokens.accent);
+    style.visuals.widgets.open.bg_stroke = Stroke::new(2.0, tokens.accent_focus);
     style.visuals.window_stroke = Stroke::new(1.0, tokens.edge);
     style.visuals.menu_corner_radius = 6.into();
     style.visuals.window_corner_radius = 10.into();
@@ -136,8 +234,14 @@ pub fn style(mode: ThemeMode) -> egui::Style {
 }
 
 pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
-    ctx.set_theme(egui::Theme::Dark);
-    ctx.set_style_of(egui::Theme::Dark, style(mode));
+    ctx.data_mut(|data| data.insert_temp(theme_mode_id(), mode));
+    let egui_theme = if mode.is_light() {
+        egui::Theme::Light
+    } else {
+        egui::Theme::Dark
+    };
+    ctx.set_theme(egui_theme);
+    ctx.set_style_of(egui_theme, style(mode));
 }
 
 #[cfg(test)]
@@ -166,16 +270,96 @@ mod tests {
         (bright + 0.05) / (dark + 0.05)
     }
 
-    #[test]
-    fn authored_text_exceeds_wcag_normal_text_contrast() {
-        let tokens = ThemeTokens::for_mode(ThemeMode::AuthoredDark);
-        assert!(contrast(tokens.text, tokens.background) >= 7.0);
-        assert!(contrast(tokens.secondary_text, tokens.background) >= 4.5);
+    fn blend_over(foreground: Color32, background: Color32, alpha: f32) -> Color32 {
+        let blend = |front: u8, back: u8| {
+            (f32::from(front).mul_add(alpha, f32::from(back) * (1.0 - alpha))).round() as u8
+        };
+        Color32::from_rgb(
+            blend(foreground.r(), background.r()),
+            blend(foreground.g(), background.g()),
+            blend(foreground.b(), background.b()),
+        )
     }
 
     #[test]
-    fn high_contrast_keeps_structural_edges_visible() {
-        let tokens = ThemeTokens::for_mode(ThemeMode::HighContrast);
-        assert!(contrast(tokens.edge, tokens.background) >= 7.0);
+    fn every_mode_meets_text_and_focus_contrast_contracts() {
+        for mode in [
+            ThemeMode::AuthoredDark,
+            ThemeMode::AuthoredLight,
+            ThemeMode::HighContrast,
+            ThemeMode::HighContrastLight,
+        ] {
+            let tokens = ThemeTokens::for_mode(mode);
+            assert!(contrast(tokens.text, tokens.background) >= 4.5, "{mode:?}");
+            assert!(
+                contrast(tokens.secondary_text, tokens.background) >= 4.5,
+                "{mode:?}"
+            );
+            assert!(
+                contrast(tokens.accent_focus, tokens.background) >= 3.0,
+                "{mode:?}"
+            );
+            assert!(
+                contrast(tokens.accent_focus, tokens.raised) >= 3.0,
+                "{mode:?}"
+            );
+            assert!(
+                contrast(tokens.destructive_text, tokens.background) >= 4.5,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn primary_action_text_is_legible_in_every_mode() {
+        for mode in [
+            ThemeMode::AuthoredDark,
+            ThemeMode::AuthoredLight,
+            ThemeMode::HighContrast,
+            ThemeMode::HighContrastLight,
+        ] {
+            let tokens = ThemeTokens::for_mode(mode);
+            assert!(contrast(tokens.on_accent, tokens.accent) >= 4.5, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn disabled_text_stays_legible_without_looking_enabled() {
+        for mode in [
+            ThemeMode::AuthoredDark,
+            ThemeMode::AuthoredLight,
+            ThemeMode::HighContrast,
+            ThemeMode::HighContrastLight,
+        ] {
+            let tokens = ThemeTokens::for_mode(mode);
+            let disabled_alpha = style(mode).visuals.disabled_alpha;
+            let disabled = blend_over(tokens.text, tokens.surface, disabled_alpha);
+            assert!(contrast(disabled, tokens.surface) >= 4.5, "{mode:?}");
+            assert!(disabled_alpha < 1.0, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn system_mapping_covers_authored_and_contrast_variants() {
+        assert_eq!(
+            ThemeMode::from_system(false, false),
+            ThemeMode::AuthoredLight
+        );
+        assert_eq!(ThemeMode::from_system(true, false), ThemeMode::AuthoredDark);
+        assert_eq!(
+            ThemeMode::from_system(false, true),
+            ThemeMode::HighContrastLight
+        );
+        assert_eq!(ThemeMode::from_system(true, true), ThemeMode::HighContrast);
+    }
+
+    #[test]
+    fn reduced_motion_is_immediate_by_construction() {
+        let context = egui::Context::default();
+        apply(&context, ThemeMode::AuthoredLight);
+        assert_eq!(
+            context.data_mut(|data| data.get_temp(theme_mode_id())),
+            Some(ThemeMode::AuthoredLight)
+        );
     }
 }

@@ -6,7 +6,7 @@ use crate::components::{
     self, ActionTone, action, empty_state, hairline, metadata, readiness_row, status_seal,
 };
 use crate::model::{GalleryScenario, InlineNotice, NoticeKind, Readiness, RuntimeStatus};
-use crate::theme::{Colors, Space};
+use crate::theme::{Space, UiThemeExt};
 
 #[derive(Clone, Debug, Default)]
 pub struct ComponentGallery {
@@ -24,12 +24,13 @@ impl ComponentGallery {
     }
 
     pub fn show(&mut self, ui: &mut Ui) {
+        let tokens = ui.tokens();
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("COMPONENT PROOF")
                     .size(10.0)
                     .strong()
-                    .color(Colors::ASH),
+                    .color(tokens.secondary_text),
             );
             ui.add_space(Space::MD);
             for scenario in GalleryScenario::ALL {
@@ -51,9 +52,9 @@ impl ComponentGallery {
                     RichText::new("PHORMINX")
                         .size(20.0)
                         .strong()
-                        .color(Colors::LIMESTONE),
+                        .color(tokens.text),
                 );
-                ui.label(RichText::new("Voice, disciplined.").color(Colors::ASH));
+                ui.label(RichText::new("Voice, disciplined.").color(tokens.secondary_text));
             });
             ui.add_space(Space::XL);
             status_seal(
@@ -102,7 +103,7 @@ impl ComponentGallery {
                         "The quieter the interface, the more exact each decision must be.",
                     )
                     .size(21.0)
-                    .color(Colors::LIMESTONE),
+                    .color(tokens.text),
                 );
             }
             GalleryScenario::Error => {
@@ -119,16 +120,17 @@ impl ComponentGallery {
 }
 
 fn token_strip(ui: &mut Ui) {
+    let palette = ui.tokens();
     let tokens = [
-        ("Abyss", Colors::ABYSS),
-        ("Iron", Colors::IRON),
-        ("Tempered", Colors::TEMPERED),
-        ("Edge", Colors::EDGE),
-        ("Limestone", Colors::LIMESTONE),
-        ("Ash", Colors::ASH),
-        ("Bronze", Colors::BRONZE),
-        ("Oxblood", Colors::OXBLOOD),
-        ("Moss", Colors::MOSS),
+        ("Background", palette.background),
+        ("Surface", palette.surface),
+        ("Raised", palette.raised),
+        ("Edge", palette.edge),
+        ("Text", palette.text),
+        ("Secondary", palette.secondary_text),
+        ("Accent", palette.accent),
+        ("Destructive", palette.destructive),
+        ("Verified", palette.verified),
     ];
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;

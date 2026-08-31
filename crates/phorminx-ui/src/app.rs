@@ -5,7 +5,7 @@ use crate::components::{
 };
 use crate::model::{Route, ShellEvent, ShellSnapshot};
 use crate::pages::{self, PageState};
-use crate::theme::{self, Colors, Space, ThemeMode};
+use crate::theme::{self, Space, ThemeMode, UiThemeExt};
 
 /// Single-window Phorminx product shell.
 ///
@@ -72,6 +72,11 @@ impl PhorminxUi {
         }
     }
 
+    #[must_use]
+    pub const fn theme(&self) -> ThemeMode {
+        self.theme
+    }
+
     pub fn close_lexicon_editor(&mut self) {
         self.pages.lexicon_draft = None;
     }
@@ -97,9 +102,10 @@ impl PhorminxUi {
             theme::apply(ui.ctx(), self.theme);
             self.theme_applied = true;
         }
+        let tokens = ui.tokens();
         ui.set_min_size(Vec2::new(900.0, 620.0));
         egui::Frame::new()
-            .fill(Colors::ABYSS)
+            .fill(tokens.background)
             .inner_margin(Margin::ZERO)
             .show(ui, |ui| {
                 self.brand_header(ui);
@@ -112,7 +118,7 @@ impl PhorminxUi {
                     );
                     ui.painter().line_segment(
                         [separator.left_top(), separator.left_bottom()],
-                        Stroke::new(1.0, Colors::EDGE),
+                        Stroke::new(1.0, tokens.edge),
                     );
                     ScrollArea::vertical()
                         .id_salt("phorminx-route")
@@ -148,8 +154,9 @@ impl PhorminxUi {
     // This is intentionally an in-content brand/status header. The native Windows
     // frame remains responsible for drag, resize, snap, system menu, and controls.
     fn brand_header(&self, ui: &mut Ui) {
+        let tokens = ui.tokens();
         egui::Frame::new()
-            .fill(Colors::IRON)
+            .fill(tokens.surface)
             .inner_margin(Margin::symmetric(20, 10))
             .show(ui, |ui| {
                 ui.set_height(48.0);
@@ -160,7 +167,7 @@ impl PhorminxUi {
                         RichText::new("PHORMINX")
                             .size(14.0)
                             .strong()
-                            .color(Colors::LIMESTONE),
+                            .color(tokens.text),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         status_seal(ui, self.snapshot.status);
@@ -170,8 +177,9 @@ impl PhorminxUi {
     }
 
     fn navigation(&mut self, ui: &mut Ui) {
+        let tokens = ui.tokens();
         egui::Frame::new()
-            .fill(Colors::IRON)
+            .fill(tokens.surface)
             .inner_margin(Margin::symmetric(16, 20))
             .show(ui, |ui| {
                 ui.set_min_width(180.0);
@@ -186,7 +194,11 @@ impl PhorminxUi {
                     ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                         shortcut_chord(ui, &self.snapshot.shortcut);
                         ui.add_space(Space::SM);
-                        ui.label(RichText::new("Local only").size(11.0).color(Colors::ASH));
+                        ui.label(
+                            RichText::new("Local only")
+                                .size(11.0)
+                                .color(tokens.secondary_text),
+                        );
                     });
                 });
             });
@@ -247,6 +259,23 @@ mod tests {
         egui::__run_test_ui(|ui| {
             let mut app = PhorminxUi::new(ShellSnapshot::gallery(GalleryScenario::Populated));
             app.show(ui);
+        });
+    }
+
+    #[test]
+    fn every_theme_paints_the_complete_shell() {
+        egui::__run_test_ui(|ui| {
+            for mode in [
+                ThemeMode::AuthoredDark,
+                ThemeMode::AuthoredLight,
+                ThemeMode::HighContrast,
+                ThemeMode::HighContrastLight,
+            ] {
+                let mut app = PhorminxUi::new(ShellSnapshot::gallery(GalleryScenario::Populated));
+                app.set_theme(mode);
+                app.show(ui);
+                assert_eq!(app.theme(), mode);
+            }
         });
     }
 }
