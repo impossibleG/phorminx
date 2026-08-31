@@ -104,34 +104,16 @@ fn home(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
     let tokens = ui.tokens();
     page_header(ui, Route::Home.title(), Route::Home.context(), None);
     ui.add_space(Space::LG);
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            metadata(ui, "Instrument state");
-            ui.add_space(Space::SM);
-            ui.label(
-                RichText::new(snapshot.status.label())
-                    .size(56.0)
-                    .color(tokens.text),
-            );
-            ui.add_space(Space::XS);
-            components::shortcut_chord(ui, &snapshot.shortcut);
-            ui.add_space(Space::XL);
-            if action(ui, "Test dictation", ActionTone::Primary).clicked() {
-                outbox.push(ShellEvent::TestDictation);
-            }
+    if ui.available_width() >= 640.0 {
+        ui.columns(2, |columns| {
+            home_instrument_state(&mut columns[0], snapshot, outbox);
+            home_local_systems(&mut columns[1], snapshot);
         });
-        ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-            ui.set_width(390.0);
-            ui.vertical(|ui| {
-                metadata(ui, "Local systems");
-                ui.add_space(Space::SM);
-                for system in &snapshot.systems {
-                    readiness_row(ui, &system.name, &system.detail, system.state);
-                    hairline(ui);
-                }
-            });
-        });
-    });
+    } else {
+        home_instrument_state(ui, snapshot, outbox);
+        ui.add_space(Space::XL);
+        home_local_systems(ui, snapshot);
+    }
     ui.add_space(Space::XXL);
     metadata(ui, "Recently held");
     ui.add_space(Space::SM);
@@ -153,6 +135,7 @@ fn home(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
                 if ui
                     .add(
                         Button::new(RichText::new(&item.output).color(tokens.text))
+                            .wrap()
                             .fill(egui::Color32::TRANSPARENT)
                             .stroke(Stroke::NONE),
                     )
@@ -167,6 +150,32 @@ fn home(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
     }
 }
 
+fn home_instrument_state(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
+    let tokens = ui.tokens();
+    metadata(ui, "Instrument state");
+    ui.add_space(Space::SM);
+    ui.label(
+        RichText::new(snapshot.status.label())
+            .size(56.0)
+            .color(tokens.text),
+    );
+    ui.add_space(Space::XS);
+    components::shortcut_chord(ui, &snapshot.shortcut);
+    ui.add_space(Space::XL);
+    if action(ui, "Test dictation", ActionTone::Primary).clicked() {
+        outbox.push(ShellEvent::TestDictation);
+    }
+}
+
+fn home_local_systems(ui: &mut Ui, snapshot: &ShellSnapshot) {
+    metadata(ui, "Local systems");
+    ui.add_space(Space::SM);
+    for system in &snapshot.systems {
+        readiness_row(ui, &system.name, &system.detail, system.state);
+        hairline(ui);
+    }
+}
+
 fn history(
     ui: &mut Ui,
     snapshot: &ShellSnapshot,
@@ -176,27 +185,31 @@ fn history(
     let tokens = ui.tokens();
     page_header(ui, Route::History.title(), Route::History.context(), None);
     if !snapshot.history.is_empty() {
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let label = if state.confirm_clear_history {
-                "Delete every retained dictation"
-            } else {
-                "Clear history"
-            };
-            if action(ui, label, ActionTone::Destructive).clicked() {
-                if state.confirm_clear_history {
-                    outbox.push(ShellEvent::ClearHistory);
-                    state.confirm_clear_history = false;
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 44.0),
+            Layout::right_to_left(Align::Center),
+            |ui| {
+                let label = if state.confirm_clear_history {
+                    "Delete every retained dictation"
                 } else {
-                    state.confirm_clear_history = true;
+                    "Clear history"
+                };
+                if action(ui, label, ActionTone::Destructive).clicked() {
+                    if state.confirm_clear_history {
+                        outbox.push(ShellEvent::ClearHistory);
+                        state.confirm_clear_history = false;
+                    } else {
+                        state.confirm_clear_history = true;
+                    }
                 }
-            }
-            if state.confirm_clear_history {
-                ui.label(
-                    RichText::new("This permanently removes all retained transcripts.")
-                        .color(tokens.secondary_text),
-                );
-            }
-        });
+                if state.confirm_clear_history {
+                    ui.label(
+                        RichText::new("This permanently removes all retained transcripts.")
+                            .color(tokens.secondary_text),
+                    );
+                }
+            },
+        );
         ui.add_space(Space::MD);
     }
     if snapshot.history.is_empty() {

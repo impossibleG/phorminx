@@ -138,27 +138,33 @@ impl PhorminxUi {
                             egui::Frame::new()
                                 .inner_margin(Margin::same(32))
                                 .show(ui, |ui| {
-                                    if let Some(notice) = &self.snapshot.notice {
-                                        let (acted, dismissed) = inline_notice(ui, notice);
-                                        if acted {
-                                            self.outbox.push(ShellEvent::NoticeAction);
+                                    // This frame is created inside the shell's horizontal
+                                    // navigation row, so explicitly restore a vertical page
+                                    // flow for route content.
+                                    ui.vertical(|ui| {
+                                        ui.set_width(ui.available_width());
+                                        if let Some(notice) = &self.snapshot.notice {
+                                            let (acted, dismissed) = inline_notice(ui, notice);
+                                            if acted {
+                                                self.outbox.push(ShellEvent::NoticeAction);
+                                            }
+                                            if dismissed {
+                                                self.outbox.push(ShellEvent::DismissNotice);
+                                            }
+                                            ui.add_space(Space::LG);
                                         }
-                                        if dismissed {
-                                            self.outbox.push(ShellEvent::DismissNotice);
+                                        if self.route_focus_requested {
+                                            request_page_header_focus(ui.ctx());
+                                            self.route_focus_requested = false;
                                         }
-                                        ui.add_space(Space::LG);
-                                    }
-                                    if self.route_focus_requested {
-                                        request_page_header_focus(ui.ctx());
-                                        self.route_focus_requested = false;
-                                    }
-                                    pages::show(
-                                        ui,
-                                        self.route,
-                                        &self.snapshot,
-                                        &mut self.pages,
-                                        &mut self.outbox,
-                                    );
+                                        pages::show(
+                                            ui,
+                                            self.route,
+                                            &self.snapshot,
+                                            &mut self.pages,
+                                            &mut self.outbox,
+                                        );
+                                    });
                                 });
                         });
                 });
