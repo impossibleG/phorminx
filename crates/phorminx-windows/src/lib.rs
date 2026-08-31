@@ -13,6 +13,8 @@ mod overlay;
 #[cfg(windows)]
 mod settings_window;
 #[cfg(windows)]
+mod startup;
+#[cfg(windows)]
 mod target;
 #[cfg(windows)]
 mod tray;
@@ -30,6 +32,10 @@ pub use overlay::{OverlayError, OverlayStatus, StatusOverlay};
 #[cfg(windows)]
 pub use settings_window::{
     SettingsForm, SettingsFormatting, SettingsWindow, SettingsWindowError, SettingsWindowEvent,
+};
+#[cfg(windows)]
+pub use startup::{
+    LaunchAtLoginError, LaunchAtLoginState, launch_at_login_state, set_launch_at_login,
 };
 #[cfg(windows)]
 pub use target::TargetSnapshot;
