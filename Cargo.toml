@@ -7,6 +7,7 @@ members = [
     "crates/phorminx-core",
     "crates/phorminx-ollama",
     "crates/phorminx-persistence",
+    "crates/phorminx-ui",
     "crates/phorminx-windows",
     "crates/phorminx-whisper",
 ]
@@ -24,6 +25,7 @@ arboard = { version = "=3.6.1", default-features = false }
 clap = { version = "=4.5.48", features = ["derive"] }
 cpal = "=0.18.2"
 ctrlc = "=3.5.1"
+eframe = { version = "=0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 hound = "=3.5.1"
 ringbuf = { version = "=0.5.1", default-features = false, features = ["alloc"] }
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
@@ -31,7 +33,7 @@ rubato = { version = "=5.0.0", default-features = false, features = ["fft_resamp
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"
-thiserror = "=2.0.16"
+thiserror = "=2.0.20"
 toml = "=1.1.4"
 tempfile = "=3.23.0"
 ureq = { version = "=3.4.0", default-features = false, features = ["rustls"] }
