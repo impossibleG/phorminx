@@ -9,7 +9,7 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GWLP_USERDATA, GetMessageW,
-    GetWindowLongPtrW, HMENU, IDC_ARROW, IsWindow, LoadCursorW, MSG, PostQuitMessage,
+    GetWindowLongPtrW, HMENU, IDC_ARROW, IsWindow, LoadCursorW, MSG, PostMessageW, PostQuitMessage,
     PostThreadMessageW, RegisterClassW, SW_SHOWNORMAL, SendMessageW, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, UnregisterClassW,
     WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_NCDESTROY, WM_QUIT,
@@ -108,13 +108,26 @@ impl HistoryWindow {
         if self.thread.is_none() {
             return Ok(());
         }
-        unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }
-            .map_err(HistoryWindowError::PostClose)?;
+        if unsafe { IsWindow(Some(window(self.window_bits))) }.as_bool()
+            && unsafe {
+                PostMessageW(
+                    Some(window(self.window_bits)),
+                    WM_CLOSE,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            }
+            .is_err()
+        {
+            let _ = unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+        }
         if let Some(thread) = self.thread.take() {
             thread
                 .join()
                 .map_err(|_| HistoryWindowError::ThreadPanicked)?;
         }
+        self.window_bits = 0;
+        self.thread_id = 0;
         Ok(())
     }
 }

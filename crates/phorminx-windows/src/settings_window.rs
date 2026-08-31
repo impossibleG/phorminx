@@ -301,8 +301,8 @@ impl SettingsWindow {
         if self.thread.is_none() {
             return Ok(());
         }
-        let post_result = if unsafe { IsWindow(Some(window(self.window_bits))) }.as_bool() {
-            unsafe {
+        if unsafe { IsWindow(Some(window(self.window_bits))) }.as_bool()
+            && unsafe {
                 PostMessageW(
                     Some(window(self.window_bits)),
                     WM_CLOSE,
@@ -310,10 +310,8 @@ impl SettingsWindow {
                     LPARAM(0),
                 )
             }
-        } else {
-            Ok(())
-        };
-        if post_result.is_err() {
+            .is_err()
+        {
             let _ = unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
         }
         let join_result = self.thread.take().map(JoinHandle::join);
@@ -322,7 +320,7 @@ impl SettingsWindow {
         if let Some(Err(_)) = join_result {
             return Err(SettingsWindowError::ThreadPanicked);
         }
-        post_result.map_err(SettingsWindowError::PostClose)
+        Ok(())
     }
 }
 

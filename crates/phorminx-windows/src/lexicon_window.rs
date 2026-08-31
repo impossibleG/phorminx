@@ -12,7 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CB_SETCURSEL, CBS_DROPDOWNLIST, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOHSCROLL, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW,
     GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, IsWindow, LoadCursorW, MSG,
-    PostQuitMessage, PostThreadMessageW, RegisterClassW, SW_SHOWNORMAL, SendMessageW,
+    PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, SW_SHOWNORMAL, SendMessageW,
     SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage,
     UnregisterClassW, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE,
     WM_NCDESTROY, WM_QUIT, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
@@ -157,13 +157,26 @@ impl LexiconWindow {
         if self.thread.is_none() {
             return Ok(());
         }
-        unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }
-            .map_err(LexiconWindowError::PostClose)?;
+        if unsafe { IsWindow(Some(window(self.window_bits))) }.as_bool()
+            && unsafe {
+                PostMessageW(
+                    Some(window(self.window_bits)),
+                    WM_CLOSE,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            }
+            .is_err()
+        {
+            let _ = unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+        }
         if let Some(thread) = self.thread.take() {
             thread
                 .join()
                 .map_err(|_| LexiconWindowError::ThreadPanicked)?;
         }
+        self.window_bits = 0;
+        self.thread_id = 0;
         Ok(())
     }
 }
@@ -682,7 +695,28 @@ pub enum LexiconWindowError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    #[test]
+    fn shutdown_joins_a_window_that_already_closed_itself() {
+        let lexicon = LexiconWindow::start(Vec::new()).unwrap();
+        unsafe {
+            PostMessageW(
+                Some(window(lexicon.window_bits)),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        }
+        .unwrap();
+        assert!(matches!(
+            lexicon.events().recv_timeout(Duration::from_secs(2)),
+            Ok(LexiconWindowEvent::Closed)
+        ));
+        lexicon.shutdown().unwrap();
+    }
 
     #[test]
     fn case_policy_indices_are_stable() {
