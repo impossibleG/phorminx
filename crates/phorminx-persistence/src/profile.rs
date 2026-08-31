@@ -128,6 +128,41 @@ impl<'connection> AppProfileRepository<'connection> {
         Ok(())
     }
 
+    /// Atomically replaces the profile identified by `original`.
+    ///
+    /// Deleting before inserting is intentional: the executable key is
+    /// case-insensitive, so an ordinary insert cannot preserve a case-only
+    /// rename. If the replacement conflicts with another profile (or the
+    /// insert otherwise fails), the transaction restores the original row.
+    pub fn replace(&self, original: &ExecutableIdentity, profile: &AppProfile) -> Result<bool> {
+        validate_profile(profile)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let deleted = transaction.execute(
+            "DELETE FROM app_profiles WHERE executable = ?1 COLLATE NOCASE",
+            [original.as_str()],
+        )? > 0;
+        if !deleted {
+            transaction.rollback()?;
+            return Ok(false);
+        }
+        transaction.execute(
+            "INSERT INTO app_profiles(\
+                 executable, formatting_style, custom_instructions, language, \
+                 insertion_preference, deny\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                profile.executable.as_str(),
+                profile.formatting_style.as_db(),
+                profile.custom_instructions,
+                profile.language,
+                profile.insertion_preference.as_db(),
+                profile.deny,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub fn get(&self, executable: &ExecutableIdentity) -> Result<Option<AppProfile>> {
         Ok(self
             .connection

@@ -347,6 +347,8 @@ pub struct UiLexiconDraft {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UiProfileDraft {
+    /// Executable identity before editing. `None` creates or upserts a profile.
+    pub original_executable: Option<String>,
     pub executable: String,
     pub formatting_style: FormattingStyle,
     pub custom_instructions: Option<String>,
@@ -537,12 +539,21 @@ impl UiBridge {
                 })
             }
             UiCommand::SaveProfile(draft) => {
-                let profile = profile_draft(draft)?;
+                let (original, profile) = profile_draft(draft)?;
                 let executable = profile.executable.to_string();
-                self.persistence
-                    .app_profiles()
-                    .upsert(&profile)
-                    .map_err(UiBridgeError::persistence)?;
+                let profiles = self.persistence.app_profiles();
+                if let Some(original) = original {
+                    if !profiles
+                        .replace(&original, &profile)
+                        .map_err(UiBridgeError::persistence)?
+                    {
+                        return Err(UiBridgeError::not_found("profile"));
+                    }
+                } else {
+                    profiles
+                        .upsert(&profile)
+                        .map_err(UiBridgeError::persistence)?;
+                }
                 Ok(UiCommandOutcome {
                     mutation: UiMutation::ProfileSaved { executable },
                     effects: vec![UiEffect::ReloadRuntime],
@@ -734,7 +745,16 @@ fn lexicon_draft(draft: UiLexiconDraft) -> Result<(Option<i64>, NewLexiconEntry)
     ))
 }
 
-fn profile_draft(draft: UiProfileDraft) -> Result<AppProfile, UiBridgeError> {
+fn profile_draft(
+    draft: UiProfileDraft,
+) -> Result<(Option<ExecutableIdentity>, AppProfile), UiBridgeError> {
+    let original = draft
+        .original_executable
+        .map(|value| {
+            ExecutableIdentity::new(value.trim())
+                .map_err(|_| UiBridgeError::validation("executable", "Use a basename only."))
+        })
+        .transpose()?;
     let executable = ExecutableIdentity::new(draft.executable.trim())
         .map_err(|_| UiBridgeError::validation("executable", "Use a basename only."))?;
     let language = normalize_optional_language(draft.language)?;
@@ -747,14 +767,17 @@ fn profile_draft(draft: UiProfileDraft) -> Result<AppProfile, UiBridgeError> {
             "Custom formatting requires instructions.",
         ));
     }
-    Ok(AppProfile {
-        executable,
-        formatting_style: draft.formatting_style,
-        custom_instructions,
-        language,
-        insertion_preference: draft.insertion_preference,
-        deny: draft.deny,
-    })
+    Ok((
+        original,
+        AppProfile {
+            executable,
+            formatting_style: draft.formatting_style,
+            custom_instructions,
+            language,
+            insertion_preference: draft.insertion_preference,
+            deny: draft.deny,
+        },
+    ))
 }
 
 fn normalize_executable_scope(value: Option<String>) -> Result<Option<String>, UiBridgeError> {
@@ -1129,6 +1152,7 @@ mod tests {
         let mut test = TestBridge::new();
         let readiness = test.readiness();
         let draft = UiProfileDraft {
+            original_executable: None,
             executable: "code.exe".to_owned(),
             formatting_style: FormattingStyle::Light,
             custom_instructions: None,
@@ -1161,6 +1185,139 @@ mod tests {
     }
 
     #[test]
+    fn profile_save_atomically_handles_case_only_renames() {
+        let mut test = TestBridge::new();
+        let readiness = test.readiness();
+        test.bridge
+            .execute(
+                UiCommand::SaveProfile(UiProfileDraft {
+                    original_executable: None,
+                    executable: "Code.exe".to_owned(),
+                    formatting_style: FormattingStyle::Light,
+                    custom_instructions: None,
+                    language: None,
+                    insertion_preference: InsertionPreference::Automatic,
+                    deny: false,
+                }),
+                &readiness,
+                0,
+            )
+            .unwrap();
+
+        test.bridge
+            .execute(
+                UiCommand::SaveProfile(UiProfileDraft {
+                    original_executable: Some("Code.exe".to_owned()),
+                    executable: "code.EXE".to_owned(),
+                    formatting_style: FormattingStyle::Strong,
+                    custom_instructions: None,
+                    language: Some("PT-BR".to_owned()),
+                    insertion_preference: InsertionPreference::Clipboard,
+                    deny: false,
+                }),
+                &readiness,
+                0,
+            )
+            .unwrap();
+
+        let profiles = test.bridge.persistence.app_profiles().list().unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].executable.as_str(), "code.EXE");
+        assert_eq!(profiles[0].formatting_style, FormattingStyle::Strong);
+        assert_eq!(profiles[0].language.as_deref(), Some("pt-br"));
+    }
+
+    #[test]
+    fn profile_save_rolls_back_when_renamed_identity_is_occupied() {
+        let mut test = TestBridge::new();
+        let readiness = test.readiness();
+        for executable in ["code.exe", "notes.exe"] {
+            test.bridge
+                .execute(
+                    UiCommand::SaveProfile(UiProfileDraft {
+                        original_executable: None,
+                        executable: executable.to_owned(),
+                        formatting_style: FormattingStyle::Light,
+                        custom_instructions: None,
+                        language: None,
+                        insertion_preference: InsertionPreference::Automatic,
+                        deny: false,
+                    }),
+                    &readiness,
+                    0,
+                )
+                .unwrap();
+        }
+
+        let error = test
+            .bridge
+            .execute(
+                UiCommand::SaveProfile(UiProfileDraft {
+                    original_executable: Some("code.exe".to_owned()),
+                    executable: "NOTES.EXE".to_owned(),
+                    formatting_style: FormattingStyle::Strong,
+                    custom_instructions: None,
+                    language: None,
+                    insertion_preference: InsertionPreference::Clipboard,
+                    deny: false,
+                }),
+                &readiness,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "local_data");
+
+        let profiles = test.bridge.persistence.app_profiles().list().unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].executable.as_str(), "code.exe");
+        assert_eq!(profiles[0].formatting_style, FormattingStyle::Light);
+        assert_eq!(profiles[1].executable.as_str(), "notes.exe");
+    }
+
+    #[test]
+    fn profile_save_rejects_invalid_original_before_mutating_data() {
+        let mut test = TestBridge::new();
+        let readiness = test.readiness();
+        test.bridge
+            .execute(
+                UiCommand::SaveProfile(UiProfileDraft {
+                    original_executable: None,
+                    executable: "code.exe".to_owned(),
+                    formatting_style: FormattingStyle::Light,
+                    custom_instructions: None,
+                    language: None,
+                    insertion_preference: InsertionPreference::Automatic,
+                    deny: false,
+                }),
+                &readiness,
+                0,
+            )
+            .unwrap();
+
+        let error = test
+            .bridge
+            .execute(
+                UiCommand::SaveProfile(UiProfileDraft {
+                    original_executable: Some(r"C:\private\code.exe".to_owned()),
+                    executable: "renamed.exe".to_owned(),
+                    formatting_style: FormattingStyle::Strong,
+                    custom_instructions: None,
+                    language: None,
+                    insertion_preference: InsertionPreference::Automatic,
+                    deny: false,
+                }),
+                &readiness,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(error.field, Some("executable"));
+
+        let profiles = test.bridge.persistence.app_profiles().list().unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].executable.as_str(), "code.exe");
+    }
+
+    #[test]
     fn custom_profiles_require_instructions() {
         let mut test = TestBridge::new();
         let readiness = test.readiness();
@@ -1168,6 +1325,7 @@ mod tests {
             .bridge
             .execute(
                 UiCommand::SaveProfile(UiProfileDraft {
+                    original_executable: None,
                     executable: "notes.exe".to_owned(),
                     formatting_style: FormattingStyle::Custom,
                     custom_instructions: Some("  ".to_owned()),

@@ -336,6 +336,73 @@ fn app_profiles_upsert_lookup_case_insensitively_and_delete() {
 }
 
 #[test]
+fn app_profiles_replace_supports_case_only_renames() {
+    let (_directory, database) = open_temp();
+    let repository = database.app_profiles();
+    let original = profile("Code.exe");
+    repository.upsert(&original).unwrap();
+
+    let mut replacement = profile("code.EXE");
+    replacement.formatting_style = FormattingStyle::Strong;
+    assert!(
+        repository
+            .replace(&original.executable, &replacement)
+            .unwrap()
+    );
+
+    assert_eq!(repository.list().unwrap(), vec![replacement]);
+}
+
+#[test]
+fn app_profiles_replace_rolls_back_when_new_identity_conflicts() {
+    let (_directory, database) = open_temp();
+    let repository = database.app_profiles();
+    let original = profile("code.exe");
+    let occupied = profile("notes.exe");
+    repository.upsert(&original).unwrap();
+    repository.upsert(&occupied).unwrap();
+
+    let conflicting = profile("NOTES.EXE");
+    assert!(matches!(
+        repository.replace(&original.executable, &conflicting),
+        Err(PersistenceError::Database(_))
+    ));
+
+    assert_eq!(
+        repository.get(&original.executable).unwrap(),
+        Some(original)
+    );
+    assert_eq!(
+        repository.get(&occupied.executable).unwrap(),
+        Some(occupied)
+    );
+}
+
+#[test]
+fn app_profiles_replace_preserves_original_when_replacement_is_invalid() {
+    let (_directory, database) = open_temp();
+    let repository = database.app_profiles();
+    let original = profile("code.exe");
+    repository.upsert(&original).unwrap();
+
+    let mut invalid = profile("renamed.exe");
+    invalid.formatting_style = FormattingStyle::Custom;
+    invalid.custom_instructions = None;
+    assert!(matches!(
+        repository.replace(&original.executable, &invalid),
+        Err(PersistenceError::Validation {
+            field: "custom_instructions",
+            ..
+        })
+    ));
+
+    assert_eq!(
+        repository.get(&original.executable).unwrap(),
+        Some(original)
+    );
+}
+
+#[test]
 fn custom_profile_requires_instructions() {
     let (_directory, database) = open_temp();
     let repository = database.app_profiles();
