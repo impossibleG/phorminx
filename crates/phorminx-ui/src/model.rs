@@ -318,8 +318,17 @@ pub enum OllamaLifecycle {
     MemorySaver,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AppearancePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsSnapshot {
+    pub appearance: AppearancePreference,
     pub microphone: String,
     pub microphones: Vec<String>,
     pub recording_mode: RecordingMode,
@@ -336,6 +345,7 @@ pub struct SettingsSnapshot {
 impl Default for SettingsSnapshot {
     fn default() -> Self {
         Self {
+            appearance: AppearancePreference::System,
             microphone: "Windows default".into(),
             microphones: vec!["Windows default".into()],
             recording_mode: RecordingMode::Hold,

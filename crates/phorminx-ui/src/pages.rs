@@ -7,9 +7,9 @@ use crate::components::{
     section_title, segmented,
 };
 use crate::model::{
-    FormattingStrength, HistoryVariant, LexiconCasePolicy, LexiconDraft, OllamaLifecycle,
-    ProfileDraft, ProfileInsertion, RecordingMode, Route, SettingsSnapshot, ShellEvent,
-    ShellSnapshot,
+    AppearancePreference, FormattingStrength, HistoryVariant, LexiconCasePolicy, LexiconDraft,
+    OllamaLifecycle, ProfileDraft, ProfileInsertion, RecordingMode, Route, SettingsSnapshot,
+    ShellEvent, ShellSnapshot,
 };
 use crate::theme::{Space, UiThemeExt};
 
@@ -839,7 +839,31 @@ fn settings(
     }
     ScrollArea::vertical().id_salt("settings").show(ui, |ui| {
         let original = state.settings.clone();
-        setting_section(ui, "01", "Input", |ui| {
+        setting_section(ui, "01", "Appearance", |ui| {
+            setting_row(
+                ui,
+                "Theme",
+                "Follow Windows or hold a deliberate light or dark palette.",
+                |ui| {
+                    ComboBox::from_id_salt("appearance")
+                        .selected_text(appearance_label(state.settings.appearance))
+                        .show_ui(ui, |ui| {
+                            for value in [
+                                AppearancePreference::System,
+                                AppearancePreference::Light,
+                                AppearancePreference::Dark,
+                            ] {
+                                ui.selectable_value(
+                                    &mut state.settings.appearance,
+                                    value,
+                                    appearance_label(value),
+                                );
+                            }
+                        });
+                },
+            );
+        });
+        setting_section(ui, "02", "Input", |ui| {
             setting_row(ui, "Microphone", "The source Phorminx listens to.", |ui| {
                 ComboBox::from_id_salt("microphone")
                     .selected_text(&state.settings.microphone)
@@ -871,7 +895,7 @@ fn settings(
                 },
             );
         });
-        setting_section(ui, "02", "Recognition", |ui| {
+        setting_section(ui, "03", "Recognition", |ui| {
             setting_row(ui, "Language", "Prefer a recognition language.", |ui| {
                 ComboBox::from_id_salt("language")
                     .selected_text(&state.settings.language)
@@ -896,7 +920,7 @@ fn settings(
                 },
             );
         });
-        setting_section(ui, "03", "Formatting", |ui| {
+        setting_section(ui, "04", "Formatting", |ui| {
             setting_row(ui, "Strength", "How much phrasing may change.", |ui| {
                 ComboBox::from_id_salt("formatting")
                     .selected_text(formatting_label(state.settings.formatting))
@@ -966,7 +990,7 @@ fn settings(
                 },
             );
         });
-        setting_section(ui, "04", "Privacy", |ui| {
+        setting_section(ui, "05", "Privacy", |ui| {
             setting_row(ui, "History", "Retain completed local dictations.", |ui| {
                 ComboBox::from_id_salt("history-retention")
                     .selected_text(&state.settings.history_retention)
@@ -981,7 +1005,7 @@ fn settings(
                     });
             });
         });
-        setting_section(ui, "05", "Startup", |ui| {
+        setting_section(ui, "06", "Startup", |ui| {
             setting_row(
                 ui,
                 "Launch at login",
@@ -991,7 +1015,7 @@ fn settings(
                 },
             );
         });
-        setting_section(ui, "06", "Advanced", |ui| {
+        setting_section(ui, "07", "Advanced", |ui| {
             setting_row(
                 ui,
                 "Whisper model path",
@@ -1066,6 +1090,14 @@ const fn formatting_label(value: FormattingStrength) -> &'static str {
         FormattingStrength::Balanced => "Balanced",
         FormattingStrength::Strong => "Strong",
         FormattingStrength::Custom => "Custom",
+    }
+}
+
+const fn appearance_label(value: AppearancePreference) -> &'static str {
+    match value {
+        AppearancePreference::System => "System",
+        AppearancePreference::Light => "Light",
+        AppearancePreference::Dark => "Dark",
     }
 }
 

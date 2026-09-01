@@ -10,15 +10,17 @@ use phorminx_ollama::OllamaClient;
 use phorminx_persistence::{CasePolicy, FormattingStyle, InsertionPreference};
 use phorminx_ui::theme::ThemeMode;
 use phorminx_ui::{
-    ApplicationProfile, FormattingStrength as ShellFormatting, HistoryItem, InlineNotice,
-    LexiconCasePolicy, LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle as ShellLifecycle,
-    PhorminxUi, ProfileInsertion, Readiness, RecordingMode as ShellRecording, Route, RuntimeStatus,
+    AppearancePreference as ShellAppearance, ApplicationProfile,
+    FormattingStrength as ShellFormatting, HistoryItem, InlineNotice, LexiconCasePolicy,
+    LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle as ShellLifecycle, PhorminxUi,
+    ProfileInsertion, Readiness, RecordingMode as ShellRecording, Route, RuntimeStatus,
     SettingsSnapshot, ShellEvent, ShellSnapshot, SystemReadiness,
 };
-use phorminx_windows::system_appearance;
+use phorminx_windows::{SystemAppearance, system_appearance};
 
 use crate::settings::{
-    FormattingStrength, HistoryRetention, OllamaLifecycle, RecordingMode, Settings, SettingsStore,
+    AppearancePreference as StoredAppearance, FormattingStrength, HistoryRetention,
+    OllamaLifecycle, RecordingMode, Settings, SettingsStore,
 };
 use crate::ui_bridge::{
     DEFAULT_HISTORY_LIMIT, UiBridge, UiCommand, UiEffect, UiLexiconDraft, UiMutation,
@@ -425,17 +427,29 @@ impl ProductShellApp {
     }
 }
 
+fn resolve_theme(
+    preference: StoredAppearance,
+    system_theme: Option<egui::Theme>,
+    appearance: SystemAppearance,
+) -> ThemeMode {
+    let prefers_dark = if appearance.high_contrast {
+        appearance.contrast_theme_is_dark
+    } else {
+        match preference {
+            StoredAppearance::System => !matches!(system_theme, Some(egui::Theme::Light)),
+            StoredAppearance::Light => false,
+            StoredAppearance::Dark => true,
+        }
+    };
+    ThemeMode::from_system(prefers_dark, appearance.high_contrast)
+}
+
 impl eframe::App for ProductShellApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let appearance = system_appearance();
-        let prefers_dark = if appearance.high_contrast {
-            appearance.contrast_theme_is_dark
-        } else {
-            !matches!(ctx.system_theme(), Some(egui::Theme::Light))
-        };
-        self.shell.set_theme(ThemeMode::from_system(
-            prefers_dark,
-            appearance.high_contrast,
+        self.shell.set_theme(resolve_theme(
+            self.bridge.settings().appearance.theme,
+            ctx.system_theme(),
+            system_appearance(),
         ));
         while let Ok(control) = self.controls.try_recv() {
             match control {
@@ -625,6 +639,11 @@ fn map_settings(
     let mut microphones = vec!["Windows default".to_owned()];
     microphones.extend(readiness.devices.iter().map(|device| device.name.clone()));
     SettingsSnapshot {
+        appearance: match settings.appearance.theme {
+            StoredAppearance::System => ShellAppearance::System,
+            StoredAppearance::Light => ShellAppearance::Light,
+            StoredAppearance::Dark => ShellAppearance::Dark,
+        },
         microphone: settings
             .recognition
             .microphone
@@ -660,6 +679,11 @@ fn map_settings(
 
 fn apply_settings_snapshot(current: &Settings, form: &SettingsSnapshot) -> Settings {
     let mut settings = current.clone();
+    settings.appearance.theme = match form.appearance {
+        ShellAppearance::System => StoredAppearance::System,
+        ShellAppearance::Light => StoredAppearance::Light,
+        ShellAppearance::Dark => StoredAppearance::Dark,
+    };
     settings.recognition.microphone =
         (form.microphone != "Windows default").then(|| form.microphone.clone());
     settings.recognition.language = match form.language.as_str() {
@@ -892,6 +916,50 @@ mod tests {
             Some("local:test")
         );
         assert_eq!(mapped.recognition.language, "pt-br");
+    }
+
+    #[test]
+    fn explicit_appearance_overrides_system_but_not_high_contrast() {
+        let normal = SystemAppearance {
+            high_contrast: false,
+            contrast_theme_is_dark: false,
+        };
+        assert_eq!(
+            resolve_theme(StoredAppearance::Dark, Some(egui::Theme::Light), normal),
+            ThemeMode::AuthoredDark
+        );
+        assert_eq!(
+            resolve_theme(StoredAppearance::Light, Some(egui::Theme::Dark), normal),
+            ThemeMode::AuthoredLight
+        );
+        let contrast = SystemAppearance {
+            high_contrast: true,
+            contrast_theme_is_dark: true,
+        };
+        assert_eq!(
+            resolve_theme(StoredAppearance::Light, Some(egui::Theme::Light), contrast),
+            ThemeMode::HighContrast
+        );
+    }
+
+    #[test]
+    fn appearance_round_trips_through_the_shell_form() {
+        let mut settings = Settings::default();
+        settings.appearance.theme = StoredAppearance::Dark;
+        let form = map_settings(
+            &settings,
+            &crate::ui_bridge::UiMicrophoneReadiness {
+                state: crate::ui_bridge::UiReadinessState::Ready,
+                devices: Vec::new(),
+                selected: None,
+                message: String::new(),
+            },
+        );
+        assert_eq!(form.appearance, ShellAppearance::Dark);
+        assert_eq!(
+            apply_settings_snapshot(&settings, &form).appearance.theme,
+            StoredAppearance::Dark
+        );
     }
 
     #[test]

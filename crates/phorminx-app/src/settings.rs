@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use phorminx_windows::atomic_replace_file;
 use serde::{Deserialize, Serialize};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 pub const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 pub const MAX_CUSTOM_INSTRUCTIONS_CHARS: usize = 4_096;
 
@@ -29,6 +29,8 @@ pub struct Settings {
     pub privacy: PrivacySettings,
     #[serde(default)]
     pub startup: StartupSettings,
+    #[serde(default)]
+    pub appearance: AppearanceSettings,
 }
 
 impl Default for Settings {
@@ -40,6 +42,7 @@ impl Default for Settings {
             interaction: InteractionSettings::default(),
             privacy: PrivacySettings::default(),
             startup: StartupSettings::default(),
+            appearance: AppearanceSettings::default(),
         }
     }
 }
@@ -48,7 +51,7 @@ impl Settings {
     pub fn validate_and_normalize(&mut self) -> Result<(), SettingsError> {
         match self.schema_version {
             CURRENT_SCHEMA_VERSION => {}
-            1 => self.schema_version = CURRENT_SCHEMA_VERSION,
+            1 | 2 => self.schema_version = CURRENT_SCHEMA_VERSION,
             0 => return Err(SettingsError::MissingOrInvalidVersion),
             version if version > CURRENT_SCHEMA_VERSION => {
                 return Err(SettingsError::FutureVersion {
@@ -228,6 +231,21 @@ pub enum HistoryRetention {
 pub struct StartupSettings {
     pub launch_at_login: bool,
     pub onboarding_complete: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AppearanceSettings {
+    pub theme: AppearancePreference,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppearancePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -560,6 +578,7 @@ mod tests {
             settings.privacy.history_retention,
             HistoryRetention::SevenDays
         );
+        assert_eq!(settings.appearance.theme, AppearancePreference::System);
     }
 
     #[test]
@@ -627,6 +646,34 @@ language = "pt-BR"
             HistoryRetention::SevenDays
         );
         assert!(!loaded.startup.launch_at_login);
+        assert_eq!(loaded.appearance.theme, AppearancePreference::System);
+    }
+
+    #[test]
+    fn version_two_files_migrate_with_system_appearance() {
+        let directory = TestDirectory::new("migrate-v2");
+        let path = directory.0.join("settings.toml");
+        fs::write(&path, "schema_version = 2\n").unwrap();
+
+        let loaded = SettingsStore::new(path).unwrap().load().unwrap();
+
+        assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(loaded.appearance.theme, AppearancePreference::System);
+    }
+
+    #[test]
+    fn every_appearance_preference_round_trips() {
+        for preference in [
+            AppearancePreference::System,
+            AppearancePreference::Light,
+            AppearancePreference::Dark,
+        ] {
+            let mut settings = Settings::default();
+            settings.appearance.theme = preference;
+            let encoded = toml::to_string_pretty(&settings).unwrap();
+            let decoded: Settings = toml::from_str(&encoded).unwrap();
+            assert_eq!(decoded.appearance.theme, preference);
+        }
     }
 
     #[test]
