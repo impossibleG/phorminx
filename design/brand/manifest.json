@@ -1,5 +1,5 @@
 {
-  "asset_family": "Tensioned P / Laconic cut",
+  "asset_family": "Rounded P / selected reference",
   "schema": 1,
   "sizes": [
     16,
@@ -27,253 +27,253 @@
   "files": [
     {
       "path": "design/brand/phorminx.ico",
-      "sha256": "1fc99b2fadd3cc86512c454e8e0fc5d0cc6602015762064de9b18337a6e9d376",
-      "bytes": 17294
+      "sha256": "f6813a3774ac4d04f10f655c8532265784a96fc5dab45fe826aff30b137b92cb",
+      "bytes": 18806
     },
     {
       "path": "design/brand/png/app/phorminx-app-128.png",
-      "sha256": "fb603d3450312c555b5fc096fd60abcc3bd5d140c40d155813705b68b11be09f",
-      "bytes": 3302
+      "sha256": "5651a223d09f69734683a610e9fe571e22b22c02e64aaaf9c27b16e59414c04c",
+      "bytes": 3764
     },
     {
       "path": "design/brand/png/app/phorminx-app-16.png",
-      "sha256": "924e58663050ff037cb2fcfeca2e5d2112bbd1fe0b9c3deb2a0327ca640fc511",
-      "bytes": 575
+      "sha256": "d7109297124a4b3bad37f0dd01b24da04b0ec477092fa4cc884a7b9958de156f",
+      "bytes": 566
     },
     {
       "path": "design/brand/png/app/phorminx-app-20.png",
-      "sha256": "c8c8fa8cb0e4d73bcd1fb697ee500bbc6ee378c046f3cca10bf24461b7836ab1",
-      "bytes": 705
+      "sha256": "b6acdd0efbe89b3e8a2e8d97a481a91b9f022949971b71f2557834474a368087",
+      "bytes": 726
     },
     {
       "path": "design/brand/png/app/phorminx-app-24.png",
-      "sha256": "dc12508f796c132984bb117ce7d4a18c02ea80c8a96b948c0bff04f90db89213",
-      "bytes": 780
+      "sha256": "9643840b224f599786b4a629b78b33715b5fd3d2653aab50ca1984099b98b8e5",
+      "bytes": 829
     },
     {
       "path": "design/brand/png/app/phorminx-app-256.png",
-      "sha256": "78cefd27c4676f29b7a4026a804f96b8bc863d841bc2987b58f40f61ad58d8a9",
-      "bytes": 6312
+      "sha256": "73e14b383589529dbf4f1e3f5ba8975c9b6f13504cb5d7f82ab1309bea8878a3",
+      "bytes": 7088
     },
     {
       "path": "design/brand/png/app/phorminx-app-32.png",
-      "sha256": "8476d07bb77b7500c25be236b2295c060c5e878f5930545ef5d1ddffd35426ff",
-      "bytes": 1002
+      "sha256": "27efeec29eb4fad2c8acd6747f2ebcae7bf4071719aa4e19249ef70a303bd9ba",
+      "bytes": 1062
     },
     {
       "path": "design/brand/png/app/phorminx-app-40.png",
-      "sha256": "62c55267d3570467c531e8ec984de60661c7c990f5aa4196050a016005eeeb54",
-      "bytes": 1262
+      "sha256": "c25a8976741b9f6d0c8495b287bada42b0db9ae8fba257dc3a0ec144656acdd6",
+      "bytes": 1270
     },
     {
       "path": "design/brand/png/app/phorminx-app-48.png",
-      "sha256": "d3642ffe2ce15e6aee54ffa3e99815308904e09808d1671de8ed6693e59a53aa",
-      "bytes": 1407
+      "sha256": "7f9698448458f345ba3203b63875890cd0b99cb5647a323d28cca3ae7e27d158",
+      "bytes": 1451
     },
     {
       "path": "design/brand/png/app/phorminx-app-512.png",
-      "sha256": "b895b4eeadc0713aab5b41cf38d0a2d4464fa72033a5e6ba6a0be9d804807ab7",
-      "bytes": 12367
+      "sha256": "dc690bdf4a6d4a309ec9137bfa548ca60eb00fe5bb6b9fe89d459e196ea1c2f8",
+      "bytes": 14039
     },
     {
       "path": "design/brand/png/app/phorminx-app-64.png",
-      "sha256": "5cfb939fd058b959b25981d80beb5a4965ffdc4a6044dc5f2c6f2fc38ce32d16",
-      "bytes": 1799
+      "sha256": "cca4544ddad8206c5f712092bffdb0528d4ee4f03ac67809375e6008dce556bf",
+      "bytes": 1900
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-black-128.png",
-      "sha256": "bc08e72959c39559bb0bb4ed41ada5a647c431a0ed30dfe8ae7744d5f2fbf4f3",
-      "bytes": 2231
+      "sha256": "9e9be9c35102fea1a3e6aafa366636c2f0b69a8500088a827b08eebe0249dc0f",
+      "bytes": 1576
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-black-16.png",
-      "sha256": "33cf73d36b100d65563834749a303081c07e547ca7f9a70dc75dab40515bc88e",
-      "bytes": 349
+      "sha256": "eda37d77c3ffb2d510f1aa1109486deac9b2645aa80be063c4853cf70c7d4483",
+      "bytes": 310
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-black-20.png",
-      "sha256": "0fd2bb046bb97448c078c621a2487cc01a361c497be0d8470c963066b3a227b2",
-      "bytes": 395
+      "sha256": "b88c3046797e3c76721aabd2cc1e7902604a2cc4bb779a5de45ae76e3198fbf1",
+      "bytes": 361
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-black-24.png",
-      "sha256": "9c914795f0b0626379c53a02851f6997019f0826bf494ba2ba7d278a0df4f460",
-      "bytes": 473
+      "sha256": "ff9731a3b730ed026f2ff76dfb61fe9fafe4a612c9ca086292dadded9f6acb2b",
+      "bytes": 412
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-black-256.png",
-      "sha256": "69e21ccff56a3268917936a1f660376169c3e08087fdd9910a0f8bc0c48f0cff",
-      "bytes": 4330
+      "sha256": "096f16df739508a2a7c9c1247981dc012a60a23b6f931b35d74b4ac6a95ae8ac",
+      "bytes": 3003
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-black-32.png",
-      "sha256": "ddd1da930e505179c3ffeb14f3364f377a488980ef55639e2d3180bb4e0992ef",
-      "bytes": 600
+      "sha256": "14e59417b8c277607f144b3d679208f2e22706975c20e57ffe3180e08789755e",
+      "bytes": 488
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-black-40.png",
-      "sha256": "8e8a701d75f87cc5bb772541b201d49e9c21740589e0ca0203558a5de2995d61",
-      "bytes": 752
+      "sha256": "e74bf67aa26cb5d836fc8172b89714851b0c0598aa6c512f4aa11fa008f693c6",
+      "bytes": 595
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-black-48.png",
-      "sha256": "4fc5694bab3c8d93719a379ae7e6c630198d2a02c3a37a0f796c21fbe3223cc7",
-      "bytes": 860
+      "sha256": "2eb7ecbf00b4cc351d69c847704324aad2479051c1616eccf554bf81b3d6aa89",
+      "bytes": 699
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-black-512.png",
-      "sha256": "c130bdfe00fb6888307a0b63cdc4ce736a1087ad01b37518ada7964c4d68d411",
-      "bytes": 8830
+      "sha256": "4f3b95af0339cebe48b08bb2b5ac8980b1d5b54bc4f8ed1a775262aba981a344",
+      "bytes": 6006
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-black-64.png",
-      "sha256": "e10894d2fa71ffdf70204a20362844c3fca8d889f34b93c577fbf349a1965f07",
-      "bytes": 1156
+      "sha256": "6806b1ab58667eb1b3b027db2137131eb8f2dae80bcbcd5a2ce6d1a60a60a88e",
+      "bytes": 772
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-white-128.png",
-      "sha256": "21edcdd3611d4a87916a765f6fadc99528027ba6182f5bbcb46902bca7e551d3",
-      "bytes": 2325
+      "sha256": "0ea34177547083f6b4ee4cb11f4cc4e125fe1abc7e6d2e5c3bdd69d75012ba86",
+      "bytes": 1637
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-white-16.png",
-      "sha256": "b1632533c4f6ef5e156b474a2089caae483482587eea7bf0d83941fd4c2f964f",
-      "bytes": 362
+      "sha256": "5b8c4addefc8a6d6eda7664f7d3fa7f85fb7e0a243b1bed6e39662fe1fa73975",
+      "bytes": 329
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-white-20.png",
-      "sha256": "038e6b448af79ee966f78d8996b2b925eea96997697d3396155945a8a51315e5",
-      "bytes": 436
+      "sha256": "d6e1af043cb305edade044ea529afd003beb9438a7a972e0f654d482831a1586",
+      "bytes": 396
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-white-24.png",
-      "sha256": "37dc72e3fea2605b2c259a03476a0836b68541240cd9f741add0a8a55a08542b",
-      "bytes": 508
+      "sha256": "e6a712b59d0d4ae554a4b3dc4de99acc2d4a3108a1bf380b487aab94fca92e44",
+      "bytes": 439
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-white-256.png",
-      "sha256": "6e3b2b339133b03acde067d5a4260f40d34c9cd747e17bbc459576a479437083",
-      "bytes": 4474
+      "sha256": "26de35687fdd592680a3f699a1d1aa6f250912aceaaf5161e7af97aa76c40942",
+      "bytes": 3122
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-white-32.png",
-      "sha256": "09e523d75a67eebb47bbe0018b6ba04e7e966df1c22872c87c2db263b20eee4a",
-      "bytes": 663
+      "sha256": "53d8f568cd92a2200d1d622308b6bcccf4974881b6525e04ed1997021898b07c",
+      "bytes": 546
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-white-40.png",
-      "sha256": "12f57fb33a2cea52c79cc40b3cf5a2447a059511ad8b82eb2dc936c2dad046f6",
-      "bytes": 832
+      "sha256": "33982f5dfab7f32d8bdc945684138475ff6f482320f326b950dea1f06df2581c",
+      "bytes": 650
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-white-48.png",
-      "sha256": "2b39e7c18db97e074f5e5fca16088c38ba220a5175bf9dce129a96e62165560e",
-      "bytes": 939
+      "sha256": "0ec5cba33b336723ffa8c9e73e6b361098c2913b9b46fe96bf19dc21db3ac840",
+      "bytes": 736
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-white-512.png",
-      "sha256": "4992ec7b86c41017f1fe3ec2111b8cfd3a95097d0d77b8951c4ba997bb8de997",
-      "bytes": 8950
+      "sha256": "5711ab69168e43d570a7991e07e03c430ac10c7f0553717b8175d3be10beed87",
+      "bytes": 6287
     },
     {
       "path": "design/brand/png/mark/phorminx-mark-white-64.png",
-      "sha256": "634dc2defeb3d31bdfcf95e1ba5cf35d25b04acd37746ee705da96626561d913",
-      "bytes": 1230
+      "sha256": "2d73153fe244c6af6f1711c2103a6d213379ca15b6924ec04c7a0b6b39617b57",
+      "bytes": 870
     },
     {
       "path": "design/brand/png/tray/phorminx-tray-for-dark-bg-16.png",
-      "sha256": "b1632533c4f6ef5e156b474a2089caae483482587eea7bf0d83941fd4c2f964f",
-      "bytes": 362
+      "sha256": "5b8c4addefc8a6d6eda7664f7d3fa7f85fb7e0a243b1bed6e39662fe1fa73975",
+      "bytes": 329
     },
     {
       "path": "design/brand/png/tray/phorminx-tray-for-dark-bg-20.png",
-      "sha256": "038e6b448af79ee966f78d8996b2b925eea96997697d3396155945a8a51315e5",
-      "bytes": 436
+      "sha256": "d6e1af043cb305edade044ea529afd003beb9438a7a972e0f654d482831a1586",
+      "bytes": 396
     },
     {
       "path": "design/brand/png/tray/phorminx-tray-for-dark-bg-24.png",
-      "sha256": "37dc72e3fea2605b2c259a03476a0836b68541240cd9f741add0a8a55a08542b",
-      "bytes": 508
+      "sha256": "e6a712b59d0d4ae554a4b3dc4de99acc2d4a3108a1bf380b487aab94fca92e44",
+      "bytes": 439
     },
     {
       "path": "design/brand/png/tray/phorminx-tray-for-light-bg-16.png",
-      "sha256": "33cf73d36b100d65563834749a303081c07e547ca7f9a70dc75dab40515bc88e",
-      "bytes": 349
+      "sha256": "eda37d77c3ffb2d510f1aa1109486deac9b2645aa80be063c4853cf70c7d4483",
+      "bytes": 310
     },
     {
       "path": "design/brand/png/tray/phorminx-tray-for-light-bg-20.png",
-      "sha256": "0fd2bb046bb97448c078c621a2487cc01a361c497be0d8470c963066b3a227b2",
-      "bytes": 395
+      "sha256": "b88c3046797e3c76721aabd2cc1e7902604a2cc4bb779a5de45ae76e3198fbf1",
+      "bytes": 361
     },
     {
       "path": "design/brand/png/tray/phorminx-tray-for-light-bg-24.png",
-      "sha256": "9c914795f0b0626379c53a02851f6997019f0826bf494ba2ba7d278a0df4f460",
-      "bytes": 473
+      "sha256": "ff9731a3b730ed026f2ff76dfb61fe9fafe4a612c9ca086292dadded9f6acb2b",
+      "bytes": 412
     },
     {
       "path": "design/brand/source/phorminx-mark-128.svg",
-      "sha256": "18c2b410b3889aa93a5e7525ce3c2b98898dff61d44b3234acb9ca788c6f15bc",
-      "bytes": 1965
+      "sha256": "4618df04b9c9722194c2eb8738b61ff4c339921dbb5157c3a0feef17275b27b1",
+      "bytes": 2045
     },
     {
       "path": "design/brand/source/phorminx-mark-16.svg",
-      "sha256": "0189570e8d85859681a1dbf125d251c0c036142e4acf97862cb7218f8a53e6b4",
-      "bytes": 900
+      "sha256": "38e8dd8884c886365296e201d1e627648f721f993b5d82eac0fa1e4c72ab515a",
+      "bytes": 1941
     },
     {
       "path": "design/brand/source/phorminx-mark-20.svg",
-      "sha256": "a013797d8cf5b93cc28501721a476682674f30aee7d4b5029b8137c7f6734cfe",
-      "bytes": 1063
+      "sha256": "f840104b8b17bd140eaf5623e80399ff2dea964413f20bfae40b80aff526eb06",
+      "bytes": 1950
     },
     {
       "path": "design/brand/source/phorminx-mark-24.svg",
-      "sha256": "a52cc49fdc2fed8c70b6719a9459fae80fc8b4403659c12ea7214a2cd2c3acf0",
-      "bytes": 1048
+      "sha256": "dd5df1f90686ca61926d3b3db6c65c6039c36c54ec23ae5ee39fb17c36df940b",
+      "bytes": 1995
     },
     {
       "path": "design/brand/source/phorminx-mark-256.svg",
-      "sha256": "6f1c694fb4896e036754c48b7245995bcc5211f8c9ce66a5c3ea468ba725b937",
-      "bytes": 2090
+      "sha256": "7b1c90267f01fc1b6cca658027a42d788a9e746712102208d8e4bed3da66f7a0",
+      "bytes": 2151
     },
     {
       "path": "design/brand/source/phorminx-mark-32.svg",
-      "sha256": "eb309a690aa01aa62df9e77f292d73b2ac4abc1ed4d2375f75ac0d0d836be189",
-      "bytes": 1216
+      "sha256": "9c8a47383436c232365d4ef1b814491a40bb0fbb0ecdf9ac76471edf03458cff",
+      "bytes": 2013
     },
     {
       "path": "design/brand/source/phorminx-mark-40.svg",
-      "sha256": "69f95471038d0458f2f4e5cfc4c2f742ca1daf6e306d20010f9940a5b5a5e1a6",
-      "bytes": 1925
+      "sha256": "78055338ae2df437aa0a6063d0ee6924c13ea3b0afa02db3d3f583c8b631501d",
+      "bytes": 2036
     },
     {
       "path": "design/brand/source/phorminx-mark-48.svg",
-      "sha256": "440879e18963b2804d56f5cb6a1a42cab060f768a6ce23207d6a693892def6b3",
-      "bytes": 1867
+      "sha256": "a523a4b5ee40e5d995b635f48b6d4b3a59e3b4174634ebbd1c8eb2c026d6c08e",
+      "bytes": 2045
     },
     {
       "path": "design/brand/source/phorminx-mark-512.svg",
-      "sha256": "b3ed1dbde234c9a66b3e1d83c2196a14dbe72dd9164e3c20c2ad65b66a1e572b",
-      "bytes": 2132
+      "sha256": "5d19cf9cd8e1f8033c3bd77312dcda8c5409458e511037d57c75d539326e5071",
+      "bytes": 2173
     },
     {
       "path": "design/brand/source/phorminx-mark-64.svg",
-      "sha256": "2d173ca1d016fd66a8e207e112a9e4b93e5bc891624b5876a18a7eacafbac89c",
-      "bytes": 1927
+      "sha256": "f2f2d77665aa98a2cefc674c37749cc4a5ffad52be2d8ee66113897c44d6c6ca",
+      "bytes": 2038
     },
     {
       "path": "design/brand/source/phorminx-mark-master.svg",
-      "sha256": "440879e18963b2804d56f5cb6a1a42cab060f768a6ce23207d6a693892def6b3",
-      "bytes": 1867
+      "sha256": "a523a4b5ee40e5d995b635f48b6d4b3a59e3b4174634ebbd1c8eb2c026d6c08e",
+      "bytes": 2045
     },
     {
       "path": "design/brand/validation/actual-size-masters.png",
-      "sha256": "e9736573ed42bb668510bed3f6d13879e2aecef6a3523f232e0662848e6d11a0",
-      "bytes": 54089
+      "sha256": "9bf970a6ede3f50966e98eb6edc6576f05284ab88a706bad6c4ebeadf15d01b9",
+      "bytes": 49299
     },
     {
       "path": "design/brand/validation/small-size-contact-sheet.png",
-      "sha256": "65c854a2628bb37ea3fab0f71e59b0e2a3cfe7b9cffaf134497c61d0b3e7ccec",
-      "bytes": 39954
+      "sha256": "9045cd9f9d545e894977e55ba1d9febbf1635b14f07726ffe001038f8523b899",
+      "bytes": 43732
     }
   ]
 }

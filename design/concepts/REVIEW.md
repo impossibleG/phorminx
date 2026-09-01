@@ -2,6 +2,11 @@
 
 Date: 2026-08-31
 
+Superseded: 2026-09-01. The user directly selected the rounded Abyss-square,
+Limestone-P, black-cut, and Bronze-bar reference documented in
+`docs/BRAND-ASSET-LINEAGE.md`. The pre-selection analysis below is retained as
+history and no longer defines the production asset family.
+
 Verdict: promote the geometry of `mark-laconic-p-v2` as the sole construction base, then redraw it. Do not ship any study unchanged. The final mark should combine the laconic P's silhouette discipline with one asymmetric, instrument-derived tension cut; it should not inherit the ornamental lyre styling of `mark-tensioned-p-v1`.
 
 All four submitted mark studies fail the literal `UI-ACCEPTANCE` small-size proof because none presents inspected 16, 24, and 32 px monochrome exports. The size findings below are predicted from the submitted geometry and must be confirmed against hand-hinted exports before asset approval.

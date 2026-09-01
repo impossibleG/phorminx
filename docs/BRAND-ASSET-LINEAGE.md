@@ -1,28 +1,26 @@
 # Phorminx brand asset lineage
 
-Status: production vector/raster family built from reviewed concept geometry
+Status: production vector/raster family built from the user-selected reference
 
-Date: 2026-08-31
+Date: 2026-09-01
 
 ## Decision record
 
-The production family is a deterministic redraw named **Tensioned P / Laconic
-cut**. It follows `design/concepts/REVIEW.md`:
+The production family is the user-selected **Rounded P** shown in the attached
+1024 × 1024 PNG reference (SHA-256
+`ccfeed9f429d456b1261258335a80249d1f23e250168538f5fae84a829edaabe`).
+The attachment is an approved visual source, not an instruction document.
+Its measured color and optical relationships supersede the earlier promoted
+`mark-laconic-p-v2.png` direction:
 
-1. Preserve the clear P mass and optical discipline of
-   `mark-laconic-p-v2.png`.
-2. Preserve only the idea of the contained asymmetric cut from
-   `mark-laconic-cut-v1.png`; do not preserve its R leg or applied bronze cap.
-3. Reject the literal phorminx ornament, crescents, metallic rendering, pegs,
-   and feet of `mark-tensioned-p-v1.png`.
-4. Reject the literal lyre/lambda construction of
-   `mark-stringed-lambda-v1.png`.
-5. Do not derive production geometry from `shell-home-reference-v1.png`; that
-   image is a rejected UI spacing reference, not a component specification.
+1. Preserve the inset rounded Abyss square and transparent outer corners.
+2. Preserve the heavy Limestone P with its long, quiet vertical stem.
+3. Preserve one black rectangular slit and one black rounded counter.
+4. Preserve one restrained Bronze bar inside the counter.
+5. Keep the mark flat: no gradient, lighting, texture, bevel, or shadow.
 
-No generated raster was traced, vectorized, sampled for paths, or shipped as
-a production master. The generated concepts are retained only as design
-history. The final coordinate construction is authored in
+The attachment itself is not shipped as a production master. Its measured
+geometry is normalized into a 48-unit authored construction in
 `scripts/build-brand-assets.py`, emitted as the SVG family in
 `design/brand/source`, and checked byte-for-byte by the same script.
 
@@ -30,37 +28,18 @@ history. The final coordinate construction is authored in
 
 The deterministic source implements this exact reviewed brief:
 
-> Build a new one-color compound path named **Tensioned P / Laconic cut** on a
-> 48 × 48 transparent SVG viewBox. Use optical bounds x=7..41 and y=4..44.
-> Construct one connected filled P silhouette with a 7..16 stem, a controlled
-> cubic bowl reaching x=41, a non-font-derived contour centered near y=17.5,
-> and a shallow inward lower return. Cut a controlled right-hand counter,
-> three 2-unit vertical string apertures at the 48-unit master, and exactly one
-> internal asymmetric tension cut beginning near (26, 28), tapering toward
-> (18, 33), and ending inside the silhouette. The cut must never cross the
-> outer contour or create an R leg. Use even-odd fill and no stroke, filter,
-> gradient, mask, blur, texture, raster content, pegs, crescents, feet,
-> sound-box ornament, or additional strings. Build separate hinted family
-> members: one string at 16 px; two at 20/24 px; three at 32 px and above.
+> On a 48 × 48 transparent viewBox, draw an inset rounded square in Abyss
+> `#0A0C0D`. Place a heavy Limestone `#E8E5DD` capital P from x≈10.31..38.44
+> and y≈7.03..39.38. Use a straight stem, a broad cubic outer bowl centered at
+> y≈17.58, a black rounded counter, and one separate black vertical slit. Add
+> one narrow Bronze `#A87542` bar inside the left portion of the counter. Use
+> flat fills only: no stroke, filter, gradient, blur, texture, or shadow.
 
-Documented optical adjustments beyond a direct 48-unit scale:
-
-- 16 px: the bowl is lifted and widened by direct pixel construction; one
-  2 px-wide string aperture remains open for six pixels, and the sole tension
-  cut reduces to an internal one-pixel diagonal notch.
-- 20/24 px: two 2 px-wide apertures replace the three-string master; counter
-  and lower return are separately balanced to preserve two-pixel separation.
-- 32 px: the full three-aperture rhythm returns, with a three-pixel minimum
-  outside bowl mass and a contained lower cut.
-- 40 px and above: the full 48-unit construction is scaled directly onto each
-  target canvas and rasterized there. No raster master is reused or reduced.
-- The Windows ICO uses a square, full-bleed Abyss field because desktop,
-  taskbar, search, installer, and wallpaper contexts cannot guarantee mark
-  contrast. The field has sharp full-bleed edges; it is not a generic rounded
-  app tile.
-- Bronze is intentionally absent from this identity release. The approved
-  brief permits one bronze string at larger sizes but does not require it; the
-  one-color result is stronger and avoids decorative compensation.
+All ten PNG sizes and all nine ICO entries are rendered directly from those
+normalized coordinates. At small sizes the build guarantees an exact core
+pixel for the black counter, black slit, and Bronze bar, while the transparent
+tray mark retains open counter/slit cores. No raster master is reused or
+reduced.
 
 ## Exact generated-concept prompts
 
