@@ -11,8 +11,9 @@ use phorminx_windows::atomic_replace_file;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::settings::AccurateModelVariant;
+
 const EMBEDDED_MANIFEST: &str = include_str!("../../../config/model-manifest.json");
-const RECOMMENDED_MODEL_ID: &str = "whisper-base-en-f16";
 const DOWNLOAD_BUFFER_BYTES: usize = 128 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -29,6 +30,11 @@ pub struct ModelSpec {
 }
 
 pub fn recommended_model() -> Result<ModelSpec, ModelError> {
+    model_for_variant(AccurateModelVariant::BaseEnglish)
+}
+
+/// Returns every pinned artifact in deterministic manifest order.
+pub fn pinned_models() -> Result<Vec<ModelSpec>, ModelError> {
     let manifest: ModelManifest =
         serde_json::from_str(EMBEDDED_MANIFEST).map_err(ModelError::Manifest)?;
     if manifest.schema_version != 1 {
@@ -37,12 +43,75 @@ pub fn recommended_model() -> Result<ModelSpec, ModelError> {
         ));
     }
     let _ = manifest.source_revision;
-    manifest
-        .models
+    Ok(manifest.models.into_iter().map(Into::into).collect())
+}
+
+pub fn model_for_variant(variant: AccurateModelVariant) -> Result<ModelSpec, ModelError> {
+    let id = variant
+        .manifest_id()
+        .ok_or(ModelError::CustomVariantHasNoPinnedModel)?;
+    pinned_models()?
         .into_iter()
-        .find(|model| model.id == RECOMMENDED_MODEL_ID)
-        .map(Into::into)
-        .ok_or(ModelError::RecommendedModelMissing)
+        .find(|model| model.id == id)
+        .ok_or_else(|| ModelError::PinnedModelMissing(id.to_owned()))
+}
+
+/// Infers a built-in variant only after filename, byte count, and SHA-256 match.
+pub fn identify_pinned_model(path: &Path) -> Result<Option<AccurateModelVariant>, ModelError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ModelError::Inspect {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let candidates = pinned_models()?
+        .into_iter()
+        .filter(|model| model.file_name == file_name && model.bytes == metadata.len())
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let actual = sha256_file(path)?;
+    Ok(candidates.into_iter().find_map(|model| {
+        actual
+            .eq_ignore_ascii_case(&model.sha256)
+            .then(|| AccurateModelVariant::from_manifest_id(&model.id))
+            .flatten()
+    }))
+}
+
+fn sha256_file(path: &Path) -> Result<String, ModelError> {
+    let mut file = File::open(path).map_err(|source| ModelError::Inspect {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|source| ModelError::Inspect {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 pub struct ModelDownload {
@@ -53,7 +122,14 @@ pub struct ModelDownload {
 
 impl ModelDownload {
     pub fn start(destination_directory: &Path) -> Result<Self, ModelError> {
-        let spec = recommended_model()?;
+        Self::start_variant(destination_directory, AccurateModelVariant::BaseEnglish)
+    }
+
+    pub fn start_variant(
+        destination_directory: &Path,
+        variant: AccurateModelVariant,
+    ) -> Result<Self, ModelError> {
+        let spec = model_for_variant(variant)?;
         let destination = destination_directory.join(&spec.file_name);
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = Arc::clone(&cancel);
@@ -285,8 +361,15 @@ pub enum ModelError {
     Manifest(serde_json::Error),
     #[error("model manifest version {0} is not supported")]
     UnsupportedManifestVersion(u32),
-    #[error("the recommended model is missing from the embedded manifest")]
-    RecommendedModelMissing,
+    #[error("the pinned model {0} is missing from the embedded manifest")]
+    PinnedModelMissing(String),
+    #[error("a custom model variant has no pinned artifact")]
+    CustomVariantHasNoPinnedModel,
+    #[error("failed to inspect model {path}: {source}")]
+    Inspect {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("invalid model destination: {0}")]
     InvalidDestination(PathBuf),
     #[error("failed to create model directory {path}: {source}")]
@@ -336,11 +419,52 @@ mod tests {
     #[test]
     fn embedded_manifest_selects_the_pinned_english_model() {
         let model = recommended_model().unwrap();
-        assert_eq!(model.id, RECOMMENDED_MODEL_ID);
+        assert_eq!(model.id, "whisper-base-en-f16");
         assert_eq!(model.file_name, "ggml-base.en.bin");
         assert_eq!(model.bytes, 147_964_211);
         assert_eq!(model.sha256.len(), 64);
         assert!(model.url.starts_with("https://"));
+    }
+
+    #[test]
+    fn manifest_pins_fast_accurate_and_multilingual_variants() {
+        let models = pinned_models().unwrap();
+        for variant in [
+            AccurateModelVariant::TinyEnglish,
+            AccurateModelVariant::BaseEnglish,
+            AccurateModelVariant::TinyMultilingual,
+            AccurateModelVariant::BaseMultilingual,
+        ] {
+            let model = model_for_variant(variant).unwrap();
+            assert!(models.contains(&model));
+            assert_eq!(model.sha256.len(), 64);
+            assert!(model.bytes > 70_000_000);
+            assert!(
+                model
+                    .url
+                    .contains("c521a4b02f422512d734391fdf08bb08c0862f68")
+            );
+        }
+        assert_eq!(
+            model_for_variant(AccurateModelVariant::TinyEnglish)
+                .unwrap()
+                .bytes,
+            77_704_715
+        );
+        assert_eq!(
+            model_for_variant(AccurateModelVariant::BaseMultilingual)
+                .unwrap()
+                .sha256,
+            "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe"
+        );
+    }
+
+    #[test]
+    fn familiar_filename_without_verified_identity_is_not_pinned() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ggml-tiny.en.bin");
+        fs::write(&path, b"not a model").unwrap();
+        assert_eq!(identify_pinned_model(&path).unwrap(), None);
     }
 
     #[test]

@@ -15,20 +15,24 @@ use phorminx_app::incremental::{
     BoundaryKind, CHUNK_OVERLAP, IncrementalPlanner, MergeExpectation, SILENCE_PROBE_DURATION,
     merge_overlapping, strip_known_non_speech_annotations,
 };
-use phorminx_app::model::{ModelDownload, ModelDownloadEvent, recommended_model};
+use phorminx_app::model::{
+    ModelDownload, ModelDownloadEvent, identify_pinned_model, model_for_variant, recommended_model,
+};
 use phorminx_app::product_shell::{ProductShell, ProductShellControl, ProductShellEvent};
 use phorminx_app::runtime::{
     AppIo, AppRuntime, FinishedAudio, InsertDisposition, RuntimeNotice, UiStatus,
 };
 use phorminx_app::settings::{
-    FormattingStrength, HistoryRetention, OllamaLifecycle, RecognitionMode, RecordingMode,
-    RuntimeFormatting, Settings, SettingsStore,
+    AccurateBackendPreference, AccurateModelVariant, FormattingStrength, HistoryRetention,
+    OllamaLifecycle, RecognitionMode, RecordingMode, RuntimeFormatting, Settings, SettingsStore,
 };
 use phorminx_app::ui_bridge::{UiMutation, UiRoute, UiRuntimeStatus};
 use phorminx_audio::{ActiveRecording, input_devices, start_input};
+#[cfg(test)]
+use phorminx_core::recommended_audio_context;
 use phorminx_core::{
     AudioClip, DictationId, RuntimeState, SpeechRecognizer, Transcript, TranscriptionOptions,
-    normalize_transcript, recommended_audio_context,
+    normalize_transcript,
 };
 use phorminx_ollama::{
     CancellationToken, ClientTimeouts, FormatProfile, FormatResult, KeepAlive, ModelName,
@@ -40,7 +44,7 @@ use phorminx_persistence::{
     TimingMetadata,
 };
 use phorminx_vosk::{VoskModel, VoskSession};
-use phorminx_whisper::WhisperRecognizer;
+use phorminx_whisper::{WhisperBackendPreference, WhisperError, WhisperRecognizer};
 use phorminx_windows::{
     ClipboardOnlyReason, GlobalHoldHotkey, HistoryItem, HistoryWindow, HistoryWindowEvent,
     HoldEvent, InsertionOutcome, LexiconCasePolicy, LexiconDraft, LexiconItem, LexiconWindow,
@@ -188,6 +192,7 @@ fn run() -> Result<()> {
         .ensure_runtime_supported()
         .context("invalid effective formatting settings")?;
     let formatting = RuntimeFormatting::try_from(settings.formatting.strength)?;
+    let model_override = cli.model.is_some();
     let model = match cli.model {
         Some(model) => model,
         None if settings_file_exists => {
@@ -227,7 +232,10 @@ fn run() -> Result<()> {
     };
     if !recognition_ready {
         if cli.smoke_test {
-            return Err(anyhow!("Whisper model was not found: {}", model.display()));
+            return Err(anyhow!(match settings.recognition.mode {
+                RecognitionMode::Accurate => "Accurate recognition is not ready",
+                RecognitionMode::Instant => "Instant recognition is not ready",
+            }));
         }
         return run_setup_mode(
             overlay,
@@ -238,6 +246,29 @@ fn run() -> Result<()> {
             shutting_down,
             instance,
         );
+    }
+    if settings.recognition.mode == RecognitionMode::Accurate {
+        let verified_variant =
+            identify_pinned_model(&model).context("failed to verify Whisper model")?;
+        if !model_override && settings.recognition.accurate_model != AccurateModelVariant::Custom {
+            let expected = model_for_variant(settings.recognition.accurate_model)
+                .context("the selected pinned Whisper model is unavailable")?;
+            if model.file_name().and_then(|name| name.to_str()) == Some(expected.file_name.as_str())
+                && verified_variant != Some(settings.recognition.accurate_model)
+            {
+                return Err(anyhow!(
+                    "the selected pinned Whisper model does not match its verified manifest identity"
+                ));
+            }
+        }
+        if let Some(variant) = verified_variant
+            && !variant.supports_language(&settings.recognition.language)
+        {
+            return Err(anyhow!(
+                "the verified English-only Whisper model cannot transcribe language {}",
+                settings.recognition.language
+            ));
+        }
     }
 
     let effective_microphone = match settings.recognition.microphone.as_deref() {
@@ -279,7 +310,10 @@ fn run() -> Result<()> {
 
     println!("Phorminx is loading its local recognition engine...");
     let recognizer = match settings.recognition.mode {
-        RecognitionMode::Accurate => RecognizerConfig::Accurate(model.clone()),
+        RecognitionMode::Accurate => RecognizerConfig::Accurate {
+            model: model.clone(),
+            backend: whisper_backend_preference(settings.recognition.accurate_backend),
+        },
         RecognitionMode::Instant => RecognizerConfig::Instant {
             runtime_bundle: instant_runtime,
             model: instant_model,
@@ -665,7 +699,20 @@ fn run() -> Result<()> {
                             Err(error) => break 'event_loop Err(error.into()),
                         }
                     };
+                    let reached_insertion = notices.iter().any(|notice| {
+                        matches!(
+                            notice,
+                            RuntimeNotice::Inserted { .. } | RuntimeNotice::ClipboardReady { .. }
+                        )
+                    });
                     report_notices(notices);
+                    if is_current && reached_insertion {
+                        eprintln!(
+                            "dictation_id={} state=Inserting event=release_to_insert release_to_insert_ms={}",
+                            completed.id.0,
+                            completed.released_at.elapsed().as_millis()
+                        );
+                    }
                     if let Some(shell) = product_shell.as_ref() {
                         let _ = shell.send(ProductShellControl::Refresh);
                     }
@@ -2225,6 +2272,14 @@ fn monotonic_uptime_ms() -> u128 {
     STARTED.get_or_init(Instant::now).elapsed().as_millis()
 }
 
+fn whisper_backend_preference(value: AccurateBackendPreference) -> WhisperBackendPreference {
+    match value {
+        AccurateBackendPreference::Auto => WhisperBackendPreference::Auto,
+        AccurateBackendPreference::Vulkan => WhisperBackendPreference::Vulkan,
+        AccurateBackendPreference::Cpu => WhisperBackendPreference::Cpu,
+    }
+}
+
 struct TranscriptionWorker {
     commands: Sender<WorkerCommand>,
     instant_audio: mpsc::SyncSender<InstantAudioCommand>,
@@ -2276,7 +2331,10 @@ fn poll_instant_transcription(
 }
 
 enum RecognizerConfig {
-    Accurate(PathBuf),
+    Accurate {
+        model: PathBuf,
+        backend: WhisperBackendPreference,
+    },
     Instant {
         runtime_bundle: PathBuf,
         model: PathBuf,
@@ -2331,8 +2389,8 @@ impl TranscriptionWorker {
             .name("phorminx-transcription".to_owned())
             .spawn(move || {
                 let recognizer = match recognizer {
-                    RecognizerConfig::Accurate(model) => {
-                        WhisperRecognizer::load(&model)
+                    RecognizerConfig::Accurate { model, backend } => {
+                        WhisperRecognizer::load_with_backend(&model, backend)
                             .map(LoadedRecognizer::Accurate)
                             .map_err(|error| error.to_string())
                     }
@@ -2357,6 +2415,25 @@ impl TranscriptionWorker {
                         return;
                     }
                 };
+                match &recognizer {
+                    LoadedRecognizer::Accurate(recognizer) => {
+                        let readiness = recognizer.readiness();
+                        eprintln!(
+                            "dictation_id=0 state=Starting event=stt_backend_ready backend={} device_present={} model_load_ms={}",
+                            readiness.backend.as_str(),
+                            readiness.device_name.is_some(),
+                            readiness.model_load_time.as_millis()
+                        );
+                    }
+                    LoadedRecognizer::Instant(model) => eprintln!(
+                        "dictation_id=0 state=Starting event=stt_backend_ready backend=vosk device_present=false model_load_ms={}",
+                        model.load_time().as_millis()
+                    ),
+                }
+                if ready_tx.send(Ok(())).is_err() {
+                    return;
+                }
+
                 let ollama = formatting.model.as_ref().map(|_| production_ollama_client());
                 let mut aliases = aliases;
                 let mut incremental_sessions = HashMap::new();
@@ -2364,16 +2441,24 @@ impl TranscriptionWorker {
                 if formatting.uses_ollama()
                     && let (Some(client), Some(model)) = (&ollama, &formatting.model)
                 {
-                    let cancel = CancellationToken::new();
-                    if let Err(error) = client.warm_up(model, formatting.keep_alive.clone(), &cancel)
-                    {
-                        eprintln!(
-                            "dictation_id=0 state=Starting event=ollama_warmup_degraded error={error}"
-                        );
-                    }
-                }
-                if ready_tx.send(Ok(())).is_err() {
-                    return;
+                    let client = client.clone();
+                    let model = model.clone();
+                    let keep_alive = formatting.keep_alive.clone();
+                    let _ = thread::Builder::new()
+                        .name("phorminx-ollama-warmup".to_owned())
+                        .spawn(move || {
+                            let cancel = CancellationToken::new();
+                            let event = match client.warm_up(&model, keep_alive, &cancel) {
+                                Ok(()) => "ollama_warmup_ready",
+                                Err(error) => {
+                                    eprintln!(
+                                        "dictation_id=0 state=Starting event=ollama_warmup_degraded error={error}"
+                                    );
+                                    return;
+                                }
+                            };
+                            eprintln!("dictation_id=0 state=Starting event={event}");
+                        });
                 }
 
                 loop {
@@ -2427,19 +2512,24 @@ impl TranscriptionWorker {
                             let LoadedRecognizer::Accurate(recognizer) = &recognizer else {
                                 continue;
                             };
+                            let partial_id = plan.id;
+                            let partial_abort = worker_cancellations.begin_partial(partial_id);
                             let event = process_partial_transcription(
                                 recognizer,
                                 &mut incremental_sessions,
                                 plan,
                                 clip,
                                 &language,
+                                &partial_abort,
                             );
+                            worker_cancellations.end_partial(partial_id);
                             if result_tx.send(event).is_err() {
                                 break;
                             }
                         }
                         WorkerCommand::Transcribe {
                             id,
+                            released_at,
                             clip,
                             language,
                             audio_context,
@@ -2478,6 +2568,13 @@ impl TranscriptionWorker {
                             };
                             let result = match recognition {
                                 Ok(transcript) => {
+                                    if has_pathological_repetition(&transcript.text) {
+                                        eprintln!(
+                                            "dictation_id={} state=Transcribing event=transcription_rejected reason=repetition_loop",
+                                            id.0
+                                        );
+                                        Err("Whisper produced a repeated output loop".to_owned())
+                                    } else {
                                     // Whisper cannot be preempted safely today,
                                     // so cancellation is checked again before
                                     // any cleanup event or potentially long
@@ -2536,11 +2633,16 @@ impl TranscriptionWorker {
                                         continue;
                                     }
                                     Ok(processed)
+                                    }
                                 }
                                 Err(error) => Err(error.to_string()),
                             };
                             if result_tx
-                                .send(WorkerEvent::Completed(Box::new(WorkerResult { id, result })))
+                                .send(WorkerEvent::Completed(Box::new(WorkerResult {
+                                    id,
+                                    released_at,
+                                    result,
+                                })))
                                 .is_err()
                             {
                                 break;
@@ -2604,9 +2706,13 @@ impl TranscriptionWorker {
         formatting: WorkerFormatting,
         app_executable: Option<String>,
     ) -> Result<()> {
+        // Publish release priority before the FIFO send. A running partial sees
+        // this through whisper.cpp's abort callback and yields to the final.
+        self.cancellations.prioritize_final(id);
         self.commands
             .send(WorkerCommand::Transcribe {
                 id,
+                released_at: Instant::now(),
                 clip,
                 language,
                 audio_context,
@@ -2711,6 +2817,7 @@ struct CancellationRegistry {
 struct CancellationState {
     ids: HashSet<DictationId>,
     formatting: HashMap<DictationId, CancellationToken>,
+    partials: HashMap<DictationId, Arc<AtomicBool>>,
 }
 
 impl Default for CancellationRegistry {
@@ -2731,6 +2838,9 @@ impl CancellationRegistry {
         if let Some(token) = state.formatting.get(&id) {
             token.cancel();
         }
+        if let Some(abort) = state.partials.get(&id) {
+            abort.store(true, Ordering::Release);
+        }
     }
 
     fn is_cancelled(&self, id: DictationId) -> bool {
@@ -2748,6 +2858,37 @@ impl CancellationRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.ids.remove(&id);
         state.formatting.remove(&id);
+        state.partials.remove(&id);
+    }
+
+    fn begin_partial(&self, id: DictationId) -> Arc<AtomicBool> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let abort = Arc::new(AtomicBool::new(state.ids.contains(&id)));
+        state.partials.insert(id, Arc::clone(&abort));
+        abort
+    }
+
+    fn end_partial(&self, id: DictationId) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .partials
+            .remove(&id);
+    }
+
+    fn prioritize_final(&self, id: DictationId) {
+        if let Some(abort) = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .partials
+            .get(&id)
+        {
+            abort.store(true, Ordering::Release);
+        }
     }
 
     fn begin_formatting(&self, id: DictationId) -> CancellationToken {
@@ -2779,6 +2920,9 @@ impl CancellationRegistry {
         for token in state.formatting.values() {
             token.cancel();
         }
+        for abort in state.partials.values() {
+            abort.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -2804,6 +2948,7 @@ enum WorkerCommand {
     },
     Transcribe {
         id: DictationId,
+        released_at: Instant,
         clip: AudioClip,
         language: String,
         audio_context: u32,
@@ -2822,6 +2967,7 @@ enum WorkerCommand {
 
 struct WorkerResult {
     id: DictationId,
+    released_at: Instant,
     result: Result<ProcessedTranscript, String>,
 }
 
@@ -2842,6 +2988,8 @@ enum WorkerEvent {
 struct PartialAccumulator {
     text: String,
     stable_end: Duration,
+    accepted_through: Duration,
+    timestamp_stable: bool,
     last_boundary: Option<BoundaryKind>,
     next_sequence: u32,
     partial_compute_time: Duration,
@@ -2986,6 +3134,8 @@ impl Default for PartialAccumulator {
         Self {
             text: String::new(),
             stable_end: Duration::ZERO,
+            accepted_through: Duration::ZERO,
+            timestamp_stable: false,
             last_boundary: None,
             next_sequence: 0,
             partial_compute_time: Duration::ZERO,
@@ -3001,6 +3151,7 @@ fn process_partial_transcription(
     plan: phorminx_app::incremental::ChunkPlan,
     clip: AudioClip,
     language: &str,
+    abort: &Arc<AtomicBool>,
 ) -> WorkerEvent {
     let audio_duration = clip.duration();
     let accumulator = sessions.entry(plan.id).or_default();
@@ -3017,48 +3168,32 @@ fn process_partial_transcription(
         let options = TranscriptionOptions {
             language: Some(language),
             thread_count: None,
-            audio_context: Some(recommended_audio_context(audio_duration)),
+            audio_context: None,
         };
-        let (recognition, measured) =
-            WallComputeClock.measure(|| recognizer.transcribe(&clip, &options));
+        let prompt = bounded_decoder_prompt(&accumulator.text);
+        let (recognition, measured) = WallComputeClock.measure(|| {
+            recognizer.transcribe_detailed(&clip, &options, prompt.as_deref(), Some(abort))
+        });
         compute_time = measured;
         accumulator.partial_compute_time = accumulator
             .partial_compute_time
             .saturating_add(compute_time);
         match recognition {
-            Ok(mut transcript) => {
+            Ok(mut detailed) => {
+                let transcript = &mut detailed.transcript;
                 transcript.text = strip_known_non_speech_annotations(&transcript.text);
-                if transcript.text.trim().is_empty() {
-                    accumulator.degraded = Some("non_speech_partial");
-                    return WorkerEvent::PartialCompleted {
-                        id: plan.id,
-                        sequence: plan.sequence,
-                        succeeded: false,
-                        compute_time,
-                        audio_duration,
-                    };
-                }
-                let merged = match plan.start_overlap {
-                    Some(expectation) => {
-                        merge_overlapping(&accumulator.text, &transcript.text, expectation)
-                    }
-                    None => Ok(transcript.text.trim().to_owned()),
-                };
-                match merged {
-                    Ok(text) => {
-                        accumulator.text = text;
-                        accumulator.stable_end = plan.stable_end;
-                        accumulator.last_boundary = Some(plan.boundary);
-                        accumulator.next_sequence = accumulator.next_sequence.saturating_add(1);
-                        accumulator.model_load_time = transcript.model_load_time;
-                        true
-                    }
-                    Err(_) => {
-                        accumulator.degraded = Some("overlap_unresolved");
-                        false
-                    }
-                }
+                append_timestamp_stable_segments(accumulator, plan, &detailed.segments);
+                accumulator.timestamp_stable = true;
+                accumulator.stable_end = plan.stable_end;
+                // Text was admitted by absolute timestamp and ends no later
+                // than the tail start, so final assembly concatenates rather
+                // than requiring a duplicated lexical overlap.
+                accumulator.last_boundary = Some(BoundaryKind::Silence);
+                accumulator.next_sequence = accumulator.next_sequence.saturating_add(1);
+                accumulator.model_load_time = transcript.model_load_time;
+                true
             }
+            Err(WhisperError::Aborted) => false,
             Err(_) => {
                 accumulator.degraded = Some("partial_recognition_failed");
                 false
@@ -3073,6 +3208,97 @@ fn process_partial_transcription(
         compute_time,
         audio_duration,
     }
+}
+
+fn append_timestamp_stable_segments(
+    accumulator: &mut PartialAccumulator,
+    plan: phorminx_app::incremental::ChunkPlan,
+    segments: &[phorminx_whisper::TimedSegment],
+) {
+    let guarded_end = match plan.boundary {
+        BoundaryKind::Silence => plan.stable_end,
+        BoundaryKind::Forced => plan.stable_end.saturating_sub(CHUNK_OVERLAP),
+    };
+    for segment in segments {
+        let absolute_start = plan.range.start.saturating_add(segment.start);
+        let absolute_end = plan.range.start.saturating_add(segment.end);
+        if absolute_end > guarded_end || absolute_end <= accumulator.accepted_through {
+            continue;
+        }
+        // A changed segmentation boundary can straddle already accepted audio.
+        // Skip that unstable segment instead of duplicating its beginning.
+        if absolute_start < accumulator.accepted_through {
+            continue;
+        }
+        let text = strip_known_non_speech_annotations(&segment.text);
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        append_with_spacing(&mut accumulator.text, text);
+        accumulator.accepted_through = accumulator.accepted_through.max(absolute_end);
+    }
+}
+
+fn append_with_spacing(output: &mut String, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    if !output.is_empty()
+        && !output.ends_with(char::is_whitespace)
+        && !value.starts_with(|character: char| {
+            character.is_whitespace() || ".,!?;:".contains(character)
+        })
+    {
+        output.push(' ');
+    }
+    output.push_str(value);
+}
+
+fn bounded_decoder_prompt(text: &str) -> Option<String> {
+    const MAX_PROMPT_CHARS: usize = 512;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let mut start = text.len();
+    for (count, (index, _)) in text.char_indices().rev().enumerate() {
+        if count == MAX_PROMPT_CHARS {
+            break;
+        }
+        start = index;
+    }
+    Some(text[start..].to_owned())
+}
+
+/// Detects decoder loops without retaining or logging content. We fail closed
+/// instead of guessing which repeated span should be deleted.
+fn has_pathological_repetition(text: &str) -> bool {
+    const MIN_SPAN_WORDS: usize = 3;
+    const REPEATS: usize = 3;
+    const MAX_SPAN_WORDS: usize = 48;
+
+    let words = text
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| !character.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let maximum_span = (words.len() / REPEATS).min(MAX_SPAN_WORDS);
+    for span in MIN_SPAN_WORDS..=maximum_span {
+        let repeated_width = span * REPEATS;
+        for start in 0..=words.len().saturating_sub(repeated_width) {
+            let candidate = &words[start..start + span];
+            if (1..REPEATS).all(|repeat| {
+                let offset = start + repeat * span;
+                words[offset..offset + span] == *candidate
+            }) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn transcribe_final<R>(
@@ -3102,7 +3328,7 @@ fn transcribe_final_with_clock<R, C>(
     incremental: Option<PartialAccumulator>,
     full_clip: &AudioClip,
     language: &str,
-    full_audio_context: u32,
+    _full_audio_context: u32,
     id: DictationId,
     clock: &C,
 ) -> Result<Transcript, String>
@@ -3125,7 +3351,10 @@ where
                     accumulator.stable_end.as_millis(),
                     full_clip
                         .duration()
-                        .saturating_sub(accumulator.stable_end.saturating_sub(CHUNK_OVERLAP))
+                        .saturating_sub(
+                            final_tail_plan(&accumulator, full_clip.duration())
+                                .map_or(accumulator.stable_end, |plan| plan.start),
+                        )
                         .as_millis(),
                     accumulator.partial_compute_time.as_millis(),
                     tail_compute_time.as_millis()
@@ -3139,7 +3368,9 @@ where
     let options = TranscriptionOptions {
         language: Some(language),
         thread_count: None,
-        audio_context: Some(full_audio_context),
+        // Accurate production recognition uses the model's native encoder
+        // context. Reduced audio_ctx remains benchmark-only.
+        audio_context: None,
     };
     let (recognition, fallback_compute_time) =
         clock.measure(|| recognizer.transcribe(full_clip, &options));
@@ -3194,7 +3425,7 @@ where
     let options = TranscriptionOptions {
         language: Some(language),
         thread_count: None,
-        audio_context: Some(recommended_audio_context(tail.duration())),
+        audio_context: None,
     };
     let (recognition, tail_compute_time) = clock.measure(|| recognizer.transcribe(&tail, &options));
     let mut tail_transcript = recognition.map_err(|_| TailAttemptError {
@@ -3265,8 +3496,16 @@ fn final_tail_plan(
         return Err("stable_audio_exceeds_final");
     }
     Ok(FinalTailPlan {
-        start: accumulator.stable_end.saturating_sub(CHUNK_OVERLAP),
-        expectation: MergeExpectation::from(boundary),
+        start: if accumulator.timestamp_stable {
+            accumulator.accepted_through
+        } else {
+            accumulator.stable_end.saturating_sub(CHUNK_OVERLAP)
+        },
+        expectation: if accumulator.timestamp_stable {
+            MergeExpectation::Silence
+        } else {
+            MergeExpectation::from(boundary)
+        },
     })
 }
 
@@ -3673,6 +3912,8 @@ mod composition_tests {
         PartialAccumulator {
             text: text.to_owned(),
             stable_end: Duration::from_secs(8),
+            accepted_through: Duration::ZERO,
+            timestamp_stable: false,
             last_boundary: Some(boundary),
             next_sequence: 1,
             partial_compute_time: Duration::from_millis(400),
@@ -3689,6 +3930,86 @@ mod composition_tests {
             inference_time: Duration::from_millis(200),
             audio_duration: Duration::from_secs(3),
         }
+    }
+
+    #[test]
+    fn timestamp_stability_discards_overlap_without_lexical_guessing() {
+        use phorminx_app::incremental::{ChunkPlan, TimeRange};
+        use phorminx_whisper::TimedSegment;
+
+        let mut accumulator = PartialAccumulator::default();
+        let first = ChunkPlan {
+            id: DictationId(1),
+            sequence: 0,
+            range: TimeRange {
+                start: Duration::ZERO,
+                end: Duration::from_secs(3),
+            },
+            stable_end: Duration::from_secs(3),
+            start_overlap: None,
+            boundary: BoundaryKind::Silence,
+        };
+        append_timestamp_stable_segments(
+            &mut accumulator,
+            first,
+            &[TimedSegment {
+                text: "Alpha beta.".to_owned(),
+                start: Duration::ZERO,
+                end: Duration::from_secs(3),
+            }],
+        );
+        let second = ChunkPlan {
+            id: DictationId(1),
+            sequence: 1,
+            range: TimeRange {
+                start: Duration::from_millis(2_500),
+                end: Duration::from_secs(5),
+            },
+            stable_end: Duration::from_secs(5),
+            start_overlap: Some(MergeExpectation::Silence),
+            boundary: BoundaryKind::Silence,
+        };
+        append_timestamp_stable_segments(
+            &mut accumulator,
+            second,
+            &[
+                TimedSegment {
+                    text: "beta.".to_owned(),
+                    start: Duration::ZERO,
+                    end: Duration::from_millis(400),
+                },
+                TimedSegment {
+                    text: "Gamma.".to_owned(),
+                    start: Duration::from_millis(500),
+                    end: Duration::from_secs(2),
+                },
+            ],
+        );
+
+        assert_eq!(accumulator.text, "Alpha beta. Gamma.");
+        assert_eq!(accumulator.accepted_through, Duration::from_millis(4_500));
+    }
+
+    #[test]
+    fn repetition_guard_rejects_decoder_loops_but_not_normal_emphasis() {
+        assert!(has_pathological_repetition(
+            "the same phrase again the same phrase again the same phrase again"
+        ));
+        assert!(!has_pathological_repetition("very very very important"));
+        assert!(!has_pathological_repetition(
+            "the same phrase again, and then one ordinary conclusion"
+        ));
+    }
+
+    #[test]
+    fn release_priority_aborts_only_the_obsolete_partial() {
+        let registry = CancellationRegistry::default();
+        let abort = registry.begin_partial(DictationId(7));
+        assert!(!abort.load(Ordering::Acquire));
+        registry.prioritize_final(DictationId(7));
+        assert!(abort.load(Ordering::Acquire));
+        assert!(!registry.is_cancelled(DictationId(7)));
+        registry.end_partial(DictationId(7));
     }
 
     struct CountingRecognizer {

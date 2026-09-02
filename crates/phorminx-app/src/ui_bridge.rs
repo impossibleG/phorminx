@@ -14,9 +14,12 @@ use phorminx_persistence::{
     AppProfile, CasePolicy, DictationRecord, ExecutableIdentity, FormattingStyle,
     InsertionPreference, LexiconEntry, NewLexiconEntry, Persistence, RetentionPolicy,
 };
+use phorminx_whisper::{WhisperBackendPreference, probe_backend};
 
+use crate::model::{identify_pinned_model, model_for_variant};
 use crate::settings::{
-    FormattingStrength, HistoryRetention, Settings, SettingsError, SettingsStore,
+    AccurateModelVariant, FormattingStrength, HistoryRetention, Settings, SettingsError,
+    SettingsStore,
 };
 
 pub const DEFAULT_HISTORY_LIMIT: usize = 100;
@@ -74,6 +77,8 @@ pub struct UiWhisperReadiness {
     pub configured_path: PathBuf,
     pub size_bytes: Option<u64>,
     pub language: String,
+    pub selected_backend: Option<String>,
+    pub device_name: Option<String>,
     pub message: String,
 }
 
@@ -144,19 +149,43 @@ impl UiReadinessSnapshot {
         };
 
         let configured_path = store.resolve_model_path(&settings.recognition.model_path);
+        let backend = probe_backend(match settings.recognition.accurate_backend {
+            crate::settings::AccurateBackendPreference::Auto => WhisperBackendPreference::Auto,
+            crate::settings::AccurateBackendPreference::Vulkan => WhisperBackendPreference::Vulkan,
+            crate::settings::AccurateBackendPreference::Cpu => WhisperBackendPreference::Cpu,
+        });
         let whisper = match std::fs::metadata(&configured_path) {
+            Ok(metadata) if metadata.is_file() && backend.is_ok() => {
+                let (backend, device_name) = backend.expect("checked as successful");
+                UiWhisperReadiness {
+                    state: UiReadinessState::Ready,
+                    configured_path,
+                    size_bytes: Some(metadata.len()),
+                    language: settings.recognition.language.clone(),
+                    selected_backend: Some(backend.as_str().to_owned()),
+                    device_name,
+                    message: format!(
+                        "Whisper model available; {} backend selected. Loaded when Phorminx is Ready.",
+                        backend.as_str()
+                    ),
+                }
+            }
             Ok(metadata) if metadata.is_file() => UiWhisperReadiness {
-                state: UiReadinessState::Ready,
+                state: UiReadinessState::NeedsAttention,
                 configured_path,
                 size_bytes: Some(metadata.len()),
                 language: settings.recognition.language.clone(),
-                message: "Whisper model ready.".to_owned(),
+                selected_backend: None,
+                device_name: None,
+                message: "The requested Whisper backend is unavailable.".to_owned(),
             },
             Ok(_) => UiWhisperReadiness {
                 state: UiReadinessState::NeedsAttention,
                 configured_path,
                 size_bytes: None,
                 language: settings.recognition.language.clone(),
+                selected_backend: None,
+                device_name: None,
                 message: "The selected Whisper model is not a file.".to_owned(),
             },
             Err(_) => UiWhisperReadiness {
@@ -164,6 +193,8 @@ impl UiReadinessSnapshot {
                 configured_path,
                 size_bytes: None,
                 language: settings.recognition.language.clone(),
+                selected_backend: None,
+                device_name: None,
                 message: "Whisper model not found.".to_owned(),
             },
         };
@@ -242,7 +273,10 @@ impl UiReadinessSnapshot {
                         "The selected Ollama model is not installed. Choose an available model.",
                     )
                 } else {
-                    (UiReadinessState::Ready, "Ollama ready.")
+                    (
+                        UiReadinessState::Ready,
+                        "Ollama available; warm-up is independent.",
+                    )
                 };
                 UiOllamaReadiness {
                     state,
@@ -280,6 +314,8 @@ impl UiReadinessSnapshot {
                 configured_path: store.resolve_model_path(&settings.recognition.model_path),
                 size_bytes: None,
                 language: settings.recognition.language.clone(),
+                selected_backend: None,
+                device_name: None,
                 message: "Checking Whisper model.".to_owned(),
             },
             vosk: UiVoskReadiness {
@@ -686,6 +722,38 @@ impl UiBridge {
                         "Select an existing Whisper model file.",
                     ));
                 }
+                let verified_variant = identify_pinned_model(&resolved_model).map_err(|_| {
+                    UiBridgeError::validation(
+                        "model_path",
+                        "The Whisper model could not be verified.",
+                    )
+                })?;
+                if candidate.recognition.accurate_model != AccurateModelVariant::Custom {
+                    let expected = model_for_variant(candidate.recognition.accurate_model)
+                        .map_err(|_| {
+                            UiBridgeError::validation(
+                                "model_path",
+                                "The pinned Whisper model is unavailable.",
+                            )
+                        })?;
+                    if resolved_model.file_name().and_then(|name| name.to_str())
+                        == Some(expected.file_name.as_str())
+                        && verified_variant != Some(candidate.recognition.accurate_model)
+                    {
+                        return Err(UiBridgeError::validation(
+                            "model_path",
+                            "The pinned Whisper model failed verification.",
+                        ));
+                    }
+                }
+                if verified_variant.is_some_and(|variant| {
+                    !variant.supports_language(&candidate.recognition.language)
+                }) {
+                    return Err(UiBridgeError::validation(
+                        "language",
+                        "Select a multilingual Whisper model for this language.",
+                    ));
+                }
             }
             crate::settings::RecognitionMode::Instant => {
                 let runtime = self
@@ -1078,7 +1146,9 @@ mod tests {
                 configured_path: store.resolve_model_path(&settings.recognition.model_path),
                 size_bytes: Some(5),
                 language: "en".to_owned(),
-                message: "Whisper model ready.".to_owned(),
+                selected_backend: Some("cpu".to_owned()),
+                device_name: None,
+                message: "Whisper model available; cpu backend selected.".to_owned(),
             },
             vosk: UiVoskReadiness {
                 state: UiReadinessState::NeedsAttention,
@@ -1095,7 +1165,7 @@ mod tests {
                     family: Some("qwen".to_owned()),
                 }],
                 selected: None,
-                message: "Ollama ready.".to_owned(),
+                message: "Ollama available; warm-up is independent.".to_owned(),
             },
         }
     }
@@ -1164,6 +1234,19 @@ mod tests {
             .execute(UiCommand::SaveSettings(missing_whisper), &readiness, 10)
             .unwrap_err();
         assert_eq!(error.field, Some("model_path"));
+
+        let mut instant_without_whisper = test.bridge.settings().clone();
+        instant_without_whisper.recognition.mode = crate::settings::RecognitionMode::Instant;
+        instant_without_whisper.recognition.model_path = test.root.join("also-missing.bin");
+        let error = test
+            .bridge
+            .execute(
+                UiCommand::SaveSettings(instant_without_whisper),
+                &readiness,
+                11,
+            )
+            .unwrap_err();
+        assert_eq!(error.field, Some("instant_runtime_path"));
 
         let mut missing_ollama = test.bridge.settings().clone();
         missing_ollama.formatting.strength = FormattingStrength::Strong;

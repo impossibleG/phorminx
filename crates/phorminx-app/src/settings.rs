@@ -151,10 +151,10 @@ pub struct RecognitionSettings {
     pub instant_model_path: PathBuf,
     /// Vosk runtime bundle directory containing vosk.dll and its dependencies.
     pub instant_runtime_path: PathBuf,
-    /// Reserved shared selector for Accurate-mode UI without another schema
-    /// migration. `None` means the explicit `model_path` wins.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub accurate_model_variant: Option<String>,
+    /// A UI/catalog hint. `model_path` remains authoritative and the runtime
+    /// verifies this identity before presenting a pinned variant.
+    pub accurate_model: AccurateModelVariant,
+    pub accurate_backend: AccurateBackendPreference,
     pub language: String,
     pub minimum_rms: f32,
     /// Exact CPAL/Windows input-device name. `None` follows the system default.
@@ -168,7 +168,8 @@ impl Default for RecognitionSettings {
             model_path: PathBuf::from("models/ggml-base.en.bin"),
             instant_model_path: PathBuf::from("models/vosk-model-small-en-us-0.15"),
             instant_runtime_path: PathBuf::from("runtime/vosk"),
-            accurate_model_variant: None,
+            accurate_model: AccurateModelVariant::BaseEnglish,
+            accurate_backend: AccurateBackendPreference::Auto,
             language: "en".to_owned(),
             minimum_rms: 0.003,
             microphone: None,
@@ -182,6 +183,58 @@ pub enum RecognitionMode {
     Instant,
     #[default]
     Accurate,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccurateModelVariant {
+    TinyEnglish,
+    BaseEnglish,
+    TinyMultilingual,
+    BaseMultilingual,
+    /// Existing and user-supplied paths deserialize conservatively as custom.
+    #[default]
+    Custom,
+}
+
+impl AccurateModelVariant {
+    pub const fn manifest_id(self) -> Option<&'static str> {
+        match self {
+            Self::TinyEnglish => Some("whisper-tiny-en-f16"),
+            Self::BaseEnglish => Some("whisper-base-en-f16"),
+            Self::TinyMultilingual => Some("whisper-tiny-multilingual-f16"),
+            Self::BaseMultilingual => Some("whisper-base-multilingual-f16"),
+            Self::Custom => None,
+        }
+    }
+
+    pub fn from_manifest_id(id: &str) -> Option<Self> {
+        match id {
+            "whisper-tiny-en-f16" => Some(Self::TinyEnglish),
+            "whisper-base-en-f16" => Some(Self::BaseEnglish),
+            "whisper-tiny-multilingual-f16" => Some(Self::TinyMultilingual),
+            "whisper-base-multilingual-f16" => Some(Self::BaseMultilingual),
+            _ => None,
+        }
+    }
+
+    pub fn supports_language(self, language: &str) -> bool {
+        match self {
+            Self::TinyEnglish | Self::BaseEnglish => {
+                language == "en" || language.starts_with("en-")
+            }
+            Self::TinyMultilingual | Self::BaseMultilingual | Self::Custom => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccurateBackendPreference {
+    #[default]
+    Auto,
+    Vulkan,
+    Cpu,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

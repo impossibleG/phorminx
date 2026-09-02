@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use phorminx_core::DictationId;
 
-pub const MIN_CHUNK_DURATION: Duration = Duration::from_secs(4);
-pub const MAX_CHUNK_DURATION: Duration = Duration::from_secs(8);
-pub const CHUNK_OVERLAP: Duration = Duration::from_millis(800);
+pub const MIN_CHUNK_DURATION: Duration = Duration::from_millis(1_500);
+pub const MAX_CHUNK_DURATION: Duration = Duration::from_secs(3);
+pub const CHUNK_OVERLAP: Duration = Duration::from_millis(500);
 pub const SILENCE_PROBE_DURATION: Duration = CHUNK_OVERLAP;
 pub const PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -395,9 +395,9 @@ mod tests {
         let mut planner = IncrementalPlanner::default();
         planner.start(id(1));
 
-        assert!(!planner.needs_probe(id(1), Duration::from_millis(3_999)));
+        assert!(!planner.needs_probe(id(1), Duration::from_millis(1_499)));
         assert_eq!(
-            planner.observe(id(1), Duration::from_millis(3_999), true),
+            planner.observe(id(1), Duration::from_millis(1_499), true),
             None
         );
     }
@@ -407,43 +407,46 @@ mod tests {
         let mut planner = IncrementalPlanner::default();
         planner.start(id(1));
         let first = planner
-            .observe(id(1), Duration::from_secs(5), true)
+            .observe(id(1), Duration::from_secs(2), true)
             .unwrap();
         assert_eq!(first.boundary, BoundaryKind::Silence);
         assert_eq!(first.range.start, Duration::ZERO);
-        assert_eq!(first.range.end, Duration::from_secs(5));
+        assert_eq!(first.range.end, Duration::from_secs(2));
         assert_eq!(planner.observe(id(1), Duration::from_secs(10), true), None);
 
         planner.partial_completed(id(1), first.sequence, true);
         let second = planner
-            .observe(id(1), Duration::from_secs(9), true)
+            .observe(id(1), Duration::from_secs(4), true)
             .unwrap();
-        assert_eq!(second.range.start, Duration::from_millis(4_200));
-        assert_eq!(second.range.end, Duration::from_secs(9));
+        assert_eq!(second.range.start, Duration::from_millis(1_500));
+        assert_eq!(second.range.end, Duration::from_secs(4));
     }
 
     #[test]
     fn continuous_speech_forces_a_bounded_chunk() {
         let mut planner = IncrementalPlanner::default();
         planner.start(id(7));
-        assert_eq!(planner.observe(id(7), Duration::from_secs(4), false), None);
+        assert_eq!(
+            planner.observe(id(7), Duration::from_millis(1_500), false),
+            None
+        );
         let plan = planner
-            .observe(id(7), Duration::from_secs(9), false)
+            .observe(id(7), Duration::from_secs(4), false)
             .unwrap();
         assert_eq!(plan.boundary, BoundaryKind::Forced);
-        assert_eq!(plan.range.end, Duration::from_secs(8));
+        assert_eq!(plan.range.end, Duration::from_secs(3));
         assert!(plan.range.duration() <= MAX_CHUNK_DURATION + CHUNK_OVERLAP);
     }
 
     #[test]
     fn silence_wins_at_and_just_after_the_forced_deadline() {
-        for captured in [Duration::from_secs(8), Duration::from_millis(8_100)] {
+        for captured in [Duration::from_secs(3), Duration::from_millis(3_100)] {
             let mut planner = IncrementalPlanner::default();
             planner.start(id(70));
             let plan = planner.observe(id(70), captured, true).unwrap();
 
             assert_eq!(plan.boundary, BoundaryKind::Silence);
-            assert_eq!(plan.range.end, captured.min(Duration::from_secs(8)));
+            assert_eq!(plan.range.end, captured.min(Duration::from_secs(3)));
         }
     }
 
@@ -452,11 +455,11 @@ mod tests {
         let mut planner = IncrementalPlanner::default();
         planner.start(id(71));
         let plan = planner
-            .observe(id(71), Duration::from_secs(10), true)
+            .observe(id(71), Duration::from_secs(5), true)
             .unwrap();
 
         assert_eq!(plan.boundary, BoundaryKind::Forced);
-        assert_eq!(plan.range.end, Duration::from_secs(8));
+        assert_eq!(plan.range.end, Duration::from_secs(3));
         assert_eq!(plan.range.duration(), MAX_CHUNK_DURATION);
     }
 
@@ -465,13 +468,13 @@ mod tests {
         let mut planner = IncrementalPlanner::default();
         planner.start(id(8));
         let forced = planner
-            .observe(id(8), Duration::from_secs(8), false)
+            .observe(id(8), Duration::from_secs(3), false)
             .unwrap();
         assert_eq!(forced.start_overlap, None);
         planner.partial_completed(id(8), forced.sequence, true);
 
         let ending_at_silence = planner
-            .observe(id(8), Duration::from_secs(12), true)
+            .observe(id(8), Duration::from_secs(5), true)
             .unwrap();
         assert_eq!(
             ending_at_silence.start_overlap,
@@ -480,7 +483,7 @@ mod tests {
         planner.partial_completed(id(8), ending_at_silence.sequence, true);
 
         let ending_forced = planner
-            .observe(id(8), Duration::from_secs(20), false)
+            .observe(id(8), Duration::from_secs(8), false)
             .unwrap();
         assert_eq!(ending_forced.start_overlap, Some(MergeExpectation::Silence));
     }
@@ -490,7 +493,7 @@ mod tests {
         let mut planner = IncrementalPlanner::default();
         planner.start(id(2));
         let plan = planner
-            .observe(id(2), Duration::from_secs(8), false)
+            .observe(id(2), Duration::from_secs(3), false)
             .unwrap();
         planner.partial_completed(id(99), plan.sequence, true);
         assert_eq!(planner.active_id(), Some(id(2)));
@@ -507,7 +510,7 @@ mod tests {
         let mut planner = IncrementalPlanner::default();
         planner.start(id(3));
         planner
-            .observe(id(3), Duration::from_secs(8), false)
+            .observe(id(3), Duration::from_secs(3), false)
             .unwrap();
         assert_eq!(planner.cancel(), Some(id(3)));
         assert_eq!(planner.active_id(), None);
@@ -528,7 +531,7 @@ mod tests {
             }
         }
 
-        assert_eq!(plans.len(), 15);
+        assert_eq!(plans.len(), 40);
         assert_eq!(plans.last().unwrap().stable_end, Duration::from_secs(120));
         assert!(plans.windows(2).all(|pair| {
             pair[1].range.start == pair[0].stable_end.saturating_sub(CHUNK_OVERLAP)

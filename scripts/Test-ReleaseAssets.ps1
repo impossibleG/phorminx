@@ -8,6 +8,7 @@ $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $installerPath = Join-Path $repositoryRoot "packaging\phorminx.iss"
 $diagnosticsScript = Join-Path $PSScriptRoot "Collect-PhorminxDiagnostics.ps1"
 $compatibilityScript = Join-Path $PSScriptRoot "Invoke-PhorminxCompatibility.ps1"
+$buildScript = Join-Path $PSScriptRoot "Build-PhorminxInstaller.ps1"
 $failures = [System.Collections.Generic.List[string]]::new()
 
 function Assert-True {
@@ -18,16 +19,19 @@ function Assert-True {
 }
 
 $installer = Get-Content -LiteralPath $installerPath -Raw
-Assert-True ($installer -match '(?m)^PrivilegesRequired=lowest$') "Installer must be per-user."
-Assert-True ($installer -match '(?m)^DefaultDirName=\{localappdata\}\\Programs\\Phorminx$') "Installer must target LocalAppData."
+$releaseBuild = Get-Content -LiteralPath $buildScript -Raw
+Assert-True ($releaseBuild -match 'PhorminxBuild') "Release build must use the short native target path."
+Assert-True ($releaseBuild -match 'desktop,vulkan') "Default Windows release must compile the Vulkan backend."
+Assert-True ($installer -match '(?m)^PrivilegesRequired=lowest\r?$') "Installer must be per-user."
+Assert-True ($installer -match '(?m)^DefaultDirName=\{localappdata\}\\Programs\\Phorminx\r?$') "Installer must target LocalAppData."
 Assert-True ($installer -match '(?m)^Root: HKCU;.*CurrentVersion\\Run') "Autostart must use HKCU."
 Assert-True ($installer -match '(?m)^Root: HKCU;.*ValueData: """\{app\}\\phorminx-app\.exe"" --background"') "Autostart must keep the product shell hidden."
-Assert-True ($installer -match '(?m)^Root: HKCU;.*ValueType: none;.*Flags: dontcreatekey uninsdeletevalue$') "Uninstall must remove runtime-enabled autostart without creating the Run key."
+Assert-True ($installer -match '(?m)^Root: HKCU;.*ValueType: none;.*Flags: dontcreatekey uninsdeletevalue\r?$') "Uninstall must remove runtime-enabled autostart without creating the Run key."
 Assert-True ($installer -notmatch '(?im)runas|PrivilegesRequiredOverridesAllowed') "Installer must not request or offer elevation."
 Assert-True ($installer -notmatch '(?im)^.*models[\\/].*\.bin') "Installer must not bundle speech models."
 Assert-True ($installer -match '(?ms)#ifdef SignToolName.*^SignTool=\{#SignToolName\}.*^SignedUninstaller=yes') "Installer must support externally configured signing for release builds."
-Assert-True ($installer -match '(?m)^SetupIconFile=\.\.\\design\\brand\\phorminx\.ico$') "Installer must use the production Phorminx icon."
-Assert-True ($installer -match '(?m)^Name: "\{autodesktop\}\\Phorminx";.*Tasks: desktopicon$') "Installer must offer the Phorminx desktop shortcut."
+Assert-True ($installer -match '(?m)^SetupIconFile=\.\.\\design\\brand\\phorminx\.ico\r?$') "Installer must use the production Phorminx icon."
+Assert-True ($installer -match '(?m)^Name: "\{autodesktop\}\\Phorminx";.*Tasks: desktopicon\r?$') "Installer must offer the Phorminx desktop shortcut."
 
 $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("phorminx-release-test-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null

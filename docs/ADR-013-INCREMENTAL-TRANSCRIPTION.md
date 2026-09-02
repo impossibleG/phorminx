@@ -1,5 +1,9 @@
 # ADR-013: Adaptive incremental transcription
 
+> Partially superseded by ADR-014. Capture ownership and bounded memory remain;
+> Accurate mode now uses shorter chunks, timestamp-stable segment admission,
+> release-priority abort, and the native model encoder context.
+
 - Status: Accepted
 - Date: 2026-09-01
 

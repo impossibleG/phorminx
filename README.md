@@ -37,10 +37,11 @@ cargo test --workspace
 cargo run --release -p phorminx-bench -- devices
 
 . .\scripts\Enter-PhorminxDevShell.ps1 -Vulkan
+$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA 'PhorminxBuild'
 cargo run --release -p phorminx-app --features vulkan
 
 # Packaged-style build: no console; use the tray menu to exit.
-cargo build --release -p phorminx-app --features desktop
+cargo build --release -p phorminx-app --features desktop,vulkan
 ```
 
 Runtime settings load from `%LOCALAPPDATA%\Phorminx\settings.toml`; local history and product data use `phorminx.db` beside it. Open the tray menu for Settings, History, Personal lexicon, and Application profiles. Settings discovers installed Ollama models without choosing one implicitly, controls model residency, and offers five formatting strengths. History defaults to disabled, raw audio is never stored, and unavailable Ollama always falls back to deterministic local output.

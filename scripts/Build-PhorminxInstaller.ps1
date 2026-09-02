@@ -5,7 +5,8 @@ param(
     [string] $InnoSignToolName,
     [string] $OutputDirectory,
     [switch] $SkipBuild,
-    [switch] $RequireSignedBinary
+    [switch] $RequireSignedBinary,
+    [switch] $Cpu
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,7 +14,11 @@ Set-StrictMode -Version Latest
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $installerScript = Join-Path $repositoryRoot "packaging\phorminx.iss"
-$sourceExecutable = Join-Path $repositoryRoot "target\release\phorminx-app.exe"
+# whisper.cpp's nested Vulkan shader project exceeds MSVC's reliable path
+# depth when Cargo uses a deep worktree target. Keep the native target short
+# and deterministic for both build and installer input.
+$releaseTargetDirectory = Join-Path $env:LOCALAPPDATA "PhorminxBuild"
+$sourceExecutable = Join-Path $releaseTargetDirectory "release\phorminx-app.exe"
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $repositoryRoot "artifacts\installer"
 }
@@ -25,12 +30,14 @@ $numericVersion = ([regex]::Match($Version, '^(\d+)\.(\d+)\.(\d+)')).Groups[1..3
 $numericVersion += '.0'
 
 if (-not $SkipBuild) {
-    & (Join-Path $PSScriptRoot "Enter-PhorminxDevShell.ps1")
+    & (Join-Path $PSScriptRoot "Enter-PhorminxDevShell.ps1") -Vulkan:(-not $Cpu)
     if ($LASTEXITCODE -ne 0) {
         throw "The Phorminx development shell could not be initialized."
     }
 
-    & cargo build --locked --release --package phorminx-app --features desktop
+    $env:CARGO_TARGET_DIR = $releaseTargetDirectory
+    $features = if ($Cpu) { "desktop" } else { "desktop,vulkan" }
+    & cargo build --locked --release --package phorminx-app --features $features
     if ($LASTEXITCODE -ne 0) {
         throw "The desktop release build failed with exit code $LASTEXITCODE."
     }
