@@ -226,7 +226,7 @@ pub fn strip_known_non_speech_annotations(input: &str) -> String {
             }
             if !output.is_empty()
                 && cursor < input.len()
-                && !input[cursor..].starts_with('[')
+                && !starts_with_known_non_speech_annotation(&input[cursor..])
                 && !input[cursor..]
                     .chars()
                     .next()
@@ -251,6 +251,16 @@ pub fn strip_known_non_speech_annotations(input: &str) -> String {
     } else {
         output
     }
+}
+
+fn starts_with_known_non_speech_annotation(input: &str) -> bool {
+    let Some(after_open) = input.strip_prefix('[') else {
+        return false;
+    };
+    let Some(close) = after_open.find(']') else {
+        return false;
+    };
+    is_known_non_speech_label(&after_open[..close])
 }
 
 fn is_known_non_speech_label(label: &str) -> bool {
@@ -657,6 +667,14 @@ mod tests {
         assert_eq!(
             strip_known_non_speech_annotations("hello  there [music]   world"),
             "hello  there world"
+        );
+        assert_eq!(
+            strip_known_non_speech_annotations("hello [music] [meeting notes] world"),
+            "hello [meeting notes] world"
+        );
+        assert_eq!(
+            strip_known_non_speech_annotations("hello [music] [silence] world"),
+            "hello world"
         );
     }
 }

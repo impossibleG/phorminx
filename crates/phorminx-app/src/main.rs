@@ -2319,14 +2319,37 @@ impl TranscriptionWorker {
                                         incremental_sessions.remove(&id);
                                         continue;
                                     }
-                                    Ok(process_transcript(
+                                    let formatting_cancel =
+                                        worker_cancellations.begin_formatting(id);
+                                    if worker_job_cancelled(
+                                        &worker_cancellations,
+                                        &thread_shutting_down,
+                                        id,
+                                    ) {
+                                        formatting_cancel.cancel();
+                                        worker_cancellations.end_formatting(id);
+                                        incremental_sessions.remove(&id);
+                                        continue;
+                                    }
+                                    let processed = process_transcript(
                                         transcript,
                                         &language,
                                         &dictation_formatting,
                                         ollama.as_ref(),
                                         &aliases,
                                         app_executable.as_deref(),
-                                    ))
+                                        &formatting_cancel,
+                                    );
+                                    worker_cancellations.end_formatting(id);
+                                    if worker_job_cancelled(
+                                        &worker_cancellations,
+                                        &thread_shutting_down,
+                                        id,
+                                    ) {
+                                        incremental_sessions.remove(&id);
+                                        continue;
+                                    }
+                                    Ok(processed)
                                 }
                                 Err(error) => Err(error.to_string()),
                             };
@@ -2426,6 +2449,7 @@ impl TranscriptionWorker {
             return Ok(());
         }
         self.shutting_down.store(true, Ordering::Release);
+        self.cancellations.cancel_active_formatting();
         let _ = self.commands.send(WorkerCommand::Shutdown);
         if let Some(thread) = self.thread.take() {
             thread
@@ -2436,31 +2460,82 @@ impl TranscriptionWorker {
     }
 }
 
-#[derive(Default)]
 struct CancellationRegistry {
-    ids: Mutex<HashSet<DictationId>>,
+    state: Mutex<CancellationState>,
+}
+
+#[derive(Default)]
+struct CancellationState {
+    ids: HashSet<DictationId>,
+    formatting: HashMap<DictationId, CancellationToken>,
+}
+
+impl Default for CancellationRegistry {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(CancellationState::default()),
+        }
+    }
 }
 
 impl CancellationRegistry {
     fn cancel(&self, id: DictationId) {
-        self.ids
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.ids.insert(id);
+        if let Some(token) = state.formatting.get(&id) {
+            token.cancel();
+        }
     }
 
     fn is_cancelled(&self, id: DictationId) -> bool {
-        self.ids
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ids
             .contains(&id)
     }
 
     fn acknowledge(&self, id: DictationId) {
-        self.ids
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.ids.remove(&id);
+        state.formatting.remove(&id);
+    }
+
+    fn begin_formatting(&self, id: DictationId) -> CancellationToken {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let token = CancellationToken::new();
+        if state.ids.contains(&id) {
+            token.cancel();
+        }
+        state.formatting.insert(id, token.clone());
+        token
+    }
+
+    fn end_formatting(&self, id: DictationId) {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .formatting
             .remove(&id);
+    }
+
+    fn cancel_active_formatting(&self) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for token in state.formatting.values() {
+            token.cancel();
+        }
     }
 }
 
@@ -2566,9 +2641,9 @@ fn process_partial_transcription(
             thread_count: None,
             audio_context: Some(recommended_audio_context(audio_duration)),
         };
-        let started = Instant::now();
-        let recognition = recognizer.transcribe(&clip, &options);
-        compute_time = started.elapsed();
+        let (recognition, measured) =
+            WallComputeClock.measure(|| recognizer.transcribe(&clip, &options));
+        compute_time = measured;
         accumulator.partial_compute_time = accumulator
             .partial_compute_time
             .saturating_add(compute_time);
@@ -2633,11 +2708,35 @@ fn transcribe_final<R>(
 where
     R: SpeechRecognizer,
 {
+    transcribe_final_with_clock(
+        recognizer,
+        incremental,
+        full_clip,
+        language,
+        full_audio_context,
+        id,
+        &WallComputeClock,
+    )
+}
+
+fn transcribe_final_with_clock<R, C>(
+    recognizer: &R,
+    incremental: Option<PartialAccumulator>,
+    full_clip: &AudioClip,
+    language: &str,
+    full_audio_context: u32,
+    id: DictationId,
+    clock: &C,
+) -> Result<Transcript, String>
+where
+    R: SpeechRecognizer,
+    C: ComputeClock,
+{
     let mut fallback = None;
     let mut partial_compute_time = Duration::ZERO;
     if let Some(accumulator) = incremental {
         partial_compute_time = accumulator.partial_compute_time;
-        match transcribe_final_tail(recognizer, &accumulator, full_clip, language) {
+        match transcribe_final_tail(recognizer, &accumulator, full_clip, language, clock) {
             Ok(transcript) => {
                 let tail_compute_time = transcript
                     .inference_time
@@ -2655,7 +2754,7 @@ where
                 );
                 return Ok(transcript);
             }
-            Err(reason) => fallback = Some(reason),
+            Err(error) => fallback = Some(error),
         }
     }
 
@@ -2664,55 +2763,67 @@ where
         thread_count: None,
         audio_context: Some(full_audio_context),
     };
-    let mut transcript = recognizer
-        .transcribe(full_clip, &options)
-        .map_err(|error| error.to_string())?;
-    let fallback_compute_time = transcript.inference_time;
-    transcript.inference_time = partial_compute_time.saturating_add(fallback_compute_time);
+    let (recognition, fallback_compute_time) =
+        clock.measure(|| recognizer.transcribe(full_clip, &options));
+    let mut transcript = recognition.map_err(|error| error.to_string())?;
+    let doomed_tail_compute_time = fallback
+        .as_ref()
+        .map_or(Duration::ZERO, |error| error.compute_time);
+    transcript.inference_time = partial_compute_time
+        .saturating_add(doomed_tail_compute_time)
+        .saturating_add(fallback_compute_time);
     suppress_non_speech_annotation(&mut transcript);
-    if let Some(reason) = fallback {
+    if let Some(error) = fallback {
         eprintln!(
-            "dictation_id={} state=Transcribing event=incremental_fallback reason={reason} partial_compute_ms={} fallback_compute_ms={}",
+            "dictation_id={} state=Transcribing event=incremental_fallback reason={} partial_compute_ms={} doomed_tail_compute_ms={} fallback_compute_ms={}",
             id.0,
+            error.reason,
             partial_compute_time.as_millis(),
+            error.compute_time.as_millis(),
             fallback_compute_time.as_millis()
         );
     }
     Ok(transcript)
 }
 
-fn transcribe_final_tail<R>(
+fn transcribe_final_tail<R, C>(
     recognizer: &R,
     accumulator: &PartialAccumulator,
     full_clip: &AudioClip,
     language: &str,
-) -> Result<Transcript, &'static str>
+    clock: &C,
+) -> Result<Transcript, TailAttemptError>
 where
     R: SpeechRecognizer,
+    C: ComputeClock,
 {
     // Eligibility must be established before copying audio or invoking
     // Whisper. An invalid partial session goes directly to the one full-clip
     // fallback in `transcribe_final`.
-    let plan = final_tail_plan(accumulator, full_clip.duration())?;
+    let plan = final_tail_plan(accumulator, full_clip.duration())
+        .map_err(TailAttemptError::before_recognition)?;
     let tail_start = plan.start;
     let start_sample =
         (tail_start.as_secs_f64() * f64::from(full_clip.sample_rate)).floor() as usize;
     if start_sample >= full_clip.samples.len() {
-        return Err("empty_final_tail");
+        return Err(TailAttemptError::before_recognition("empty_final_tail"));
     }
     let tail = AudioClip::new(
         full_clip.samples[start_sample..].to_vec(),
         full_clip.sample_rate,
     )
-    .map_err(|_| "invalid_final_tail")?;
+    .map_err(|_| TailAttemptError::before_recognition("invalid_final_tail"))?;
     let options = TranscriptionOptions {
         language: Some(language),
         thread_count: None,
         audio_context: Some(recommended_audio_context(tail.duration())),
     };
-    let mut tail_transcript = recognizer
-        .transcribe(&tail, &options)
-        .map_err(|_| "tail_recognition_failed")?;
+    let (recognition, tail_compute_time) = clock.measure(|| recognizer.transcribe(&tail, &options));
+    let mut tail_transcript = recognition.map_err(|_| TailAttemptError {
+        reason: "tail_recognition_failed",
+        compute_time: tail_compute_time,
+    })?;
+    tail_transcript.inference_time = tail_compute_time;
     suppress_non_speech_annotation(&mut tail_transcript);
     assemble_incremental_transcript(
         accumulator,
@@ -2720,6 +2831,39 @@ where
         tail.rms(),
         full_clip.duration(),
     )
+    .map_err(|reason| TailAttemptError {
+        reason,
+        compute_time: tail_compute_time,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TailAttemptError {
+    reason: &'static str,
+    compute_time: Duration,
+}
+
+impl TailAttemptError {
+    fn before_recognition(reason: &'static str) -> Self {
+        Self {
+            reason,
+            compute_time: Duration::ZERO,
+        }
+    }
+}
+
+trait ComputeClock {
+    fn measure<T>(&self, operation: impl FnOnce() -> T) -> (T, Duration);
+}
+
+struct WallComputeClock;
+
+impl ComputeClock for WallComputeClock {
+    fn measure<T>(&self, operation: impl FnOnce() -> T) -> (T, Duration) {
+        let started = Instant::now();
+        let result = operation();
+        (result, started.elapsed())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2921,6 +3065,7 @@ fn process_transcript(
     ollama: Option<&OllamaClient>,
     aliases: &[LexiconEntry],
     app_executable: Option<&str>,
+    cancel: &CancellationToken,
 ) -> ProcessedTranscript {
     let raw_text = transcript.text.clone();
     let normalized_text = apply_aliases(
@@ -2937,13 +3082,12 @@ fn process_transcript(
         FormatProfile::Balanced | FormatProfile::Strong | FormatProfile::Custom(_) => {
             match (ollama, formatting.model.as_ref()) {
                 (Some(client), Some(model)) => {
-                    let cancel = CancellationToken::new();
                     match client.format(
                         model,
                         &normalized_text,
                         &formatting.profile,
                         formatting.keep_alive.clone(),
-                        &cancel,
+                        cancel,
                     ) {
                         FormatResult::Formatted { text, .. } => (text.clone(), Some(text)),
                         FormatResult::Fallback { reason, .. } => {
@@ -3128,6 +3272,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod composition_tests {
     use std::cell::RefCell;
+    use std::collections::VecDeque;
 
     use super::*;
     use phorminx_persistence::NewLexiconEntry;
@@ -3214,6 +3359,71 @@ mod composition_tests {
         }
     }
 
+    enum SequencedOutcome {
+        Text(&'static str),
+        Failure,
+    }
+
+    struct SequencedRecognizer {
+        outcomes: RefCell<VecDeque<SequencedOutcome>>,
+        clip_lengths: RefCell<Vec<usize>>,
+    }
+
+    impl SequencedRecognizer {
+        fn new(outcomes: impl IntoIterator<Item = SequencedOutcome>) -> Self {
+            Self {
+                outcomes: RefCell::new(outcomes.into_iter().collect()),
+                clip_lengths: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SpeechRecognizer for SequencedRecognizer {
+        type Error = std::io::Error;
+
+        fn load(_model_path: &Path) -> Result<Self, Self::Error> {
+            Ok(Self::new([]))
+        }
+
+        fn transcribe(
+            &self,
+            clip: &AudioClip,
+            _options: &TranscriptionOptions<'_>,
+        ) -> Result<Transcript, Self::Error> {
+            self.clip_lengths.borrow_mut().push(clip.samples.len());
+            match self.outcomes.borrow_mut().pop_front().unwrap() {
+                SequencedOutcome::Text(text) => Ok(Transcript {
+                    text: text.to_owned(),
+                    backend: "fake",
+                    model_load_time: Duration::ZERO,
+                    inference_time: Duration::from_secs(99),
+                    audio_duration: clip.duration(),
+                }),
+                SequencedOutcome::Failure => Err(std::io::Error::other("fake failure")),
+            }
+        }
+    }
+
+    struct ScriptedClock {
+        durations: RefCell<VecDeque<Duration>>,
+    }
+
+    impl ScriptedClock {
+        fn new(durations: impl IntoIterator<Item = Duration>) -> Self {
+            Self {
+                durations: RefCell::new(durations.into_iter().collect()),
+            }
+        }
+    }
+
+    impl ComputeClock for ScriptedClock {
+        fn measure<T>(&self, operation: impl FnOnce() -> T) -> (T, Duration) {
+            let result = operation();
+            let duration = self.durations.borrow_mut().pop_front().unwrap();
+            (result, duration)
+        }
+    }
+
     #[test]
     fn aliases_are_exact_bounded_scoped_and_longest_first() {
         let aliases = [
@@ -3288,6 +3498,58 @@ mod composition_tests {
             .unwrap_err(),
             "partial_recognition_failed"
         );
+    }
+
+    #[test]
+    fn rejected_tail_compute_is_included_in_full_fallback_total() {
+        let recognizer = SequencedRecognizer::new([
+            SequencedOutcome::Text("gamma delta"),
+            SequencedOutcome::Text("full recovered transcript"),
+        ]);
+        let clock = ScriptedClock::new([Duration::from_millis(200), Duration::from_millis(300)]);
+        let full_clip = AudioClip::new(vec![0.1; 160_000], 16_000).unwrap();
+
+        let result = transcribe_final_with_clock(
+            &recognizer,
+            Some(partial("alpha beta", BoundaryKind::Forced)),
+            &full_clip,
+            "en",
+            recommended_audio_context(full_clip.duration()),
+            DictationId(79),
+            &clock,
+        )
+        .unwrap();
+
+        assert_eq!(result.text, "full recovered transcript");
+        assert_eq!(result.inference_time, Duration::from_millis(900));
+        let lengths = recognizer.clip_lengths.borrow();
+        assert_eq!(lengths.len(), 2);
+        assert!(lengths[0] < full_clip.samples.len());
+        assert_eq!(lengths[1], full_clip.samples.len());
+    }
+
+    #[test]
+    fn failed_tail_recognition_compute_is_also_included_in_fallback_total() {
+        let recognizer = SequencedRecognizer::new([
+            SequencedOutcome::Failure,
+            SequencedOutcome::Text("full recovered transcript"),
+        ]);
+        let clock = ScriptedClock::new([Duration::from_millis(200), Duration::from_millis(300)]);
+        let full_clip = AudioClip::new(vec![0.1; 160_000], 16_000).unwrap();
+
+        let result = transcribe_final_with_clock(
+            &recognizer,
+            Some(partial("alpha beta", BoundaryKind::Forced)),
+            &full_clip,
+            "en",
+            recommended_audio_context(full_clip.duration()),
+            DictationId(80),
+            &clock,
+        )
+        .unwrap();
+
+        assert_eq!(result.inference_time, Duration::from_millis(900));
+        assert_eq!(recognizer.clip_lengths.borrow().len(), 2);
     }
 
     #[test]
@@ -3478,6 +3740,21 @@ mod composition_tests {
         // recognizer is running and the post-recognition guard seeing it.
         cancellations.cancel(id);
         assert!(worker_job_cancelled(&cancellations, &shutting_down, id));
+    }
+
+    #[test]
+    fn cancellation_registry_propagates_to_active_ollama_token() {
+        let cancellations = CancellationRegistry::default();
+        let id = DictationId(94);
+        let token = cancellations.begin_formatting(id);
+        assert!(!token.is_cancelled());
+
+        cancellations.cancel(id);
+        assert!(token.is_cancelled());
+        cancellations.end_formatting(id);
+
+        let already_cancelled = cancellations.begin_formatting(id);
+        assert!(already_cancelled.is_cancelled());
     }
 
     #[test]

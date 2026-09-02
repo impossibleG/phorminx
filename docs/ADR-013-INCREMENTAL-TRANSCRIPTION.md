@@ -51,6 +51,9 @@ Cancellation is visible outside the worker's FIFO through a shared ID registry.
 Queued partial and final commands check it before recognition; final work checks
 again after non-preemptible Whisper and before cleanup or Ollama. Resume marks
 the runtime's active ID canceled even when its planner was already finalized.
+A clonable Ollama cancellation token is registered against the active final ID;
+resume, quit, and shutdown cancel it, and completion is checked again after the
+formatter returns.
 A shared shutdown flag similarly makes queued jobs no-ops, so shutdown waits for
 at most the inference already running rather than every stale queued job.
 
@@ -74,7 +77,7 @@ Content-free diagnostics expose:
   partial compute time;
 - `incremental_final_tail` with separate accumulated partial and tail compute;
 - `incremental_fallback` with a non-content reason and separate accumulated
-  partial and full-fallback compute;
+  partial, rejected-tail, and full-fallback compute;
 - `incremental_cancelled` on abandoned listening sessions.
 
 No transcript or audio content is logged or persisted by this feature.
@@ -89,7 +92,8 @@ No transcript or audio content is logged or persisted by this feature.
   Whisper renders an overlap differently. Correctness wins over latency.
 - Formatting remains a final, globally coherent operation.
 - Persisted STT duration means total local recognition compute used by the
-  selected path: partial plus tail, or prior partial plus full fallback. It is
-  not labeled as post-release wall-clock latency.
+  selected path, measured consistently around local recognizer calls: partial
+  plus tail, or prior partial plus rejected tail plus full fallback. It is not
+  labeled as post-release wall-clock latency.
 - A future real VAD can replace the low-energy boundary hint without changing
   the worker protocol or final fallback invariant.
