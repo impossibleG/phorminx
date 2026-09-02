@@ -72,6 +72,11 @@ model default unless an explicit benchmark command asks for an override.
 11. The Models page and both settings surfaces expose all four pinned variants
     and Auto/Vulkan/CPU. Downloads use the selected manifest and switch the
     authoritative model path only after size and SHA-256 verification.
+12. UI readiness receives the resident worker's loaded backend and fallback as
+    its authority. Device enumeration describes availability only and cannot
+    produce a Ready state. Schema 4 migrates older settings without Accurate
+    fields by accepting a verified pinned identity or conservatively retaining
+    the path as Custom with Auto backend.
 
 ## Consequences
 

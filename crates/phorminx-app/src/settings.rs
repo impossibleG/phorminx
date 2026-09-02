@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use phorminx_windows::atomic_replace_file;
 use serde::{Deserialize, Serialize};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 pub const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 pub const MAX_CUSTOM_INSTRUCTIONS_CHARS: usize = 4_096;
 
@@ -51,7 +51,7 @@ impl Settings {
     pub fn validate_and_normalize(&mut self) -> Result<(), SettingsError> {
         match self.schema_version {
             CURRENT_SCHEMA_VERSION => {}
-            1..=3 => self.schema_version = CURRENT_SCHEMA_VERSION,
+            1..=4 => self.schema_version = CURRENT_SCHEMA_VERSION,
             0 => return Err(SettingsError::MissingOrInvalidVersion),
             version if version > CURRENT_SCHEMA_VERSION => {
                 return Err(SettingsError::FutureVersion {
@@ -449,11 +449,39 @@ impl SettingsStore {
             path: self.path.clone(),
             source,
         })?;
+        let raw = toml::from_str::<toml::Value>(text).map_err(|source| SettingsError::Parse {
+            path: self.path.clone(),
+            source,
+        })?;
+        let source_version = raw
+            .get("schema_version")
+            .and_then(toml::Value::as_integer)
+            .and_then(|version| u32::try_from(version).ok());
+        let recognition = raw.get("recognition").and_then(toml::Value::as_table);
+        let missing_accurate_model = source_version.is_some_and(|version| version <= 4)
+            && recognition.is_none_or(|table| !table.contains_key("accurate_model"));
+        let missing_accurate_backend = source_version.is_some_and(|version| version <= 4)
+            && recognition.is_none_or(|table| !table.contains_key("accurate_backend"));
         let mut settings =
             toml::from_str::<Settings>(text).map_err(|source| SettingsError::Parse {
                 path: self.path.clone(),
                 source,
             })?;
+        let identified_legacy_model = missing_accurate_model
+            .then(|| {
+                crate::model::identify_pinned_model(
+                    &self.resolve_model_path(&settings.recognition.model_path),
+                )
+                .ok()
+                .flatten()
+            })
+            .flatten();
+        migrate_legacy_accurate_fields(
+            &mut settings,
+            missing_accurate_model,
+            missing_accurate_backend,
+            identified_legacy_model,
+        );
         settings.validate_and_normalize()?;
         Ok(settings)
     }
@@ -542,6 +570,21 @@ impl SettingsStore {
         Err(SettingsError::TemporaryNameExhausted(
             directory.to_path_buf(),
         ))
+    }
+}
+
+fn migrate_legacy_accurate_fields(
+    settings: &mut Settings,
+    missing_model: bool,
+    missing_backend: bool,
+    identified_model: Option<AccurateModelVariant>,
+) {
+    if missing_model {
+        settings.recognition.accurate_model =
+            identified_model.unwrap_or(AccurateModelVariant::Custom);
+    }
+    if missing_backend {
+        settings.recognition.accurate_backend = AccurateBackendPreference::Auto;
     }
 }
 
@@ -761,21 +804,74 @@ language = "pt-BR"
     }
 
     #[test]
-    fn version_three_files_migrate_to_accurate_without_losing_whisper_path() {
-        let directory = TestDirectory::new("migrate-v3");
+    fn version_three_custom_path_migrates_conservatively_instead_of_claiming_base() {
+        let directory = TestDirectory::new("migrate-v3-custom");
         let path = directory.0.join("settings.toml");
         fs::write(
+            directory.0.join("personal-model.bin"),
+            b"not a pinned model",
+        )
+        .unwrap();
+        fs::write(
             &path,
-            "schema_version = 3\n[recognition]\nmodel_path = 'models/custom.bin'\n",
+            "schema_version = 3\n[recognition]\nmodel_path = \"personal-model.bin\"\nlanguage = \"pt-br\"\n",
         )
         .unwrap();
 
         let loaded = SettingsStore::new(path).unwrap().load().unwrap();
-        assert_eq!(loaded.schema_version, 4);
+        assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(loaded.recognition.mode, RecognitionMode::Accurate);
         assert_eq!(
-            loaded.recognition.model_path,
-            PathBuf::from("models/custom.bin")
+            loaded.recognition.accurate_model,
+            AccurateModelVariant::Custom
+        );
+        assert_eq!(
+            loaded.recognition.accurate_backend,
+            AccurateBackendPreference::Auto
+        );
+    }
+
+    #[test]
+    fn version_three_missing_fields_adopt_verified_multilingual_identity() {
+        let mut settings = Settings {
+            schema_version: 3,
+            ..Settings::default()
+        };
+
+        migrate_legacy_accurate_fields(
+            &mut settings,
+            true,
+            true,
+            Some(AccurateModelVariant::BaseMultilingual),
+        );
+
+        assert_eq!(
+            settings.recognition.accurate_model,
+            AccurateModelVariant::BaseMultilingual
+        );
+        assert_eq!(
+            settings.recognition.accurate_backend,
+            AccurateBackendPreference::Auto
+        );
+    }
+
+    #[test]
+    fn version_three_missing_fields_adopt_verified_english_pinned_identity() {
+        let mut settings = Settings {
+            schema_version: 3,
+            ..Settings::default()
+        };
+
+        migrate_legacy_accurate_fields(
+            &mut settings,
+            true,
+            true,
+            Some(AccurateModelVariant::TinyEnglish),
+        );
+
+        assert_eq!(
+            settings.recognition.accurate_model,
+            AccurateModelVariant::TinyEnglish
         );
     }
 

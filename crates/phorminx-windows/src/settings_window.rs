@@ -20,15 +20,15 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL,
-    CB_SETCURSEL, CBS_DROPDOWNLIST, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, GWLP_USERDATA, GetMessageW,
-    GetSystemMetrics, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW,
-    IsWindow, LoadCursorW, MB_ICONERROR, MB_OK, MSG, MessageBoxW, PostMessageW, PostQuitMessage,
-    PostThreadMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SW_SHOWNORMAL,
-    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
-    TranslateMessage, UnregisterClassW, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_DESTROY, WM_NCCREATE, WM_NCDESTROY, WM_QUIT, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION,
-    WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX,
+    CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, CREATESTRUCTW, CreateWindowExW, DefWindowProcW,
+    DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, GWLP_USERDATA,
+    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HMENU,
+    IDC_ARROW, IsWindow, LoadCursorW, MB_ICONERROR, MB_OK, MSG, MessageBoxW, PostMessageW,
+    PostQuitMessage, PostThreadMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE,
+    SW_SHOWNORMAL, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW,
+    ShowWindow, TranslateMessage, UnregisterClassW, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_NCDESTROY, WM_QUIT, WM_SETFONT, WNDCLASSW, WS_BORDER,
+    WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX,
     WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR, w};
@@ -202,7 +202,8 @@ pub struct SettingsForm {
     pub microphone_status: String,
     pub microphones: Vec<String>,
     pub microphone: Option<String>,
-    pub recommended_download_label: String,
+    /// Stable-index labels for every `SettingsAccurateModel` choice.
+    pub model_download_labels: Vec<String>,
     pub accurate_model: SettingsAccurateModel,
     pub accurate_backend: SettingsAccurateBackend,
     pub language: String,
@@ -386,6 +387,7 @@ struct WindowState {
     model_status: HWND,
     accurate_model: HWND,
     accurate_backend: HWND,
+    download_model: HWND,
     language: HWND,
     minimum_rms: HWND,
     microphone: HWND,
@@ -448,6 +450,7 @@ unsafe fn create_and_run(
         model_status: HWND::default(),
         accurate_model: HWND::default(),
         accurate_backend: HWND::default(),
+        download_model: HWND::default(),
         language: HWND::default(),
         minimum_rms: HWND::default(),
         microphone: HWND::default(),
@@ -547,6 +550,7 @@ unsafe extern "system" fn window_procedure(
         }
         WM_COMMAND => {
             let command = wparam.0 & 0xffff;
+            let notification = (wparam.0 >> 16) & 0xffff;
             match command {
                 ID_SAVE => {
                     if let Some(state) = unsafe { window_state(hwnd) }
@@ -568,12 +572,20 @@ unsafe extern "system" fn window_procedure(
                         let _ = unsafe { SetWindowTextW(state.model, PCWSTR(path.as_ptr())) };
                     }
                 }
+                ID_ACCURATE_MODEL if notification == CBN_SELCHANGE as usize => {
+                    if let Some(state) = unsafe { window_state(hwnd) } {
+                        unsafe { update_download_button(state) };
+                    }
+                }
                 ID_DOWNLOAD => {
                     if let Some(state) = unsafe { window_state(hwnd) } {
                         let selected =
                             unsafe { SendMessageW(state.accurate_model, CB_GETCURSEL, None, None) }
                                 .0;
-                        if let Some(variant) = SettingsAccurateModel::from_index(selected) {
+                        if let Some((variant, _)) =
+                            download_selection(&state.initial.model_download_labels, selected)
+                            && variant != SettingsAccurateModel::Custom
+                        {
                             let _ = state
                                 .events
                                 .send(SettingsWindowEvent::DownloadModel(variant));
@@ -952,8 +964,13 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             scale,
             font,
         )?;
-        let download_label = wide(&state.initial.recommended_download_label);
-        create_button(
+        let download_label = download_selection(
+            &state.initial.model_download_labels,
+            state.initial.accurate_model.index() as isize,
+        )
+        .map_or("Model download unavailable", |(_, label)| label);
+        let download_label = wide(download_label);
+        state.download_model = create_button(
             hwnd,
             ID_DOWNLOAD,
             PCWSTR(download_label.as_ptr()),
@@ -1302,7 +1319,7 @@ unsafe fn read_form(state: &WindowState) -> Option<SettingsForm> {
         microphone_status: state.initial.microphone_status.clone(),
         microphones: state.initial.microphones.clone(),
         microphone: (microphone_index > 0).then(|| unsafe { read_text(state.microphone) }),
-        recommended_download_label: state.initial.recommended_download_label.clone(),
+        model_download_labels: state.initial.model_download_labels.clone(),
         accurate_model: SettingsAccurateModel::from_index(accurate_model_index)?,
         accurate_backend: SettingsAccurateBackend::from_index(accurate_backend_index)?,
         language: unsafe { read_text(state.language) },
@@ -1317,6 +1334,20 @@ unsafe fn read_form(state: &WindowState) -> Option<SettingsForm> {
         history_retention: SettingsHistoryRetention::from_index(retention_index)?,
         launch_at_login,
     })
+}
+
+fn download_selection(labels: &[String], selected: isize) -> Option<(SettingsAccurateModel, &str)> {
+    let variant = SettingsAccurateModel::from_index(selected)?;
+    let label = labels.get(variant.index())?;
+    Some((variant, label.as_str()))
+}
+
+unsafe fn update_download_button(state: &WindowState) {
+    let selected = unsafe { SendMessageW(state.accurate_model, CB_GETCURSEL, None, None) }.0;
+    if let Some((_, label)) = download_selection(&state.initial.model_download_labels, selected) {
+        let label = wide(label);
+        let _ = unsafe { SetWindowTextW(state.download_model, PCWSTR(label.as_ptr())) };
+    }
 }
 
 unsafe fn choose_model_file(owner: HWND, model_edit: HWND) -> Option<String> {
@@ -1492,6 +1523,33 @@ mod tests {
         assert_eq!(SettingsHistoryRetention::from_index(99), None);
         assert_eq!(SettingsAccurateModel::from_index(99), None);
         assert_eq!(SettingsAccurateBackend::from_index(-1), None);
+    }
+
+    #[test]
+    fn accurate_selector_maps_each_index_to_its_exact_label_and_event_variant() {
+        let labels = vec![
+            "Download Tiny English (74.1 MiB)".to_owned(),
+            "Download Base English (141.1 MiB)".to_owned(),
+            "Download Tiny Multilingual (74.1 MiB)".to_owned(),
+            "Download Base Multilingual (141.1 MiB)".to_owned(),
+            "Custom model: use Browse instead of download".to_owned(),
+        ];
+        let variants = [
+            SettingsAccurateModel::TinyEnglish,
+            SettingsAccurateModel::BaseEnglish,
+            SettingsAccurateModel::TinyMultilingual,
+            SettingsAccurateModel::BaseMultilingual,
+            SettingsAccurateModel::Custom,
+        ];
+
+        for (index, expected_variant) in variants.into_iter().enumerate() {
+            let (event_variant, label) =
+                download_selection(&labels, index as isize).expect("complete label table");
+            assert_eq!(event_variant, expected_variant);
+            assert_eq!(label, labels[index]);
+        }
+        assert!(download_selection(&labels, -1).is_none());
+        assert!(download_selection(&labels[..4], 4).is_none());
     }
 
     #[test]

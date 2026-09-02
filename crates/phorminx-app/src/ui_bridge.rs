@@ -14,7 +14,9 @@ use phorminx_persistence::{
     AppProfile, CasePolicy, DictationRecord, ExecutableIdentity, FormattingStyle,
     InsertionPreference, LexiconEntry, NewLexiconEntry, Persistence, RetentionPolicy,
 };
-use phorminx_whisper::{WhisperBackendPreference, probe_backend};
+#[cfg(test)]
+use phorminx_whisper::WhisperBackend;
+use phorminx_whisper::{WhisperBackendPreference, WhisperReadiness, probe_backend};
 
 use crate::model::{identify_pinned_model, model_for_variant};
 use crate::settings::{
@@ -127,7 +129,12 @@ pub struct UiReadinessSnapshot {
 impl UiReadinessSnapshot {
     /// Probes local resources synchronously. Callers should run this away from a
     /// latency-sensitive paint/update callback because CPAL and Ollama may block.
-    pub fn probe(settings: &Settings, store: &SettingsStore, ollama: &OllamaClient) -> Self {
+    pub fn probe(
+        settings: &Settings,
+        store: &SettingsStore,
+        ollama: &OllamaClient,
+        loaded_whisper: Option<&WhisperReadiness>,
+    ) -> Self {
         let selected_microphone = settings.recognition.microphone.clone();
         let microphone = match input_devices() {
             Ok(devices) => {
@@ -148,56 +155,7 @@ impl UiReadinessSnapshot {
             },
         };
 
-        let configured_path = store.resolve_model_path(&settings.recognition.model_path);
-        let backend = probe_backend(match settings.recognition.accurate_backend {
-            crate::settings::AccurateBackendPreference::Auto => WhisperBackendPreference::Auto,
-            crate::settings::AccurateBackendPreference::Vulkan => WhisperBackendPreference::Vulkan,
-            crate::settings::AccurateBackendPreference::Cpu => WhisperBackendPreference::Cpu,
-        });
-        let whisper = match std::fs::metadata(&configured_path) {
-            Ok(metadata) if metadata.is_file() && backend.is_ok() => {
-                let (backend, device_name) = backend.expect("checked as successful");
-                UiWhisperReadiness {
-                    state: UiReadinessState::Ready,
-                    configured_path,
-                    size_bytes: Some(metadata.len()),
-                    language: settings.recognition.language.clone(),
-                    selected_backend: Some(backend.as_str().to_owned()),
-                    device_name,
-                    message: format!(
-                        "Whisper model available; {} backend selected. Loaded when Phorminx is Ready.",
-                        backend.as_str()
-                    ),
-                }
-            }
-            Ok(metadata) if metadata.is_file() => UiWhisperReadiness {
-                state: UiReadinessState::NeedsAttention,
-                configured_path,
-                size_bytes: Some(metadata.len()),
-                language: settings.recognition.language.clone(),
-                selected_backend: None,
-                device_name: None,
-                message: "The requested Whisper backend is unavailable.".to_owned(),
-            },
-            Ok(_) => UiWhisperReadiness {
-                state: UiReadinessState::NeedsAttention,
-                configured_path,
-                size_bytes: None,
-                language: settings.recognition.language.clone(),
-                selected_backend: None,
-                device_name: None,
-                message: "The selected Whisper model is not a file.".to_owned(),
-            },
-            Err(_) => UiWhisperReadiness {
-                state: UiReadinessState::NeedsAttention,
-                configured_path,
-                size_bytes: None,
-                language: settings.recognition.language.clone(),
-                selected_backend: None,
-                device_name: None,
-                message: "Whisper model not found.".to_owned(),
-            },
-        };
+        let whisper = whisper_readiness(settings, store, loaded_whisper);
 
         let vosk_runtime = store.resolve_asset_path(&settings.recognition.instant_runtime_path);
         let vosk_model = store.resolve_asset_path(&settings.recognition.instant_model_path);
@@ -337,6 +295,78 @@ impl UiReadinessSnapshot {
     fn has_installed_ollama_model(&self, name: &str) -> bool {
         self.ollama.state == UiReadinessState::Ready
             && self.ollama.models.iter().any(|model| model.name == name)
+    }
+}
+
+fn whisper_readiness(
+    settings: &Settings,
+    store: &SettingsStore,
+    loaded_whisper: Option<&WhisperReadiness>,
+) -> UiWhisperReadiness {
+    let configured_path = store.resolve_model_path(&settings.recognition.model_path);
+    let backend = probe_backend(match settings.recognition.accurate_backend {
+        crate::settings::AccurateBackendPreference::Auto => WhisperBackendPreference::Auto,
+        crate::settings::AccurateBackendPreference::Vulkan => WhisperBackendPreference::Vulkan,
+        crate::settings::AccurateBackendPreference::Cpu => WhisperBackendPreference::Cpu,
+    });
+    match (std::fs::metadata(&configured_path), loaded_whisper) {
+        (Ok(metadata), Some(loaded)) if metadata.is_file() => {
+            let fallback = loaded
+                .fallback_from
+                .map(|backend| format!(" after {} fallback", backend.as_str()))
+                .unwrap_or_default();
+            UiWhisperReadiness {
+                state: UiReadinessState::Ready,
+                configured_path,
+                size_bytes: Some(metadata.len()),
+                language: settings.recognition.language.clone(),
+                selected_backend: Some(loaded.backend.as_str().to_owned()),
+                device_name: loaded.device_name.clone(),
+                message: format!("Whisper loaded on {}{fallback}.", loaded.backend.as_str()),
+            }
+        }
+        (Ok(metadata), None) if metadata.is_file() && backend.is_ok() => {
+            let (available_backend, _) = backend.expect("checked as successful");
+            UiWhisperReadiness {
+                state: UiReadinessState::NeedsAttention,
+                configured_path,
+                size_bytes: Some(metadata.len()),
+                language: settings.recognition.language.clone(),
+                selected_backend: None,
+                device_name: None,
+                message: format!(
+                    "Whisper model available; {} is available but no recognizer is loaded.",
+                    available_backend.as_str()
+                ),
+            }
+        }
+        (Ok(metadata), None) if metadata.is_file() => UiWhisperReadiness {
+            state: UiReadinessState::NeedsAttention,
+            configured_path,
+            size_bytes: Some(metadata.len()),
+            language: settings.recognition.language.clone(),
+            selected_backend: None,
+            device_name: None,
+            message: "The requested Whisper backend is unavailable.".to_owned(),
+        },
+        (Ok(_), _) => UiWhisperReadiness {
+            state: UiReadinessState::NeedsAttention,
+            configured_path,
+            size_bytes: None,
+            language: settings.recognition.language.clone(),
+            selected_backend: None,
+            device_name: None,
+            message: "The selected Whisper model is not a file.".to_owned(),
+        },
+        (Err(_), _) => UiWhisperReadiness {
+            state: UiReadinessState::NeedsAttention,
+            configured_path,
+            size_bytes: None,
+            language: settings.recognition.language.clone(),
+            selected_backend: None,
+            device_name: None,
+            message: "Whisper model not found.".to_owned(),
+        },
     }
 }
 
@@ -1238,6 +1268,39 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn loaded_cpu_fallback_is_authoritative_over_vulkan_availability() {
+        let test = TestBridge::new();
+        let loaded = WhisperReadiness {
+            requested: WhisperBackendPreference::Auto,
+            backend: WhisperBackend::Cpu,
+            device_name: None,
+            fallback_from: Some(WhisperBackend::Vulkan),
+            model_load_time: std::time::Duration::from_millis(12),
+        };
+
+        let readiness =
+            whisper_readiness(test.bridge.settings(), &test.bridge.store, Some(&loaded));
+
+        assert_eq!(readiness.state, UiReadinessState::Ready);
+        assert_eq!(readiness.selected_backend.as_deref(), Some("cpu"));
+        assert_eq!(readiness.device_name, None);
+        assert!(readiness.message.contains("after vulkan fallback"));
+    }
+
+    #[test]
+    fn explicit_vulkan_without_a_loaded_context_is_never_ready() {
+        let mut test = TestBridge::new();
+        test.bridge.settings.recognition.accurate_backend =
+            crate::settings::AccurateBackendPreference::Vulkan;
+
+        let readiness = whisper_readiness(test.bridge.settings(), &test.bridge.store, None);
+
+        assert_eq!(readiness.state, UiReadinessState::NeedsAttention);
+        assert_eq!(readiness.selected_backend, None);
+        assert_eq!(readiness.device_name, None);
     }
 
     #[test]

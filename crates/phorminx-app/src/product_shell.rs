@@ -18,6 +18,7 @@ use phorminx_ui::{
     RecordingMode as ShellRecording, Route, RuntimeStatus, SettingsSnapshot, ShellEvent,
     ShellSnapshot, SystemReadiness,
 };
+use phorminx_whisper::WhisperReadiness;
 use phorminx_windows::{SystemAppearance, system_appearance};
 
 use crate::settings::{
@@ -72,6 +73,7 @@ impl ProductShell {
         initial_route: UiRoute,
         initial_status: UiRuntimeStatus,
         initially_visible: bool,
+        loaded_whisper: Option<WhisperReadiness>,
     ) -> Result<Self, String> {
         let (control_tx, control_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
@@ -85,6 +87,7 @@ impl ProductShell {
                     initial_route,
                     initial_status,
                     initially_visible,
+                    loaded_whisper,
                     ShellChannels {
                         controls: control_rx,
                         events: event_tx.clone(),
@@ -151,6 +154,7 @@ fn run_shell(
     initial_route: UiRoute,
     initial_status: UiRuntimeStatus,
     initially_visible: bool,
+    loaded_whisper: Option<WhisperReadiness>,
     channels: ShellChannels,
 ) -> Result<(), String> {
     let ShellChannels {
@@ -164,7 +168,12 @@ fn run_shell(
         .snapshot(initial_status, readiness.clone(), DEFAULT_HISTORY_LIMIT)
         .map_err(|error| error.to_string())?;
     let (readiness_tx, readiness_rx) = mpsc::channel();
-    probe_readiness(bridge.settings().clone(), store.clone(), readiness_tx);
+    probe_readiness(
+        bridge.settings().clone(),
+        store.clone(),
+        loaded_whisper.clone(),
+        readiness_tx,
+    );
 
     let mut native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -198,6 +207,7 @@ fn run_shell(
         events,
         readiness_rx,
         store,
+        loaded_whisper,
     );
     eframe::run_native(
         "Phorminx",
@@ -216,11 +226,21 @@ struct ShellChannels {
     ready: mpsc::SyncSender<Result<egui::Context, String>>,
 }
 
-fn probe_readiness(settings: Settings, store: SettingsStore, sender: Sender<UiReadinessSnapshot>) {
+fn probe_readiness(
+    settings: Settings,
+    store: SettingsStore,
+    loaded_whisper: Option<WhisperReadiness>,
+    sender: Sender<UiReadinessSnapshot>,
+) {
     let _ = thread::Builder::new()
         .name("phorminx-readiness".to_owned())
         .spawn(move || {
-            let readiness = UiReadinessSnapshot::probe(&settings, &store, &OllamaClient::default());
+            let readiness = UiReadinessSnapshot::probe(
+                &settings,
+                &store,
+                &OllamaClient::default(),
+                loaded_whisper.as_ref(),
+            );
             let _ = sender.send(readiness);
         });
 }
@@ -235,6 +255,7 @@ struct ProductShellApp {
     events: Sender<ProductShellEvent>,
     readiness_rx: Receiver<UiReadinessSnapshot>,
     store: SettingsStore,
+    loaded_whisper: Option<WhisperReadiness>,
     notice: Option<InlineNotice>,
     download_active: bool,
     quitting: bool,
@@ -252,6 +273,7 @@ impl ProductShellApp {
         events: Sender<ProductShellEvent>,
         readiness_rx: Receiver<UiReadinessSnapshot>,
         store: SettingsStore,
+        loaded_whisper: Option<WhisperReadiness>,
     ) -> Self {
         Self {
             shell: PhorminxUi::new(map_snapshot(snapshot, route, None)),
@@ -263,6 +285,7 @@ impl ProductShellApp {
             events,
             readiness_rx,
             store,
+            loaded_whisper,
             notice: None,
             download_active: false,
             quitting: false,
@@ -308,11 +331,19 @@ impl ProductShellApp {
                     let _ = self.events.send(event);
                 }
                 if matches!(outcome.mutation, UiMutation::SettingsSaved) {
+                    // The resident recognizer still represents the old saved
+                    // configuration until the requested restart completes.
+                    self.loaded_whisper = None;
                     self.readiness =
                         UiReadinessSnapshot::checking(self.bridge.settings(), &self.store);
                     let (sender, receiver) = mpsc::channel();
                     self.readiness_rx = receiver;
-                    probe_readiness(self.bridge.settings().clone(), self.store.clone(), sender);
+                    probe_readiness(
+                        self.bridge.settings().clone(),
+                        self.store.clone(),
+                        self.loaded_whisper.clone(),
+                        sender,
+                    );
                 }
                 self.refresh();
                 true
@@ -390,7 +421,12 @@ impl ProductShellApp {
                 self.readiness = UiReadinessSnapshot::checking(self.bridge.settings(), &self.store);
                 let (sender, receiver) = mpsc::channel();
                 self.readiness_rx = receiver;
-                probe_readiness(self.bridge.settings().clone(), self.store.clone(), sender);
+                probe_readiness(
+                    self.bridge.settings().clone(),
+                    self.store.clone(),
+                    self.loaded_whisper.clone(),
+                    sender,
+                );
                 self.refresh();
             }
             ShellEvent::NoticeAction if self.download_active => {
@@ -402,7 +438,12 @@ impl ProductShellApp {
                 self.readiness = UiReadinessSnapshot::checking(self.bridge.settings(), &self.store);
                 let (sender, receiver) = mpsc::channel();
                 self.readiness_rx = receiver;
-                probe_readiness(self.bridge.settings().clone(), self.store.clone(), sender);
+                probe_readiness(
+                    self.bridge.settings().clone(),
+                    self.store.clone(),
+                    self.loaded_whisper.clone(),
+                    sender,
+                );
                 self.refresh();
             }
             ShellEvent::ChangeWhisperModel(variant) => {

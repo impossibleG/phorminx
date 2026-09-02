@@ -16,7 +16,7 @@ use phorminx_app::incremental::{
     merge_overlapping, strip_known_non_speech_annotations,
 };
 use phorminx_app::model::{
-    ModelDownload, ModelDownloadEvent, identify_pinned_model, model_for_variant, recommended_model,
+    ModelDownload, ModelDownloadEvent, identify_pinned_model, model_for_variant,
 };
 use phorminx_app::product_shell::{ProductShell, ProductShellControl, ProductShellEvent};
 use phorminx_app::runtime::{
@@ -44,7 +44,9 @@ use phorminx_persistence::{
     TimingMetadata,
 };
 use phorminx_vosk::{VoskModel, VoskSession};
-use phorminx_whisper::{WhisperBackendPreference, WhisperError, WhisperRecognizer};
+use phorminx_whisper::{
+    WhisperBackendPreference, WhisperError, WhisperReadiness, WhisperRecognizer,
+};
 use phorminx_windows::{
     ClipboardOnlyReason, GlobalHoldHotkey, HistoryItem, HistoryWindow, HistoryWindowEvent,
     HoldEvent, InsertionOutcome, LexiconCasePolicy, LexiconDraft, LexiconItem, LexiconWindow,
@@ -364,6 +366,7 @@ fn run() -> Result<()> {
                 route,
                 UiRuntimeStatus::Ready,
                 !cli.background,
+                worker.readiness().cloned(),
             )
             .map_err(|error| anyhow!(error))
             .context("failed to start the product shell")?,
@@ -394,6 +397,7 @@ fn run() -> Result<()> {
                 settings_store: &settings_store,
                 settings: &mut settings,
                 effective_model: &model,
+                loaded_whisper: worker.readiness(),
                 persistence: Some(&persistence),
             },
         ) {
@@ -456,6 +460,7 @@ fn run() -> Result<()> {
                 settings_store: &settings_store,
                 settings: &mut settings,
                 effective_model: &model,
+                loaded_whisper: worker.readiness(),
                 persistence: Some(&persistence),
             },
         ) {
@@ -620,6 +625,7 @@ fn run() -> Result<()> {
                 settings_store: &settings_store,
                 settings: &mut settings,
                 effective_model: &model,
+                loaded_whisper: worker.readiness(),
                 persistence: Some(&persistence),
             },
         ) {
@@ -900,6 +906,7 @@ fn run_setup_mode(
             UiRoute::Models,
             UiRuntimeStatus::NeedsAttention,
             true,
+            None,
         )
         .map_err(|error| anyhow!(error))
         .context("failed to open first-run model setup")?,
@@ -927,6 +934,7 @@ fn run_setup_mode(
                 settings_store: &settings_store,
                 settings: &mut settings,
                 effective_model: &model,
+                loaded_whisper: None,
                 persistence: None,
             },
         ) {
@@ -1035,6 +1043,7 @@ struct ShellPoll<'a> {
     settings_store: &'a SettingsStore,
     settings: &'a mut Settings,
     effective_model: &'a Path,
+    loaded_whisper: Option<&'a WhisperReadiness>,
     persistence: Option<&'a Persistence>,
 }
 
@@ -1053,6 +1062,7 @@ fn poll_shell_events(
         settings_store,
         settings,
         effective_model,
+        loaded_whisper,
         persistence,
     } = poll;
     loop {
@@ -1070,8 +1080,12 @@ fn poll_shell_events(
                     window.focus().context("failed to focus settings")?;
                 } else {
                     *settings_window = Some(
-                        SettingsWindow::start(settings_form(settings, effective_model))
-                            .context("failed to open settings")?,
+                        SettingsWindow::start(settings_form(
+                            settings,
+                            effective_model,
+                            loaded_whisper,
+                        ))
+                        .context("failed to open settings")?,
                     );
                 }
             }
@@ -1634,14 +1648,29 @@ fn poll_shell_events(
     Ok(ShellAction::Continue)
 }
 
-fn settings_form(settings: &Settings, effective_model: &Path) -> SettingsForm {
-    let model_status = match std::fs::metadata(effective_model) {
-        Ok(metadata) if metadata.is_file() => format!(
-            "Model ready ({:.1} MiB)",
+fn settings_form(
+    settings: &Settings,
+    effective_model: &Path,
+    loaded_whisper: Option<&WhisperReadiness>,
+) -> SettingsForm {
+    let model_status = match (std::fs::metadata(effective_model), loaded_whisper) {
+        (Ok(metadata), Some(loaded)) if metadata.is_file() => {
+            let fallback = loaded
+                .fallback_from
+                .map(|backend| format!(" after {} fallback", backend.as_str()))
+                .unwrap_or_default();
+            format!(
+                "Model loaded on {}{fallback} ({:.1} MiB)",
+                loaded.backend.as_str(),
+                metadata.len() as f64 / (1024.0 * 1024.0)
+            )
+        }
+        (Ok(metadata), None) if metadata.is_file() => format!(
+            "Model available but recognizer not loaded ({:.1} MiB)",
             metadata.len() as f64 / (1024.0 * 1024.0)
         ),
-        Ok(_) => "The selected model path is not a file".to_owned(),
-        Err(_) => "Model not found - choose a local .bin file".to_owned(),
+        (Ok(_), _) => "The selected model path is not a file".to_owned(),
+        (Err(_), _) => "Model not found - choose a local .bin file".to_owned(),
     };
     let (microphones, microphone_status) = match input_devices() {
         Ok(devices) => {
@@ -1723,14 +1752,7 @@ fn settings_form(settings: &Settings, effective_model: &Path) -> SettingsForm {
         microphone_status,
         microphones,
         microphone: settings.recognition.microphone.clone(),
-        recommended_download_label: recommended_model()
-            .map(|model| {
-                format!(
-                    "Download recommended English model ({:.0} MiB)",
-                    model.bytes as f64 / (1024.0 * 1024.0)
-                )
-            })
-            .unwrap_or_else(|_| "Recommended model download unavailable".to_owned()),
+        model_download_labels: accurate_model_download_labels(),
         accurate_model: to_window_accurate_model(settings.recognition.accurate_model),
         accurate_backend: match settings.recognition.accurate_backend {
             AccurateBackendPreference::Auto => SettingsAccurateBackend::Auto,
@@ -1772,6 +1794,31 @@ fn settings_form(settings: &Settings, effective_model: &Path) -> SettingsForm {
         },
         launch_at_login: settings.startup.launch_at_login,
     }
+}
+
+fn accurate_model_download_labels() -> Vec<String> {
+    [
+        (AccurateModelVariant::TinyEnglish, "Tiny English"),
+        (AccurateModelVariant::BaseEnglish, "Base English"),
+        (AccurateModelVariant::TinyMultilingual, "Tiny Multilingual"),
+        (AccurateModelVariant::BaseMultilingual, "Base Multilingual"),
+    ]
+    .into_iter()
+    .map(|(variant, name)| {
+        model_for_variant(variant).map_or_else(
+            |_| format!("{name} download unavailable"),
+            |model| {
+                format!(
+                    "Download {name} ({:.1} MiB)",
+                    model.bytes as f64 / (1024.0 * 1024.0)
+                )
+            },
+        )
+    })
+    .chain(std::iter::once(
+        "Custom model: use Browse instead of download".to_owned(),
+    ))
+    .collect()
 }
 
 fn to_window_accurate_model(variant: AccurateModelVariant) -> SettingsAccurateModel {
@@ -2370,6 +2417,7 @@ struct TranscriptionWorker {
     cancellations: Arc<CancellationRegistry>,
     shutting_down: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    readiness: Option<WhisperReadiness>,
 }
 
 #[derive(Default)]
@@ -2508,7 +2556,7 @@ impl TranscriptionWorker {
                         return;
                     }
                 };
-                match &recognizer {
+                let readiness = match &recognizer {
                     LoadedRecognizer::Accurate(recognizer) => {
                         let readiness = recognizer.readiness();
                         eprintln!(
@@ -2519,13 +2567,17 @@ impl TranscriptionWorker {
                             readiness.device_name.is_some(),
                             readiness.model_load_time.as_millis()
                         );
+                        Some(readiness)
                     }
-                    LoadedRecognizer::Instant(model) => eprintln!(
-                        "dictation_id=0 state=Starting event=stt_backend_ready backend=vosk device_present=false model_load_ms={}",
-                        model.load_time().as_millis()
-                    ),
-                }
-                if ready_tx.send(Ok(())).is_err() {
+                    LoadedRecognizer::Instant(model) => {
+                        eprintln!(
+                            "dictation_id=0 state=Starting event=stt_backend_ready backend=vosk device_present=false model_load_ms={}",
+                            model.load_time().as_millis()
+                        );
+                        None
+                    }
+                };
+                if ready_tx.send(Ok(readiness)).is_err() {
                     return;
                 }
 
@@ -2787,13 +2839,14 @@ impl TranscriptionWorker {
             })?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(readiness)) => Ok(Self {
                 commands: command_tx,
                 instant_audio: instant_audio_tx,
                 results: result_rx,
                 cancellations,
                 shutting_down: worker_shutting_down,
                 thread: Some(thread),
+                readiness,
             }),
             Ok(Err(message)) => {
                 let _ = thread.join();
@@ -2832,6 +2885,10 @@ impl TranscriptionWorker {
             return Err(anyhow!(error)).context("transcription worker is unavailable");
         }
         Ok(())
+    }
+
+    fn readiness(&self) -> Option<&WhisperReadiness> {
+        self.readiness.as_ref()
     }
 
     fn transcribe_partial(
@@ -4481,6 +4538,29 @@ mod composition_tests {
         assert_eq!(worker.profile, FormatProfile::Strong);
         assert_eq!(worker.model.unwrap().as_str(), "qwen2.5:3b");
         assert_eq!(worker.keep_alive, KeepAlive::UnloadAfterRequest);
+    }
+
+    #[test]
+    fn native_download_labels_match_every_manifest_variant_and_size() {
+        let labels = accurate_model_download_labels();
+        assert_eq!(labels.len(), 5);
+        for (index, (variant, name)) in [
+            (AccurateModelVariant::TinyEnglish, "Tiny English"),
+            (AccurateModelVariant::BaseEnglish, "Base English"),
+            (AccurateModelVariant::TinyMultilingual, "Tiny Multilingual"),
+            (AccurateModelVariant::BaseMultilingual, "Base Multilingual"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let spec = model_for_variant(variant).unwrap();
+            assert!(labels[index].contains(name));
+            assert!(
+                labels[index]
+                    .contains(&format!("{:.1} MiB", spec.bytes as f64 / (1024.0 * 1024.0)))
+            );
+        }
+        assert!(labels[4].contains("Browse"));
     }
 
     #[test]
