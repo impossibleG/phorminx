@@ -62,6 +62,69 @@ pub struct CapturedAudio {
 }
 
 impl ActiveRecording {
+    /// Duration captured at one observed ring-buffer position.
+    pub fn captured_duration(&self) -> Duration {
+        Duration::from_secs_f64(self.captured.occupied_len() as f64 / f64::from(self.sample_rate))
+    }
+
+    /// RMS of the most recently observed native-rate samples.
+    ///
+    /// The consumer never advances during capture. We first observe a fixed
+    /// length, then read at most that prefix, so samples appended concurrently
+    /// by CPAL are not accidentally included in the measurement.
+    pub fn recent_rms(&self, window: Duration) -> f32 {
+        let observed = self.captured.occupied_len();
+        if observed == 0 {
+            return 0.0;
+        }
+        let requested = duration_to_samples(window, self.sample_rate).min(observed);
+        if requested == 0 {
+            return 0.0;
+        }
+        let start = observed - requested;
+        let (first, second) = self.captured.as_slices();
+        let mean_square = first
+            .iter()
+            .chain(second)
+            .take(observed)
+            .skip(start)
+            .map(|sample| f64::from(*sample) * f64::from(*sample))
+            .sum::<f64>()
+            / requested as f64;
+        mean_square.sqrt() as f32
+    }
+
+    /// Copies and converts one bounded range without consuming the recording.
+    ///
+    /// Returned audio is owned; no ring-buffer slice survives this call. The
+    /// untouched full recording therefore remains available for the final
+    /// single-shot correctness fallback.
+    pub fn snapshot_range(
+        &self,
+        start: Duration,
+        end: Duration,
+    ) -> Result<AudioClip, CaptureError> {
+        let observed = self.captured.occupied_len();
+        let start_sample = duration_to_samples(start, self.sample_rate);
+        let end_sample = duration_to_samples(end, self.sample_rate);
+        if start_sample >= end_sample || end_sample > observed {
+            return Err(CaptureError::InvalidSnapshotRange {
+                start_sample,
+                end_sample,
+                observed_samples: observed,
+            });
+        }
+
+        let (first, second) = self.captured.as_slices();
+        let native_samples = copy_observed_range(first, second, observed, start_sample..end_sample);
+        let samples = if self.sample_rate == WHISPER_SAMPLE_RATE {
+            native_samples
+        } else {
+            resample(&native_samples, self.sample_rate, WHISPER_SAMPLE_RATE)?
+        };
+        AudioClip::new(samples, WHISPER_SAMPLE_RATE).map_err(CaptureError::Audio)
+    }
+
     /// Stops capture and converts the recording to Whisper's 16 kHz mono format.
     pub fn finish(self) -> Result<AudioClip, CaptureError> {
         Ok(self.finish_with_diagnostics()?.clip)
@@ -105,6 +168,26 @@ impl ActiveRecording {
             backend_warning_count: warning_count,
         })
     }
+}
+
+fn duration_to_samples(duration: Duration, sample_rate: u32) -> usize {
+    (duration.as_secs_f64() * f64::from(sample_rate)).floor() as usize
+}
+
+fn copy_observed_range(
+    first: &[f32],
+    second: &[f32],
+    observed: usize,
+    range: std::ops::Range<usize>,
+) -> Vec<f32> {
+    first
+        .iter()
+        .chain(second)
+        .take(observed)
+        .skip(range.start)
+        .take(range.end - range.start)
+        .copied()
+        .collect()
 }
 
 /// Starts recording from the default microphone and returns immediately.
@@ -437,6 +520,14 @@ pub enum CaptureError {
         max_seconds: u64,
         dropped_samples: u64,
     },
+    #[error(
+        "incremental snapshot range {start_sample}..{end_sample} exceeds the {observed_samples} observed samples"
+    )]
+    InvalidSnapshotRange {
+        start_sample: usize,
+        end_sample: usize,
+        observed_samples: usize,
+    },
     #[error("audio resampling failed: {0}")]
     Resample(String),
     #[error("sample rates must be nonzero (source={source_rate}, target={target_rate})")]
@@ -517,6 +608,26 @@ mod tests {
 
         assert_eq!(consumer.pop_iter().collect::<Vec<_>>(), vec![2.0, 3.0]);
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn observed_range_copy_is_bounded_to_the_recorded_prefix() {
+        let first = [0.0, 1.0, 2.0];
+        let second = [3.0, 4.0, 99.0];
+
+        assert_eq!(
+            copy_observed_range(&first, &second, 5, 2..5),
+            vec![2.0, 3.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn duration_sample_conversion_rounds_down_to_observed_audio() {
+        assert_eq!(
+            duration_to_samples(Duration::from_millis(800), 48_000),
+            38_400
+        );
+        assert_eq!(duration_to_samples(Duration::from_micros(62), 16_000), 0);
     }
 
     #[test]

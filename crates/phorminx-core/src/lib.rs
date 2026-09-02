@@ -103,7 +103,7 @@ pub trait SpeechRecognizer {
 }
 
 /// Stable identifier used to correlate one activation across content-free logs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DictationId(pub u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

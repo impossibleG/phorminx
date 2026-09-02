@@ -7,6 +7,9 @@ The product is local-first:
 - `whisper.cpp` performs speech recognition.
 - Deterministic rules handle safe normalization and explicit aliases.
 - Ollama optionally cleans and formats transcripts.
+- Longer dictations are transcribed incrementally with bounded overlapping
+  chunks; short dictations retain the single-shot path, and uncertain overlap
+  automatically falls back to the untouched full recording.
 - Raw audio is not retained by default.
 - Dictation remains usable when Ollama is missing or unavailable.
 

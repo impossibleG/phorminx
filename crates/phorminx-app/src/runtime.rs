@@ -150,6 +150,13 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
         self.pending_id
     }
 
+    /// Read-only access used by the event-loop incremental scheduler. The
+    /// recording remains owned by the runtime and can still be finalized or
+    /// dropped through the existing state-machine paths.
+    pub fn active_recording(&self) -> Option<&Recording> {
+        self.recording.as_ref()
+    }
+
     pub fn is_clean_idle(&self) -> bool {
         self.machine.state() == RuntimeState::Idle
             && self.machine.active_id().is_none()
