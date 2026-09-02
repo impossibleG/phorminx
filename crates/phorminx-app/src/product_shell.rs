@@ -154,6 +154,7 @@ impl Drop for ProductShell {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_shell(
     store: SettingsStore,
     database_path: PathBuf,

@@ -931,7 +931,7 @@ language = "pt-BR"
     }
 
     #[test]
-    fn first_schema_four_save_preserves_exact_schema_three_rollback_backup() {
+    fn first_schema_five_save_preserves_exact_schema_three_rollback_backup() {
         let directory = TestDirectory::new("schema-v3-backup");
         let path = directory.0.join("settings.toml");
         let original = "schema_version = 3\n[recognition]\nmodel_path = 'models/custom.bin'\n";
