@@ -54,6 +54,12 @@ matching official model-directory identity and carries a quality warning.
 Instant mode rejects a per-application language override that does not match the
 resident model.
 
+After the worker's single successful load, the product shell consumes that
+authoritative resident readiness instead of probing Vosk again. Accurate mode
+and automatic shell refreshes use an explicit installed/unvalidated layout
+state that is never called Ready. Full native probing is reserved for setup,
+explicit Verify, verified import, and settings validation.
+
 The Settings UI offers an explicit verified import. The user supplies the two
 official ZIPs; Phorminx embeds its pinned installer, verifies exact byte length
 and SHA-256, rejects unsafe archive paths, extracts into a fresh directory, and
@@ -61,10 +67,15 @@ performs the full native readiness probe before saving. No download is implicit.
 
 The app loop stamps the monotonic release time at receipt of both hold-release
 and toggle-stop events, before audio finalization. That anchor is carried through
-worker completion and insertion. History schema v2 stores audio-finalization,
-worker-queue, insertion, and release-to-insert durations separately. Schema 3
-settings are preserved byte-for-byte as a one-time rollback backup before the
-first schema 4 save.
+worker completion and insertion. History keeps its schema-1 marker and adds
+nullable audio-finalization, worker-queue, and release-to-insert columns
+idempotently. The prior binary uses explicit column lists, so it can read and
+write the same live database without a private rollback copy. Pre-release
+schema-2 markers for this exact additive shape are normalized back to 1.
+Schema-3 settings are preserved byte-for-byte as a one-time rollback backup
+before the first schema-4 save. Phorminx removes the obsolete
+`phorminx.db.schema-1.backup` artifact, if present, so dictated text, lexicon
+entries, and profiles cannot escape retention or deletion through a snapshot.
 
 ## Consequences
 

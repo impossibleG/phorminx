@@ -2,7 +2,11 @@ use rusqlite::Connection;
 
 use crate::Result;
 
-const LATEST_VERSION: u32 = 2;
+// The timing extension is deliberately additive and keeps schema version 1.
+// Older Phorminx binaries use explicit column lists, so nullable extra columns
+// are backward-compatible for both reads and writes.
+const LATEST_VERSION: u32 = 1;
+const TRANSITIONAL_ADDITIVE_VERSION: u32 = 2;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE dictation_history (
@@ -56,11 +60,20 @@ CREATE TABLE app_profiles (
 );
 "#;
 
-const MIGRATION_2: &str = r#"
-ALTER TABLE dictation_history ADD COLUMN audio_finalization_duration_ms INTEGER;
-ALTER TABLE dictation_history ADD COLUMN worker_queue_duration_ms INTEGER;
-ALTER TABLE dictation_history ADD COLUMN release_to_insert_duration_ms INTEGER;
-"#;
+const TIMING_COLUMNS: [(&str, &str); 3] = [
+    (
+        "audio_finalization_duration_ms",
+        "ALTER TABLE dictation_history ADD COLUMN audio_finalization_duration_ms INTEGER",
+    ),
+    (
+        "worker_queue_duration_ms",
+        "ALTER TABLE dictation_history ADD COLUMN worker_queue_duration_ms INTEGER",
+    ),
+    (
+        "release_to_insert_duration_ms",
+        "ALTER TABLE dictation_history ADD COLUMN release_to_insert_duration_ms INTEGER",
+    ),
+];
 
 pub(crate) fn apply(connection: &Connection) -> Result<()> {
     connection.execute_batch(
@@ -83,17 +96,25 @@ pub(crate) fn apply(connection: &Connection) -> Result<()> {
         transaction.commit()?;
     }
 
-    if current < 2 {
-        let transaction = connection.unchecked_transaction()?;
-        transaction.execute_batch(MIGRATION_2)?;
-        transaction.execute(
-            "INSERT INTO schema_migrations(version, applied_at_ms) \
-             VALUES (2, unixepoch('subsec') * 1000)",
-            [],
+    let transaction = connection.unchecked_transaction()?;
+    for (name, statement) in TIMING_COLUMNS {
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('dictation_history') WHERE name = ?1)",
+            [name],
+            |row| row.get(0),
         )?;
-        transaction.pragma_update(None, "user_version", 2)?;
-        transaction.commit()?;
+        if !exists {
+            transaction.execute_batch(statement)?;
+        }
     }
+    if current == TRANSITIONAL_ADDITIVE_VERSION {
+        // Pre-release builds briefly labeled the same nullable extension as
+        // schema 2. Normalize only that known shape so the previous binary can
+        // open it, without copying or discarding any private user data.
+        transaction.execute("DELETE FROM schema_migrations WHERE version = 2", [])?;
+    }
+    transaction.pragma_update(None, "user_version", LATEST_VERSION)?;
+    transaction.commit()?;
 
     Ok(())
 }
@@ -114,7 +135,7 @@ pub(crate) fn current_version(connection: &Connection) -> Result<u32> {
         [],
         |row| row.get(0),
     )?;
-    if version > LATEST_VERSION {
+    if version > TRANSITIONAL_ADDITIVE_VERSION {
         return Err(crate::PersistenceError::Validation {
             field: "schema_version",
             reason: "database was created by a newer Phorminx version",

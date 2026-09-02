@@ -29,6 +29,7 @@ use crate::settings::{
 use crate::ui_bridge::{
     DEFAULT_HISTORY_LIMIT, UiBridge, UiCommand, UiEffect, UiLexiconDraft, UiMutation,
     UiProfileDraft, UiReadinessSnapshot, UiReadinessState, UiRoute, UiRuntimeStatus, UiSnapshot,
+    UiVoskProbe,
 };
 
 #[cfg(windows)]
@@ -46,6 +47,7 @@ pub enum ProductShellControl {
     },
     ModelDownloadFailed,
     VoskInstallFailed(String),
+    ActivationBlocked(String),
     Quit,
 }
 
@@ -74,6 +76,7 @@ impl ProductShell {
         database_path: PathBuf,
         initial_route: UiRoute,
         initial_status: UiRuntimeStatus,
+        initial_vosk_probe: UiVoskProbe,
         initially_visible: bool,
         loaded_whisper: Option<WhisperReadiness>,
     ) -> Result<Self, String> {
@@ -88,6 +91,7 @@ impl ProductShell {
                     database_path,
                     initial_route,
                     initial_status,
+                    initial_vosk_probe,
                     initially_visible,
                     loaded_whisper,
                     ShellChannels {
@@ -155,6 +159,7 @@ fn run_shell(
     database_path: PathBuf,
     initial_route: UiRoute,
     initial_status: UiRuntimeStatus,
+    initial_vosk_probe: UiVoskProbe,
     initially_visible: bool,
     loaded_whisper: Option<WhisperReadiness>,
     channels: ShellChannels,
@@ -174,6 +179,7 @@ fn run_shell(
         bridge.settings().clone(),
         store.clone(),
         loaded_whisper.clone(),
+        initial_vosk_probe,
         readiness_tx,
     );
 
@@ -232,6 +238,7 @@ fn probe_readiness(
     settings: Settings,
     store: SettingsStore,
     loaded_whisper: Option<WhisperReadiness>,
+    vosk_probe: UiVoskProbe,
     sender: Sender<UiReadinessSnapshot>,
 ) {
     let _ = thread::Builder::new()
@@ -242,10 +249,13 @@ fn probe_readiness(
                 &store,
                 &OllamaClient::default(),
                 loaded_whisper.as_ref(),
+                vosk_probe,
             );
             let _ = sender.send(readiness);
         });
 }
+
+const AUTOMATIC_REFRESH_VOSK_PROBE: UiVoskProbe = UiVoskProbe::LayoutOnly;
 
 struct ProductShellApp {
     shell: PhorminxUi,
@@ -344,6 +354,7 @@ impl ProductShellApp {
                         self.bridge.settings().clone(),
                         self.store.clone(),
                         self.loaded_whisper.clone(),
+                        AUTOMATIC_REFRESH_VOSK_PROBE,
                         sender,
                     );
                 }
@@ -427,6 +438,7 @@ impl ProductShellApp {
                     self.bridge.settings().clone(),
                     self.store.clone(),
                     self.loaded_whisper.clone(),
+                    UiVoskProbe::FullValidation,
                     sender,
                 );
                 self.refresh();
@@ -444,6 +456,7 @@ impl ProductShellApp {
                     self.bridge.settings().clone(),
                     self.store.clone(),
                     self.loaded_whisper.clone(),
+                    UiVoskProbe::FullValidation,
                     sender,
                 );
                 self.refresh();
@@ -548,6 +561,10 @@ impl eframe::App for ProductShellApp {
                     self.refresh();
                 }
                 ProductShellControl::VoskInstallFailed(message) => {
+                    self.set_error(message);
+                    self.refresh();
+                }
+                ProductShellControl::ActivationBlocked(message) => {
                     self.set_error(message);
                     self.refresh();
                 }
@@ -1017,6 +1034,12 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_refresh_policy_never_full_loads_vosk() {
+        assert_eq!(AUTOMATIC_REFRESH_VOSK_PROBE, UiVoskProbe::LayoutOnly);
+        assert_ne!(AUTOMATIC_REFRESH_VOSK_PROBE, UiVoskProbe::FullValidation);
+    }
 
     #[test]
     fn route_mapping_is_bidirectional() {

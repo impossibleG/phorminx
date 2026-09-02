@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -26,7 +26,7 @@ use phorminx_app::settings::{
     AccurateBackendPreference, AccurateModelVariant, FormattingStrength, HistoryRetention,
     OllamaLifecycle, RecognitionMode, RecordingMode, RuntimeFormatting, Settings, SettingsStore,
 };
-use phorminx_app::ui_bridge::{UiMutation, UiRoute, UiRuntimeStatus};
+use phorminx_app::ui_bridge::{UiMutation, UiRoute, UiRuntimeStatus, UiVoskProbe};
 use phorminx_audio::{ActiveRecording, input_devices, start_input};
 #[cfg(test)]
 use phorminx_core::recommended_audio_context;
@@ -43,7 +43,7 @@ use phorminx_persistence::{
     InsertionPreference, LexiconEntry, NewLexiconEntry, Persistence, RetentionPolicy,
     TimingMetadata,
 };
-use phorminx_vosk::{VoskModel, VoskSession};
+use phorminx_vosk::{AssetLayout as VoskAssetLayout, VoskModel, VoskSession};
 use phorminx_whisper::{
     WhisperBackendPreference, WhisperError, WhisperReadiness, WhisperRecognizer,
 };
@@ -226,12 +226,16 @@ fn run() -> Result<()> {
 
     let recognition_ready = match settings.recognition.mode {
         RecognitionMode::Accurate => model.is_file(),
-        RecognitionMode::Instant => phorminx_vosk::inspect(
-            &instant_runtime,
-            &instant_model,
-            &settings.recognition.language,
-        )
-        .is_ready(),
+        // This gate performs no native/model load. The worker below takes sole
+        // ownership of the one full load and retains it for the process lifetime.
+        RecognitionMode::Instant => matches!(
+            phorminx_vosk::validate_asset_layout(
+                &instant_runtime,
+                &instant_model,
+                &settings.recognition.language,
+            ),
+            VoskAssetLayout::Present { .. }
+        ),
     };
     if !recognition_ready {
         if cli.smoke_test {
@@ -384,6 +388,7 @@ fn run() -> Result<()> {
                 database_path.clone(),
                 route,
                 UiRuntimeStatus::Ready,
+                active_shell_vosk_probe(settings.recognition.mode),
                 !cli.background,
                 worker.readiness().cloned(),
             )
@@ -557,10 +562,17 @@ fn run() -> Result<()> {
                             continue 'event_loop;
                         }
                     };
-                    if dictation_context.deny {
+                    if let Some(reason) = dictation_context.activation_block {
                         eprintln!(
-                            "dictation_id=0 state=Idle event=activation_denied_by_app_profile"
+                            "dictation_id=0 state=Idle event=activation_blocked reason={}",
+                            reason.label()
                         );
+                        show_shell_status(&overlay, &tray, OverlayStatus::Error, TrayStatus::Error);
+                        if let Some(shell) = product_shell.as_ref() {
+                            let _ = shell.send(ProductShellControl::ActivationBlocked(
+                                reason.message().to_owned(),
+                            ));
+                        }
                         continue 'event_loop;
                     }
                     runtime.configure_next_dictation(
@@ -777,40 +789,37 @@ fn run() -> Result<()> {
                             Err(error) => break 'event_loop Err(error.into()),
                         }
                     };
-                    let reached_insertion = notices.iter().any(|notice| {
-                        matches!(
-                            notice,
-                            RuntimeNotice::Inserted { .. } | RuntimeNotice::ClipboardReady { .. }
-                        )
-                    });
                     let insertion_completed_at = Instant::now();
-                    if is_current
-                        && reached_insertion
-                        && let Some(processed) = processed_for_history.as_ref()
-                    {
-                        if let Some(lifecycle) = processed.lifecycle {
-                            eprintln!(
-                                "uptime_ms={} dictation_id={} state=Inserting event=release_terminal release_to_insert_ms={} insertion_ms={}",
-                                monotonic_uptime_ms(),
-                                completed.id.0,
-                                insertion_completed_at
-                                    .saturating_duration_since(lifecycle.release.released_at)
-                                    .as_millis(),
-                                insertion_completed_at
-                                    .saturating_duration_since(insertion_started_at)
-                                    .as_millis()
-                            );
-                        }
-                        if let Err(error) = persist_transcript(
-                            &persistence,
-                            processed,
-                            insertion_started_at,
-                            insertion_completed_at,
-                        ) {
-                            eprintln!(
-                                "dictation_id={} state=Cleaning event=history_write_failed error={error}",
-                                completed.id.0
-                            );
+                    if is_current && let Some(processed) = processed_for_history.as_ref() {
+                        let outcome = terminal_outcome(&notices);
+                        if outcome.is_success() {
+                            if let Some(lifecycle) = processed.lifecycle {
+                                eprintln!(
+                                    "uptime_ms={} dictation_id={} state=Inserting event=release_terminal outcome={} release_to_insert_ms={} insertion_ms={}",
+                                    monotonic_uptime_ms(),
+                                    completed.id.0,
+                                    outcome.label(),
+                                    insertion_completed_at
+                                        .saturating_duration_since(lifecycle.release.released_at)
+                                        .as_millis(),
+                                    insertion_completed_at
+                                        .saturating_duration_since(insertion_started_at)
+                                        .as_millis()
+                                );
+                            }
+                            if let Err(error) = persist_transcript(
+                                &persistence,
+                                processed,
+                                insertion_started_at,
+                                insertion_completed_at,
+                            ) {
+                                eprintln!(
+                                    "dictation_id={} state=Cleaning event=history_write_failed error={error}",
+                                    completed.id.0
+                                );
+                            }
+                        } else {
+                            record_terminal_failure(completed.id, outcome);
                         }
                     }
                     report_notices(notices);
@@ -946,6 +955,17 @@ fn runtime_shell_status(state: RuntimeState) -> UiRuntimeStatus {
     }
 }
 
+fn active_shell_vosk_probe(mode: RecognitionMode) -> UiVoskProbe {
+    match mode {
+        RecognitionMode::Instant => UiVoskProbe::ResidentReady,
+        RecognitionMode::Accurate => UiVoskProbe::LayoutOnly,
+    }
+}
+
+fn setup_shell_vosk_probe() -> UiVoskProbe {
+    UiVoskProbe::FullValidation
+}
+
 fn run_setup_mode(
     overlay: StatusOverlay,
     tray: SystemTray,
@@ -967,6 +987,7 @@ fn run_setup_mode(
             database_path,
             UiRoute::Models,
             UiRuntimeStatus::NeedsAttention,
+            setup_shell_vosk_probe(),
             true,
             None,
         )
@@ -2508,6 +2529,94 @@ fn log_release_received(id: DictationId, released_at: Instant) {
     );
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalOutcome {
+    Inserted,
+    ClipboardReady,
+    EmptyTranscript,
+    InsertionFailed,
+    Stale,
+    OtherFailure,
+}
+
+impl TerminalOutcome {
+    fn is_success(self) -> bool {
+        matches!(self, Self::Inserted | Self::ClipboardReady)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Inserted => "inserted",
+            Self::ClipboardReady => "clipboard_ready",
+            Self::EmptyTranscript => "empty_transcript",
+            Self::InsertionFailed => "insertion_failed",
+            Self::Stale => "stale",
+            Self::OtherFailure => "other_failure",
+        }
+    }
+}
+
+fn terminal_outcome<R>(notices: &[RuntimeNotice<R>]) -> TerminalOutcome {
+    if notices
+        .iter()
+        .any(|notice| matches!(notice, RuntimeNotice::Inserted { .. }))
+    {
+        return TerminalOutcome::Inserted;
+    }
+    if notices
+        .iter()
+        .any(|notice| matches!(notice, RuntimeNotice::ClipboardReady { .. }))
+    {
+        return TerminalOutcome::ClipboardReady;
+    }
+    if notices
+        .iter()
+        .any(|notice| matches!(notice, RuntimeNotice::NoSpeech { .. }))
+    {
+        return TerminalOutcome::EmptyTranscript;
+    }
+    if notices.iter().any(|notice| {
+        matches!(
+            notice,
+            RuntimeNotice::Failure {
+                event: "insertion_failed",
+                ..
+            }
+        )
+    }) {
+        return TerminalOutcome::InsertionFailed;
+    }
+    if notices
+        .iter()
+        .any(|notice| matches!(notice, RuntimeNotice::StaleTranscription { .. }))
+    {
+        return TerminalOutcome::Stale;
+    }
+    TerminalOutcome::OtherFailure
+}
+
+fn record_terminal_failure(id: DictationId, outcome: TerminalOutcome) {
+    static EMPTY_TRANSCRIPTS: AtomicU64 = AtomicU64::new(0);
+    static INSERTION_FAILURES: AtomicU64 = AtomicU64::new(0);
+    static STALE_RESULTS: AtomicU64 = AtomicU64::new(0);
+    static OTHER_FAILURES: AtomicU64 = AtomicU64::new(0);
+    let counter = match outcome {
+        TerminalOutcome::EmptyTranscript => &EMPTY_TRANSCRIPTS,
+        TerminalOutcome::InsertionFailed => &INSERTION_FAILURES,
+        TerminalOutcome::Stale => &STALE_RESULTS,
+        TerminalOutcome::Inserted
+        | TerminalOutcome::ClipboardReady
+        | TerminalOutcome::OtherFailure => &OTHER_FAILURES,
+    };
+    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "uptime_ms={} dictation_id={} state=Idle event=release_terminal_failed category={} failure_count={count}",
+        monotonic_uptime_ms(),
+        id.0,
+        outcome.label()
+    );
+}
+
 fn monotonic_uptime_ms() -> u128 {
     static STARTED: OnceLock<Instant> = OnceLock::new();
     STARTED.get_or_init(Instant::now).elapsed().as_millis()
@@ -2641,14 +2750,17 @@ impl TranscriptionWorker {
                         runtime_bundle,
                         model,
                         language,
-                    } => VoskModel::load(&runtime_bundle, &model, &language)
-                        .and_then(|model| {
+                    } => load_and_probe_resident(
+                        || VoskModel::load(&runtime_bundle, &model, &language),
+                        |model| {
                             // Loading the model alone does not prove that the native runtime can
                             // construct a recognizer. Probe that boundary before advertising Ready.
                             let probe = model.session(16_000)?;
                             drop(probe);
-                            Ok(LoadedRecognizer::Instant(model))
-                        })
+                            Ok(())
+                        },
+                    )
+                        .map(LoadedRecognizer::Instant)
                         .map_err(|error| error.to_string()),
                 };
                 let recognizer = match recognizer {
@@ -2910,7 +3022,6 @@ impl TranscriptionWorker {
                             if result_tx
                                 .send(WorkerEvent::Completed(Box::new(WorkerResult {
                                     id,
-                                    released_at,
                                     result,
                                 })))
                                 .is_err()
@@ -3088,6 +3199,15 @@ impl TranscriptionWorker {
         }
         Ok(())
     }
+}
+
+fn load_and_probe_resident<T, E>(
+    loader: impl FnOnce() -> Result<T, E>,
+    probe: impl FnOnce(&T) -> Result<(), E>,
+) -> Result<T, E> {
+    let resident = loader()?;
+    probe(&resident)?;
+    Ok(resident)
 }
 
 struct TranscriptionRequest {
@@ -3275,7 +3395,6 @@ enum WorkerCommand {
 
 struct WorkerResult {
     id: DictationId,
-    released_at: Instant,
     result: Result<ProcessedTranscript, String>,
 }
 
@@ -3980,8 +4099,32 @@ struct DictationContext {
     formatting: WorkerFormatting,
     runtime_formatting: RuntimeFormatting,
     insertion_preference: InsertionPreference,
-    deny: bool,
     verified_variant: Option<AccurateModelVariant>,
+    activation_block: Option<ActivationBlockReason>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivationBlockReason {
+    ProfileDenied,
+    InstantLanguageMismatch,
+}
+
+impl ActivationBlockReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ProfileDenied => "profile_denied",
+            Self::InstantLanguageMismatch => "instant_language_mismatch",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::ProfileDenied => "Dictation is disabled by this application profile.",
+            Self::InstantLanguageMismatch => {
+                "This application profile requests a language that does not match the resident Instant model. Change the profile language or use Accurate mode."
+            }
+        }
+    }
 }
 
 impl DictationContext {
@@ -3999,8 +4142,8 @@ impl DictationContext {
             formatting: WorkerFormatting::from_settings(settings)?,
             runtime_formatting: RuntimeFormatting::try_from(settings.formatting.strength)?,
             insertion_preference: InsertionPreference::Automatic,
-            deny: false,
             verified_variant,
+            activation_block: None,
         })
     }
 
@@ -4010,8 +4153,18 @@ impl DictationContext {
         settings: &Settings,
         verified_variant: Option<AccurateModelVariant>,
     ) -> Result<Self> {
-        let mut context = Self::global(settings, verified_variant)?;
-        let Some(executable) = target.and_then(TargetSnapshot::executable_name) else {
+        let context = Self::global(settings, verified_variant)?;
+        let executable = target.and_then(TargetSnapshot::executable_name);
+        Self::for_executable(context, executable, persistence, settings)
+    }
+
+    fn for_executable(
+        mut context: Self,
+        executable: Option<String>,
+        persistence: &Persistence,
+        settings: &Settings,
+    ) -> Result<Self> {
+        let Some(executable) = executable else {
             return Ok(context);
         };
         let identity = ExecutableIdentity::new(executable.clone())
@@ -4030,20 +4183,23 @@ impl DictationContext {
                 &settings.recognition.language,
                 &profile_language,
             ) {
-                return Err(anyhow!(
-                    "the active application profile language does not match the resident Instant model"
-                ));
+                context.activation_block = Some(ActivationBlockReason::InstantLanguageMismatch);
             } else {
                 context.language = profile_language;
             }
         }
-        if verified_variant.is_some_and(|variant| !variant.supports_language(&context.language)) {
+        if context
+            .verified_variant
+            .is_some_and(|variant| !variant.supports_language(&context.language))
+        {
             return Err(anyhow!(
                 "the verified English-only Whisper model cannot transcribe the active application profile language"
             ));
         }
         context.insertion_preference = profile.insertion_preference;
-        context.deny = profile.deny;
+        if profile.deny {
+            context.activation_block = Some(ActivationBlockReason::ProfileDenied);
+        }
         context.runtime_formatting = match profile.formatting_style {
             FormattingStyle::Raw => RuntimeFormatting::Raw,
             FormattingStyle::Light => RuntimeFormatting::Light,
@@ -4457,7 +4613,7 @@ fn elapsed_since_release(released_at: Instant, stage_at: Instant) -> Duration {
 
 #[cfg(test)]
 mod composition_tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
     use super::*;
@@ -5377,5 +5533,155 @@ mod composition_tests {
             "en",
             "pt-br"
         ));
+    }
+
+    #[test]
+    fn existing_incompatible_profile_blocks_before_any_runtime_work() {
+        let path = std::env::temp_dir().join(format!(
+            "phorminx-profile-language-gate-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let persistence = Persistence::open(&path).unwrap();
+        persistence
+            .app_profiles()
+            .upsert(&AppProfile {
+                executable: ExecutableIdentity::new("code.exe").unwrap(),
+                formatting_style: FormattingStyle::Light,
+                custom_instructions: None,
+                language: Some("pt-br".to_owned()),
+                insertion_preference: InsertionPreference::Automatic,
+                deny: false,
+            })
+            .unwrap();
+        let mut settings = Settings::default();
+        settings.recognition.mode = RecognitionMode::Instant;
+        settings.recognition.language = "en".to_owned();
+
+        let context = DictationContext::for_executable(
+            DictationContext::global(&settings, None).unwrap(),
+            Some("code.exe".to_owned()),
+            &persistence,
+            &settings,
+        )
+        .unwrap();
+        assert_eq!(
+            context.activation_block,
+            Some(ActivationBlockReason::InstantLanguageMismatch)
+        );
+        assert_eq!(
+            context.activation_block.unwrap().label(),
+            "instant_language_mismatch"
+        );
+        assert!(!context.activation_block.unwrap().message().is_empty());
+
+        // This is the same gate used by the event loop before it configures the
+        // runtime or calls `hold_started`. None of those effects are eligible.
+        let recording_starts = Cell::new(0);
+        let stt_submissions = Cell::new(0);
+        let insertions = Cell::new(0);
+        if context.activation_block.is_none() {
+            recording_starts.set(recording_starts.get() + 1);
+            stt_submissions.set(stt_submissions.get() + 1);
+            insertions.set(insertions.get() + 1);
+        }
+        assert_eq!(recording_starts.get(), 0);
+        assert_eq!(stt_submissions.get(), 0);
+        assert_eq!(insertions.get(), 0);
+
+        drop(persistence);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn only_successful_terminal_outcomes_are_latency_and_history_eligible() {
+        let id = DictationId(7);
+        let cases: Vec<(RuntimeNotice<&str>, TerminalOutcome, bool)> = vec![
+            (
+                RuntimeNotice::Inserted {
+                    id,
+                    inference_time: Duration::from_millis(2),
+                },
+                TerminalOutcome::Inserted,
+                true,
+            ),
+            (
+                RuntimeNotice::ClipboardReady {
+                    id,
+                    reason: "clipboard",
+                },
+                TerminalOutcome::ClipboardReady,
+                true,
+            ),
+            (
+                RuntimeNotice::NoSpeech {
+                    id,
+                    event: "silence_rejected",
+                },
+                TerminalOutcome::EmptyTranscript,
+                false,
+            ),
+            (
+                RuntimeNotice::Failure {
+                    id: Some(id),
+                    event: "insertion_failed",
+                    message: "content-free test failure".to_owned(),
+                },
+                TerminalOutcome::InsertionFailed,
+                false,
+            ),
+            (
+                RuntimeNotice::StaleTranscription {
+                    id,
+                    state: RuntimeState::Idle,
+                },
+                TerminalOutcome::Stale,
+                false,
+            ),
+        ];
+
+        for (notice, expected, eligible) in cases {
+            let outcome = terminal_outcome(&[notice]);
+            assert_eq!(outcome, expected);
+            assert_eq!(outcome.is_success(), eligible);
+        }
+        let other = terminal_outcome::<&str>(&[]);
+        assert_eq!(other, TerminalOutcome::OtherFailure);
+        assert!(!other.is_success());
+    }
+
+    #[test]
+    fn resident_loader_loads_and_probes_exactly_once_then_retains_value() {
+        let loads = Cell::new(0);
+        let probes = Cell::new(0);
+        let resident = load_and_probe_resident(
+            || {
+                loads.set(loads.get() + 1);
+                Ok::<_, ()>("resident")
+            },
+            |loaded| {
+                assert_eq!(*loaded, "resident");
+                probes.set(probes.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(resident, "resident");
+        assert_eq!(loads.get(), 1);
+        assert_eq!(probes.get(), 1);
+    }
+
+    #[test]
+    fn active_shell_uses_resident_instant_readiness_without_another_load() {
+        assert_eq!(
+            active_shell_vosk_probe(RecognitionMode::Instant),
+            UiVoskProbe::ResidentReady
+        );
+        assert_eq!(
+            active_shell_vosk_probe(RecognitionMode::Accurate),
+            UiVoskProbe::LayoutOnly
+        );
+        assert_eq!(setup_shell_vosk_probe(), UiVoskProbe::FullValidation);
     }
 }

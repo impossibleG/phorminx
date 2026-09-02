@@ -8,7 +8,8 @@ mod lexicon;
 mod migration;
 mod profile;
 
-use std::{fs, path::Path, time::Duration};
+use std::ffi::OsString;
+use std::{fs, path::Path, path::PathBuf, time::Duration};
 
 pub use history::{
     DictationDraft, DictationRecord, HistoryRepository, RetentionPolicy, TimingMetadata,
@@ -35,6 +36,8 @@ pub enum PersistenceError {
         field: &'static str,
         reason: &'static str,
     },
+    #[error("an obsolete privacy-unsafe rollback artifact could not be removed")]
+    PrivacyCleanup(#[source] std::io::Error),
 }
 
 /// A connection to the per-user Phorminx database.
@@ -54,6 +57,7 @@ impl Persistence {
         {
             fs::create_dir_all(parent).map_err(PersistenceError::CreateDirectory)?;
         }
+        remove_obsolete_rollback_artifact(path)?;
 
         let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
@@ -80,4 +84,41 @@ impl Persistence {
     pub fn schema_version(&self) -> Result<u32> {
         migration::current_version(&self.connection)
     }
+}
+
+fn obsolete_rollback_artifact_path(database_path: &Path) -> PathBuf {
+    let mut name = database_path
+        .file_name()
+        .map_or_else(|| OsString::from("phorminx.db"), OsString::from);
+    name.push(".schema-1.backup");
+    database_path.with_file_name(name)
+}
+
+fn remove_obsolete_rollback_artifact(database_path: &Path) -> Result<()> {
+    let artifact = obsolete_rollback_artifact_path(database_path);
+    let mut artifacts = vec![artifact.clone()];
+    for suffix in ["-wal", "-shm"] {
+        let mut name = artifact.as_os_str().to_os_string();
+        name.push(suffix);
+        artifacts.push(PathBuf::from(name));
+    }
+    if let Some(directory) = database_path.parent() {
+        let database_name = database_path
+            .file_name()
+            .map_or_else(|| "phorminx.db".into(), |name| name.to_string_lossy());
+        let temporary_prefix = format!("{database_name}.schema-1-backup-");
+        for entry in fs::read_dir(directory).map_err(PersistenceError::PrivacyCleanup)? {
+            let entry = entry.map_err(PersistenceError::PrivacyCleanup)?;
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with(&temporary_prefix) {
+                artifacts.push(entry.path());
+            }
+        }
+    }
+    for artifact in artifacts {
+        if artifact.exists() {
+            fs::remove_file(artifact).map_err(PersistenceError::PrivacyCleanup)?;
+        }
+    }
+    Ok(())
 }

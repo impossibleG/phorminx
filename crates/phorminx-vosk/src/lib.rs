@@ -43,6 +43,16 @@ pub enum Readiness {
     IncompatibleModelLanguage { language: String },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AssetLayout {
+    Present { warning: Option<&'static str> },
+    MissingRuntime { expected: PathBuf },
+    MissingModel { expected: PathBuf },
+    InvalidRuntime,
+    UnsupportedLanguage { language: String },
+    IncompatibleModelLanguage { language: String },
+}
+
 impl Readiness {
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready { .. })
@@ -50,10 +60,10 @@ impl Readiness {
 }
 
 pub fn inspect(runtime_bundle: &Path, model: &Path, language: &str) -> Readiness {
-    let layout = inspect_layout(runtime_bundle, model, language);
+    let layout = validate_asset_layout(runtime_bundle, model, language);
     let warning = match layout {
-        Readiness::Ready { warning } => warning,
-        readiness => return readiness,
+        AssetLayout::Present { warning } => warning,
+        layout => return layout.into(),
     };
     let loaded = match VoskModel::load_validated(runtime_bundle, model) {
         Ok(model) => model,
@@ -71,27 +81,25 @@ pub fn inspect(runtime_bundle: &Path, model: &Path, language: &str) -> Readiness
     Readiness::Ready { warning }
 }
 
-fn inspect_layout(runtime_bundle: &Path, model: &Path, language: &str) -> Readiness {
+pub fn validate_asset_layout(runtime_bundle: &Path, model: &Path, language: &str) -> AssetLayout {
     let language = language.trim().to_ascii_lowercase();
     if !matches!(language.as_str(), "en" | "en-us" | "pt" | "pt-br") {
-        return Readiness::UnsupportedLanguage { language };
+        return AssetLayout::UnsupportedLanguage { language };
     }
     for required in WINDOWS_RUNTIME_FILES {
         let expected = runtime_bundle.join(required);
         if !expected.is_file() {
-            return Readiness::MissingRuntime { expected };
+            return AssetLayout::MissingRuntime { expected };
         }
         if expected
             .metadata()
             .map_or(true, |metadata| metadata.len() == 0)
         {
-            return Readiness::LoadFailed {
-                component: "runtime_bundle",
-            };
+            return AssetLayout::InvalidRuntime;
         }
     }
     if !model.is_dir() {
-        return Readiness::MissingModel {
+        return AssetLayout::MissingModel {
             expected: model.to_path_buf(),
         };
     }
@@ -102,16 +110,33 @@ fn inspect_layout(runtime_bundle: &Path, model: &Path, language: &str) -> Readin
                 .metadata()
                 .map_or(true, |metadata| metadata.len() == 0)
         {
-            return Readiness::MissingModel { expected };
+            return AssetLayout::MissingModel { expected };
         }
     }
     if !model_matches_language(model, &language) {
-        return Readiness::IncompatibleModelLanguage { language };
+        return AssetLayout::IncompatibleModelLanguage { language };
     }
-    Readiness::Ready {
+    AssetLayout::Present {
         warning: matches!(language.as_str(), "pt" | "pt-br").then_some(
             "Instant Portuguese quality depends strongly on the selected Vosk model; Accurate mode is recommended when fidelity matters.",
         ),
+    }
+}
+
+impl From<AssetLayout> for Readiness {
+    fn from(layout: AssetLayout) -> Self {
+        match layout {
+            AssetLayout::Present { warning } => Self::Ready { warning },
+            AssetLayout::MissingRuntime { expected } => Self::MissingRuntime { expected },
+            AssetLayout::MissingModel { expected } => Self::MissingModel { expected },
+            AssetLayout::InvalidRuntime => Self::LoadFailed {
+                component: "runtime_bundle",
+            },
+            AssetLayout::UnsupportedLanguage { language } => Self::UnsupportedLanguage { language },
+            AssetLayout::IncompatibleModelLanguage { language } => {
+                Self::IncompatibleModelLanguage { language }
+            }
+        }
     }
 }
 
@@ -206,9 +231,9 @@ pub struct VoskModel {
 
 impl VoskModel {
     pub fn load(runtime_bundle: &Path, model: &Path, language: &str) -> Result<Self, VoskError> {
-        match inspect_layout(runtime_bundle, model, language) {
-            Readiness::Ready { .. } => {}
-            readiness => return Err(VoskError::NotReady(readiness)),
+        match validate_asset_layout(runtime_bundle, model, language) {
+            AssetLayout::Present { .. } => {}
+            layout => return Err(VoskError::NotReady(layout.into())),
         }
         Self::load_validated(runtime_bundle, model)
     }
@@ -433,8 +458,8 @@ mod tests {
             fs::write(runtime.join(file), [1]).unwrap();
         }
         assert!(matches!(
-            inspect_layout(&runtime, &model, "en"),
-            Readiness::MissingModel { .. }
+            validate_asset_layout(&runtime, &model, "en"),
+            AssetLayout::MissingModel { .. }
         ));
         for file in MODEL_FILES {
             let path = model.join(file);

@@ -65,11 +65,11 @@ fn creates_parent_enables_wal_and_applies_migrations_idempotently() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("a/b/history.sqlite3");
     let database = Persistence::open(&path).unwrap();
-    assert_eq!(database.schema_version().unwrap(), 2);
+    assert_eq!(database.schema_version().unwrap(), 1);
     drop(database);
 
     let reopened = Persistence::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 2);
+    assert_eq!(reopened.schema_version().unwrap(), 1);
 
     let raw = rusqlite::Connection::open(&path).unwrap();
     let mode: String = raw
@@ -82,6 +82,164 @@ fn creates_parent_enables_wal_and_applies_migrations_idempotently() {
     // Bundled SQLite is built with foreign-key enforcement as its default, and
     // Persistence also enables it explicitly on every managed connection.
     assert!(foreign_keys);
+}
+
+#[test]
+fn additive_timings_are_compatible_with_old_schema_one_reads_and_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("phorminx.db");
+    let current = Persistence::open(&path).unwrap();
+    assert_eq!(current.schema_version().unwrap(), 1);
+    drop(current);
+
+    let old_binary = rusqlite::Connection::open(&path).unwrap();
+    let timing_column_count: u32 = old_binary
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('dictation_history')
+             WHERE name IN (
+                 'audio_finalization_duration_ms',
+                 'worker_queue_duration_ms',
+                 'release_to_insert_duration_ms'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(timing_column_count, 3);
+    old_binary
+        .execute(
+            "INSERT INTO dictation_history(
+                 created_at_ms, raw_text, normalized_text, cleaned_text,
+                 selected_output, language, target_executable,
+                 audio_duration_ms, stt_duration_ms, formatting_duration_ms,
+                 insertion_duration_ms, warnings_json
+             ) VALUES (
+                 1, 'old raw', NULL, NULL, 'old selected', 'en', NULL,
+                 100, 20, 0, 1, '[]'
+             )",
+            [],
+        )
+        .unwrap();
+    let old_selected: String = old_binary
+        .query_row(
+            "SELECT selected_output FROM dictation_history WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_selected, "old selected");
+
+    // A pre-release build briefly labeled these same nullable columns schema
+    // 2. The current build safely normalizes that marker back to the additive,
+    // old-binary-compatible schema 1 contract without touching content.
+    old_binary
+        .execute(
+            "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (2, 2)",
+            [],
+        )
+        .unwrap();
+    old_binary.pragma_update(None, "user_version", 2).unwrap();
+    drop(old_binary);
+
+    let normalized = Persistence::open(&path).unwrap();
+    assert_eq!(normalized.schema_version().unwrap(), 1);
+    let record = normalized.history().recent(1).unwrap().remove(0);
+    assert_eq!(record.dictation.selected_output, "old selected");
+    assert_eq!(record.dictation.timings.release_to_insert_duration_ms, None);
+    drop(normalized);
+
+    let old_binary = rusqlite::Connection::open(&path).unwrap();
+    let version: u32 = old_binary
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let user_version: u32 = old_binary
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 1);
+    assert_eq!(user_version, 1);
+    old_binary
+        .execute(
+            "INSERT INTO dictation_history(
+                 created_at_ms, raw_text, selected_output, warnings_json
+             ) VALUES (2, 'second old raw', 'second old output', '[]')",
+            [],
+        )
+        .unwrap();
+    let outputs: Vec<String> = old_binary
+        .prepare("SELECT selected_output FROM dictation_history ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(outputs, ["old selected", "second old output"]);
+}
+
+#[test]
+fn privacy_deletions_never_leave_a_rollback_artifact() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("phorminx.db");
+    let artifact = directory.path().join("phorminx.db.schema-1.backup");
+    std::fs::write(
+        &artifact,
+        b"stale private transcript lexicon alias and profile",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("phorminx.db.schema-1.backup-wal"),
+        b"stale WAL private transcript",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("phorminx.db.schema-1.backup-shm"),
+        b"stale shared-memory artifact",
+    )
+    .unwrap();
+    std::fs::write(
+        directory
+            .path()
+            .join("phorminx.db.schema-1-backup-99-1.tmp"),
+        b"interrupted private snapshot",
+    )
+    .unwrap();
+
+    let database = Persistence::open(&path).unwrap();
+    assert!(!artifact.exists());
+    database
+        .history()
+        .set_retention(RetentionPolicy::Indefinite, NOW)
+        .unwrap();
+    database.history().insert(&draft(NOW, "clear me")).unwrap();
+    assert_eq!(database.history().clear().unwrap(), 1);
+    database
+        .history()
+        .insert(&draft(NOW - 2 * DAY_MS, "expire me"))
+        .unwrap();
+    database
+        .history()
+        .set_retention(RetentionPolicy::Hours24, NOW)
+        .unwrap();
+    assert_eq!(database.history().count().unwrap(), 0);
+
+    let lexicon_id = database.lexicon().insert(&lexicon("delete alias")).unwrap();
+    assert!(database.lexicon().delete(lexicon_id).unwrap());
+    let profile = profile("private-profile.exe");
+    database.app_profiles().upsert(&profile).unwrap();
+    assert!(database.app_profiles().delete(&profile.executable).unwrap());
+    drop(database);
+
+    assert!(!artifact.exists());
+    let artifacts = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("backup"))
+        .collect::<Vec<_>>();
+    assert!(
+        artifacts.is_empty(),
+        "unexpected rollback artifacts: {artifacts:?}"
+    );
 }
 
 #[test]

@@ -88,10 +88,21 @@ pub struct UiWhisperReadiness {
 pub enum UiVoskReadinessKind {
     Checking,
     Ready,
+    InstalledUnvalidated,
     MissingRuntime,
     MissingModel,
     LoadFailed,
     UnsupportedLanguage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiVoskProbe {
+    /// The active worker already loaded the model and created a recognizer.
+    ResidentReady,
+    /// Inspect paths and language identity without loading native code/model.
+    LayoutOnly,
+    /// Explicit user-requested or pre-save native validation.
+    FullValidation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,6 +145,7 @@ impl UiReadinessSnapshot {
         store: &SettingsStore,
         ollama: &OllamaClient,
         loaded_whisper: Option<&WhisperReadiness>,
+        vosk_probe: UiVoskProbe,
     ) -> Self {
         let selected_microphone = settings.recognition.microphone.clone();
         let microphone = match input_devices() {
@@ -157,59 +169,7 @@ impl UiReadinessSnapshot {
 
         let whisper = whisper_readiness(settings, store, loaded_whisper);
 
-        let vosk_runtime = store.resolve_asset_path(&settings.recognition.instant_runtime_path);
-        let vosk_model = store.resolve_asset_path(&settings.recognition.instant_model_path);
-        let (vosk_state, vosk_kind, vosk_message) = match phorminx_vosk::inspect(
-            &vosk_runtime,
-            &vosk_model,
-            &settings.recognition.language,
-        ) {
-            phorminx_vosk::Readiness::Ready {
-                warning: Some(warning),
-            } => (
-                UiReadinessState::Ready,
-                UiVoskReadinessKind::Ready,
-                warning.to_owned(),
-            ),
-            phorminx_vosk::Readiness::Ready { warning: None } => (
-                UiReadinessState::Ready,
-                UiVoskReadinessKind::Ready,
-                "Vosk Instant model ready.".to_owned(),
-            ),
-            phorminx_vosk::Readiness::MissingRuntime { .. } => (
-                UiReadinessState::NeedsAttention,
-                UiVoskReadinessKind::MissingRuntime,
-                "Vosk runtime bundle not found.".to_owned(),
-            ),
-            phorminx_vosk::Readiness::MissingModel { .. } => (
-                UiReadinessState::NeedsAttention,
-                UiVoskReadinessKind::MissingModel,
-                "Vosk model directory not found.".to_owned(),
-            ),
-            phorminx_vosk::Readiness::LoadFailed { .. } => (
-                UiReadinessState::NeedsAttention,
-                UiVoskReadinessKind::LoadFailed,
-                "Vosk runtime could not be loaded.".to_owned(),
-            ),
-            phorminx_vosk::Readiness::UnsupportedLanguage { .. } => (
-                UiReadinessState::NeedsAttention,
-                UiVoskReadinessKind::UnsupportedLanguage,
-                "Instant mode supports en and pt-br.".to_owned(),
-            ),
-            phorminx_vosk::Readiness::IncompatibleModelLanguage { .. } => (
-                UiReadinessState::NeedsAttention,
-                UiVoskReadinessKind::UnsupportedLanguage,
-                "The Vosk model name does not verify that it matches the selected language."
-                    .to_owned(),
-            ),
-        };
-        let vosk = UiVoskReadiness {
-            state: vosk_state,
-            kind: vosk_kind,
-            runtime_path: vosk_runtime,
-            model_path: vosk_model,
-            message: vosk_message,
-        };
+        let vosk = vosk_readiness(settings, store, vosk_probe);
 
         let ollama = match ollama.discover(&CancellationToken::new()) {
             Ok(catalog) => {
@@ -373,6 +333,111 @@ fn whisper_readiness(
             device_name: None,
             message: "Whisper model not found.".to_owned(),
         },
+    }
+}
+
+fn vosk_readiness(
+    settings: &Settings,
+    store: &SettingsStore,
+    probe: UiVoskProbe,
+) -> UiVoskReadiness {
+    let runtime = store.resolve_asset_path(&settings.recognition.instant_runtime_path);
+    let model = store.resolve_asset_path(&settings.recognition.instant_model_path);
+    vosk_readiness_with(
+        runtime.clone(),
+        model.clone(),
+        &settings.recognition.language,
+        probe,
+        || phorminx_vosk::inspect(&runtime, &model, &settings.recognition.language),
+        || phorminx_vosk::validate_asset_layout(&runtime, &model, &settings.recognition.language),
+    )
+}
+
+fn vosk_readiness_with(
+    runtime_path: PathBuf,
+    model_path: PathBuf,
+    language: &str,
+    probe: UiVoskProbe,
+    inspect: impl FnOnce() -> phorminx_vosk::Readiness,
+    inspect_layout: impl FnOnce() -> phorminx_vosk::AssetLayout,
+) -> UiVoskReadiness {
+    let (state, kind, message) = match probe {
+        UiVoskProbe::ResidentReady => (
+            UiReadinessState::Ready,
+            UiVoskReadinessKind::Ready,
+            if matches!(language, "pt" | "pt-br") {
+                "Vosk Instant is resident. Portuguese quality depends strongly on the selected model; Accurate mode is recommended when fidelity matters."
+            } else {
+                "Vosk Instant is loaded and resident."
+            }
+            .to_owned(),
+        ),
+        UiVoskProbe::LayoutOnly => match inspect_layout() {
+            phorminx_vosk::AssetLayout::Present { warning } => (
+                UiReadinessState::NeedsAttention,
+                UiVoskReadinessKind::InstalledUnvalidated,
+                warning.map_or_else(
+                    || {
+                        "Vosk assets are installed but inactive; they will be validated when Instant mode starts."
+                            .to_owned()
+                    },
+                    str::to_owned,
+                ),
+            ),
+            layout => map_vosk_readiness(layout.into()),
+        },
+        UiVoskProbe::FullValidation => map_vosk_readiness(inspect()),
+    };
+    UiVoskReadiness {
+        state,
+        kind,
+        runtime_path,
+        model_path,
+        message,
+    }
+}
+
+fn map_vosk_readiness(
+    readiness: phorminx_vosk::Readiness,
+) -> (UiReadinessState, UiVoskReadinessKind, String) {
+    match readiness {
+        phorminx_vosk::Readiness::Ready {
+            warning: Some(warning),
+        } => (
+            UiReadinessState::Ready,
+            UiVoskReadinessKind::Ready,
+            warning.to_owned(),
+        ),
+        phorminx_vosk::Readiness::Ready { warning: None } => (
+            UiReadinessState::Ready,
+            UiVoskReadinessKind::Ready,
+            "Vosk Instant model ready.".to_owned(),
+        ),
+        phorminx_vosk::Readiness::MissingRuntime { .. } => (
+            UiReadinessState::NeedsAttention,
+            UiVoskReadinessKind::MissingRuntime,
+            "Vosk runtime bundle not found.".to_owned(),
+        ),
+        phorminx_vosk::Readiness::MissingModel { .. } => (
+            UiReadinessState::NeedsAttention,
+            UiVoskReadinessKind::MissingModel,
+            "Vosk model directory not found.".to_owned(),
+        ),
+        phorminx_vosk::Readiness::LoadFailed { .. } => (
+            UiReadinessState::NeedsAttention,
+            UiVoskReadinessKind::LoadFailed,
+            "Vosk runtime could not be loaded.".to_owned(),
+        ),
+        phorminx_vosk::Readiness::UnsupportedLanguage { .. } => (
+            UiReadinessState::NeedsAttention,
+            UiVoskReadinessKind::UnsupportedLanguage,
+            "Instant mode supports en and pt-br.".to_owned(),
+        ),
+        phorminx_vosk::Readiness::IncompatibleModelLanguage { .. } => (
+            UiReadinessState::NeedsAttention,
+            UiVoskReadinessKind::UnsupportedLanguage,
+            "The Vosk model name does not verify that it matches the selected language.".to_owned(),
+        ),
     }
 }
 
@@ -1156,6 +1221,7 @@ impl UiBridgeError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1164,6 +1230,56 @@ mod tests {
     use super::*;
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn resident_and_layout_readiness_never_invoke_the_full_vosk_loader() {
+        for (probe, expected_full, expected_layout) in [
+            (UiVoskProbe::ResidentReady, 0, 0),
+            (UiVoskProbe::LayoutOnly, 0, 1),
+            (UiVoskProbe::FullValidation, 1, 0),
+        ] {
+            let full_loads = Cell::new(0);
+            let layout_checks = Cell::new(0);
+            let readiness = vosk_readiness_with(
+                PathBuf::from("runtime"),
+                PathBuf::from("vosk-model-small-en-us-0.15"),
+                "en",
+                probe,
+                || {
+                    full_loads.set(full_loads.get() + 1);
+                    phorminx_vosk::Readiness::Ready { warning: None }
+                },
+                || {
+                    layout_checks.set(layout_checks.get() + 1);
+                    phorminx_vosk::AssetLayout::Present { warning: None }
+                },
+            );
+            let expected_state = if probe == UiVoskProbe::LayoutOnly {
+                UiReadinessState::NeedsAttention
+            } else {
+                UiReadinessState::Ready
+            };
+            assert_eq!(readiness.state, expected_state);
+            if probe == UiVoskProbe::LayoutOnly {
+                assert_eq!(readiness.kind, UiVoskReadinessKind::InstalledUnvalidated);
+            }
+            assert_eq!(full_loads.get(), expected_full);
+            assert_eq!(layout_checks.get(), expected_layout);
+        }
+
+        let failed = vosk_readiness_with(
+            PathBuf::from("runtime"),
+            PathBuf::from("vosk-model-small-en-us-0.15"),
+            "en",
+            UiVoskProbe::FullValidation,
+            || phorminx_vosk::Readiness::LoadFailed {
+                component: "runtime_or_model",
+            },
+            || unreachable!("full validation must not fall back to layout readiness"),
+        );
+        assert_eq!(failed.state, UiReadinessState::NeedsAttention);
+        assert_eq!(failed.kind, UiVoskReadinessKind::LoadFailed);
+    }
 
     struct TestBridge {
         root: PathBuf,
