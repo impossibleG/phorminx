@@ -11,7 +11,10 @@ at least four seconds of uncommitted audio, the existing application-loop wakeup
 may schedule a bounded Whisper-only partial job. Prefer a boundary after an
 800 ms low-energy observation; force a boundary after eight seconds of
 continuous audio. Start every later chunk 800 ms before the prior stable end.
-Allow only one partial job to be outstanding.
+Allow only one partial job to be outstanding per active recording. A silence
+probe at the hard deadline wins only when it is no more than one 200 ms probe
+interval late; the chunk end remains capped at eight seconds. A later probe
+cannot retroactively classify the deadline as silence.
 
 Snapshotting is read-only. `ActiveRecording` observes one occupied length,
 copies only an explicitly validated range into an owned vector, releases all
@@ -28,6 +31,14 @@ transcribes audio from 800 ms before the last stable boundary through release,
 reconciles it with stable partial text, then runs the existing formatting and
 insertion path exactly once.
 
+Before tail audio is copied or recognized, validate that the partial accumulator
+is non-degraded, non-empty, ordered, bounded by the final clip, and has a known
+boundary. Ineligible state goes directly to one full-clip recognition. Strip a
+narrow multilingual whitelist of bracketed Whisper non-speech annotations from
+partial, tail, and full output, including annotations adjacent to real words;
+preserve all unknown bracketed text and byte-for-byte raw text when no marker
+exists. Low-energy tail text without confident lexical overlap also falls back.
+
 Reconciliation is deliberately fail-closed. A boundary forced through speech
 requires two or more exact normalized words across the transcript suffix and
 prefix. A single matching word is ambiguous because it may be deliberate
@@ -35,6 +46,13 @@ repetition. A measured-silence boundary may concatenate unmatched text, but
 still refuses an ambiguous single-word match. If a snapshot, submission,
 partial recognition, ordering check, or overlap check is uncertain, discard the
 incremental assembly and transcribe the untouched full clip once.
+
+Cancellation is visible outside the worker's FIFO through a shared ID registry.
+Queued partial and final commands check it before recognition; final work checks
+again after non-preemptible Whisper and before cleanup or Ollama. Resume marks
+the runtime's active ID canceled even when its planner was already finalized.
+A shared shutdown flag similarly makes queued jobs no-ops, so shutdown waits for
+at most the inference already running rather than every stale queued job.
 
 ## Rationale
 
@@ -52,9 +70,11 @@ separately managed Silero VAD model remains valid.
 Content-free diagnostics expose:
 
 - `incremental_partial_submitted` with sequence, boundary kind, and audio time;
-- `incremental_partial_completed` with success and inference time;
-- `incremental_final_tail` when the low-latency path is used;
-- `incremental_fallback` with a non-content reason when full-clip recovery runs;
+- `incremental_partial_completed` with success, actual runtime state, and
+  partial compute time;
+- `incremental_final_tail` with separate accumulated partial and tail compute;
+- `incremental_fallback` with a non-content reason and separate accumulated
+  partial and full-fallback compute;
 - `incremental_cancelled` on abandoned listening sessions.
 
 No transcript or audio content is logged or persisted by this feature.
@@ -63,9 +83,13 @@ No transcript or audio content is logged or persisted by this feature.
 
 - Dictations shorter than four seconds have no additional inference or copy.
 - Long continuous speech produces at most one queued partial every four to
-  eight seconds, never an unbounded worker backlog.
+  eight seconds. Canceled cross-session work may remain briefly in the FIFO but
+  is discarded before inference.
 - Conservative reconciliation can choose the slower full-clip path when
   Whisper renders an overlap differently. Correctness wins over latency.
 - Formatting remains a final, globally coherent operation.
+- Persisted STT duration means total local recognition compute used by the
+  selected path: partial plus tail, or prior partial plus full fallback. It is
+  not labeled as post-release wall-clock latency.
 - A future real VAD can replace the low-energy boundary hint without changing
   the worker protocol or final fallback invariant.

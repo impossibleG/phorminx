@@ -1,11 +1,11 @@
 #![cfg_attr(all(windows, feature = "desktop"), windows_subsystem = "windows")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
 use phorminx_app::incremental::{
     BoundaryKind, CHUNK_OVERLAP, IncrementalPlanner, MergeExpectation, SILENCE_PROBE_DURATION,
-    merge_overlapping,
+    merge_overlapping, strip_known_non_speech_annotations,
 };
 use phorminx_app::model::{ModelDownload, ModelDownloadEvent, recommended_model};
 use phorminx_app::product_shell::{ProductShell, ProductShellControl, ProductShellEvent};
@@ -579,17 +579,18 @@ fn run() -> Result<()> {
                     id,
                     sequence,
                     succeeded,
-                    inference_time,
+                    compute_time,
                     audio_duration,
                 }) => {
                     incremental.partial_completed(id, sequence, succeeded);
                     eprintln!(
-                        "dictation_id={} state=Listening event=incremental_partial_completed sequence={} success={} audio_ms={} inference_ms={}",
+                        "dictation_id={} state={:?} event=incremental_partial_completed sequence={} success={} audio_ms={} partial_compute_ms={}",
                         id.0,
+                        runtime.state(),
                         sequence,
                         succeeded,
                         audio_duration.as_millis(),
-                        inference_time.as_millis()
+                        compute_time.as_millis()
                     );
                 }
                 Ok(WorkerEvent::CleanupStarted { id }) => {
@@ -2028,7 +2029,12 @@ fn recover_runtime_after_resume(
     microphone: Option<&str>,
     context: &DictationContext,
 ) -> Result<()> {
-    if let Some(id) = incremental.cancel() {
+    let runtime_id = runtime.active_id();
+    let planner_id = incremental.cancel();
+    if let Some(id) = runtime_id {
+        let _ = worker.cancel_incremental(id);
+    }
+    if let Some(id) = planner_id.filter(|id| Some(*id) != runtime_id) {
         let _ = worker.cancel_incremental(id);
     }
     let mut io = ProductionIo {
@@ -2166,6 +2172,8 @@ fn log_state(id: Option<DictationId>, state: RuntimeState, event: &'static str) 
 struct TranscriptionWorker {
     commands: Sender<WorkerCommand>,
     results: Receiver<WorkerEvent>,
+    cancellations: Arc<CancellationRegistry>,
+    shutting_down: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -2178,6 +2186,10 @@ impl TranscriptionWorker {
         let (command_tx, command_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let cancellations = Arc::new(CancellationRegistry::default());
+        let worker_cancellations = Arc::clone(&cancellations);
+        let worker_shutting_down = Arc::new(AtomicBool::new(false));
+        let thread_shutting_down = Arc::clone(&worker_shutting_down);
         let model = model.to_path_buf();
         let thread = thread::Builder::new()
             .name("phorminx-transcription".to_owned())
@@ -2207,12 +2219,43 @@ impl TranscriptionWorker {
                 }
 
                 while let Ok(command) = command_rx.recv() {
+                    if thread_shutting_down.load(Ordering::Acquire) {
+                        match command {
+                            WorkerCommand::Shutdown => break,
+                            WorkerCommand::CancelIncremental { id } => {
+                                incremental_sessions.remove(&id);
+                                worker_cancellations.acknowledge(id);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     match command {
                         WorkerCommand::TranscribePartial {
                             plan,
                             clip,
                             language,
                         } => {
+                            if worker_job_cancelled(
+                                &worker_cancellations,
+                                &thread_shutting_down,
+                                plan.id,
+                            ) {
+                                incremental_sessions.remove(&plan.id);
+                                if result_tx
+                                    .send(WorkerEvent::PartialCompleted {
+                                        id: plan.id,
+                                        sequence: plan.sequence,
+                                        succeeded: false,
+                                        compute_time: Duration::ZERO,
+                                        audio_duration: clip.duration(),
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
                             let event = process_partial_transcription(
                                 &recognizer,
                                 &mut incremental_sessions,
@@ -2232,6 +2275,14 @@ impl TranscriptionWorker {
                             formatting: dictation_formatting,
                             app_executable,
                         } => {
+                            if worker_job_cancelled(
+                                &worker_cancellations,
+                                &thread_shutting_down,
+                                id,
+                            ) {
+                                incremental_sessions.remove(&id);
+                                continue;
+                            }
                             let result = match transcribe_final(
                                 &recognizer,
                                 incremental_sessions.remove(&id),
@@ -2241,12 +2292,32 @@ impl TranscriptionWorker {
                                 id,
                             ) {
                                 Ok(transcript) => {
+                                    // Whisper cannot be preempted safely today,
+                                    // so cancellation is checked again before
+                                    // any cleanup event or potentially long
+                                    // Ollama pass begins.
+                                    if worker_job_cancelled(
+                                        &worker_cancellations,
+                                        &thread_shutting_down,
+                                        id,
+                                    ) {
+                                        incremental_sessions.remove(&id);
+                                        continue;
+                                    }
                                     if dictation_formatting.uses_ollama()
                                         && result_tx
                                             .send(WorkerEvent::CleanupStarted { id })
                                             .is_err()
                                     {
                                         break;
+                                    }
+                                    if worker_job_cancelled(
+                                        &worker_cancellations,
+                                        &thread_shutting_down,
+                                        id,
+                                    ) {
+                                        incremental_sessions.remove(&id);
+                                        continue;
                                     }
                                     Ok(process_transcript(
                                         transcript,
@@ -2268,6 +2339,7 @@ impl TranscriptionWorker {
                         }
                         WorkerCommand::CancelIncremental { id } => {
                             incremental_sessions.remove(&id);
+                            worker_cancellations.acknowledge(id);
                         }
                         WorkerCommand::ReloadAliases(updated) => aliases = updated,
                         WorkerCommand::Shutdown => break,
@@ -2279,6 +2351,8 @@ impl TranscriptionWorker {
             Ok(Ok(())) => Ok(Self {
                 commands: command_tx,
                 results: result_rx,
+                cancellations,
+                shutting_down: worker_shutting_down,
                 thread: Some(thread),
             }),
             Ok(Err(message)) => {
@@ -2329,6 +2403,9 @@ impl TranscriptionWorker {
     }
 
     fn cancel_incremental(&self, id: DictationId) -> Result<()> {
+        // Cancellation is visible before this FIFO command reaches the worker,
+        // so queued stale audio is dropped without another Whisper invocation.
+        self.cancellations.cancel(id);
         self.commands
             .send(WorkerCommand::CancelIncremental { id })
             .context("transcription worker is unavailable")
@@ -2348,6 +2425,7 @@ impl TranscriptionWorker {
         if self.thread.is_none() {
             return Ok(());
         }
+        self.shutting_down.store(true, Ordering::Release);
         let _ = self.commands.send(WorkerCommand::Shutdown);
         if let Some(thread) = self.thread.take() {
             thread
@@ -2356,6 +2434,42 @@ impl TranscriptionWorker {
         }
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct CancellationRegistry {
+    ids: Mutex<HashSet<DictationId>>,
+}
+
+impl CancellationRegistry {
+    fn cancel(&self, id: DictationId) {
+        self.ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id);
+    }
+
+    fn is_cancelled(&self, id: DictationId) -> bool {
+        self.ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&id)
+    }
+
+    fn acknowledge(&self, id: DictationId) {
+        self.ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+    }
+}
+
+fn worker_job_cancelled(
+    cancellations: &CancellationRegistry,
+    shutting_down: &AtomicBool,
+    id: DictationId,
+) -> bool {
+    shutting_down.load(Ordering::Acquire) || cancellations.is_cancelled(id)
 }
 
 impl Drop for TranscriptionWorker {
@@ -2395,7 +2509,7 @@ enum WorkerEvent {
         id: DictationId,
         sequence: u32,
         succeeded: bool,
-        inference_time: Duration,
+        compute_time: Duration,
         audio_duration: Duration,
     },
     CleanupStarted {
@@ -2409,7 +2523,7 @@ struct PartialAccumulator {
     stable_end: Duration,
     last_boundary: Option<BoundaryKind>,
     next_sequence: u32,
-    inference_time: Duration,
+    partial_compute_time: Duration,
     model_load_time: Duration,
     degraded: Option<&'static str>,
 }
@@ -2421,7 +2535,7 @@ impl Default for PartialAccumulator {
             stable_end: Duration::ZERO,
             last_boundary: None,
             next_sequence: 0,
-            inference_time: Duration::ZERO,
+            partial_compute_time: Duration::ZERO,
             model_load_time: Duration::ZERO,
             degraded: None,
         }
@@ -2437,7 +2551,7 @@ fn process_partial_transcription(
 ) -> WorkerEvent {
     let audio_duration = clip.duration();
     let accumulator = sessions.entry(plan.id).or_default();
-    let mut inference_time = Duration::ZERO;
+    let mut compute_time = Duration::ZERO;
     let succeeded = if accumulator.degraded.is_some() {
         false
     } else if plan.sequence != accumulator.next_sequence {
@@ -2452,14 +2566,25 @@ fn process_partial_transcription(
             thread_count: None,
             audio_context: Some(recommended_audio_context(audio_duration)),
         };
-        match recognizer.transcribe(&clip, &options) {
-            Ok(transcript) if transcript.text.trim().is_empty() => {
-                accumulator.degraded = Some("empty_partial");
-                inference_time = transcript.inference_time;
-                false
-            }
-            Ok(transcript) => {
-                inference_time = transcript.inference_time;
+        let started = Instant::now();
+        let recognition = recognizer.transcribe(&clip, &options);
+        compute_time = started.elapsed();
+        accumulator.partial_compute_time = accumulator
+            .partial_compute_time
+            .saturating_add(compute_time);
+        match recognition {
+            Ok(mut transcript) => {
+                transcript.text = strip_known_non_speech_annotations(&transcript.text);
+                if transcript.text.trim().is_empty() {
+                    accumulator.degraded = Some("non_speech_partial");
+                    return WorkerEvent::PartialCompleted {
+                        id: plan.id,
+                        sequence: plan.sequence,
+                        succeeded: false,
+                        compute_time,
+                        audio_duration,
+                    };
+                }
                 let merged = match plan.start_overlap {
                     Some(expectation) => {
                         merge_overlapping(&accumulator.text, &transcript.text, expectation)
@@ -2472,9 +2597,6 @@ fn process_partial_transcription(
                         accumulator.stable_end = plan.stable_end;
                         accumulator.last_boundary = Some(plan.boundary);
                         accumulator.next_sequence = accumulator.next_sequence.saturating_add(1);
-                        accumulator.inference_time = accumulator
-                            .inference_time
-                            .saturating_add(transcript.inference_time);
                         accumulator.model_load_time = transcript.model_load_time;
                         true
                     }
@@ -2495,38 +2617,45 @@ fn process_partial_transcription(
         id: plan.id,
         sequence: plan.sequence,
         succeeded,
-        inference_time,
+        compute_time,
         audio_duration,
     }
 }
 
-fn transcribe_final(
-    recognizer: &WhisperRecognizer,
+fn transcribe_final<R>(
+    recognizer: &R,
     incremental: Option<PartialAccumulator>,
     full_clip: &AudioClip,
     language: &str,
     full_audio_context: u32,
     id: DictationId,
-) -> Result<Transcript, String> {
+) -> Result<Transcript, String>
+where
+    R: SpeechRecognizer,
+{
+    let mut fallback = None;
+    let mut partial_compute_time = Duration::ZERO;
     if let Some(accumulator) = incremental {
+        partial_compute_time = accumulator.partial_compute_time;
         match transcribe_final_tail(recognizer, &accumulator, full_clip, language) {
             Ok(transcript) => {
+                let tail_compute_time = transcript
+                    .inference_time
+                    .saturating_sub(accumulator.partial_compute_time);
                 eprintln!(
-                    "dictation_id={} state=Transcribing event=incremental_final_tail stable_ms={} tail_ms={} inference_ms={}",
+                    "dictation_id={} state=Transcribing event=incremental_final_tail stable_ms={} tail_audio_ms={} partial_compute_ms={} tail_compute_ms={}",
                     id.0,
                     accumulator.stable_end.as_millis(),
                     full_clip
                         .duration()
                         .saturating_sub(accumulator.stable_end.saturating_sub(CHUNK_OVERLAP))
                         .as_millis(),
-                    transcript.inference_time.as_millis()
+                    accumulator.partial_compute_time.as_millis(),
+                    tail_compute_time.as_millis()
                 );
                 return Ok(transcript);
             }
-            Err(reason) => eprintln!(
-                "dictation_id={} state=Transcribing event=incremental_fallback reason={reason}",
-                id.0
-            ),
+            Err(reason) => fallback = Some(reason),
         }
     }
 
@@ -2535,21 +2664,37 @@ fn transcribe_final(
         thread_count: None,
         audio_context: Some(full_audio_context),
     };
-    recognizer
+    let mut transcript = recognizer
         .transcribe(full_clip, &options)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let fallback_compute_time = transcript.inference_time;
+    transcript.inference_time = partial_compute_time.saturating_add(fallback_compute_time);
+    suppress_non_speech_annotation(&mut transcript);
+    if let Some(reason) = fallback {
+        eprintln!(
+            "dictation_id={} state=Transcribing event=incremental_fallback reason={reason} partial_compute_ms={} fallback_compute_ms={}",
+            id.0,
+            partial_compute_time.as_millis(),
+            fallback_compute_time.as_millis()
+        );
+    }
+    Ok(transcript)
 }
 
-fn transcribe_final_tail(
-    recognizer: &WhisperRecognizer,
+fn transcribe_final_tail<R>(
+    recognizer: &R,
     accumulator: &PartialAccumulator,
     full_clip: &AudioClip,
     language: &str,
-) -> Result<Transcript, &'static str> {
-    if accumulator.stable_end > full_clip.duration() {
-        return Err("stable_audio_exceeds_final");
-    }
-    let tail_start = accumulator.stable_end.saturating_sub(CHUNK_OVERLAP);
+) -> Result<Transcript, &'static str>
+where
+    R: SpeechRecognizer,
+{
+    // Eligibility must be established before copying audio or invoking
+    // Whisper. An invalid partial session goes directly to the one full-clip
+    // fallback in `transcribe_final`.
+    let plan = final_tail_plan(accumulator, full_clip.duration())?;
+    let tail_start = plan.start;
     let start_sample =
         (tail_start.as_secs_f64() * f64::from(full_clip.sample_rate)).floor() as usize;
     if start_sample >= full_clip.samples.len() {
@@ -2565,9 +2710,10 @@ fn transcribe_final_tail(
         thread_count: None,
         audio_context: Some(recommended_audio_context(tail.duration())),
     };
-    let tail_transcript = recognizer
+    let mut tail_transcript = recognizer
         .transcribe(&tail, &options)
         .map_err(|_| "tail_recognition_failed")?;
+    suppress_non_speech_annotation(&mut tail_transcript);
     assemble_incremental_transcript(
         accumulator,
         tail_transcript,
@@ -2576,12 +2722,16 @@ fn transcribe_final_tail(
     )
 }
 
-fn assemble_incremental_transcript(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FinalTailPlan {
+    start: Duration,
+    expectation: MergeExpectation,
+}
+
+fn final_tail_plan(
     accumulator: &PartialAccumulator,
-    tail_transcript: Transcript,
-    tail_rms: f32,
     full_audio_duration: Duration,
-) -> Result<Transcript, &'static str> {
+) -> Result<FinalTailPlan, &'static str> {
     if let Some(reason) = accumulator.degraded {
         return Err(reason);
     }
@@ -2589,15 +2739,38 @@ fn assemble_incremental_transcript(
         return Err("no_stable_partial");
     }
     let boundary = accumulator.last_boundary.ok_or("missing_boundary")?;
+    if accumulator.stable_end > full_audio_duration {
+        return Err("stable_audio_exceeds_final");
+    }
+    Ok(FinalTailPlan {
+        start: accumulator.stable_end.saturating_sub(CHUNK_OVERLAP),
+        expectation: MergeExpectation::from(boundary),
+    })
+}
+
+fn assemble_incremental_transcript(
+    accumulator: &PartialAccumulator,
+    tail_transcript: Transcript,
+    tail_rms: f32,
+    full_audio_duration: Duration,
+) -> Result<Transcript, &'static str> {
+    let plan = final_tail_plan(accumulator, full_audio_duration)?;
     if tail_transcript.text.trim().is_empty() && tail_rms > 0.001 {
         return Err("uncertain_empty_tail");
     }
-    let text = merge_overlapping(
-        &accumulator.text,
-        &tail_transcript.text,
-        MergeExpectation::from(boundary),
-    )
-    .map_err(|_| "tail_overlap_unresolved")?;
+    if tail_rms <= 0.001
+        && !tail_transcript.text.trim().is_empty()
+        && merge_overlapping(
+            &accumulator.text,
+            &tail_transcript.text,
+            MergeExpectation::LexicalOverlap,
+        )
+        .is_err()
+    {
+        return Err("low_energy_unmatched_tail");
+    }
+    let text = merge_overlapping(&accumulator.text, &tail_transcript.text, plan.expectation)
+        .map_err(|_| "tail_overlap_unresolved")?;
 
     Ok(Transcript {
         text,
@@ -2606,10 +2779,14 @@ fn assemble_incremental_transcript(
             .model_load_time
             .max(tail_transcript.model_load_time),
         inference_time: accumulator
-            .inference_time
+            .partial_compute_time
             .saturating_add(tail_transcript.inference_time),
         audio_duration: full_audio_duration,
     })
+}
+
+fn suppress_non_speech_annotation(transcript: &mut Transcript) {
+    transcript.text = strip_known_non_speech_annotations(&transcript.text);
 }
 
 struct DictationContext {
@@ -2950,6 +3127,8 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod composition_tests {
+    use std::cell::RefCell;
+
     use super::*;
     use phorminx_persistence::NewLexiconEntry;
 
@@ -2973,7 +3152,7 @@ mod composition_tests {
             stable_end: Duration::from_secs(8),
             last_boundary: Some(boundary),
             next_sequence: 1,
-            inference_time: Duration::from_millis(400),
+            partial_compute_time: Duration::from_millis(400),
             model_load_time: Duration::from_millis(100),
             degraded: None,
         }
@@ -2986,6 +3165,52 @@ mod composition_tests {
             model_load_time: Duration::from_millis(100),
             inference_time: Duration::from_millis(200),
             audio_duration: Duration::from_secs(3),
+        }
+    }
+
+    struct CountingRecognizer {
+        clip_lengths: RefCell<Vec<usize>>,
+        output: String,
+    }
+
+    impl Default for CountingRecognizer {
+        fn default() -> Self {
+            Self {
+                clip_lengths: RefCell::new(Vec::new()),
+                output: "full fallback".to_owned(),
+            }
+        }
+    }
+
+    impl CountingRecognizer {
+        fn returning(output: &str) -> Self {
+            Self {
+                output: output.to_owned(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl SpeechRecognizer for CountingRecognizer {
+        type Error = std::io::Error;
+
+        fn load(_model_path: &Path) -> Result<Self, Self::Error> {
+            Ok(Self::default())
+        }
+
+        fn transcribe(
+            &self,
+            clip: &AudioClip,
+            _options: &TranscriptionOptions<'_>,
+        ) -> Result<Transcript, Self::Error> {
+            self.clip_lengths.borrow_mut().push(clip.samples.len());
+            Ok(Transcript {
+                text: self.output.clone(),
+                backend: "fake",
+                model_load_time: Duration::ZERO,
+                inference_time: Duration::from_millis(1),
+                audio_duration: clip.duration(),
+            })
         }
     }
 
@@ -3066,6 +3291,60 @@ mod composition_tests {
     }
 
     #[test]
+    fn ineligible_partial_sessions_skip_tail_recognition_and_run_one_full_fallback() {
+        let mut degraded = partial("stable words", BoundaryKind::Forced);
+        degraded.degraded = Some("empty_partial");
+        let mut empty = partial("", BoundaryKind::Forced);
+        empty.next_sequence = 1;
+        let mut missing_boundary = partial("stable words", BoundaryKind::Forced);
+        missing_boundary.last_boundary = None;
+        let full_clip = AudioClip::new(vec![0.1; 160_000], 16_000).unwrap();
+
+        for accumulator in [degraded, empty, missing_boundary] {
+            let recognizer = CountingRecognizer::default();
+            let result = transcribe_final(
+                &recognizer,
+                Some(accumulator),
+                &full_clip,
+                "en",
+                recommended_audio_context(full_clip.duration()),
+                DictationId(77),
+            )
+            .unwrap();
+
+            assert_eq!(result.text, "full fallback");
+            assert_eq!(
+                recognizer.clip_lengths.borrow().as_slice(),
+                [full_clip.samples.len()]
+            );
+        }
+    }
+
+    #[test]
+    fn final_tail_plan_rejects_invalid_state_before_audio_work() {
+        let mut degraded = partial("stable words", BoundaryKind::Forced);
+        degraded.degraded = Some("partial_recognition_failed");
+        assert_eq!(
+            final_tail_plan(&degraded, Duration::from_secs(10)),
+            Err("partial_recognition_failed")
+        );
+
+        let mut empty = partial("", BoundaryKind::Forced);
+        empty.next_sequence = 1;
+        assert_eq!(
+            final_tail_plan(&empty, Duration::from_secs(10)),
+            Err("no_stable_partial")
+        );
+
+        let mut missing_boundary = partial("stable words", BoundaryKind::Forced);
+        missing_boundary.last_boundary = None;
+        assert_eq!(
+            final_tail_plan(&missing_boundary, Duration::from_secs(10)),
+            Err("missing_boundary")
+        );
+    }
+
+    #[test]
     fn silence_tail_can_append_but_uncertain_empty_speech_falls_back() {
         let accumulator = partial("First sentence.", BoundaryKind::Silence);
         let appended = assemble_incremental_transcript(
@@ -3098,6 +3377,107 @@ mod composition_tests {
             .text,
             "First sentence."
         );
+    }
+
+    #[test]
+    fn known_non_speech_markers_never_reach_final_output() {
+        let recognizer = CountingRecognizer::returning("hello [BLANK_AUDIO]");
+        let full_clip = AudioClip::new(vec![0.1; 16_000], 16_000).unwrap();
+        let result = transcribe_final(
+            &recognizer,
+            None,
+            &full_clip,
+            "en",
+            recommended_audio_context(full_clip.duration()),
+            DictationId(78),
+        )
+        .unwrap();
+        assert_eq!(result.text, "hello");
+
+        let accumulator = partial("Hello.", BoundaryKind::Silence);
+        let mut marker_tail = transcript(" [ blank_audio ] ");
+        suppress_non_speech_annotation(&mut marker_tail);
+        assert_eq!(
+            assemble_incremental_transcript(
+                &accumulator,
+                marker_tail,
+                0.0,
+                Duration::from_secs(10),
+            )
+            .unwrap()
+            .text,
+            "Hello."
+        );
+    }
+
+    #[test]
+    fn low_energy_unmatched_tail_falls_back_instead_of_appending_hallucination() {
+        assert_eq!(
+            assemble_incremental_transcript(
+                &partial("Hello.", BoundaryKind::Silence),
+                transcript("invented words"),
+                0.000_1,
+                Duration::from_secs(10),
+            )
+            .unwrap_err(),
+            "low_energy_unmatched_tail"
+        );
+    }
+
+    #[test]
+    fn cancellation_is_visible_before_queued_final_or_partial_work_starts() {
+        let cancellations = CancellationRegistry::default();
+        let shutting_down = AtomicBool::new(false);
+        let active = DictationId(80);
+        let cancelled = DictationId(81);
+
+        cancellations.cancel(cancelled);
+        assert!(!worker_job_cancelled(
+            &cancellations,
+            &shutting_down,
+            active
+        ));
+        // These checks model a partial and final already ahead of the FIFO
+        // Cancel command: both see shared cancellation and skip inference.
+        assert!(worker_job_cancelled(
+            &cancellations,
+            &shutting_down,
+            cancelled
+        ));
+        assert!(worker_job_cancelled(
+            &cancellations,
+            &shutting_down,
+            cancelled
+        ));
+        cancellations.acknowledge(cancelled);
+        assert!(!worker_job_cancelled(
+            &cancellations,
+            &shutting_down,
+            cancelled
+        ));
+    }
+
+    #[test]
+    fn shutdown_flag_skips_every_queued_job_before_fifo_shutdown_arrives() {
+        let cancellations = CancellationRegistry::default();
+        let shutting_down = AtomicBool::new(true);
+
+        for id in [DictationId(90), DictationId(91), DictationId(92)] {
+            assert!(worker_job_cancelled(&cancellations, &shutting_down, id));
+        }
+    }
+
+    #[test]
+    fn cancellation_observed_after_recognition_blocks_followup_formatting() {
+        let cancellations = CancellationRegistry::default();
+        let shutting_down = AtomicBool::new(false);
+        let id = DictationId(93);
+
+        assert!(!worker_job_cancelled(&cancellations, &shutting_down, id));
+        // Models the cancellation becoming visible while the non-preemptible
+        // recognizer is running and the post-recognition guard seeing it.
+        cancellations.cancel(id);
+        assert!(worker_job_cancelled(&cancellations, &shutting_down, id));
     }
 
     #[test]

@@ -105,10 +105,12 @@ impl IncrementalPlanner {
         }
 
         let forced_end = session.stable_end.saturating_add(MAX_CHUNK_DURATION);
-        let (end, boundary) = if captured >= forced_end {
+        let silence_covers_deadline =
+            silence_observed && captured <= forced_end.saturating_add(PROBE_INTERVAL);
+        let (end, boundary) = if silence_covers_deadline {
+            (captured.min(forced_end), BoundaryKind::Silence)
+        } else if captured >= forced_end {
             (forced_end, BoundaryKind::Forced)
-        } else if silence_observed {
-            (captured, BoundaryKind::Silence)
         } else {
             session.next_probe_at = captured.saturating_add(PROBE_INTERVAL);
             return None;
@@ -187,6 +189,90 @@ impl From<BoundaryKind> for MergeExpectation {
 pub enum MergeError {
     AmbiguousOverlap,
     MissingOverlap,
+}
+
+/// Returns true only when the complete Whisper output consists of known,
+/// bracketed non-speech annotations. Arbitrary bracketed dictation is retained.
+pub fn is_non_speech_only(input: &str) -> bool {
+    !input.trim().is_empty() && strip_known_non_speech_annotations(input).is_empty()
+}
+
+/// Removes only whitelisted bracketed Whisper annotations, including when
+/// they appear beside real speech. Unknown bracketed content is preserved.
+pub fn strip_known_non_speech_annotations(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    let mut removed = false;
+    while let Some(relative_open) = input[cursor..].find('[') {
+        let open = cursor + relative_open;
+        let Some(relative_close) = input[open + 1..].find(']') else {
+            break;
+        };
+        let close = open + 1 + relative_close;
+        if is_known_non_speech_label(&input[open + 1..close]) {
+            output.push_str(&input[cursor..open]);
+            while output.ends_with(char::is_whitespace) {
+                output.pop();
+            }
+            cursor = close + 1;
+            while cursor < input.len() {
+                let Some(character) = input[cursor..].chars().next() else {
+                    break;
+                };
+                if !character.is_whitespace() {
+                    break;
+                }
+                cursor += character.len_utf8();
+            }
+            if !output.is_empty()
+                && cursor < input.len()
+                && !input[cursor..].starts_with('[')
+                && !input[cursor..]
+                    .chars()
+                    .next()
+                    .is_some_and(|character| matches!(character, '.' | ',' | ';' | ':' | '!' | '?'))
+            {
+                output.push(' ');
+            }
+            removed = true;
+        } else {
+            output.push_str(&input[cursor..=close]);
+            cursor = close + 1;
+        }
+    }
+    output.push_str(&input[cursor..]);
+    if !removed {
+        return input.to_owned();
+    }
+    if output.chars().all(|character| {
+        character.is_whitespace() || matches!(character, '.' | ',' | ';' | ':' | '!' | '?' | '-')
+    }) {
+        String::new()
+    } else {
+        output
+    }
+}
+
+fn is_known_non_speech_label(label: &str) -> bool {
+    let normalized = label
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "blankaudio"
+            | "silence"
+            | "music"
+            | "nospeech"
+            | "noaudio"
+            | "silêncio"
+            | "música"
+            | "semfala"
+            | "semáudio"
+            | "áudioembranco"
+            | "áudiovazio"
+    )
 }
 
 /// Reconciles two overlapping Whisper outputs without guessing.
@@ -337,6 +423,31 @@ mod tests {
         assert_eq!(plan.boundary, BoundaryKind::Forced);
         assert_eq!(plan.range.end, Duration::from_secs(8));
         assert!(plan.range.duration() <= MAX_CHUNK_DURATION + CHUNK_OVERLAP);
+    }
+
+    #[test]
+    fn silence_wins_at_and_just_after_the_forced_deadline() {
+        for captured in [Duration::from_secs(8), Duration::from_millis(8_100)] {
+            let mut planner = IncrementalPlanner::default();
+            planner.start(id(70));
+            let plan = planner.observe(id(70), captured, true).unwrap();
+
+            assert_eq!(plan.boundary, BoundaryKind::Silence);
+            assert_eq!(plan.range.end, captured.min(Duration::from_secs(8)));
+        }
+    }
+
+    #[test]
+    fn delayed_silence_probe_does_not_reclassify_or_extend_the_hard_boundary() {
+        let mut planner = IncrementalPlanner::default();
+        planner.start(id(71));
+        let plan = planner
+            .observe(id(71), Duration::from_secs(10), true)
+            .unwrap();
+
+        assert_eq!(plan.boundary, BoundaryKind::Forced);
+        assert_eq!(plan.range.end, Duration::from_secs(8));
+        assert_eq!(plan.range.duration(), MAX_CHUNK_DURATION);
     }
 
     #[test]
@@ -495,6 +606,57 @@ mod tests {
                 MergeExpectation::LexicalOverlap
             ),
             Err(MergeError::AmbiguousOverlap)
+        );
+    }
+
+    #[test]
+    fn recognizes_only_whitelisted_non_speech_annotations_in_english_and_portuguese() {
+        for annotation in [
+            "[BLANK_AUDIO]",
+            " [ blank audio ] ",
+            "[No-Speech]",
+            "[silence] [ MUSIC ]",
+            "[SILÊNCIO]",
+            "[ música ]",
+            "[sem fala]",
+            "[ÁUDIO_EM_BRANCO]",
+        ] {
+            assert!(is_non_speech_only(annotation), "{annotation}");
+        }
+
+        for dictation in [
+            "",
+            "[meeting]",
+            "[código importante]",
+            "say [silence] now",
+            "[silence] continue",
+            "silence",
+        ] {
+            assert!(!is_non_speech_only(dictation), "{dictation}");
+        }
+    }
+
+    #[test]
+    fn strips_known_annotations_around_speech_but_preserves_unknown_brackets() {
+        assert_eq!(
+            strip_known_non_speech_annotations("[silence] hello [BLANK_AUDIO] world [music]"),
+            "hello world"
+        );
+        assert_eq!(
+            strip_known_non_speech_annotations("hello [meeting notes] [BLANK_AUDIO] world"),
+            "hello [meeting notes] world"
+        );
+        assert_eq!(
+            strip_known_non_speech_annotations("[SEM FALA] [ áudio vazio ]"),
+            ""
+        );
+        assert_eq!(
+            strip_known_non_speech_annotations("  raw   spacing , untouched  "),
+            "  raw   spacing , untouched  "
+        );
+        assert_eq!(
+            strip_known_non_speech_annotations("hello  there [music]   world"),
+            "hello  there world"
         );
     }
 }
