@@ -30,6 +30,9 @@ fn draft(created_at_ms: i64, text: &str) -> DictationDraft {
             stt_duration_ms: Some(250),
             formatting_duration_ms: Some(90),
             insertion_duration_ms: Some(12),
+            audio_finalization_duration_ms: Some(7),
+            worker_queue_duration_ms: Some(3),
+            release_to_insert_duration_ms: Some(362),
         },
         warnings: vec!["low confidence".into(), "clipboard fallback".into()],
     }
@@ -62,11 +65,11 @@ fn creates_parent_enables_wal_and_applies_migrations_idempotently() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("a/b/history.sqlite3");
     let database = Persistence::open(&path).unwrap();
-    assert_eq!(database.schema_version().unwrap(), 1);
+    assert_eq!(database.schema_version().unwrap(), 2);
     drop(database);
 
     let reopened = Persistence::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 1);
+    assert_eq!(reopened.schema_version().unwrap(), 2);
 
     let raw = rusqlite::Connection::open(&path).unwrap();
     let mode: String = raw

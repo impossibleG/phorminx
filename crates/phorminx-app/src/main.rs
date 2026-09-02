@@ -20,7 +20,7 @@ use phorminx_app::model::{
 };
 use phorminx_app::product_shell::{ProductShell, ProductShellControl, ProductShellEvent};
 use phorminx_app::runtime::{
-    AppIo, AppRuntime, FinishedAudio, InsertDisposition, RuntimeNotice, UiStatus,
+    AppIo, AppRuntime, FinishedAudio, InsertDisposition, ReleaseTiming, RuntimeNotice, UiStatus,
 };
 use phorminx_app::settings::{
     AccurateBackendPreference, AccurateModelVariant, FormattingStrength, HistoryRetention,
@@ -55,7 +55,8 @@ use phorminx_windows::{
     SettingsForm, SettingsFormatting, SettingsHistoryRetention, SettingsOllamaLifecycle,
     SettingsRecognitionMode, SettingsRecordingMode, SettingsWindow, SettingsWindowEvent,
     SingleInstance, SingleInstanceError, StatusOverlay, SystemTray, TargetSnapshot, TrayEvent,
-    TrayStatus, activate_existing_window, copy_and_maybe_paste, set_launch_at_login,
+    TrayStatus, activate_existing_window, choose_zip_archive, copy_and_maybe_paste,
+    set_launch_at_login,
 };
 
 #[cfg(feature = "desktop")]
@@ -234,10 +235,9 @@ fn run() -> Result<()> {
     };
     if !recognition_ready {
         if cli.smoke_test {
-            return Err(anyhow!(match settings.recognition.mode {
-                RecognitionMode::Accurate => "Accurate recognition is not ready",
-                RecognitionMode::Instant => "Instant recognition is not ready",
-            }));
+            return Err(anyhow!(
+                "the selected local recognition engine is not ready"
+            ));
         }
         return run_setup_mode(
             overlay,
@@ -323,7 +323,26 @@ fn run() -> Result<()> {
             language: settings.recognition.language.clone(),
         },
     };
-    let worker = TranscriptionWorker::start(recognizer, worker_formatting, aliases)?;
+    let worker = match TranscriptionWorker::start(recognizer, worker_formatting, aliases) {
+        Ok(worker) => worker,
+        Err(error) if settings.recognition.mode == RecognitionMode::Instant => {
+            eprintln!(
+                "dictation_id=0 state=Starting event=instant_startup_probe_failed recovery=setup"
+            );
+            drop(persistence);
+            return run_setup_mode(
+                overlay,
+                tray,
+                settings_store,
+                settings,
+                model,
+                shutting_down,
+                instance,
+            )
+            .with_context(|| format!("Instant recovery setup failed after: {error}"));
+        }
+        Err(error) => return Err(error),
+    };
 
     let hotkey = GlobalHoldHotkey::start().context("failed to install the global hotkey")?;
     let mut runtime = AppRuntime::<TargetSnapshot, ActiveRecording>::new_with_formatting(
@@ -514,6 +533,9 @@ fn run() -> Result<()> {
                     == RecordingMode::Toggle
                     && runtime.state() == RuntimeState::Listening)
                     .then(Instant::now);
+                if let (Some(released_at), Some(id)) = (release_received_at, runtime.active_id()) {
+                    log_release_received(id, released_at);
+                }
                 if runtime.state() == RuntimeState::Idle {
                     dictation_context = match DictationContext::for_target(
                         activation_target,
@@ -555,10 +577,8 @@ fn run() -> Result<()> {
                         context: &dictation_context,
                         released_at: release_received_at,
                     };
-                    let action = if settings.interaction.recording_mode == RecordingMode::Toggle
-                        && runtime.state() == RuntimeState::Listening
-                    {
-                        runtime.hold_ended(&mut io)
+                    let action = if let Some(released_at) = release_received_at {
+                        runtime.hold_ended_at(released_at, &mut io)
                     } else {
                         runtime.hold_started(activation_target, &mut io)
                     };
@@ -573,9 +593,12 @@ fn run() -> Result<()> {
                 // This is the user-observable release boundary. Capture it
                 // before stopping/resampling the recording so telemetry
                 // includes all finalization work.
-                let release_received_at = Instant::now();
                 if settings.interaction.recording_mode == RecordingMode::Toggle {
                     continue 'event_loop;
+                }
+                let released_at = Instant::now();
+                if let Some(id) = runtime.active_id() {
+                    log_release_received(id, released_at);
                 }
                 let notices = {
                     let mut io = ProductionIo {
@@ -584,9 +607,9 @@ fn run() -> Result<()> {
                         worker: &worker,
                         microphone: effective_microphone.as_deref(),
                         context: &dictation_context,
-                        released_at: Some(release_received_at),
+                        released_at: Some(released_at),
                     };
-                    match runtime.hold_ended(&mut io) {
+                    match runtime.hold_ended_at(released_at, &mut io) {
                         Ok(notices) => notices,
                         Err(error) => break 'event_loop Err(error.into()),
                     }
@@ -711,18 +734,35 @@ fn run() -> Result<()> {
                 Ok(WorkerEvent::Completed(completed)) => {
                     let completed = *completed;
                     let is_current = runtime.pending_id() == Some(completed.id);
+                    let mut processed_for_history = None;
                     let result = completed.result.map(|processed| {
-                        if !is_current {
-                            return processed.transcript;
+                        if is_current {
+                            if let Some(lifecycle) = processed.lifecycle {
+                                eprintln!(
+                                    "uptime_ms={} dictation_id={} state=Cleaning event=worker_completed release_to_worker_ms={} audio_finalize_ms={} worker_queue_ms={}",
+                                    monotonic_uptime_ms(),
+                                    completed.id.0,
+                                    lifecycle
+                                        .worker_completed_at
+                                        .saturating_duration_since(lifecycle.release.released_at)
+                                        .as_millis(),
+                                    lifecycle.release.audio_finalization_time().as_millis(),
+                                    lifecycle
+                                        .worker_started_at
+                                        .saturating_duration_since(
+                                            lifecycle.release.audio_finalized_at,
+                                        )
+                                        .as_millis()
+                                );
+                            }
+                            let transcript = processed.transcript.clone();
+                            processed_for_history = Some(processed);
+                            transcript
+                        } else {
+                            processed.transcript
                         }
-                        if let Err(error) = persist_transcript(&persistence, &processed) {
-                            eprintln!(
-                                "dictation_id={} state=Cleaning event=history_write_failed error={error}",
-                                completed.id.0
-                            );
-                        }
-                        processed.transcript
                     });
+                    let insertion_started_at = Instant::now();
                     let notices = {
                         let mut io = ProductionIo {
                             overlay: &overlay,
@@ -743,15 +783,37 @@ fn run() -> Result<()> {
                             RuntimeNotice::Inserted { .. } | RuntimeNotice::ClipboardReady { .. }
                         )
                     });
-                    report_notices(notices);
-                    if is_current && reached_insertion {
-                        eprintln!(
-                            "dictation_id={} state=Inserting event=release_to_insert release_to_insert_ms={}",
-                            completed.id.0,
-                            elapsed_since_release(completed.released_at, Instant::now())
-                                .as_millis()
-                        );
+                    let insertion_completed_at = Instant::now();
+                    if is_current
+                        && reached_insertion
+                        && let Some(processed) = processed_for_history.as_ref()
+                    {
+                        if let Some(lifecycle) = processed.lifecycle {
+                            eprintln!(
+                                "uptime_ms={} dictation_id={} state=Inserting event=release_terminal release_to_insert_ms={} insertion_ms={}",
+                                monotonic_uptime_ms(),
+                                completed.id.0,
+                                insertion_completed_at
+                                    .saturating_duration_since(lifecycle.release.released_at)
+                                    .as_millis(),
+                                insertion_completed_at
+                                    .saturating_duration_since(insertion_started_at)
+                                    .as_millis()
+                            );
+                        }
+                        if let Err(error) = persist_transcript(
+                            &persistence,
+                            processed,
+                            insertion_started_at,
+                            insertion_completed_at,
+                        ) {
+                            eprintln!(
+                                "dictation_id={} state=Cleaning event=history_write_failed error={error}",
+                                completed.id.0
+                            );
+                        }
                     }
+                    report_notices(notices);
                     if let Some(shell) = product_shell.as_ref() {
                         let _ = shell.send(ProductShellControl::Refresh);
                     }
@@ -1214,6 +1276,29 @@ fn poll_shell_events(
                                 eprintln!("model_download_failed error={error}");
                                 let _ = shell.send(ProductShellControl::ModelDownloadFailed);
                             }
+                        }
+                    }
+                }
+                Ok(ProductShellEvent::InstallVerifiedVoskAssets) => {
+                    match install_verified_vosk_assets(settings_store) {
+                        Ok(Some((runtime_path, model_path))) => {
+                            settings.recognition.mode = RecognitionMode::Instant;
+                            settings.recognition.language = "en".to_owned();
+                            settings.recognition.instant_runtime_path = runtime_path;
+                            settings.recognition.instant_model_path = model_path;
+                            settings_store
+                                .save(settings)
+                                .context("failed to save verified Vosk asset paths")?;
+                            return Ok(ShellAction::Restart);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!(
+                                "dictation_id=0 state=Setup event=vosk_verified_import_failed"
+                            );
+                            let _ = shell.send(ProductShellControl::VoskInstallFailed(format!(
+                                "Verified Vosk import failed: {error}"
+                            )));
                         }
                     }
                 }
@@ -2099,9 +2184,10 @@ impl AppIo for ProductionIo<'_> {
         clip: AudioClip,
         language: &str,
         audio_context: u32,
+        timing: ReleaseTiming,
     ) -> Result<(), String> {
         self.worker
-            .transcribe(FinalTranscriptionRequest {
+            .transcribe(TranscriptionRequest {
                 id,
                 released_at: self.released_at.unwrap_or_else(Instant::now),
                 clip,
@@ -2109,6 +2195,7 @@ impl AppIo for ProductionIo<'_> {
                 audio_context,
                 formatting: self.context.formatting.clone(),
                 app_executable: self.context.app_executable.clone(),
+                timing,
             })
             .map_err(|error| error.to_string())
     }
@@ -2288,6 +2375,10 @@ fn handle_test_dictation(
         *context = DictationContext::global(settings, context.verified_variant)?;
         runtime.configure_next_dictation(context.language.clone(), context.runtime_formatting)?;
     }
+    let released_at = (runtime.state() == RuntimeState::Listening).then(Instant::now);
+    if let (Some(released_at), Some(id)) = (released_at, runtime.active_id()) {
+        log_release_received(id, released_at);
+    }
     let mut io = ProductionIo {
         overlay,
         tray,
@@ -2298,7 +2389,10 @@ fn handle_test_dictation(
     };
     let notices = match runtime.state() {
         RuntimeState::Idle => runtime.hold_started(None, &mut io)?,
-        RuntimeState::Listening => runtime.hold_ended(&mut io)?,
+        RuntimeState::Listening => runtime.hold_ended_at(
+            released_at.expect("listening test dictation has a release timestamp"),
+            &mut io,
+        )?,
         _ => Vec::new(),
     };
     report_notices(notices);
@@ -2315,8 +2409,16 @@ fn report_notices(notices: Vec<RuntimeNotice<ClipboardOnlyReason>>) {
                 println!("Listening...");
                 log_state(Some(id), RuntimeState::Listening, "recording_started");
             }
-            RuntimeNotice::RecordingStopped { id } => {
-                log_state(Some(id), RuntimeState::FinalizingAudio, "recording_stopped");
+            RuntimeNotice::RecordingStopped {
+                id,
+                audio_finalization_time,
+            } => {
+                eprintln!(
+                    "uptime_ms={} dictation_id={} state=FinalizingAudio event=audio_finalized release_to_audio_finalized_ms={}",
+                    monotonic_uptime_ms(),
+                    id.0,
+                    audio_finalization_time.as_millis()
+                );
             }
             RuntimeNotice::AudioBackendWarning { id, state, count } => {
                 eprintln!(
@@ -2394,6 +2496,15 @@ fn log_state(id: Option<DictationId>, state: RuntimeState, event: &'static str) 
     eprintln!(
         "uptime_ms={} dictation_id={id} state={state:?} event={event}",
         monotonic_uptime_ms()
+    );
+}
+
+fn log_release_received(id: DictationId, released_at: Instant) {
+    let _ = released_at;
+    eprintln!(
+        "uptime_ms={} dictation_id={} state=FinalizingAudio event=release_received release_to_event_ms=0",
+        monotonic_uptime_ms(),
+        id.0
     );
 }
 
@@ -2484,6 +2595,7 @@ struct InstantSession {
     accepted_samples: u64,
     inference_time: Duration,
     degraded: bool,
+    continuity_prefix: Vec<f32>,
 }
 
 enum InstantAudioCommand {
@@ -2500,16 +2612,6 @@ enum InstantAudioCommand {
     Cancel {
         id: DictationId,
     },
-}
-
-struct FinalTranscriptionRequest {
-    id: DictationId,
-    released_at: Instant,
-    clip: AudioClip,
-    language: String,
-    audio_context: u32,
-    formatting: WorkerFormatting,
-    app_executable: Option<String>,
 }
 
 impl TranscriptionWorker {
@@ -2682,12 +2784,14 @@ impl TranscriptionWorker {
                             audio_context,
                             formatting: dictation_formatting,
                             app_executable,
+                            timing,
                         } => {
                             // Clear the release-priority tombstone only when
                             // the final command reaches the head of the FIFO.
                             // Every older queued partial therefore observes an
                             // already-aborted flag in `begin_partial`.
                             worker_cancellations.begin_final(id);
+                            let worker_started_at = Instant::now();
                             if worker_job_cancelled(
                                 &worker_cancellations,
                                 &thread_shutting_down,
@@ -2784,6 +2888,11 @@ impl TranscriptionWorker {
                                         processed.transcript.inference_time.as_millis(),
                                         processed.formatting_time.as_millis()
                                     );
+                                    processed.lifecycle = Some(LifecycleTiming {
+                                        release: timing,
+                                        worker_started_at,
+                                        worker_completed_at: Instant::now(),
+                                    });
                                     worker_cancellations.end_formatting(id);
                                     if worker_job_cancelled(
                                         &worker_cancellations,
@@ -2828,6 +2937,7 @@ impl TranscriptionWorker {
                                         accepted_samples: 0,
                                         inference_time: Duration::ZERO,
                                         degraded: true,
+                                        continuity_prefix: Vec::new(),
                                     },
                                 );
                             }
@@ -2859,8 +2969,8 @@ impl TranscriptionWorker {
         }
     }
 
-    fn transcribe(&self, request: FinalTranscriptionRequest) -> Result<()> {
-        let FinalTranscriptionRequest {
+    fn transcribe(&self, request: TranscriptionRequest) -> Result<()> {
+        let TranscriptionRequest {
             id,
             released_at,
             clip,
@@ -2868,6 +2978,7 @@ impl TranscriptionWorker {
             audio_context,
             formatting,
             app_executable,
+            timing,
         } = request;
         // Publish release priority before the FIFO send. A running partial sees
         // this through whisper.cpp's abort callback and yields to the final.
@@ -2880,6 +2991,7 @@ impl TranscriptionWorker {
             audio_context,
             formatting,
             app_executable,
+            timing,
         }) {
             self.cancellations.clear_final_priority(id);
             return Err(anyhow!(error)).context("transcription worker is unavailable");
@@ -2976,6 +3088,17 @@ impl TranscriptionWorker {
         }
         Ok(())
     }
+}
+
+struct TranscriptionRequest {
+    id: DictationId,
+    released_at: Instant,
+    clip: AudioClip,
+    language: String,
+    audio_context: u32,
+    formatting: WorkerFormatting,
+    app_executable: Option<String>,
+    timing: ReleaseTiming,
 }
 
 struct CancellationRegistry {
@@ -3138,6 +3261,7 @@ enum WorkerCommand {
         audio_context: u32,
         formatting: WorkerFormatting,
         app_executable: Option<String>,
+        timing: ReleaseTiming,
     },
     CancelIncremental {
         id: DictationId,
@@ -3210,6 +3334,7 @@ fn drain_instant_audio(
                                 accepted_samples: 0,
                                 inference_time: Duration::ZERO,
                                 degraded: false,
+                                continuity_prefix: Vec::new(),
                             },
                         );
                     }
@@ -3241,7 +3366,13 @@ fn drain_instant_audio(
                 let accepted = session.recognizer.accept_f32(&samples);
                 session.inference_time += started.elapsed();
                 match accepted {
-                    Ok(_) => session.accepted_samples += samples.len() as u64,
+                    Ok(_) => {
+                        let remaining = 2_048usize.saturating_sub(session.continuity_prefix.len());
+                        session
+                            .continuity_prefix
+                            .extend_from_slice(&samples[..samples.len().min(remaining)]);
+                        session.accepted_samples += samples.len() as u64;
+                    }
                     Err(_) => session.degraded = true,
                 }
             }
@@ -3258,25 +3389,24 @@ fn transcribe_instant_final(
     clip: &AudioClip,
     id: DictationId,
 ) -> Result<Transcript, phorminx_vosk::VoskError> {
-    let audio_duration = clip.duration();
     let mut session = match session {
-        Some(session) if !session.degraded => session,
+        Some(session)
+            if !session.degraded
+                && instant_stream_is_continuous(
+                    session.accepted_samples,
+                    session.sample_rate,
+                    &session.continuity_prefix,
+                    clip,
+                ) =>
+        {
+            session
+        }
         _ => {
             eprintln!(
                 "dictation_id={} state=Transcribing event=instant_recovery path=full_clip",
                 id.0
             );
-            let mut recognizer = model.session(clip.sample_rate)?;
-            let started = Instant::now();
-            recognizer.accept_f32(&clip.samples)?;
-            let text = recognizer.finish()?;
-            return Ok(Transcript {
-                text,
-                backend: "vosk",
-                model_load_time: model.load_time(),
-                inference_time: started.elapsed(),
-                audio_duration,
-            });
+            return transcribe_instant_full_clip(model, clip);
         }
     };
 
@@ -3299,13 +3429,87 @@ fn transcribe_instant_final(
     let started = Instant::now();
     let text = session.recognizer.finish()?;
     session.inference_time += started.elapsed();
+    if text.trim().is_empty() && clip.rms() >= 0.01 {
+        eprintln!(
+            "dictation_id={} state=Transcribing event=instant_recovery path=full_clip reason=empty_high_energy",
+            id.0
+        );
+        return transcribe_instant_full_clip(model, clip);
+    }
     Ok(Transcript {
         text,
         backend: "vosk",
         model_load_time: model.load_time(),
         inference_time: session.inference_time,
-        audio_duration,
+        audio_duration: clip.duration(),
     })
+}
+
+fn transcribe_instant_full_clip(
+    model: &VoskModel,
+    clip: &AudioClip,
+) -> Result<Transcript, phorminx_vosk::VoskError> {
+    let mut recognizer = model.session(clip.sample_rate)?;
+    let started = Instant::now();
+    recognizer.accept_f32(&clip.samples)?;
+    let text = recognizer.finish()?;
+    Ok(Transcript {
+        text,
+        backend: "vosk",
+        model_load_time: model.load_time(),
+        inference_time: started.elapsed(),
+        audio_duration: clip.duration(),
+    })
+}
+
+fn instant_stream_is_continuous(
+    accepted_samples: u64,
+    accepted_sample_rate: u32,
+    continuity_prefix: &[f32],
+    clip: &AudioClip,
+) -> bool {
+    if accepted_sample_rate == 0 {
+        return false;
+    }
+    let maximum_native_samples = (clip.samples.len() as u128)
+        .saturating_mul(u128::from(accepted_sample_rate))
+        .div_ceil(u128::from(clip.sample_rate));
+    let edge_tolerance = 2;
+    if u128::from(accepted_samples) > maximum_native_samples.saturating_add(edge_tolerance) {
+        return false;
+    }
+    if accepted_samples == 0 {
+        return continuity_prefix.is_empty();
+    }
+    if continuity_prefix.is_empty() {
+        return false;
+    }
+    let Ok(expected) =
+        phorminx_audio::resample(&clip.samples, clip.sample_rate, accepted_sample_rate)
+    else {
+        return false;
+    };
+    let length = continuity_prefix.len().min(expected.len());
+    if length < 64 {
+        return false;
+    }
+    let observed = &continuity_prefix[..length];
+    let expected = &expected[..length];
+    let observed_energy = observed.iter().map(|sample| sample * sample).sum::<f32>();
+    let expected_energy = expected.iter().map(|sample| sample * sample).sum::<f32>();
+    if observed_energy < 1e-6 && expected_energy < 1e-6 {
+        return true;
+    }
+    if observed_energy < 1e-6 || expected_energy < 1e-6 {
+        return false;
+    }
+    let correlation = observed
+        .iter()
+        .zip(expected)
+        .map(|(left, right)| left * right)
+        .sum::<f32>()
+        / (observed_energy * expected_energy).sqrt();
+    correlation >= 0.70
 }
 
 fn tail_start_at_clip_rate(
@@ -3820,7 +4024,19 @@ impl DictationContext {
         else {
             return Ok(context);
         };
-        context.language = profile.language.unwrap_or(context.language);
+        if let Some(profile_language) = profile.language {
+            if !profile_language_matches_resident_model(
+                settings.recognition.mode,
+                &settings.recognition.language,
+                &profile_language,
+            ) {
+                return Err(anyhow!(
+                    "the active application profile language does not match the resident Instant model"
+                ));
+            } else {
+                context.language = profile_language;
+            }
+        }
         if verified_variant.is_some_and(|variant| !variant.supports_language(&context.language)) {
             return Err(anyhow!(
                 "the verified English-only Whisper model cannot transcribe the active application profile language"
@@ -3848,6 +4064,14 @@ impl DictationContext {
         };
         Ok(context)
     }
+}
+
+fn profile_language_matches_resident_model(
+    mode: RecognitionMode,
+    resident_language: &str,
+    profile_language: &str,
+) -> bool {
+    mode != RecognitionMode::Instant || profile_language.eq_ignore_ascii_case(resident_language)
 }
 
 #[derive(Clone)]
@@ -3911,6 +4135,14 @@ struct ProcessedTranscript {
     warnings: Vec<String>,
     language: String,
     app_executable: Option<String>,
+    lifecycle: Option<LifecycleTiming>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LifecycleTiming {
+    release: ReleaseTiming,
+    worker_started_at: Instant,
+    worker_completed_at: Instant,
 }
 
 fn process_transcript(
@@ -3970,6 +4202,7 @@ fn process_transcript(
         warnings,
         language: language.to_owned(),
         app_executable: app_executable.map(str::to_owned),
+        lifecycle: None,
     }
 }
 
@@ -4057,7 +4290,10 @@ fn replace_bounded(input: &str, needle: &str, replacement: &str) -> String {
 fn persist_transcript(
     persistence: &Persistence,
     processed: &ProcessedTranscript,
+    insertion_started_at: Instant,
+    insertion_completed_at: Instant,
 ) -> phorminx_persistence::Result<()> {
+    let lifecycle = processed.lifecycle;
     let draft = DictationDraft {
         created_at_ms: now_ms(),
         raw_text: processed.raw_text.clone(),
@@ -4087,11 +4323,31 @@ fn persist_transcript(
                     .as_millis()
                     .min(u128::from(u64::MAX)) as u64,
             ),
-            insertion_duration_ms: None,
+            insertion_duration_ms: Some(duration_ms(
+                insertion_completed_at.saturating_duration_since(insertion_started_at),
+            )),
+            audio_finalization_duration_ms: lifecycle
+                .map(|timing| duration_ms(timing.release.audio_finalization_time())),
+            worker_queue_duration_ms: lifecycle.map(|timing| {
+                duration_ms(
+                    timing
+                        .worker_started_at
+                        .saturating_duration_since(timing.release.audio_finalized_at),
+                )
+            }),
+            release_to_insert_duration_ms: lifecycle.map(|timing| {
+                duration_ms(
+                    insertion_completed_at.saturating_duration_since(timing.release.released_at),
+                )
+            }),
         },
         warnings: processed.warnings.clone(),
     };
     persistence.history().insert(&draft).map(|_| ())
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn retention_policy(retention: HistoryRetention) -> RetentionPolicy {
@@ -4115,6 +4371,76 @@ fn production_ollama_client() -> OllamaClient {
         },
     )
     .expect("the fixed production Ollama timeout policy is valid")
+}
+
+fn install_verified_vosk_assets(
+    settings_store: &SettingsStore,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+
+    let Some(runtime_archive) = choose_zip_archive("Choose official Vosk runtime ZIP") else {
+        return Ok(None);
+    };
+    let Some(model_archive) = choose_zip_archive("Choose official English Vosk model ZIP") else {
+        return Ok(None);
+    };
+    let destination = settings_store
+        .path()
+        .parent()
+        .context("settings directory is unavailable")?
+        .join(format!("vosk-assets-{}", now_ms()));
+    let script_path = std::env::temp_dir().join(format!(
+        "phorminx-verified-vosk-import-{}-{}.ps1",
+        std::process::id(),
+        now_ms()
+    ));
+    let mut script = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&script_path)
+        .context("could not create the verified importer")?;
+    script
+        .write_all(include_bytes!(
+            "../../../scripts/Install-PhorminxVoskAssets.ps1"
+        ))
+        .and_then(|_| script.flush())
+        .and_then(|_| script.sync_all())
+        .context("could not stage the verified importer")?;
+    drop(script);
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script_path)
+        .arg("-RuntimeArchive")
+        .arg(&runtime_archive)
+        .arg("-ModelArchive")
+        .arg(&model_archive)
+        .arg("-DestinationRoot")
+        .arg(&destination)
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    let _ = std::fs::remove_file(&script_path);
+    if !status.is_ok_and(|status| status.success()) {
+        return Err(anyhow!(
+            "archive verification or safe extraction was rejected"
+        ));
+    }
+    let runtime_path = destination.join("runtime/vosk");
+    let model_path = destination.join("models/vosk-model-small-en-us-0.15");
+    if !phorminx_vosk::inspect(&runtime_path, &model_path, "en").is_ready() {
+        return Err(anyhow!(
+            "installed assets failed the native readiness probe"
+        ));
+    }
+    Ok(Some((runtime_path, model_path)))
 }
 
 fn now_ms() -> i64 {
@@ -4929,5 +5255,127 @@ mod composition_tests {
         assert_eq!(tail_start_at_clip_rate(48_000, 48_000, 16_000), 16_000);
         assert_eq!(tail_start_at_clip_rate(47_999, 48_000, 16_000), 15_999);
         assert_eq!(tail_start_at_clip_rate(16_000, 16_000, 16_000), 16_000);
+    }
+
+    #[test]
+    fn persisted_release_lifecycle_includes_audio_finalization_and_terminal_insert() {
+        let path = std::env::temp_dir().join(format!(
+            "phorminx-release-timing-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let persistence = Persistence::open(&path).unwrap();
+        persistence
+            .history()
+            .set_retention(RetentionPolicy::Indefinite, now_ms())
+            .unwrap();
+        let released_at = Instant::now();
+        let mut processed = process_transcript(
+            transcript("timed"),
+            "en",
+            &WorkerFormatting {
+                profile: FormatProfile::Raw,
+                model: None,
+                keep_alive: KeepAlive::UnloadAfterRequest,
+            },
+            None,
+            &[],
+            None,
+            &CancellationToken::new(),
+        );
+        processed.lifecycle = Some(LifecycleTiming {
+            release: ReleaseTiming {
+                released_at,
+                audio_finalized_at: released_at + Duration::from_millis(11),
+            },
+            worker_started_at: released_at + Duration::from_millis(19),
+            worker_completed_at: released_at + Duration::from_millis(73),
+        });
+        persist_transcript(
+            &persistence,
+            &processed,
+            released_at + Duration::from_millis(80),
+            released_at + Duration::from_millis(91),
+        )
+        .unwrap();
+        let record = persistence.history().recent(1).unwrap().remove(0);
+        assert_eq!(
+            record.dictation.timings.audio_finalization_duration_ms,
+            Some(11)
+        );
+        assert_eq!(record.dictation.timings.worker_queue_duration_ms, Some(8));
+        assert_eq!(record.dictation.timings.insertion_duration_ms, Some(11));
+        assert_eq!(
+            record.dictation.timings.release_to_insert_duration_ms,
+            Some(91)
+        );
+        drop(persistence);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn instant_continuity_accepts_44k1_and_48k_callback_boundaries() {
+        for sample_rate in [44_100, 48_000] {
+            let native = (0..sample_rate)
+                .map(|index| {
+                    ((index as f32 * 2.0 * std::f32::consts::PI * 233.0) / sample_rate as f32).sin()
+                        * 0.2
+                })
+                .collect::<Vec<_>>();
+            let archival = phorminx_audio::resample(&native, sample_rate, 16_000).unwrap();
+            let clip = AudioClip::new(archival, 16_000).unwrap();
+            assert!(instant_stream_is_continuous(
+                u64::from(sample_rate - 256),
+                sample_rate,
+                &native[..2_048],
+                &clip,
+            ));
+        }
+    }
+
+    #[test]
+    fn instant_continuity_rejects_dropped_mismatched_and_late_batches() {
+        let native = (0..48_000)
+            .map(|index| ((index as f32) / 37.0).sin() * 0.2)
+            .collect::<Vec<_>>();
+        let clip = AudioClip::new(
+            phorminx_audio::resample(&native, 48_000, 16_000).unwrap(),
+            16_000,
+        )
+        .unwrap();
+        let mismatched = native[..2_048].iter().rev().copied().collect::<Vec<_>>();
+        assert!(!instant_stream_is_continuous(
+            24_000,
+            48_000,
+            &mismatched,
+            &clip,
+        ));
+        assert!(!instant_stream_is_continuous(
+            48_100,
+            48_000,
+            &native[..2_048],
+            &clip,
+        ));
+        assert!(!instant_stream_is_continuous(1_000, 48_000, &[], &clip));
+    }
+
+    #[test]
+    fn instant_rejects_profile_language_that_does_not_match_resident_model() {
+        assert!(profile_language_matches_resident_model(
+            RecognitionMode::Instant,
+            "en",
+            "EN"
+        ));
+        assert!(!profile_language_matches_resident_model(
+            RecognitionMode::Instant,
+            "en",
+            "pt-br"
+        ));
+        assert!(profile_language_matches_resident_model(
+            RecognitionMode::Accurate,
+            "en",
+            "pt-br"
+        ));
     }
 }

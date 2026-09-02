@@ -1131,6 +1131,16 @@ fn settings(
             );
             setting_row(
                 ui,
+                "Verified Vosk import",
+                "Choose the official runtime and model ZIPs. Phorminx verifies exact SHA-256 and size before safe extraction; it never downloads or executes archive contents.",
+                |ui| {
+                    if action(ui, "Import verified archives", ActionTone::Secondary).clicked() {
+                        outbox.push(ShellEvent::InstallVerifiedVoskAssets);
+                    }
+                },
+            );
+            setting_row(
+                ui,
                 "Local diagnostics",
                 "Refresh content-free readiness checks.",
                 |ui| {

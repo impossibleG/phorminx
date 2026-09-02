@@ -3,6 +3,8 @@
 #[cfg(windows)]
 mod appearance;
 #[cfg(windows)]
+mod asset_dialog;
+#[cfg(windows)]
 mod dialog;
 #[cfg(windows)]
 mod file;
@@ -31,6 +33,8 @@ mod tray;
 
 #[cfg(windows)]
 pub use appearance::{SystemAppearance, system_appearance};
+#[cfg(windows)]
+pub use asset_dialog::choose_zip_archive;
 #[cfg(windows)]
 pub use dialog::show_error_dialog;
 #[cfg(windows)]

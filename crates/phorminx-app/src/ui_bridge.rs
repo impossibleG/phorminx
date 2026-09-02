@@ -196,6 +196,12 @@ impl UiReadinessSnapshot {
                 UiVoskReadinessKind::UnsupportedLanguage,
                 "Instant mode supports en and pt-br.".to_owned(),
             ),
+            phorminx_vosk::Readiness::IncompatibleModelLanguage { .. } => (
+                UiReadinessState::NeedsAttention,
+                UiVoskReadinessKind::UnsupportedLanguage,
+                "The Vosk model name does not verify that it matches the selected language."
+                    .to_owned(),
+            ),
         };
         let vosk = UiVoskReadiness {
             state: vosk_state,
@@ -424,6 +430,9 @@ pub struct UiHistoryItem {
     pub stt_duration_ms: Option<u64>,
     pub formatting_duration_ms: Option<u64>,
     pub insertion_duration_ms: Option<u64>,
+    pub audio_finalization_duration_ms: Option<u64>,
+    pub worker_queue_duration_ms: Option<u64>,
+    pub release_to_insert_duration_ms: Option<u64>,
     pub warnings: Vec<String>,
 }
 
@@ -818,6 +827,12 @@ impl UiBridge {
                             "Instant mode currently supports en and pt-br.",
                         ));
                     }
+                    phorminx_vosk::Readiness::IncompatibleModelLanguage { .. } => {
+                        return Err(UiBridgeError::validation(
+                            "instant_model_path",
+                            "Choose a Vosk model whose official directory name matches the selected language.",
+                        ));
+                    }
                     phorminx_vosk::Readiness::LoadFailed { .. } => {
                         return Err(UiBridgeError::validation(
                             "instant_runtime_path",
@@ -931,6 +946,9 @@ fn history_item(record: DictationRecord) -> UiHistoryItem {
         stt_duration_ms: draft.timings.stt_duration_ms,
         formatting_duration_ms: draft.timings.formatting_duration_ms,
         insertion_duration_ms: draft.timings.insertion_duration_ms,
+        audio_finalization_duration_ms: draft.timings.audio_finalization_duration_ms,
+        worker_queue_duration_ms: draft.timings.worker_queue_duration_ms,
+        release_to_insert_duration_ms: draft.timings.release_to_insert_duration_ms,
         warnings: draft.warnings,
     }
 }
@@ -1673,6 +1691,9 @@ mod tests {
                     stt_duration_ms: Some(2),
                     formatting_duration_ms: Some(3),
                     insertion_duration_ms: Some(4),
+                    audio_finalization_duration_ms: Some(5),
+                    worker_queue_duration_ms: Some(6),
+                    release_to_insert_duration_ms: Some(7),
                 },
                 warnings: vec!["clipboard_fallback".to_owned()],
             })

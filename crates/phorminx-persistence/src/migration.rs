@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::Result;
 
-const LATEST_VERSION: u32 = 1;
+const LATEST_VERSION: u32 = 2;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE dictation_history (
@@ -56,6 +56,12 @@ CREATE TABLE app_profiles (
 );
 "#;
 
+const MIGRATION_2: &str = r#"
+ALTER TABLE dictation_history ADD COLUMN audio_finalization_duration_ms INTEGER;
+ALTER TABLE dictation_history ADD COLUMN worker_queue_duration_ms INTEGER;
+ALTER TABLE dictation_history ADD COLUMN release_to_insert_duration_ms INTEGER;
+"#;
+
 pub(crate) fn apply(connection: &Connection) -> Result<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (\
@@ -74,6 +80,18 @@ pub(crate) fn apply(connection: &Connection) -> Result<()> {
             [],
         )?;
         transaction.pragma_update(None, "user_version", 1)?;
+        transaction.commit()?;
+    }
+
+    if current < 2 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_2)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_ms) \
+             VALUES (2, unixepoch('subsec') * 1000)",
+            [],
+        )?;
+        transaction.pragma_update(None, "user_version", 2)?;
         transaction.commit()?;
     }
 

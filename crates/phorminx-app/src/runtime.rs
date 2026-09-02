@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use phorminx_core::{
     AudioClip, DictationId, RuntimeState, RuntimeStateMachine, StateError, Transcript,
@@ -25,6 +25,22 @@ pub struct FinishedAudio {
     pub backend_warning_count: u64,
 }
 
+/// Monotonic lifecycle anchors for one release-to-insert measurement. The
+/// timestamp is captured by the app loop as soon as it receives the physical
+/// stop event, before audio finalization can do any work.
+#[derive(Clone, Copy, Debug)]
+pub struct ReleaseTiming {
+    pub released_at: Instant,
+    pub audio_finalized_at: Instant,
+}
+
+impl ReleaseTiming {
+    pub fn audio_finalization_time(self) -> Duration {
+        self.audio_finalized_at
+            .saturating_duration_since(self.released_at)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InsertDisposition<R> {
     Pasted,
@@ -44,6 +60,7 @@ pub trait AppIo {
         clip: AudioClip,
         language: &str,
         audio_context: u32,
+        timing: ReleaseTiming,
     ) -> Result<(), String>;
     fn insert(
         &mut self,
@@ -64,6 +81,7 @@ pub enum RuntimeNotice<R> {
     },
     RecordingStopped {
         id: DictationId,
+        audio_finalization_time: Duration,
     },
     AudioBackendWarning {
         id: DictationId,
@@ -237,6 +255,17 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
     where
         I: AppIo<Target = Target, Recording = Recording>,
     {
+        self.hold_ended_at(Instant::now(), io)
+    }
+
+    pub fn hold_ended_at<I>(
+        &mut self,
+        released_at: Instant,
+        io: &mut I,
+    ) -> Result<Vec<RuntimeNotice<I::ClipboardReason>>, StateError>
+    where
+        I: AppIo<Target = Target, Recording = Recording>,
+    {
         let mut notices = Vec::new();
         if self.machine.state() != RuntimeState::Listening {
             return Ok(notices);
@@ -247,8 +276,6 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
             .active_id()
             .expect("listening state must have a dictation id");
         self.machine.transition(RuntimeState::FinalizingAudio)?;
-        notices.push(RuntimeNotice::RecordingStopped { id });
-
         let Some(recording) = self.recording.take() else {
             self.reset_after_fault()?;
             Self::show_status(io, UiStatus::Error, &mut notices);
@@ -274,6 +301,14 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
                 return Ok(notices);
             }
         };
+        let timing = ReleaseTiming {
+            released_at,
+            audio_finalized_at: Instant::now(),
+        };
+        notices.push(RuntimeNotice::RecordingStopped {
+            id,
+            audio_finalization_time: timing.audio_finalization_time(),
+        });
 
         if captured.backend_warning_count != 0 {
             notices.push(RuntimeNotice::AudioBackendWarning {
@@ -301,7 +336,7 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
         let audio_context = recommended_audio_context(captured.clip.duration());
         self.machine.transition(RuntimeState::Transcribing)?;
         Self::show_status(io, UiStatus::Transcribing, &mut notices);
-        match io.submit_transcription(id, captured.clip, &self.language, audio_context) {
+        match io.submit_transcription(id, captured.clip, &self.language, audio_context, timing) {
             Ok(()) => {
                 self.pending_id = Some(id);
                 notices.push(RuntimeNotice::TranscriptionStarted { id });
@@ -567,6 +602,7 @@ mod tests {
         next_token: u64,
         start_fails: bool,
         finish_plan: FinishPlan,
+        finish_delay: Duration,
         submit_fails: bool,
         insertion_fails: bool,
         status_fails: bool,
@@ -576,6 +612,7 @@ mod tests {
         pasted_targets: Vec<u64>,
         inserted_texts: Vec<String>,
         submitted: VecDeque<DictationId>,
+        submitted_timings: VecDeque<ReleaseTiming>,
         max_outstanding: usize,
         statuses: Vec<UiStatus>,
         recording_drops: Arc<AtomicUsize>,
@@ -587,6 +624,7 @@ mod tests {
                 next_token: 0,
                 start_fails: false,
                 finish_plan: FinishPlan::Speech,
+                finish_delay: Duration::ZERO,
                 submit_fails: false,
                 insertion_fails: false,
                 status_fails: false,
@@ -596,6 +634,7 @@ mod tests {
                 pasted_targets: Vec::new(),
                 inserted_texts: Vec::new(),
                 submitted: VecDeque::new(),
+                submitted_timings: VecDeque::new(),
                 max_outstanding: 0,
                 statuses: Vec::new(),
                 recording_drops: Arc::new(AtomicUsize::new(0)),
@@ -616,6 +655,7 @@ mod tests {
 
         fn complete_submission(&mut self, expected: DictationId) {
             assert_eq!(self.submitted.pop_front(), Some(expected));
+            self.submitted_timings.pop_front();
         }
     }
 
@@ -640,6 +680,7 @@ mod tests {
             recording: Self::Recording,
         ) -> Result<FinishedAudio, String> {
             assert_eq!(recording.token, self.next_token);
+            std::thread::sleep(self.finish_delay);
             match self.finish_plan {
                 FinishPlan::Speech => Ok(FinishedAudio {
                     clip: clip(3_200, 0.1),
@@ -663,11 +704,13 @@ mod tests {
             _clip: AudioClip,
             _language: &str,
             _audio_context: u32,
+            timing: ReleaseTiming,
         ) -> Result<(), String> {
             if self.submit_fails {
                 return Err("submit failed".to_owned());
             }
             self.submitted.push_back(id);
+            self.submitted_timings.push_back(timing);
             self.max_outstanding = self.max_outstanding.max(self.submitted.len());
             Ok(())
         }
@@ -1014,5 +1057,26 @@ mod tests {
             .unwrap();
         assert_eq!(io.insertions, 1);
         assert_eq!(io.inserted_texts, ["one result"]);
+    }
+
+    #[test]
+    fn release_timing_starts_before_audio_finalization_and_reaches_submission() {
+        let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".to_owned()).unwrap();
+        let mut io = FakeIo::default();
+        io.reset_plan(77);
+        io.finish_delay = Duration::from_millis(12);
+        runtime.hold_started(Some(77), &mut io).unwrap();
+        let released_at = Instant::now();
+        let notices = runtime.hold_ended_at(released_at, &mut io).unwrap();
+        let submitted = io.submitted_timings.pop_front().unwrap();
+        assert_eq!(submitted.released_at, released_at);
+        assert!(submitted.audio_finalization_time() >= Duration::from_millis(10));
+        assert!(notices.iter().any(|notice| matches!(
+            notice,
+            RuntimeNotice::RecordingStopped {
+                audio_finalization_time,
+                ..
+            } if *audio_finalization_time >= Duration::from_millis(10)
+        )));
     }
 }

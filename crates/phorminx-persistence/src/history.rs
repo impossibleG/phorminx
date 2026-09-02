@@ -56,6 +56,9 @@ pub struct TimingMetadata {
     pub stt_duration_ms: Option<u64>,
     pub formatting_duration_ms: Option<u64>,
     pub insertion_duration_ms: Option<u64>,
+    pub audio_finalization_duration_ms: Option<u64>,
+    pub worker_queue_duration_ms: Option<u64>,
+    pub release_to_insert_duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,8 +146,10 @@ impl<'connection> HistoryRepository<'connection> {
             "INSERT INTO dictation_history(\
                  created_at_ms, raw_text, normalized_text, cleaned_text, selected_output, \
                  language, target_executable, audio_duration_ms, stt_duration_ms, \
-                 formatting_duration_ms, insertion_duration_ms, warnings_json\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 formatting_duration_ms, insertion_duration_ms, \
+                 audio_finalization_duration_ms, worker_queue_duration_ms, \
+                 release_to_insert_duration_ms, warnings_json\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 draft.created_at_ms,
                 draft.raw_text,
@@ -157,6 +162,9 @@ impl<'connection> HistoryRepository<'connection> {
                 u64_to_i64(draft.timings.stt_duration_ms)?,
                 u64_to_i64(draft.timings.formatting_duration_ms)?,
                 u64_to_i64(draft.timings.insertion_duration_ms)?,
+                u64_to_i64(draft.timings.audio_finalization_duration_ms)?,
+                u64_to_i64(draft.timings.worker_queue_duration_ms)?,
+                u64_to_i64(draft.timings.release_to_insert_duration_ms)?,
                 warnings,
             ],
         )?;
@@ -171,7 +179,9 @@ impl<'connection> HistoryRepository<'connection> {
             .query_row(
                 "SELECT id, created_at_ms, raw_text, normalized_text, cleaned_text, \
                         selected_output, language, target_executable, audio_duration_ms, \
-                        stt_duration_ms, formatting_duration_ms, insertion_duration_ms, warnings_json \
+                        stt_duration_ms, formatting_duration_ms, insertion_duration_ms, \
+                        audio_finalization_duration_ms, worker_queue_duration_ms, \
+                        release_to_insert_duration_ms, warnings_json \
                  FROM dictation_history WHERE id = ?1",
                 [id],
                 map_record,
@@ -185,7 +195,9 @@ impl<'connection> HistoryRepository<'connection> {
         let mut statement = self.connection.prepare(
             "SELECT id, created_at_ms, raw_text, normalized_text, cleaned_text, \
                     selected_output, language, target_executable, audio_duration_ms, \
-                    stt_duration_ms, formatting_duration_ms, insertion_duration_ms, warnings_json \
+                    stt_duration_ms, formatting_duration_ms, insertion_duration_ms, \
+                    audio_finalization_duration_ms, worker_queue_duration_ms, \
+                    release_to_insert_duration_ms, warnings_json \
              FROM dictation_history ORDER BY created_at_ms DESC, id DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([limit], map_record)?;
@@ -237,6 +249,9 @@ type EncodedRecord = (
     Option<i64>,
     Option<i64>,
     Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
     String,
 );
 
@@ -255,6 +270,9 @@ fn map_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<EncodedRecord> {
         row.get(10)?,
         row.get(11)?,
         row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
     ))
 }
 
@@ -277,8 +295,11 @@ fn decode_record(record: Option<EncodedRecord>) -> Result<Option<DictationRecord
                 stt_duration_ms: i64_to_u64(record.9)?,
                 formatting_duration_ms: i64_to_u64(record.10)?,
                 insertion_duration_ms: i64_to_u64(record.11)?,
+                audio_finalization_duration_ms: i64_to_u64(record.12)?,
+                worker_queue_duration_ms: i64_to_u64(record.13)?,
+                release_to_insert_duration_ms: i64_to_u64(record.14)?,
             },
-            warnings: serde_json::from_str(&record.12)?,
+            warnings: serde_json::from_str(&record.15)?,
         },
     }))
 }

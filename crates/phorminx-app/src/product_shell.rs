@@ -45,6 +45,7 @@ pub enum ProductShellControl {
         variant: AccurateModelVariant,
     },
     ModelDownloadFailed,
+    VoskInstallFailed(String),
     Quit,
 }
 
@@ -52,6 +53,7 @@ pub enum ProductShellControl {
 pub enum ProductShellEvent {
     TestDictation,
     ChangeWhisperModel(AccurateModelVariant),
+    InstallVerifiedVoskAssets,
     CancelWhisperModelDownload,
     RuntimeReloadRequested(UiMutation),
     ApplyLaunchAtLogin(bool),
@@ -453,6 +455,11 @@ impl ProductShellApp {
                     ));
                 }
             }
+            ShellEvent::InstallVerifiedVoskAssets => {
+                let _ = self
+                    .events
+                    .send(ProductShellEvent::InstallVerifiedVoskAssets);
+            }
             ShellEvent::SelectOllamaModel(model) => {
                 let mut settings = self.bridge.settings().clone();
                 settings.formatting.ollama_model = Some(model);
@@ -540,6 +547,10 @@ impl eframe::App for ProductShellApp {
                     self.set_error("The verified model could not be downloaded. Your previous model was not changed.".to_owned());
                     self.refresh();
                 }
+                ProductShellControl::VoskInstallFailed(message) => {
+                    self.set_error(message);
+                    self.refresh();
+                }
                 ProductShellControl::Quit => {
                     self.quitting = true;
                     ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -589,10 +600,15 @@ fn map_snapshot(
             raw: Some(item.raw_text),
             normalized: item.normalized_text,
             cleaned: item.cleaned_text,
-            latency: format_duration(
-                item.stt_duration_ms,
-                item.formatting_duration_ms,
-                item.insertion_duration_ms,
+            latency: item.release_to_insert_duration_ms.map_or_else(
+                || {
+                    format_duration(
+                        item.stt_duration_ms,
+                        item.formatting_duration_ms,
+                        item.insertion_duration_ms,
+                    )
+                },
+                |duration| format!("{duration} ms"),
             ),
             warning: item.warnings.first().cloned(),
         })

@@ -48,6 +48,12 @@ Runtime settings load from `%LOCALAPPDATA%\Phorminx\settings.toml`; local histor
 
 The model picker offers an explicit download for the pinned recommended English Whisper model. Downloads stream to a temporary file and must match the manifest size and SHA-256 before atomic promotion. Saving validates and atomically persists settings, then restarts Phorminx when runtime state must be reloaded. If the selected model is missing at startup, Phorminx remains in setup mode instead of terminating. Command-line values such as `--model`, `--language`, `--minimum-rms`, and `--formatting raw|light|balanced|strong|custom` override settings for one run; `--config PATH` selects a development/test settings file.
 
+Instant mode's Settings action imports user-selected official Vosk runtime and
+English-model ZIPs only after pinned size/SHA-256 verification and safe
+extraction. Ready requires an actual native model and recognizer probe. The
+release-to-insert timer begins at the physical hold-release or toggle-stop event,
+and history keeps content-free stage timings for performance analysis.
+
 Whisper models belong in `models/` and personal recordings in `test-data/`; neither directory is committed to Git. The Phase 1 executable keeps the selected model resident and uses `Ctrl+Alt+Space` as its temporary hold-to-talk shortcut.
 
 ## Name

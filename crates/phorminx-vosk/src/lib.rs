@@ -18,6 +18,12 @@ const WINDOWS_RUNTIME_FILES: [&str; 4] = [
     "libstdc++-6.dll",
     "libwinpthread-1.dll",
 ];
+const MODEL_FILES: [&str; 4] = [
+    "am/final.mdl",
+    "conf/model.conf",
+    "graph/HCLr.fst",
+    "graph/Gr.fst",
+];
 
 type ModelNew = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type ModelFree = unsafe extern "C" fn(*mut c_void);
@@ -34,6 +40,7 @@ pub enum Readiness {
     MissingModel { expected: PathBuf },
     LoadFailed { component: &'static str },
     UnsupportedLanguage { language: String },
+    IncompatibleModelLanguage { language: String },
 }
 
 impl Readiness {
@@ -43,6 +50,28 @@ impl Readiness {
 }
 
 pub fn inspect(runtime_bundle: &Path, model: &Path, language: &str) -> Readiness {
+    let layout = inspect_layout(runtime_bundle, model, language);
+    let warning = match layout {
+        Readiness::Ready { warning } => warning,
+        readiness => return readiness,
+    };
+    let loaded = match VoskModel::load_validated(runtime_bundle, model) {
+        Ok(model) => model,
+        Err(_) => {
+            return Readiness::LoadFailed {
+                component: "runtime_or_model",
+            };
+        }
+    };
+    if loaded.session(16_000).is_err() {
+        return Readiness::LoadFailed {
+            component: "recognizer",
+        };
+    }
+    Readiness::Ready { warning }
+}
+
+fn inspect_layout(runtime_bundle: &Path, model: &Path, language: &str) -> Readiness {
     let language = language.trim().to_ascii_lowercase();
     if !matches!(language.as_str(), "en" | "en-us" | "pt" | "pt-br") {
         return Readiness::UnsupportedLanguage { language };
@@ -52,11 +81,32 @@ pub fn inspect(runtime_bundle: &Path, model: &Path, language: &str) -> Readiness
         if !expected.is_file() {
             return Readiness::MissingRuntime { expected };
         }
+        if expected
+            .metadata()
+            .map_or(true, |metadata| metadata.len() == 0)
+        {
+            return Readiness::LoadFailed {
+                component: "runtime_bundle",
+            };
+        }
     }
     if !model.is_dir() {
         return Readiness::MissingModel {
             expected: model.to_path_buf(),
         };
+    }
+    for required in MODEL_FILES {
+        let expected = model.join(required);
+        if !expected.is_file()
+            || expected
+                .metadata()
+                .map_or(true, |metadata| metadata.len() == 0)
+        {
+            return Readiness::MissingModel { expected };
+        }
+    }
+    if !model_matches_language(model, &language) {
+        return Readiness::IncompatibleModelLanguage { language };
     }
     Readiness::Ready {
         warning: matches!(language.as_str(), "pt" | "pt-br").then_some(
@@ -156,10 +206,14 @@ pub struct VoskModel {
 
 impl VoskModel {
     pub fn load(runtime_bundle: &Path, model: &Path, language: &str) -> Result<Self, VoskError> {
-        match inspect(runtime_bundle, model, language) {
+        match inspect_layout(runtime_bundle, model, language) {
             Readiness::Ready { .. } => {}
             readiness => return Err(VoskError::NotReady(readiness)),
         }
+        Self::load_validated(runtime_bundle, model)
+    }
+
+    fn load_validated(runtime_bundle: &Path, model: &Path) -> Result<Self, VoskError> {
         let model_text = model
             .to_str()
             .ok_or_else(|| VoskError::NonUtf8Path(model.to_path_buf()))?;
@@ -197,6 +251,18 @@ impl VoskModel {
             raw,
             finalized: FinalizedText::default(),
         })
+    }
+}
+
+fn model_matches_language(model: &Path, language: &str) -> bool {
+    let Some(name) = model.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let normalized = format!("-{}-", name.trim().to_ascii_lowercase().replace('_', "-"));
+    match language {
+        "en" | "en-us" => normalized.contains("-en-") || normalized.contains("-en-us-"),
+        "pt" | "pt-br" => normalized.contains("-pt-") || normalized.contains("-pt-br-"),
+        _ => false,
     }
 }
 
@@ -323,6 +389,7 @@ pub enum VoskError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn parses_text_without_exposing_other_result_fields() {
@@ -342,6 +409,58 @@ mod tests {
         assert!(matches!(
             inspect(&root, &root, "en"),
             Readiness::MissingRuntime { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_runtime_and_model_layout_never_report_ready() {
+        let root =
+            std::env::temp_dir().join(format!("phorminx-vosk-empty-assets-{}", std::process::id()));
+        let runtime = root.join("runtime");
+        let model = root.join("vosk-model-small-en-us-test");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::create_dir_all(&model).unwrap();
+        for file in WINDOWS_RUNTIME_FILES {
+            fs::write(runtime.join(file), []).unwrap();
+        }
+        assert!(matches!(
+            inspect(&runtime, &model, "en"),
+            Readiness::LoadFailed {
+                component: "runtime_bundle"
+            }
+        ));
+        for file in WINDOWS_RUNTIME_FILES {
+            fs::write(runtime.join(file), [1]).unwrap();
+        }
+        assert!(matches!(
+            inspect_layout(&runtime, &model, "en"),
+            Readiness::MissingModel { .. }
+        ));
+        for file in MODEL_FILES {
+            let path = model.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, [1]).unwrap();
+        }
+        assert!(matches!(
+            inspect(&runtime, &model, "en"),
+            Readiness::LoadFailed { .. }
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_directory_name_must_match_selected_language() {
+        assert!(model_matches_language(
+            Path::new("vosk-model-small-en-us-0.15"),
+            "en"
+        ));
+        assert!(!model_matches_language(
+            Path::new("vosk-model-small-en-us-0.15"),
+            "pt-br"
+        ));
+        assert!(model_matches_language(
+            Path::new("vosk-model-small-pt-0.3"),
+            "pt-br"
         ));
     }
 
@@ -373,9 +492,15 @@ mod tests {
     fn installed_native_bundle_loads_and_streams() {
         let runtime = std::env::var_os("PHORMINX_VOSK_RUNTIME").unwrap();
         let model = std::env::var_os("PHORMINX_VOSK_MODEL").unwrap();
+        assert!(inspect(Path::new(&runtime), Path::new(&model), "en").is_ready());
         let loaded = VoskModel::load(Path::new(&runtime), Path::new(&model), "en").unwrap();
-        let mut session = loaded.session(16_000).unwrap();
-        session.accept_f32(&vec![0.0; 16_000]).unwrap();
-        assert!(session.finish().unwrap().is_empty());
+        for sample_rate in [16_000, 44_100, 48_000] {
+            let mut session = loaded.session(sample_rate).unwrap();
+            let silence = vec![0.0; sample_rate as usize];
+            for batch in silence.chunks(1_337) {
+                session.accept_f32(batch).unwrap();
+            }
+            assert!(session.finish().unwrap().is_empty());
+        }
     }
 }

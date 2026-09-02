@@ -149,7 +149,7 @@ pub struct RecognitionSettings {
     pub model_path: PathBuf,
     /// Unpacked Vosk model directory matching `language`.
     pub instant_model_path: PathBuf,
-    /// Vosk runtime bundle directory containing vosk.dll and its dependencies.
+    /// Vosk runtime bundle directory containing libvosk.dll and its dependencies.
     pub instant_runtime_path: PathBuf,
     /// A UI/catalog hint. `model_path` remains authoritative and the runtime
     /// verifies this identity before presenting a pinned variant.
@@ -510,6 +510,7 @@ impl SettingsStore {
             path: directory.to_path_buf(),
             source,
         })?;
+        self.preserve_schema_3_backup(directory)?;
 
         let (temporary_path, mut temporary_file) = self.create_temporary_file(directory)?;
         let write_result = (|| {
@@ -570,6 +571,60 @@ impl SettingsStore {
         Err(SettingsError::TemporaryNameExhausted(
             directory.to_path_buf(),
         ))
+    }
+
+    fn preserve_schema_3_backup(&self, directory: &Path) -> Result<(), SettingsError> {
+        let backup_path = directory.join("settings.schema-3.backup.toml");
+        if backup_path.exists() || !self.path.is_file() {
+            return Ok(());
+        }
+        let original = fs::read(&self.path).map_err(|source| SettingsError::Read {
+            path: self.path.clone(),
+            source,
+        })?;
+        if original.len() as u64 > MAX_SETTINGS_BYTES {
+            return Err(SettingsError::TooLarge(self.path.clone()));
+        }
+        let value =
+            toml::from_str::<toml::Value>(std::str::from_utf8(&original).map_err(|source| {
+                SettingsError::Utf8 {
+                    path: self.path.clone(),
+                    source,
+                }
+            })?)
+            .map_err(|source| SettingsError::Parse {
+                path: self.path.clone(),
+                source,
+            })?;
+        let version = value
+            .get("schema_version")
+            .and_then(toml::Value::as_integer)
+            .unwrap_or_default();
+        if !(1..=3).contains(&version) {
+            return Ok(());
+        }
+        let mut backup = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(source) => {
+                return Err(SettingsError::CreateTemporary {
+                    path: backup_path,
+                    source,
+                });
+            }
+        };
+        backup
+            .write_all(&original)
+            .and_then(|_| backup.flush())
+            .and_then(|_| backup.sync_all())
+            .map_err(|source| SettingsError::Write {
+                path: backup_path,
+                source,
+            })
     }
 }
 
@@ -873,6 +928,23 @@ language = "pt-BR"
             settings.recognition.accurate_model,
             AccurateModelVariant::TinyEnglish
         );
+    }
+
+    #[test]
+    fn first_schema_four_save_preserves_exact_schema_three_rollback_backup() {
+        let directory = TestDirectory::new("schema-v3-backup");
+        let path = directory.0.join("settings.toml");
+        let original = "schema_version = 3\n[recognition]\nmodel_path = 'models/custom.bin'\n";
+        fs::write(&path, original).unwrap();
+        let store = SettingsStore::new(path).unwrap();
+        let loaded = store.load().unwrap();
+        store.save(&loaded).unwrap();
+        let backup = directory.0.join("settings.schema-3.backup.toml");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+
+        fs::write(&backup, "do not replace").unwrap();
+        store.save(&loaded).unwrap();
+        assert_eq!(fs::read_to_string(backup).unwrap(), "do not replace");
     }
 
     #[test]

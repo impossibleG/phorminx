@@ -677,6 +677,7 @@ pub enum ShellEvent {
     RemoveProfile(String),
     VerifyModels,
     ChangeWhisperModel(AccurateModel),
+    InstallVerifiedVoskAssets,
     SelectOllamaModel(String),
     SaveSettings(SettingsSnapshot),
     DismissNotice,

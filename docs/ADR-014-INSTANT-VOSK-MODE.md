@@ -45,14 +45,33 @@ instant.
 ## Readiness
 
 Readiness is typed: ready (optionally with a PT-BR quality warning), missing
-runtime, missing model, load failed, or unsupported language. Ready is announced
-only after the library and model are loaded and resident. Instant v1 accepts
+runtime, missing model, load failed, unsupported language, or an incompatible
+model/language pair. Filename and directory checks never produce Ready by
+themselves: the probe loads the native library and model and creates a real
+recognizer. Startup load failures return to recoverable setup. Instant v1 accepts
 `en`, `en-us`, `pt`, and `pt-br`. English is recommended. PT-BR requires a
-matching local model and carries a quality warning.
+matching official model-directory identity and carries a quality warning.
+Instant mode rejects a per-application language override that does not match the
+resident model.
+
+The Settings UI offers an explicit verified import. The user supplies the two
+official ZIPs; Phorminx embeds its pinned installer, verifies exact byte length
+and SHA-256, rejects unsafe archive paths, extracts into a fresh directory, and
+performs the full native readiness probe before saving. No download is implicit.
+
+The app loop stamps the monotonic release time at receipt of both hold-release
+and toggle-stop events, before audio finalization. That anchor is carried through
+worker completion and insertion. History schema v2 stores audio-finalization,
+worker-queue, insertion, and release-to-insert durations separately. Schema 3
+settings are preserved byte-for-byte as a one-time rollback backup before the
+first schema 4 save.
 
 ## Consequences
 
 Normal release cost is the unconsumed callback tail, Vosk `FinalResult`,
 deterministic formatting, and insertion. AI formatting may still add latency.
 Missing assets enter recoverable setup instead of false readiness. Native
-runtime and model licenses must be reviewed before distributing a bundle.
+runtime and model licenses must be reviewed before distributing a bundle. A
+stream-prefix continuity check, late/overrun detection, queue-drop detection,
+and an empty/high-energy sanity check route uncertain assembly through the
+untouched full archival clip.
