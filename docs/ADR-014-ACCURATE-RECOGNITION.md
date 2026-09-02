@@ -27,10 +27,12 @@ model default unless an explicit benchmark command asks for an override.
    duration, and whether GPU use was compiled in. A disk file is described only
    as available, never as a loaded recognizer.
 2. Ship Vulkan in the Windows Accurate release. `Auto` selects Vulkan when that
-   backend is compiled; explicit `Vulkan` fails visibly in a CPU-only build.
-   `Cpu` remains selectable for diagnosis and benchmarks. Runtime proof requires
-   an actual transcription whose returned backend is Vulkan; compilation alone
-   is recorded separately.
+   backend is compiled and a device enumerates. If Vulkan context/model loading
+   fails, `Auto` creates a fresh CPU context and exposes the fallback; explicit
+   `Vulkan` fails visibly. `Cpu` remains selectable for diagnosis and
+   benchmarks. The binding proves configuration through device enumeration plus
+   successful context creation; actual kernel execution is proven separately by
+   whisper.cpp runtime logs and a hardware benchmark.
 3. Pin four verified upstream artifacts: Tiny English, Base English, Tiny
    Multilingual, and Base Multilingual. Existing `model_path` remains
    authoritative. A pinned variant is inferred only after filename, byte count,
@@ -42,12 +44,17 @@ model default unless an explicit benchmark command asks for an override.
    boundary at 3 seconds, and retain 500 ms overlap. This bounds the ordinary
    release tail to 3.5 seconds while preserving the 120-second capture ceiling.
 6. A final request publishes a shared release-priority flag before entering the
-   FIFO. The running partial supplies that flag to whisper.cpp's abort callback,
-   so final work does not wait for obsolete partial inference. Aborted work is
-   never accepted into the stable accumulator.
+   FIFO. A tombstone also aborts older partial commands that have not reached
+   `begin_partial` yet. The running partial supplies the same flag to
+   whisper.cpp's abort callback, so final work does not wait for obsolete
+   partial inference. The tombstone clears only when the final command dequeues.
+   Aborted work is never accepted into the stable accumulator.
 7. Whisper partials expose segment timestamps. Only segments ending before the
    overlap guard become stable. Later chunks append segments by their absolute
-   audio interval and use a bounded prior-text prompt for decoder context. Text
+   audio interval and use a bounded prior-text prompt for decoder context. A
+   segment that crosses the stability guard or already-accepted frontier freezes
+   admission at the earliest unresolved instant; the final tail resumes there,
+   so a later timestamp can never jump across and permanently lose audio. Text
    overlap remains a compatibility fallback, not the primary boundary proof.
 8. Formatting, history, and insertion remain downstream of exactly one accepted
    final result. Ollama warm-up cannot block STT readiness or the transcription
@@ -56,9 +63,15 @@ model default unless an explicit benchmark command asks for an override.
    partial audio/compute/abort, final tail audio/compute, full fallback reason
    and compute, formatting, insertion, and release-to-insert. Never log audio or
    transcript text.
-10. Reject pathological repeated output before persistence/insertion. The guard
-    detects three or more consecutive repetitions of a multi-word span and
-    fails closed; it does not silently rewrite recognized speech.
+10. Recover from pathological repeated incremental output with one clean
+    full-clip pass before persistence/insertion. The high-specificity guard
+    requires four consecutive repetitions of a phrase at least five words long,
+    so intentional short repetition such as `red green blue` three times remains
+    valid. A repeated full-clip result fails closed; recognized speech is never
+    silently rewritten.
+11. The Models page and both settings surfaces expose all four pinned variants
+    and Auto/Vulkan/CPU. Downloads use the selected manifest and switch the
+    authoritative model path only after size and SHA-256 verification.
 
 ## Consequences
 
@@ -70,6 +83,6 @@ model default unless an explicit benchmark command asks for an override.
   reproducible.
 - Vulkan packaging adds SDK/build complexity and must be proven on physical AMD
   hardware before claiming acceleration.
-- The repetition guard can reject unusual intentionally repeated dictation; a
-  visible failure is preferable to inserting a long hallucinated loop.
-
+- Very long intentional verbatim repetition can still meet the conservative
+  loop threshold; it receives a full-clip recovery pass before any visible
+  failure.

@@ -7,9 +7,9 @@ use crate::components::{
     section_title, segmented,
 };
 use crate::model::{
-    AppearancePreference, FormattingStrength, HistoryVariant, LexiconCasePolicy, LexiconDraft,
-    OllamaLifecycle, ProfileDraft, ProfileInsertion, RecognitionMode, RecordingMode, Route,
-    SettingsSnapshot, ShellEvent, ShellSnapshot,
+    AccurateBackend, AccurateModel, AppearancePreference, FormattingStrength, HistoryVariant,
+    LexiconCasePolicy, LexiconDraft, OllamaLifecycle, ProfileDraft, ProfileInsertion,
+    RecognitionMode, RecordingMode, Route, SettingsSnapshot, ShellEvent, ShellSnapshot,
 };
 use crate::theme::{Space, UiThemeExt};
 
@@ -26,7 +26,7 @@ pub(crate) struct PageState {
     pub confirm_profile_delete: Option<String>,
     pub settings: SettingsSnapshot,
     pub settings_dirty: bool,
-    pub confirm_model_download: bool,
+    pub confirm_model_download: Option<AccurateModel>,
 }
 
 impl PageState {
@@ -46,7 +46,7 @@ impl PageState {
             confirm_profile_delete: None,
             settings: snapshot.settings.clone(),
             settings_dirty: false,
-            confirm_model_download: false,
+            confirm_model_download: None,
         }
     }
 
@@ -737,22 +737,22 @@ fn models(
     model_system(ui, "01", &snapshot.whisper, true, state, outbox);
     ui.add_space(Space::LG);
     model_system(ui, "02", &snapshot.vosk, false, state, outbox);
-    if state.confirm_model_download {
+    if let Some(variant) = state.confirm_model_download {
         ui.add_space(Space::MD);
         ui.label(
             RichText::new(
-                "Download the pinned 141 MiB English Whisper model. The file stays local and replaces the active model only after SHA-256 verification.",
+                format!("Download {}. The file stays local and replaces the active model only after SHA-256 verification.", variant.label()),
             )
             .color(tokens.secondary_text),
         );
         ui.add_space(Space::SM);
         ui.horizontal(|ui| {
             if action(ui, "Download and verify", ActionTone::Primary).clicked() {
-                state.confirm_model_download = false;
-                outbox.push(ShellEvent::ChangeWhisperModel);
+                state.confirm_model_download = None;
+                outbox.push(ShellEvent::ChangeWhisperModel(variant));
             }
             if action(ui, "Cancel", ActionTone::Quiet).clicked() {
-                state.confirm_model_download = false;
+                state.confirm_model_download = None;
             }
         });
     }
@@ -796,14 +796,15 @@ fn model_system(
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if whisper {
-                if action(
-                    ui,
-                    "Download recommended · base.en · 141 MiB",
-                    ActionTone::Secondary,
-                )
-                .clicked()
-                {
-                    state.confirm_model_download = true;
+                for variant in [
+                    AccurateModel::TinyEnglish,
+                    AccurateModel::BaseEnglish,
+                    AccurateModel::TinyMultilingual,
+                    AccurateModel::BaseMultilingual,
+                ] {
+                    if action(ui, variant.label(), ActionTone::Secondary).clicked() {
+                        state.confirm_model_download = Some(variant);
+                    }
                 }
             } else {
                 for model in &system.installed {
@@ -913,6 +914,42 @@ fn settings(
                         RecognitionMode::Accurate,
                         "Accurate",
                     );
+                },
+            );
+            setting_row(
+                ui,
+                "Accurate model",
+                "Pinned Whisper model size and language coverage.",
+                |ui| {
+                    ComboBox::from_id_salt("accurate-model")
+                        .selected_text(state.settings.accurate_model.label())
+                        .show_ui(ui, |ui| {
+                            for value in AccurateModel::ALL {
+                                ui.selectable_value(
+                                    &mut state.settings.accurate_model,
+                                    value,
+                                    value.label(),
+                                );
+                            }
+                        });
+                },
+            );
+            setting_row(
+                ui,
+                "Compute backend",
+                "Auto uses Vulkan when it loads successfully and otherwise recovers on CPU.",
+                |ui| {
+                    ComboBox::from_id_salt("accurate-backend")
+                        .selected_text(state.settings.accurate_backend.label())
+                        .show_ui(ui, |ui| {
+                            for value in AccurateBackend::ALL {
+                                ui.selectable_value(
+                                    &mut state.settings.accurate_backend,
+                                    value,
+                                    value.label(),
+                                );
+                            }
+                        });
                 },
             );
             setting_row(ui, "Language", "Prefer a recognition language.", |ui| {

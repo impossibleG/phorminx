@@ -10,6 +10,7 @@ use phorminx_ollama::OllamaClient;
 use phorminx_persistence::{CasePolicy, FormattingStyle, InsertionPreference};
 use phorminx_ui::theme::ThemeMode;
 use phorminx_ui::{
+    AccurateBackend as ShellAccurateBackend, AccurateModel as ShellAccurateModel,
     AppearancePreference as ShellAppearance, ApplicationProfile,
     FormattingStrength as ShellFormatting, HistoryItem, InlineNotice, LexiconCasePolicy,
     LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle as ShellLifecycle, PhorminxUi,
@@ -20,8 +21,9 @@ use phorminx_ui::{
 use phorminx_windows::{SystemAppearance, system_appearance};
 
 use crate::settings::{
-    AppearancePreference as StoredAppearance, FormattingStrength, HistoryRetention,
-    OllamaLifecycle, RecognitionMode, RecordingMode, Settings, SettingsStore,
+    AccurateBackendPreference, AccurateModelVariant, AppearancePreference as StoredAppearance,
+    FormattingStrength, HistoryRetention, OllamaLifecycle, RecognitionMode, RecordingMode,
+    Settings, SettingsStore,
 };
 use crate::ui_bridge::{
     DEFAULT_HISTORY_LIMIT, UiBridge, UiCommand, UiEffect, UiLexiconDraft, UiMutation,
@@ -37,7 +39,10 @@ pub enum ProductShellControl {
     SetRuntimeStatus(UiRuntimeStatus),
     Refresh,
     ModelDownloadProgress(u64),
-    ModelDownloaded(PathBuf),
+    ModelDownloaded {
+        path: PathBuf,
+        variant: AccurateModelVariant,
+    },
     ModelDownloadFailed,
     Quit,
 }
@@ -45,7 +50,7 @@ pub enum ProductShellControl {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProductShellEvent {
     TestDictation,
-    ChangeWhisperModel,
+    ChangeWhisperModel(AccurateModelVariant),
     CancelWhisperModelDownload,
     RuntimeReloadRequested(UiMutation),
     ApplyLaunchAtLogin(bool),
@@ -400,8 +405,12 @@ impl ProductShellApp {
                 probe_readiness(self.bridge.settings().clone(), self.store.clone(), sender);
                 self.refresh();
             }
-            ShellEvent::ChangeWhisperModel => {
-                let _ = self.events.send(ProductShellEvent::ChangeWhisperModel);
+            ShellEvent::ChangeWhisperModel(variant) => {
+                if variant != ShellAccurateModel::Custom {
+                    let _ = self.events.send(ProductShellEvent::ChangeWhisperModel(
+                        unmap_accurate_model(variant),
+                    ));
+                }
             }
             ShellEvent::SelectOllamaModel(model) => {
                 let mut settings = self.bridge.settings().clone();
@@ -477,10 +486,11 @@ impl eframe::App for ProductShellApp {
                     });
                     self.refresh();
                 }
-                ProductShellControl::ModelDownloaded(path) => {
+                ProductShellControl::ModelDownloaded { path, variant } => {
                     self.download_active = false;
                     let mut settings = self.bridge.settings().clone();
                     settings.recognition.model_path = path;
+                    settings.recognition.accurate_model = variant;
                     settings.startup.onboarding_complete = true;
                     self.execute(UiCommand::SaveSettings(settings));
                 }
@@ -700,6 +710,12 @@ fn map_settings(
             .instant_runtime_path
             .display()
             .to_string(),
+        accurate_model: map_accurate_model(settings.recognition.accurate_model),
+        accurate_backend: match settings.recognition.accurate_backend {
+            AccurateBackendPreference::Auto => ShellAccurateBackend::Auto,
+            AccurateBackendPreference::Vulkan => ShellAccurateBackend::Vulkan,
+            AccurateBackendPreference::Cpu => ShellAccurateBackend::Cpu,
+        },
         history_retention: history_label(settings.privacy.history_retention).to_owned(),
         launch_at_login: settings.startup.launch_at_login,
     }
@@ -740,6 +756,12 @@ fn apply_settings_snapshot(current: &Settings, form: &SettingsSnapshot) -> Setti
     settings.recognition.model_path = PathBuf::from(form.model_path.trim());
     settings.recognition.instant_model_path = PathBuf::from(form.instant_model_path.trim());
     settings.recognition.instant_runtime_path = PathBuf::from(form.instant_runtime_path.trim());
+    settings.recognition.accurate_model = unmap_accurate_model(form.accurate_model);
+    settings.recognition.accurate_backend = match form.accurate_backend {
+        ShellAccurateBackend::Auto => AccurateBackendPreference::Auto,
+        ShellAccurateBackend::Vulkan => AccurateBackendPreference::Vulkan,
+        ShellAccurateBackend::Cpu => AccurateBackendPreference::Cpu,
+    };
     settings.privacy.history_retention = match form.history_retention.as_str() {
         "Off" => HistoryRetention::Disabled,
         "1 day" => HistoryRetention::OneDay,
@@ -750,6 +772,26 @@ fn apply_settings_snapshot(current: &Settings, form: &SettingsSnapshot) -> Setti
     settings.startup.launch_at_login = form.launch_at_login;
     settings.startup.onboarding_complete = true;
     settings
+}
+
+fn map_accurate_model(value: AccurateModelVariant) -> ShellAccurateModel {
+    match value {
+        AccurateModelVariant::TinyEnglish => ShellAccurateModel::TinyEnglish,
+        AccurateModelVariant::BaseEnglish => ShellAccurateModel::BaseEnglish,
+        AccurateModelVariant::TinyMultilingual => ShellAccurateModel::TinyMultilingual,
+        AccurateModelVariant::BaseMultilingual => ShellAccurateModel::BaseMultilingual,
+        AccurateModelVariant::Custom => ShellAccurateModel::Custom,
+    }
+}
+
+fn unmap_accurate_model(value: ShellAccurateModel) -> AccurateModelVariant {
+    match value {
+        ShellAccurateModel::TinyEnglish => AccurateModelVariant::TinyEnglish,
+        ShellAccurateModel::BaseEnglish => AccurateModelVariant::BaseEnglish,
+        ShellAccurateModel::TinyMultilingual => AccurateModelVariant::TinyMultilingual,
+        ShellAccurateModel::BaseMultilingual => AccurateModelVariant::BaseMultilingual,
+        ShellAccurateModel::Custom => AccurateModelVariant::Custom,
+    }
 }
 
 fn optional(value: String) -> Option<String> {

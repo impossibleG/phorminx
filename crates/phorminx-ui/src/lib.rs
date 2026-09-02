@@ -14,9 +14,9 @@ pub mod theme;
 pub use app::PhorminxUi;
 pub use gallery::ComponentGallery;
 pub use model::{
-    AppearancePreference, ApplicationProfile, FormattingStrength, GalleryScenario, HistoryItem,
-    HistoryVariant, InlineNotice, LexiconCasePolicy, LexiconDraft, LexiconEntry, ModelSystem,
-    NoticeKind, OllamaLifecycle, ProfileDraft, ProfileInsertion, Readiness, RecognitionMode,
-    RecordingMode, Route, RuntimeStatus, SettingsSnapshot, ShellEvent, ShellSnapshot,
-    SystemReadiness,
+    AccurateBackend, AccurateModel, AppearancePreference, ApplicationProfile, FormattingStrength,
+    GalleryScenario, HistoryItem, HistoryVariant, InlineNotice, LexiconCasePolicy, LexiconDraft,
+    LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle, ProfileDraft, ProfileInsertion,
+    Readiness, RecognitionMode, RecordingMode, Route, RuntimeStatus, SettingsSnapshot, ShellEvent,
+    ShellSnapshot, SystemReadiness,
 };

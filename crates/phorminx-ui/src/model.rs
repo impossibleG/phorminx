@@ -348,6 +348,8 @@ pub struct SettingsSnapshot {
     pub model_path: String,
     pub instant_model_path: String,
     pub instant_runtime_path: String,
+    pub accurate_model: AccurateModel,
+    pub accurate_backend: AccurateBackend,
     pub history_retention: String,
     pub launch_at_login: bool,
 }
@@ -368,8 +370,60 @@ impl Default for SettingsSnapshot {
             model_path: "models/ggml-base.en.bin".into(),
             instant_model_path: "models/vosk-model-small-en-us-0.15".into(),
             instant_runtime_path: "runtime/vosk".into(),
+            accurate_model: AccurateModel::BaseEnglish,
+            accurate_backend: AccurateBackend::Auto,
             history_retention: "7 days".into(),
             launch_at_login: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AccurateModel {
+    TinyEnglish,
+    #[default]
+    BaseEnglish,
+    TinyMultilingual,
+    BaseMultilingual,
+    Custom,
+}
+
+impl AccurateModel {
+    pub const ALL: [Self; 5] = [
+        Self::TinyEnglish,
+        Self::BaseEnglish,
+        Self::TinyMultilingual,
+        Self::BaseMultilingual,
+        Self::Custom,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::TinyEnglish => "Tiny · English",
+            Self::BaseEnglish => "Base · English",
+            Self::TinyMultilingual => "Tiny · Multilingual",
+            Self::BaseMultilingual => "Base · Multilingual",
+            Self::Custom => "Custom file",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AccurateBackend {
+    #[default]
+    Auto,
+    Vulkan,
+    Cpu,
+}
+
+impl AccurateBackend {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Vulkan, Self::Cpu];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Vulkan => "Vulkan GPU",
+            Self::Cpu => "CPU",
         }
     }
 }
@@ -622,7 +676,7 @@ pub enum ShellEvent {
     CancelProfileEdit,
     RemoveProfile(String),
     VerifyModels,
-    ChangeWhisperModel,
+    ChangeWhisperModel(AccurateModel),
     SelectOllamaModel(String),
     SaveSettings(SettingsSnapshot),
     DismissNotice,

@@ -144,7 +144,10 @@ impl ModelDownload {
                     });
                 });
                 let event = match result {
-                    Ok(()) => ModelDownloadEvent::Completed { path: destination },
+                    Ok(()) => ModelDownloadEvent::Completed {
+                        path: destination,
+                        variant,
+                    },
                     Err(ModelError::Cancelled) => ModelDownloadEvent::Cancelled,
                     Err(error) => ModelDownloadEvent::Failed(error.to_string()),
                 };
@@ -187,8 +190,14 @@ impl Drop for ModelDownload {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModelDownloadEvent {
-    Progress { downloaded: u64, total: u64 },
-    Completed { path: PathBuf },
+    Progress {
+        downloaded: u64,
+        total: u64,
+    },
+    Completed {
+        path: PathBuf,
+        variant: AccurateModelVariant,
+    },
     Cancelled,
     Failed(String),
 }

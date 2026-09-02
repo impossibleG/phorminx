@@ -661,6 +661,16 @@ impl UiBridge {
             }
             UiCommand::SaveProfile(draft) => {
                 let (original, profile) = profile_draft(draft)?;
+                let resolved_model = self
+                    .store
+                    .resolve_model_path(&self.settings.recognition.model_path);
+                let verified_variant = identify_pinned_model(&resolved_model).map_err(|_| {
+                    UiBridgeError::validation(
+                        "language",
+                        "The active Whisper model could not be verified for this language.",
+                    )
+                })?;
+                validate_profile_model_language(verified_variant, profile.language.as_deref())?;
                 let executable = profile.executable.to_string();
                 let profiles = self.persistence.app_profiles();
                 if let Some(original) = original {
@@ -729,20 +739,16 @@ impl UiBridge {
                     )
                 })?;
                 if candidate.recognition.accurate_model != AccurateModelVariant::Custom {
-                    let expected = model_for_variant(candidate.recognition.accurate_model)
-                        .map_err(|_| {
-                            UiBridgeError::validation(
-                                "model_path",
-                                "The pinned Whisper model is unavailable.",
-                            )
-                        })?;
-                    if resolved_model.file_name().and_then(|name| name.to_str())
-                        == Some(expected.file_name.as_str())
-                        && verified_variant != Some(candidate.recognition.accurate_model)
-                    {
+                    model_for_variant(candidate.recognition.accurate_model).map_err(|_| {
+                        UiBridgeError::validation(
+                            "model_path",
+                            "The pinned Whisper model is unavailable.",
+                        )
+                    })?;
+                    if verified_variant != Some(candidate.recognition.accurate_model) {
                         return Err(UiBridgeError::validation(
                             "model_path",
-                            "The pinned Whisper model failed verification.",
+                            "Download and verify the selected pinned Whisper model before switching.",
                         ));
                     }
                 }
@@ -843,6 +849,21 @@ fn requires_ollama(strength: FormattingStrength) -> bool {
         strength,
         FormattingStrength::Balanced | FormattingStrength::Strong | FormattingStrength::Custom
     )
+}
+
+fn validate_profile_model_language(
+    verified_variant: Option<AccurateModelVariant>,
+    language: Option<&str>,
+) -> Result<(), UiBridgeError> {
+    if language.is_some_and(|language| {
+        verified_variant.is_some_and(|variant| !variant.supports_language(language))
+    }) {
+        return Err(UiBridgeError::validation(
+            "language",
+            "Select a multilingual Whisper model before using this profile language.",
+        ));
+    }
+    Ok(())
 }
 
 fn retention_policy(retention: HistoryRetention) -> RetentionPolicy {
@@ -1114,6 +1135,7 @@ mod tests {
             let store = SettingsStore::new(root.join("settings.toml")).unwrap();
             let mut settings = Settings::default();
             settings.recognition.model_path = model;
+            settings.recognition.accurate_model = AccurateModelVariant::Custom;
             store.save(&settings).unwrap();
             let bridge = UiBridge::open(store, root.join("phorminx.sqlite3")).unwrap();
             Self { root, bridge }
@@ -1200,6 +1222,21 @@ mod tests {
         assert_eq!(
             microphone_readiness(None, Vec::new()).state,
             UiReadinessState::NeedsAttention
+        );
+    }
+
+    #[test]
+    fn english_only_verified_model_rejects_portuguese_profile_language() {
+        let error =
+            validate_profile_model_language(Some(AccurateModelVariant::BaseEnglish), Some("pt-br"))
+                .unwrap_err();
+        assert_eq!(error.field, Some("language"));
+        assert!(
+            validate_profile_model_language(
+                Some(AccurateModelVariant::BaseMultilingual),
+                Some("pt-br")
+            )
+            .is_ok()
         );
     }
 

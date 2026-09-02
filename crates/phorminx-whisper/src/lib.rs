@@ -12,8 +12,10 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 pub struct WhisperRecognizer {
     context: WhisperContext,
     model_load_time: Duration,
+    requested: WhisperBackendPreference,
     backend: WhisperBackend,
     device_name: Option<String>,
+    fallback_from: Option<WhisperBackend>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -22,6 +24,16 @@ pub enum WhisperBackendPreference {
     Auto,
     Vulkan,
     Cpu,
+}
+
+impl WhisperBackendPreference {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Vulkan => "vulkan",
+            Self::Cpu => "cpu",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,8 +61,12 @@ pub fn probe_backend(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WhisperReadiness {
+    pub requested: WhisperBackendPreference,
     pub backend: WhisperBackend,
     pub device_name: Option<String>,
+    /// The initially selected backend when Auto recovered by loading a CPU
+    /// context. Explicit Vulkan never silently falls back.
+    pub fallback_from: Option<WhisperBackend>,
     pub model_load_time: Duration,
 }
 
@@ -94,28 +110,44 @@ impl WhisperRecognizer {
         }
 
         let started = Instant::now();
-        let mut context_parameters = WhisperContextParameters::default();
         let (backend, device_name) = select_backend(preference)?;
-        context_parameters.use_gpu(backend == WhisperBackend::Vulkan);
-        let context = WhisperContext::new_with_params(
-            model_path
-                .to_str()
-                .ok_or_else(|| WhisperError::NonUtf8ModelPath(model_path.to_path_buf()))?,
-            context_parameters,
-        )?;
+        let model_path_text = model_path
+            .to_str()
+            .ok_or_else(|| WhisperError::NonUtf8ModelPath(model_path.to_path_buf()))?;
+        let first = load_context(model_path_text, backend);
+        let (context, active_backend, active_device, fallback_from) = match first {
+            Ok(context) => (context, backend, device_name, None),
+            Err(_error) if should_retry_cpu(preference, backend) => {
+                // Auto promises availability, not GPU-or-fail. A device may
+                // enumerate successfully while context/model initialization
+                // still fails, so retry with an independently created CPU
+                // context. The readiness result exposes this recovery.
+                (
+                    load_context(model_path_text, WhisperBackend::Cpu)?,
+                    WhisperBackend::Cpu,
+                    None,
+                    Some(WhisperBackend::Vulkan),
+                )
+            }
+            Err(error) => return Err(error),
+        };
 
         Ok(Self {
             context,
             model_load_time: started.elapsed(),
-            backend,
-            device_name,
+            backend: active_backend,
+            device_name: active_device,
+            requested: preference,
+            fallback_from,
         })
     }
 
     pub fn readiness(&self) -> WhisperReadiness {
         WhisperReadiness {
+            requested: self.requested,
             backend: self.backend,
             device_name: self.device_name.clone(),
+            fallback_from: self.fallback_from,
             model_load_time: self.model_load_time,
         }
     }
@@ -200,6 +232,16 @@ impl WhisperRecognizer {
     }
 }
 
+fn should_retry_cpu(preference: WhisperBackendPreference, selected: WhisperBackend) -> bool {
+    preference == WhisperBackendPreference::Auto && selected == WhisperBackend::Vulkan
+}
+
+fn load_context(model_path: &str, backend: WhisperBackend) -> Result<WhisperContext, WhisperError> {
+    let mut parameters = WhisperContextParameters::default();
+    parameters.use_gpu(backend == WhisperBackend::Vulkan);
+    Ok(WhisperContext::new_with_params(model_path, parameters)?)
+}
+
 unsafe extern "C" fn whisper_abort_callback(user_data: *mut c_void) -> bool {
     if user_data.is_null() {
         return false;
@@ -277,6 +319,22 @@ mod tests {
             select_backend(WhisperBackendPreference::Cpu).unwrap(),
             (WhisperBackend::Cpu, None)
         );
+    }
+
+    #[test]
+    fn only_auto_retries_cpu_after_a_selected_vulkan_context_fails() {
+        assert!(should_retry_cpu(
+            WhisperBackendPreference::Auto,
+            WhisperBackend::Vulkan
+        ));
+        assert!(!should_retry_cpu(
+            WhisperBackendPreference::Vulkan,
+            WhisperBackend::Vulkan
+        ));
+        assert!(!should_retry_cpu(
+            WhisperBackendPreference::Auto,
+            WhisperBackend::Cpu
+        ));
     }
 
     #[cfg(not(feature = "vulkan"))]

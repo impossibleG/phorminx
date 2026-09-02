@@ -53,6 +53,8 @@ const ID_OLLAMA_LIFECYCLE: usize = 110;
 const ID_RECORDING_MODE: usize = 111;
 const ID_RETENTION: usize = 112;
 const ID_LAUNCH_AT_LOGIN: usize = 113;
+const ID_ACCURATE_MODEL: usize = 114;
+const ID_ACCURATE_BACKEND: usize = 115;
 const ID_SAVE: usize = 201;
 const ID_CANCEL: usize = 202;
 
@@ -91,6 +93,22 @@ pub enum SettingsHistoryRetention {
 pub enum SettingsRecognitionMode {
     Instant,
     Accurate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingsAccurateModel {
+    TinyEnglish,
+    BaseEnglish,
+    TinyMultilingual,
+    BaseMultilingual,
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingsAccurateBackend {
+    Auto,
+    Vulkan,
+    Cpu,
 }
 
 impl SettingsFormatting {
@@ -142,6 +160,24 @@ indexed_setting!(
     ]
 );
 indexed_setting!(
+    SettingsAccurateModel,
+    [
+        SettingsAccurateModel::TinyEnglish,
+        SettingsAccurateModel::BaseEnglish,
+        SettingsAccurateModel::TinyMultilingual,
+        SettingsAccurateModel::BaseMultilingual,
+        SettingsAccurateModel::Custom,
+    ]
+);
+indexed_setting!(
+    SettingsAccurateBackend,
+    [
+        SettingsAccurateBackend::Auto,
+        SettingsAccurateBackend::Vulkan,
+        SettingsAccurateBackend::Cpu,
+    ]
+);
+indexed_setting!(
     SettingsRecordingMode,
     [SettingsRecordingMode::Hold, SettingsRecordingMode::Toggle,]
 );
@@ -167,6 +203,8 @@ pub struct SettingsForm {
     pub microphones: Vec<String>,
     pub microphone: Option<String>,
     pub recommended_download_label: String,
+    pub accurate_model: SettingsAccurateModel,
+    pub accurate_backend: SettingsAccurateBackend,
     pub language: String,
     pub minimum_rms: String,
     pub formatting: SettingsFormatting,
@@ -183,7 +221,7 @@ pub struct SettingsForm {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SettingsWindowEvent {
     SaveAndRestart(Box<SettingsForm>),
-    DownloadRecommended,
+    DownloadModel(SettingsAccurateModel),
     Closed,
 }
 
@@ -346,6 +384,8 @@ struct WindowState {
     model_updates: Arc<Mutex<Option<ModelUpdate>>>,
     model: HWND,
     model_status: HWND,
+    accurate_model: HWND,
+    accurate_backend: HWND,
     language: HWND,
     minimum_rms: HWND,
     microphone: HWND,
@@ -406,6 +446,8 @@ unsafe fn create_and_run(
         model_updates,
         model: HWND::default(),
         model_status: HWND::default(),
+        accurate_model: HWND::default(),
+        accurate_backend: HWND::default(),
         language: HWND::default(),
         minimum_rms: HWND::default(),
         microphone: HWND::default(),
@@ -420,7 +462,7 @@ unsafe fn create_and_run(
     let state_pointer = (&mut *state as *mut WindowState).cast();
     let system_dpi = unsafe { GetDpiForSystem() }.max(96) as i32;
     let width = 560 * system_dpi / 96;
-    let height = 790 * system_dpi / 96;
+    let height = 852 * system_dpi / 96;
     let x = (unsafe { GetSystemMetrics(SM_CXSCREEN) } - width).max(0) / 2;
     let y = (unsafe { GetSystemMetrics(SM_CYSCREEN) } - height).max(0) / 2;
     let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
@@ -528,7 +570,14 @@ unsafe extern "system" fn window_procedure(
                 }
                 ID_DOWNLOAD => {
                     if let Some(state) = unsafe { window_state(hwnd) } {
-                        let _ = state.events.send(SettingsWindowEvent::DownloadRecommended);
+                        let selected =
+                            unsafe { SendMessageW(state.accurate_model, CB_GETCURSEL, None, None) }
+                                .0;
+                        if let Some(variant) = SettingsAccurateModel::from_index(selected) {
+                            let _ = state
+                                .events
+                                .send(SettingsWindowEvent::DownloadModel(variant));
+                        }
                     }
                 }
                 _ => {}
@@ -643,12 +692,44 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             scale,
             font,
         )?;
-        create_label(hwnd, w!("Language"), 24, 108, 220, 20, scale, font)?;
+        create_label(hwnd, w!("Accurate model"), 24, 108, 240, 20, scale, font)?;
+        state.accurate_model = create_choice_combo(
+            hwnd,
+            ID_ACCURATE_MODEL,
+            &[
+                "Tiny · English".to_owned(),
+                "Base · English".to_owned(),
+                "Tiny · Multilingual".to_owned(),
+                "Base · Multilingual".to_owned(),
+                "Custom file".to_owned(),
+            ],
+            state.initial.accurate_model.index(),
+            24,
+            132,
+            240,
+            140,
+            scale,
+            font,
+        )?;
+        create_label(hwnd, w!("Compute backend"), 284, 108, 240, 20, scale, font)?;
+        state.accurate_backend = create_choice_combo(
+            hwnd,
+            ID_ACCURATE_BACKEND,
+            &["Auto".to_owned(), "Vulkan GPU".to_owned(), "CPU".to_owned()],
+            state.initial.accurate_backend.index(),
+            284,
+            132,
+            240,
+            100,
+            scale,
+            font,
+        )?;
+        create_label(hwnd, w!("Language"), 24, 170, 220, 20, scale, font)?;
         create_label(
             hwnd,
             w!("Minimum speech level (RMS)"),
             284,
-            108,
+            170,
             240,
             20,
             scale,
@@ -659,7 +740,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_LANGUAGE,
             &state.initial.language,
             24,
-            132,
+            194,
             220,
             25,
             false,
@@ -671,14 +752,14 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_MINIMUM_RMS,
             &state.initial.minimum_rms,
             284,
-            132,
+            194,
             240,
             25,
             false,
             scale,
             font,
         )?;
-        create_label(hwnd, w!("Microphone"), 24, 174, 500, 20, scale, font)?;
+        create_label(hwnd, w!("Microphone"), 24, 236, 500, 20, scale, font)?;
         let mut microphone_choices = vec!["Windows default".to_owned()];
         microphone_choices.extend(state.initial.microphones.iter().cloned());
         let microphone_index = state
@@ -697,7 +778,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             &microphone_choices,
             microphone_index,
             24,
-            198,
+            260,
             500,
             160,
             scale,
@@ -708,7 +789,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             hwnd,
             PCWSTR(microphone_status.as_ptr()),
             24,
-            230,
+            292,
             500,
             20,
             scale,
@@ -718,7 +799,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             hwnd,
             w!("Formatting strength"),
             24,
-            260,
+            322,
             240,
             20,
             scale,
@@ -728,13 +809,13 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             hwnd,
             state.initial.formatting,
             24,
-            284,
+            346,
             240,
             180,
             scale,
             font,
         )?;
-        create_label(hwnd, w!("Ollama lifecycle"), 284, 260, 240, 20, scale, font)?;
+        create_label(hwnd, w!("Ollama lifecycle"), 284, 322, 240, 20, scale, font)?;
         state.ollama_lifecycle = create_choice_combo(
             hwnd,
             ID_OLLAMA_LIFECYCLE,
@@ -744,7 +825,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
                 "Memory saver".to_owned(),
             ],
             state.initial.ollama_lifecycle.index(),
-            284,
+            346,
             284,
             240,
             120,
@@ -755,7 +836,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             hwnd,
             w!("Local Ollama model"),
             24,
-            326,
+            388,
             500,
             20,
             scale,
@@ -779,7 +860,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             &ollama_choices,
             ollama_index,
             24,
-            350,
+            412,
             500,
             180,
             scale,
@@ -790,7 +871,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             hwnd,
             PCWSTR(ollama_status.as_ptr()),
             24,
-            382,
+            444,
             500,
             20,
             scale,
@@ -800,7 +881,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             hwnd,
             w!("Custom instructions (used by Custom formatting)"),
             24,
-            412,
+            474,
             500,
             20,
             scale,
@@ -811,21 +892,21 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_CUSTOM,
             &state.initial.custom_instructions,
             24,
-            436,
+            498,
             500,
             74,
             true,
             scale,
             font,
         )?;
-        create_label(hwnd, w!("Recording mode"), 24, 526, 240, 20, scale, font)?;
+        create_label(hwnd, w!("Recording mode"), 24, 588, 240, 20, scale, font)?;
         state.recording_mode = create_choice_combo(
             hwnd,
             ID_RECORDING_MODE,
             &["Hold to talk".to_owned(), "Toggle".to_owned()],
             state.initial.recording_mode.index(),
             24,
-            550,
+            612,
             240,
             100,
             scale,
@@ -835,7 +916,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             hwnd,
             w!("History retention"),
             284,
-            526,
+            588,
             240,
             20,
             scale,
@@ -853,7 +934,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ],
             state.initial.history_retention.index(),
             284,
-            550,
+            612,
             240,
             140,
             scale,
@@ -865,7 +946,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             w!("Launch Phorminx when I sign in"),
             state.initial.launch_at_login,
             24,
-            590,
+            652,
             500,
             24,
             scale,
@@ -877,7 +958,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_DOWNLOAD,
             PCWSTR(download_label.as_ptr()),
             24,
-            626,
+            688,
             500,
             30,
             false,
@@ -889,7 +970,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_CANCEL,
             w!("Cancel"),
             296,
-            678,
+            740,
             92,
             30,
             false,
@@ -901,7 +982,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
             ID_SAVE,
             w!("Save and Restart"),
             398,
-            678,
+            740,
             126,
             30,
             true,
@@ -1198,6 +1279,10 @@ unsafe fn create_control(
 }
 
 unsafe fn read_form(state: &WindowState) -> Option<SettingsForm> {
+    let accurate_model_index =
+        unsafe { SendMessageW(state.accurate_model, CB_GETCURSEL, None, None) }.0;
+    let accurate_backend_index =
+        unsafe { SendMessageW(state.accurate_backend, CB_GETCURSEL, None, None) }.0;
     let selected = unsafe { SendMessageW(state.formatting, CB_GETCURSEL, None, None) }.0;
     let microphone_index = unsafe { SendMessageW(state.microphone, CB_GETCURSEL, None, None) }.0;
     let ollama_index = unsafe { SendMessageW(state.ollama_model, CB_GETCURSEL, None, None) }.0;
@@ -1218,6 +1303,8 @@ unsafe fn read_form(state: &WindowState) -> Option<SettingsForm> {
         microphones: state.initial.microphones.clone(),
         microphone: (microphone_index > 0).then(|| unsafe { read_text(state.microphone) }),
         recommended_download_label: state.initial.recommended_download_label.clone(),
+        accurate_model: SettingsAccurateModel::from_index(accurate_model_index)?,
+        accurate_backend: SettingsAccurateBackend::from_index(accurate_backend_index)?,
         language: unsafe { read_text(state.language) },
         minimum_rms: unsafe { read_text(state.minimum_rms) },
         formatting: SettingsFormatting::from_index(selected)?,
@@ -1344,6 +1431,36 @@ mod tests {
                 Some(value)
             );
         }
+        for (index, value) in [
+            SettingsAccurateModel::TinyEnglish,
+            SettingsAccurateModel::BaseEnglish,
+            SettingsAccurateModel::TinyMultilingual,
+            SettingsAccurateModel::BaseMultilingual,
+            SettingsAccurateModel::Custom,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(value.index(), index);
+            assert_eq!(
+                SettingsAccurateModel::from_index(index as isize),
+                Some(value)
+            );
+        }
+        for (index, value) in [
+            SettingsAccurateBackend::Auto,
+            SettingsAccurateBackend::Vulkan,
+            SettingsAccurateBackend::Cpu,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(value.index(), index);
+            assert_eq!(
+                SettingsAccurateBackend::from_index(index as isize),
+                Some(value)
+            );
+        }
         for (index, value) in [SettingsRecordingMode::Hold, SettingsRecordingMode::Toggle]
             .into_iter()
             .enumerate()
@@ -1373,6 +1490,8 @@ mod tests {
         assert_eq!(SettingsOllamaLifecycle::from_index(-1), None);
         assert_eq!(SettingsRecordingMode::from_index(99), None);
         assert_eq!(SettingsHistoryRetention::from_index(99), None);
+        assert_eq!(SettingsAccurateModel::from_index(99), None);
+        assert_eq!(SettingsAccurateBackend::from_index(-1), None);
     }
 
     #[test]

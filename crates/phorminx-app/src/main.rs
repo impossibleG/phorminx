@@ -49,11 +49,11 @@ use phorminx_windows::{
     ClipboardOnlyReason, GlobalHoldHotkey, HistoryItem, HistoryWindow, HistoryWindowEvent,
     HoldEvent, InsertionOutcome, LexiconCasePolicy, LexiconDraft, LexiconItem, LexiconWindow,
     LexiconWindowEvent, OverlayStatus, ProfileFormatting, ProfileInsertion, ProfileItem,
-    ProfileWindow, ProfileWindowEvent, SettingsForm, SettingsFormatting, SettingsHistoryRetention,
-    SettingsOllamaLifecycle, SettingsRecognitionMode, SettingsRecordingMode, SettingsWindow,
-    SettingsWindowEvent, SingleInstance, SingleInstanceError, StatusOverlay, SystemTray,
-    TargetSnapshot, TrayEvent, TrayStatus, activate_existing_window, copy_and_maybe_paste,
-    set_launch_at_login,
+    ProfileWindow, ProfileWindowEvent, SettingsAccurateBackend, SettingsAccurateModel,
+    SettingsForm, SettingsFormatting, SettingsHistoryRetention, SettingsOllamaLifecycle,
+    SettingsRecognitionMode, SettingsRecordingMode, SettingsWindow, SettingsWindowEvent,
+    SingleInstance, SingleInstanceError, StatusOverlay, SystemTray, TargetSnapshot, TrayEvent,
+    TrayStatus, activate_existing_window, copy_and_maybe_paste, set_launch_at_login,
 };
 
 #[cfg(feature = "desktop")]
@@ -247,15 +247,13 @@ fn run() -> Result<()> {
             instance,
         );
     }
-    if settings.recognition.mode == RecognitionMode::Accurate {
+    let verified_variant = if settings.recognition.mode == RecognitionMode::Accurate {
         let verified_variant =
             identify_pinned_model(&model).context("failed to verify Whisper model")?;
         if !model_override && settings.recognition.accurate_model != AccurateModelVariant::Custom {
-            let expected = model_for_variant(settings.recognition.accurate_model)
+            model_for_variant(settings.recognition.accurate_model)
                 .context("the selected pinned Whisper model is unavailable")?;
-            if model.file_name().and_then(|name| name.to_str()) == Some(expected.file_name.as_str())
-                && verified_variant != Some(settings.recognition.accurate_model)
-            {
+            if verified_variant != Some(settings.recognition.accurate_model) {
                 return Err(anyhow!(
                     "the selected pinned Whisper model does not match its verified manifest identity"
                 ));
@@ -269,7 +267,10 @@ fn run() -> Result<()> {
                 settings.recognition.language
             ));
         }
-    }
+        verified_variant
+    } else {
+        None
+    };
 
     let effective_microphone = match settings.recognition.microphone.as_deref() {
         Some(selected)
@@ -306,7 +307,7 @@ fn run() -> Result<()> {
         .list()
         .context("failed to load the personal lexicon")?;
     let worker_formatting = WorkerFormatting::from_settings(&settings)?;
-    let mut dictation_context = DictationContext::global(&settings)?;
+    let mut dictation_context = DictationContext::global(&settings, verified_variant)?;
 
     println!("Phorminx is loading its local recognition engine...");
     let recognizer = match settings.recognition.mode {
@@ -340,6 +341,7 @@ fn run() -> Result<()> {
             worker: &worker,
             microphone: effective_microphone.as_deref(),
             context: &dictation_context,
+            released_at: None,
         };
         report_notices(runtime.announce_ready(&mut io));
     }
@@ -503,9 +505,31 @@ fn run() -> Result<()> {
             Ok(HoldEvent::Started {
                 target: activation_target,
             }) => {
+                let release_received_at = (settings.interaction.recording_mode
+                    == RecordingMode::Toggle
+                    && runtime.state() == RuntimeState::Listening)
+                    .then(Instant::now);
                 if runtime.state() == RuntimeState::Idle {
-                    dictation_context =
-                        DictationContext::for_target(activation_target, &persistence, &settings)?;
+                    dictation_context = match DictationContext::for_target(
+                        activation_target,
+                        &persistence,
+                        &settings,
+                        verified_variant,
+                    ) {
+                        Ok(context) => context,
+                        Err(error) => {
+                            eprintln!(
+                                "dictation_id=0 state=Idle event=dictation_context_rejected error={error}"
+                            );
+                            show_shell_status(
+                                &overlay,
+                                &tray,
+                                OverlayStatus::Error,
+                                TrayStatus::Error,
+                            );
+                            continue 'event_loop;
+                        }
+                    };
                     if dictation_context.deny {
                         eprintln!(
                             "dictation_id=0 state=Idle event=activation_denied_by_app_profile"
@@ -524,6 +548,7 @@ fn run() -> Result<()> {
                         worker: &worker,
                         microphone: effective_microphone.as_deref(),
                         context: &dictation_context,
+                        released_at: release_received_at,
                     };
                     let action = if settings.interaction.recording_mode == RecordingMode::Toggle
                         && runtime.state() == RuntimeState::Listening
@@ -540,6 +565,10 @@ fn run() -> Result<()> {
                 report_notices(notices);
             }
             Ok(HoldEvent::Ended) => {
+                // This is the user-observable release boundary. Capture it
+                // before stopping/resampling the recording so telemetry
+                // includes all finalization work.
+                let release_received_at = Instant::now();
                 if settings.interaction.recording_mode == RecordingMode::Toggle {
                     continue 'event_loop;
                 }
@@ -550,6 +579,7 @@ fn run() -> Result<()> {
                         worker: &worker,
                         microphone: effective_microphone.as_deref(),
                         context: &dictation_context,
+                        released_at: Some(release_received_at),
                     };
                     match runtime.hold_ended(&mut io) {
                         Ok(notices) => notices,
@@ -663,6 +693,7 @@ fn run() -> Result<()> {
                             worker: &worker,
                             microphone: effective_microphone.as_deref(),
                             context: &dictation_context,
+                            released_at: None,
                         };
                         match runtime.cleanup_started(id, &mut io) {
                             Ok(notices) => notices,
@@ -693,6 +724,7 @@ fn run() -> Result<()> {
                             worker: &worker,
                             microphone: effective_microphone.as_deref(),
                             context: &dictation_context,
+                            released_at: None,
                         };
                         match runtime.transcription_completed(completed.id, result, &mut io) {
                             Ok(notices) => notices,
@@ -710,7 +742,8 @@ fn run() -> Result<()> {
                         eprintln!(
                             "dictation_id={} state=Inserting event=release_to_insert release_to_insert_ms={}",
                             completed.id.0,
-                            completed.released_at.elapsed().as_millis()
+                            elapsed_since_release(completed.released_at, Instant::now())
+                                .as_millis()
                         );
                     }
                     if let Some(shell) = product_shell.as_ref() {
@@ -726,6 +759,7 @@ fn run() -> Result<()> {
                             worker: &worker,
                             microphone: effective_microphone.as_deref(),
                             context: &dictation_context,
+                            released_at: None,
                         };
                         match runtime.worker_disconnected(&mut io) {
                             Ok(notices) => notices,
@@ -1153,14 +1187,14 @@ fn poll_shell_events(
                 Ok(ProductShellEvent::TestDictation) => {
                     return Ok(ShellAction::TestDictation);
                 }
-                Ok(ProductShellEvent::ChangeWhisperModel) => {
+                Ok(ProductShellEvent::ChangeWhisperModel(variant)) => {
                     if model_download.is_none() {
                         let directory = settings_store
                             .path()
                             .parent()
                             .context("the settings path has no parent directory")?
                             .join("models");
-                        match ModelDownload::start(&directory) {
+                        match ModelDownload::start_variant(&directory, variant) {
                             Ok(download) => *model_download = Some(download),
                             Err(error) => {
                                 eprintln!("model_download_failed error={error}");
@@ -1293,6 +1327,15 @@ fn poll_shell_events(
                     continue;
                 };
                 match app_profile(item).and_then(|profile| {
+                    let verified_variant = identify_pinned_model(effective_model)
+                        .context("failed to verify the active Whisper model")?;
+                    if profile.language.as_deref().is_some_and(|language| {
+                        verified_variant.is_some_and(|variant| !variant.supports_language(language))
+                    }) {
+                        return Err(anyhow!(
+                            "select a multilingual Whisper model before using this profile language"
+                        ));
+                    }
                     persistence
                         .app_profiles()
                         .upsert(&profile)
@@ -1451,7 +1494,7 @@ fn poll_shell_events(
                     }
                 }
             }
-            SettingsWindowEvent::DownloadRecommended => {
+            SettingsWindowEvent::DownloadModel(variant) => {
                 if model_download.is_some() {
                     if let Some(window) = settings_window.as_ref() {
                         window
@@ -1465,7 +1508,8 @@ fn poll_shell_events(
                     .parent()
                     .ok_or_else(|| anyhow!("the settings path has no parent directory"))?
                     .join("models");
-                match ModelDownload::start(&directory) {
+                match ModelDownload::start_variant(&directory, from_window_accurate_model(variant))
+                {
                     Ok(download) => {
                         *model_download = Some(download);
                         if let Some(window) = settings_window.as_ref() {
@@ -1531,9 +1575,12 @@ fn poll_shell_events(
                         .context("failed to update download progress")?;
                 }
             }
-            ModelDownloadEvent::Completed { path } => {
+            ModelDownloadEvent::Completed { path, variant } => {
                 if let Some(shell) = product_shell {
-                    let _ = shell.send(ProductShellControl::ModelDownloaded(path.clone()));
+                    let _ = shell.send(ProductShellControl::ModelDownloaded {
+                        path: path.clone(),
+                        variant,
+                    });
                 }
                 if let Some(window) = settings_window.as_ref() {
                     let size = std::fs::metadata(&path)
@@ -1684,6 +1731,12 @@ fn settings_form(settings: &Settings, effective_model: &Path) -> SettingsForm {
                 )
             })
             .unwrap_or_else(|_| "Recommended model download unavailable".to_owned()),
+        accurate_model: to_window_accurate_model(settings.recognition.accurate_model),
+        accurate_backend: match settings.recognition.accurate_backend {
+            AccurateBackendPreference::Auto => SettingsAccurateBackend::Auto,
+            AccurateBackendPreference::Vulkan => SettingsAccurateBackend::Vulkan,
+            AccurateBackendPreference::Cpu => SettingsAccurateBackend::Cpu,
+        },
         language: settings.recognition.language.clone(),
         minimum_rms: settings.recognition.minimum_rms.to_string(),
         formatting: match settings.formatting.strength {
@@ -1718,6 +1771,26 @@ fn settings_form(settings: &Settings, effective_model: &Path) -> SettingsForm {
             HistoryRetention::Indefinite => SettingsHistoryRetention::Indefinite,
         },
         launch_at_login: settings.startup.launch_at_login,
+    }
+}
+
+fn to_window_accurate_model(variant: AccurateModelVariant) -> SettingsAccurateModel {
+    match variant {
+        AccurateModelVariant::TinyEnglish => SettingsAccurateModel::TinyEnglish,
+        AccurateModelVariant::BaseEnglish => SettingsAccurateModel::BaseEnglish,
+        AccurateModelVariant::TinyMultilingual => SettingsAccurateModel::TinyMultilingual,
+        AccurateModelVariant::BaseMultilingual => SettingsAccurateModel::BaseMultilingual,
+        AccurateModelVariant::Custom => SettingsAccurateModel::Custom,
+    }
+}
+
+fn from_window_accurate_model(variant: SettingsAccurateModel) -> AccurateModelVariant {
+    match variant {
+        SettingsAccurateModel::TinyEnglish => AccurateModelVariant::TinyEnglish,
+        SettingsAccurateModel::BaseEnglish => AccurateModelVariant::BaseEnglish,
+        SettingsAccurateModel::TinyMultilingual => AccurateModelVariant::TinyMultilingual,
+        SettingsAccurateModel::BaseMultilingual => AccurateModelVariant::BaseMultilingual,
+        SettingsAccurateModel::Custom => AccurateModelVariant::Custom,
     }
 }
 
@@ -1806,6 +1879,12 @@ fn apply_settings_form(
     candidate.recognition.model_path = PathBuf::from(form.model_path.trim());
     candidate.recognition.instant_model_path = PathBuf::from(form.instant_model_path.trim());
     candidate.recognition.instant_runtime_path = PathBuf::from(form.instant_runtime_path.trim());
+    candidate.recognition.accurate_model = from_window_accurate_model(form.accurate_model);
+    candidate.recognition.accurate_backend = match form.accurate_backend {
+        SettingsAccurateBackend::Auto => AccurateBackendPreference::Auto,
+        SettingsAccurateBackend::Vulkan => AccurateBackendPreference::Vulkan,
+        SettingsAccurateBackend::Cpu => AccurateBackendPreference::Cpu,
+    };
     candidate.recognition.language = form.language;
     candidate.recognition.minimum_rms = form
         .minimum_rms
@@ -1932,6 +2011,7 @@ struct ProductionIo<'a> {
     worker: &'a TranscriptionWorker,
     microphone: Option<&'a str>,
     context: &'a DictationContext,
+    released_at: Option<Instant>,
 }
 
 impl AppIo for ProductionIo<'_> {
@@ -1974,14 +2054,15 @@ impl AppIo for ProductionIo<'_> {
         audio_context: u32,
     ) -> Result<(), String> {
         self.worker
-            .transcribe(
+            .transcribe(FinalTranscriptionRequest {
                 id,
+                released_at: self.released_at.unwrap_or_else(Instant::now),
                 clip,
-                language.to_owned(),
+                language: language.to_owned(),
                 audio_context,
-                self.context.formatting.clone(),
-                self.context.app_executable.clone(),
-            )
+                formatting: self.context.formatting.clone(),
+                app_executable: self.context.app_executable.clone(),
+            })
             .map_err(|error| error.to_string())
     }
 
@@ -2138,6 +2219,7 @@ fn recover_runtime_after_resume(
         worker,
         microphone,
         context,
+        released_at: None,
     };
     let notices = runtime
         .recover_after_system_resume(&mut io)
@@ -2156,7 +2238,7 @@ fn handle_test_dictation(
     settings: &Settings,
 ) -> Result<()> {
     if runtime.state() == RuntimeState::Idle {
-        *context = DictationContext::global(settings)?;
+        *context = DictationContext::global(settings, context.verified_variant)?;
         runtime.configure_next_dictation(context.language.clone(), context.runtime_formatting)?;
     }
     let mut io = ProductionIo {
@@ -2165,6 +2247,7 @@ fn handle_test_dictation(
         worker,
         microphone,
         context,
+        released_at: None,
     };
     let notices = match runtime.state() {
         RuntimeState::Idle => runtime.hold_started(None, &mut io)?,
@@ -2371,6 +2454,16 @@ enum InstantAudioCommand {
     },
 }
 
+struct FinalTranscriptionRequest {
+    id: DictationId,
+    released_at: Instant,
+    clip: AudioClip,
+    language: String,
+    audio_context: u32,
+    formatting: WorkerFormatting,
+    app_executable: Option<String>,
+}
+
 impl TranscriptionWorker {
     fn start(
         recognizer: RecognizerConfig,
@@ -2419,8 +2512,10 @@ impl TranscriptionWorker {
                     LoadedRecognizer::Accurate(recognizer) => {
                         let readiness = recognizer.readiness();
                         eprintln!(
-                            "dictation_id=0 state=Starting event=stt_backend_ready backend={} device_present={} model_load_ms={}",
+                            "dictation_id=0 state=Starting event=stt_backend_ready requested_backend={} active_backend={} fallback={} device_present={} model_load_ms={}",
+                            readiness.requested.as_str(),
                             readiness.backend.as_str(),
+                            readiness.fallback_from.is_some(),
                             readiness.device_name.is_some(),
                             readiness.model_load_time.as_millis()
                         );
@@ -2536,6 +2631,11 @@ impl TranscriptionWorker {
                             formatting: dictation_formatting,
                             app_executable,
                         } => {
+                            // Clear the release-priority tombstone only when
+                            // the final command reaches the head of the FIFO.
+                            // Every older queued partial therefore observes an
+                            // already-aborted flag in `begin_partial`.
+                            worker_cancellations.begin_final(id);
                             if worker_job_cancelled(
                                 &worker_cancellations,
                                 &thread_shutting_down,
@@ -2544,6 +2644,7 @@ impl TranscriptionWorker {
                                 incremental_sessions.remove(&id);
                                 continue;
                             }
+                            let pre_stt_time = elapsed_since_release(released_at, Instant::now());
                             drain_instant_audio(
                                 &recognizer,
                                 &instant_audio_rx,
@@ -2614,7 +2715,7 @@ impl TranscriptionWorker {
                                         incremental_sessions.remove(&id);
                                         continue;
                                     }
-                                    let processed = process_transcript(
+                                    let mut processed = process_transcript(
                                         transcript,
                                         &language,
                                         &dictation_formatting,
@@ -2622,6 +2723,14 @@ impl TranscriptionWorker {
                                         &aliases,
                                         app_executable.as_deref(),
                                         &formatting_cancel,
+                                    );
+                                    processed.pre_stt_time = pre_stt_time;
+                                    eprintln!(
+                                        "dictation_id={} state=Cleaning event=release_pipeline_stages pre_stt_ms={} stt_compute_ms={} formatting_ms={}",
+                                        id.0,
+                                        processed.pre_stt_time.as_millis(),
+                                        processed.transcript.inference_time.as_millis(),
+                                        processed.formatting_time.as_millis()
                                     );
                                     worker_cancellations.end_formatting(id);
                                     if worker_job_cancelled(
@@ -2697,29 +2806,32 @@ impl TranscriptionWorker {
         }
     }
 
-    fn transcribe(
-        &self,
-        id: DictationId,
-        clip: AudioClip,
-        language: String,
-        audio_context: u32,
-        formatting: WorkerFormatting,
-        app_executable: Option<String>,
-    ) -> Result<()> {
+    fn transcribe(&self, request: FinalTranscriptionRequest) -> Result<()> {
+        let FinalTranscriptionRequest {
+            id,
+            released_at,
+            clip,
+            language,
+            audio_context,
+            formatting,
+            app_executable,
+        } = request;
         // Publish release priority before the FIFO send. A running partial sees
         // this through whisper.cpp's abort callback and yields to the final.
         self.cancellations.prioritize_final(id);
-        self.commands
-            .send(WorkerCommand::Transcribe {
-                id,
-                released_at: Instant::now(),
-                clip,
-                language,
-                audio_context,
-                formatting,
-                app_executable,
-            })
-            .context("transcription worker is unavailable")
+        if let Err(error) = self.commands.send(WorkerCommand::Transcribe {
+            id,
+            released_at,
+            clip,
+            language,
+            audio_context,
+            formatting,
+            app_executable,
+        }) {
+            self.cancellations.clear_final_priority(id);
+            return Err(anyhow!(error)).context("transcription worker is unavailable");
+        }
+        Ok(())
     }
 
     fn transcribe_partial(
@@ -2816,6 +2928,7 @@ struct CancellationRegistry {
 #[derive(Default)]
 struct CancellationState {
     ids: HashSet<DictationId>,
+    final_priorities: HashSet<DictationId>,
     formatting: HashMap<DictationId, CancellationToken>,
     partials: HashMap<DictationId, Arc<AtomicBool>>,
 }
@@ -2857,6 +2970,7 @@ impl CancellationRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.ids.remove(&id);
+        state.final_priorities.remove(&id);
         state.formatting.remove(&id);
         state.partials.remove(&id);
     }
@@ -2866,7 +2980,9 @@ impl CancellationRegistry {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let abort = Arc::new(AtomicBool::new(state.ids.contains(&id)));
+        let abort = Arc::new(AtomicBool::new(
+            state.ids.contains(&id) || state.final_priorities.contains(&id),
+        ));
         state.partials.insert(id, Arc::clone(&abort));
         abort
     }
@@ -2880,15 +2996,26 @@ impl CancellationRegistry {
     }
 
     fn prioritize_final(&self, id: DictationId) {
-        if let Some(abort) = self
+        let mut state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .partials
-            .get(&id)
-        {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.final_priorities.insert(id);
+        if let Some(abort) = state.partials.get(&id) {
             abort.store(true, Ordering::Release);
         }
+    }
+
+    fn begin_final(&self, id: DictationId) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .final_priorities
+            .remove(&id);
+    }
+
+    fn clear_final_priority(&self, id: DictationId) {
+        self.begin_final(id);
     }
 
     fn begin_formatting(&self, id: DictationId) -> CancellationToken {
@@ -2989,6 +3116,10 @@ struct PartialAccumulator {
     text: String,
     stable_end: Duration,
     accepted_through: Duration,
+    /// Earliest audio that was observed but could not be accepted
+    /// contiguously. Once present, later partials cannot advance past it and
+    /// the final pass resumes here.
+    unresolved_from: Option<Duration>,
     timestamp_stable: bool,
     last_boundary: Option<BoundaryKind>,
     next_sequence: u32,
@@ -3135,6 +3266,7 @@ impl Default for PartialAccumulator {
             text: String::new(),
             stable_end: Duration::ZERO,
             accepted_through: Duration::ZERO,
+            unresolved_from: None,
             timestamp_stable: false,
             last_boundary: None,
             next_sequence: 0,
@@ -3215,6 +3347,12 @@ fn append_timestamp_stable_segments(
     plan: phorminx_app::incremental::ChunkPlan,
     segments: &[phorminx_whisper::TimedSegment],
 ) {
+    // Once Whisper changes a boundary across the accepted frontier, only the
+    // final pass may resolve it. Admitting later segments would create a
+    // permanent hole while moving `accepted_through` beyond missing audio.
+    if accumulator.unresolved_from.is_some() {
+        return;
+    }
     let guarded_end = match plan.boundary {
         BoundaryKind::Silence => plan.stable_end,
         BoundaryKind::Forced => plan.stable_end.saturating_sub(CHUNK_OVERLAP),
@@ -3222,13 +3360,23 @@ fn append_timestamp_stable_segments(
     for segment in segments {
         let absolute_start = plan.range.start.saturating_add(segment.start);
         let absolute_end = plan.range.start.saturating_add(segment.end);
-        if absolute_end > guarded_end || absolute_end <= accumulator.accepted_through {
+        if absolute_end <= accumulator.accepted_through {
             continue;
         }
         // A changed segmentation boundary can straddle already accepted audio.
-        // Skip that unstable segment instead of duplicating its beginning.
+        // Freeze the frontier at the first unresolved instant instead of
+        // skipping forward and losing the unaccepted suffix.
         if absolute_start < accumulator.accepted_through {
-            continue;
+            accumulator.unresolved_from = Some(accumulator.accepted_through);
+            break;
+        }
+        // Segments beyond the stability guard are deliberately deferred. The
+        // final tail must resume at the accepted frontier before later
+        // partials can be admitted; timestamps may contain silent gaps before
+        // this segment, and Accurate mode never assumes those gaps are empty.
+        if absolute_end > guarded_end {
+            accumulator.unresolved_from = Some(accumulator.accepted_through);
+            break;
         }
         let text = strip_known_non_speech_annotations(&segment.text);
         let text = text.trim();
@@ -3270,11 +3418,12 @@ fn bounded_decoder_prompt(text: &str) -> Option<String> {
     Some(text[start..].to_owned())
 }
 
-/// Detects decoder loops without retaining or logging content. We fail closed
-/// instead of guessing which repeated span should be deleted.
+/// Detects high-confidence decoder loops without retaining or logging content.
+/// Short intentional repetition is valid speech, so only a long phrase
+/// repeated at least four consecutive times is classified as pathological.
 fn has_pathological_repetition(text: &str) -> bool {
-    const MIN_SPAN_WORDS: usize = 3;
-    const REPEATS: usize = 3;
+    const MIN_SPAN_WORDS: usize = 5;
+    const REPEATS: usize = 4;
     const MAX_SPAN_WORDS: usize = 48;
 
     let words = text
@@ -3359,7 +3508,16 @@ where
                     accumulator.partial_compute_time.as_millis(),
                     tail_compute_time.as_millis()
                 );
-                return Ok(transcript);
+                if has_pathological_repetition(&transcript.text) {
+                    fallback = Some(TailAttemptError {
+                        reason: "incremental_repetition_loop",
+                        compute_time: transcript
+                            .inference_time
+                            .saturating_sub(accumulator.partial_compute_time),
+                    });
+                } else {
+                    return Ok(transcript);
+                }
             }
             Err(error) => fallback = Some(error),
         }
@@ -3391,6 +3549,9 @@ where
             error.compute_time.as_millis(),
             fallback_compute_time.as_millis()
         );
+    }
+    if has_pathological_repetition(&transcript.text) {
+        return Err("Whisper produced a repeated output loop".to_owned());
     }
     Ok(transcript)
 }
@@ -3497,7 +3658,9 @@ fn final_tail_plan(
     }
     Ok(FinalTailPlan {
         start: if accumulator.timestamp_stable {
-            accumulator.accepted_through
+            accumulator
+                .unresolved_from
+                .unwrap_or(accumulator.accepted_through)
         } else {
             accumulator.stable_end.saturating_sub(CHUNK_OVERLAP)
         },
@@ -3557,10 +3720,18 @@ struct DictationContext {
     runtime_formatting: RuntimeFormatting,
     insertion_preference: InsertionPreference,
     deny: bool,
+    verified_variant: Option<AccurateModelVariant>,
 }
 
 impl DictationContext {
-    fn global(settings: &Settings) -> Result<Self> {
+    fn global(settings: &Settings, verified_variant: Option<AccurateModelVariant>) -> Result<Self> {
+        if verified_variant
+            .is_some_and(|variant| !variant.supports_language(&settings.recognition.language))
+        {
+            return Err(anyhow!(
+                "the verified English-only Whisper model cannot transcribe the configured language"
+            ));
+        }
         Ok(Self {
             app_executable: None,
             language: settings.recognition.language.clone(),
@@ -3568,6 +3739,7 @@ impl DictationContext {
             runtime_formatting: RuntimeFormatting::try_from(settings.formatting.strength)?,
             insertion_preference: InsertionPreference::Automatic,
             deny: false,
+            verified_variant,
         })
     }
 
@@ -3575,8 +3747,9 @@ impl DictationContext {
         target: Option<TargetSnapshot>,
         persistence: &Persistence,
         settings: &Settings,
+        verified_variant: Option<AccurateModelVariant>,
     ) -> Result<Self> {
-        let mut context = Self::global(settings)?;
+        let mut context = Self::global(settings, verified_variant)?;
         let Some(executable) = target.and_then(TargetSnapshot::executable_name) else {
             return Ok(context);
         };
@@ -3591,6 +3764,11 @@ impl DictationContext {
             return Ok(context);
         };
         context.language = profile.language.unwrap_or(context.language);
+        if verified_variant.is_some_and(|variant| !variant.supports_language(&context.language)) {
+            return Err(anyhow!(
+                "the verified English-only Whisper model cannot transcribe the active application profile language"
+            ));
+        }
         context.insertion_preference = profile.insertion_preference;
         context.deny = profile.deny;
         context.runtime_formatting = match profile.formatting_style {
@@ -3670,6 +3848,9 @@ struct ProcessedTranscript {
     normalized_text: String,
     cleaned_text: Option<String>,
     formatting_time: Duration,
+    /// Release receipt through audio finalization and worker dequeue. This is
+    /// kept content-free and persisted as part of the STT-stage latency.
+    pre_stt_time: Duration,
     warnings: Vec<String>,
     language: String,
     app_executable: Option<String>,
@@ -3728,6 +3909,7 @@ fn process_transcript(
         normalized_text,
         cleaned_text,
         formatting_time,
+        pre_stt_time: Duration::ZERO,
         warnings,
         language: language.to_owned(),
         app_executable: app_executable.map(str::to_owned),
@@ -3837,8 +4019,8 @@ fn persist_transcript(
             ),
             stt_duration_ms: Some(
                 processed
-                    .transcript
-                    .inference_time
+                    .pre_stt_time
+                    .saturating_add(processed.transcript.inference_time)
                     .as_millis()
                     .min(u128::from(u64::MAX)) as u64,
             ),
@@ -3886,6 +4068,10 @@ fn now_ms() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+fn elapsed_since_release(released_at: Instant, stage_at: Instant) -> Duration {
+    stage_at.saturating_duration_since(released_at)
+}
+
 #[cfg(test)]
 mod composition_tests {
     use std::cell::RefCell;
@@ -3913,6 +4099,7 @@ mod composition_tests {
             text: text.to_owned(),
             stable_end: Duration::from_secs(8),
             accepted_through: Duration::ZERO,
+            unresolved_from: None,
             timestamp_stable: false,
             last_boundary: Some(boundary),
             next_sequence: 1,
@@ -3993,9 +4180,12 @@ mod composition_tests {
     #[test]
     fn repetition_guard_rejects_decoder_loops_but_not_normal_emphasis() {
         assert!(has_pathological_repetition(
-            "the same phrase again the same phrase again the same phrase again"
+            "the same decoder phrase repeats forever the same decoder phrase repeats forever the same decoder phrase repeats forever the same decoder phrase repeats forever"
         ));
         assert!(!has_pathological_repetition("very very very important"));
+        assert!(!has_pathological_repetition(
+            "red green blue red green blue red green blue"
+        ));
         assert!(!has_pathological_repetition(
             "the same phrase again, and then one ordinary conclusion"
         ));
@@ -4010,6 +4200,144 @@ mod composition_tests {
         assert!(abort.load(Ordering::Acquire));
         assert!(!registry.is_cancelled(DictationId(7)));
         registry.end_partial(DictationId(7));
+    }
+
+    #[test]
+    fn release_priority_tombstone_aborts_a_partial_that_has_not_started_yet() {
+        let registry = CancellationRegistry::default();
+        let id = DictationId(8);
+
+        // FIFO order: release is published while an older partial command is
+        // queued, before that command calls begin_partial.
+        registry.prioritize_final(id);
+        let obsolete = registry.begin_partial(id);
+        assert!(obsolete.load(Ordering::Acquire));
+        registry.end_partial(id);
+
+        // Only dequeuing the final command clears the tombstone. A new
+        // dictation using this id would not inherit the release priority.
+        registry.begin_final(id);
+        let later = registry.begin_partial(id);
+        assert!(!later.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn release_latency_includes_work_before_worker_dequeue() {
+        let released_at = Instant::now();
+        let worker_dequeued_at = released_at + Duration::from_millis(37);
+        let inserted_at = released_at + Duration::from_millis(91);
+
+        assert_eq!(
+            elapsed_since_release(released_at, worker_dequeued_at),
+            Duration::from_millis(37)
+        );
+        assert_eq!(
+            elapsed_since_release(released_at, inserted_at),
+            Duration::from_millis(91)
+        );
+    }
+
+    #[test]
+    fn forced_guard_gap_freezes_frontier_and_final_resumes_before_missing_audio() {
+        use phorminx_app::incremental::{ChunkPlan, TimeRange};
+        use phorminx_whisper::TimedSegment;
+
+        let mut accumulator = PartialAccumulator::default();
+        let first = ChunkPlan {
+            id: DictationId(9),
+            sequence: 0,
+            range: TimeRange {
+                start: Duration::ZERO,
+                end: Duration::from_secs(3),
+            },
+            stable_end: Duration::from_secs(3),
+            start_overlap: None,
+            boundary: BoundaryKind::Forced,
+        };
+        append_timestamp_stable_segments(
+            &mut accumulator,
+            first,
+            &[
+                TimedSegment {
+                    text: "accepted".to_owned(),
+                    start: Duration::ZERO,
+                    end: Duration::from_secs(2),
+                },
+                TimedSegment {
+                    text: "guarded".to_owned(),
+                    start: Duration::from_secs(2),
+                    end: Duration::from_secs(3),
+                },
+            ],
+        );
+        assert_eq!(accumulator.accepted_through, Duration::from_secs(2));
+        assert_eq!(accumulator.unresolved_from, Some(Duration::from_secs(2)));
+
+        let later = ChunkPlan {
+            id: DictationId(9),
+            sequence: 1,
+            range: TimeRange {
+                start: Duration::from_millis(2_500),
+                end: Duration::from_secs(4),
+            },
+            stable_end: Duration::from_secs(4),
+            start_overlap: Some(MergeExpectation::LexicalOverlap),
+            boundary: BoundaryKind::Silence,
+        };
+        append_timestamp_stable_segments(
+            &mut accumulator,
+            later,
+            &[TimedSegment {
+                text: "must not jump the gap".to_owned(),
+                start: Duration::ZERO,
+                end: Duration::from_millis(1_500),
+            }],
+        );
+        accumulator.timestamp_stable = true;
+        accumulator.stable_end = Duration::from_secs(4);
+        accumulator.last_boundary = Some(BoundaryKind::Silence);
+        accumulator.next_sequence = 2;
+
+        assert_eq!(accumulator.text, "accepted");
+        assert_eq!(
+            final_tail_plan(&accumulator, Duration::from_secs(5))
+                .unwrap()
+                .start,
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn segment_straddling_accepted_frontier_defers_its_suffix_to_final() {
+        use phorminx_app::incremental::{ChunkPlan, TimeRange};
+        use phorminx_whisper::TimedSegment;
+
+        let mut accumulator = PartialAccumulator {
+            text: "accepted".to_owned(),
+            accepted_through: Duration::from_secs(2),
+            ..PartialAccumulator::default()
+        };
+        append_timestamp_stable_segments(
+            &mut accumulator,
+            ChunkPlan {
+                id: DictationId(10),
+                sequence: 1,
+                range: TimeRange {
+                    start: Duration::from_millis(1_800),
+                    end: Duration::from_secs(4),
+                },
+                stable_end: Duration::from_secs(4),
+                start_overlap: Some(MergeExpectation::Silence),
+                boundary: BoundaryKind::Silence,
+            },
+            &[TimedSegment {
+                text: "changed boundary".to_owned(),
+                start: Duration::ZERO,
+                end: Duration::from_millis(700),
+            }],
+        );
+        assert_eq!(accumulator.accepted_through, Duration::from_secs(2));
+        assert_eq!(accumulator.unresolved_from, Some(Duration::from_secs(2)));
     }
 
     struct CountingRecognizer {
@@ -4225,6 +4553,33 @@ mod composition_tests {
         assert_eq!(lengths.len(), 2);
         assert!(lengths[0] < full_clip.samples.len());
         assert_eq!(lengths[1], full_clip.samples.len());
+    }
+
+    #[test]
+    fn incremental_decoder_loop_recovers_with_one_clean_full_clip_pass() {
+        let recognizer = SequencedRecognizer::new([
+            SequencedOutcome::Text(
+                "the same decoder phrase repeats forever the same decoder phrase repeats forever the same decoder phrase repeats forever the same decoder phrase repeats forever",
+            ),
+            SequencedOutcome::Text("clean full transcript"),
+        ]);
+        let clock = ScriptedClock::new([Duration::from_millis(200), Duration::from_millis(300)]);
+        let full_clip = AudioClip::new(vec![0.1; 160_000], 16_000).unwrap();
+
+        let result = transcribe_final_with_clock(
+            &recognizer,
+            Some(partial("stable introduction", BoundaryKind::Silence)),
+            &full_clip,
+            "en",
+            recommended_audio_context(full_clip.duration()),
+            DictationId(81),
+            &clock,
+        )
+        .unwrap();
+
+        assert_eq!(result.text, "clean full transcript");
+        assert_eq!(recognizer.clip_lengths.borrow().len(), 2);
+        assert_eq!(recognizer.clip_lengths.borrow()[1], full_clip.samples.len());
     }
 
     #[test]
