@@ -8,6 +8,7 @@ artifacts/
 TestResults/
 target/
 target-vulkan/
+target-ninja/
 models/
 test-data/
 *.db

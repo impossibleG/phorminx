@@ -8,8 +8,8 @@ use crate::components::{
 };
 use crate::model::{
     AppearancePreference, FormattingStrength, HistoryVariant, LexiconCasePolicy, LexiconDraft,
-    OllamaLifecycle, ProfileDraft, ProfileInsertion, RecordingMode, Route, SettingsSnapshot,
-    ShellEvent, ShellSnapshot,
+    OllamaLifecycle, ProfileDraft, ProfileInsertion, RecognitionMode, RecordingMode, Route,
+    SettingsSnapshot, ShellEvent, ShellSnapshot,
 };
 use crate::theme::{Space, UiThemeExt};
 
@@ -735,6 +735,8 @@ fn models(
     }
     let tokens = ui.tokens();
     model_system(ui, "01", &snapshot.whisper, true, state, outbox);
+    ui.add_space(Space::LG);
+    model_system(ui, "02", &snapshot.vosk, false, state, outbox);
     if state.confirm_model_download {
         ui.add_space(Space::MD);
         ui.label(
@@ -757,7 +759,7 @@ fn models(
     ui.add_space(Space::XL);
     hairline(ui);
     ui.add_space(Space::XL);
-    model_system(ui, "02", &snapshot.ollama, false, state, outbox);
+    model_system(ui, "03", &snapshot.ollama, false, state, outbox);
 }
 
 fn model_system(
@@ -896,6 +898,23 @@ fn settings(
             );
         });
         setting_section(ui, "03", "Recognition", |ui| {
+            setting_row(
+                ui,
+                "Mode",
+                "Instant streams locally; Accurate prioritizes fidelity.",
+                |ui| {
+                    ui.selectable_value(
+                        &mut state.settings.recognition_mode,
+                        RecognitionMode::Instant,
+                        "Instant",
+                    );
+                    ui.selectable_value(
+                        &mut state.settings.recognition_mode,
+                        RecognitionMode::Accurate,
+                        "Accurate",
+                    );
+                },
+            );
             setting_row(ui, "Language", "Prefer a recognition language.", |ui| {
                 ComboBox::from_id_salt("language")
                     .selected_text(&state.settings.language)
@@ -909,6 +928,16 @@ fn settings(
                         }
                     });
             });
+            if state.settings.recognition_mode == RecognitionMode::Instant
+                && state.settings.language == "Português (Brasil)"
+            {
+                ui.label(
+                    RichText::new(
+                        "Portuguese Instant quality depends on the selected Vosk model. Use Accurate when fidelity matters.",
+                    )
+                    .color(tokens.accent_focus),
+                );
+            }
             setting_row(
                 ui,
                 "Minimum speech level",
@@ -957,6 +986,21 @@ fn settings(
                         "Select an installed Ollama model before saving this formatting strength.",
                     )
                     .color(tokens.accent_focus),
+                );
+            }
+            if state.settings.recognition_mode == RecognitionMode::Instant
+                && matches!(
+                    state.settings.formatting,
+                    FormattingStrength::Balanced
+                        | FormattingStrength::Strong
+                        | FormattingStrength::Custom
+                )
+            {
+                ui.label(
+                    RichText::new(
+                        "Recognition streams instantly; AI formatting remains a separate post-release latency stage.",
+                    )
+                    .color(tokens.secondary_text),
                 );
             }
             if state.settings.formatting == FormattingStrength::Custom {
@@ -1023,6 +1067,28 @@ fn settings(
                 |ui| {
                     ui.add(
                         TextEdit::singleline(&mut state.settings.model_path).desired_width(360.0),
+                    );
+                },
+            );
+            setting_row(
+                ui,
+                "Vosk model directory",
+                "Local unpacked model used by Instant mode.",
+                |ui| {
+                    ui.add(
+                        TextEdit::singleline(&mut state.settings.instant_model_path)
+                            .desired_width(360.0),
+                    );
+                },
+            );
+            setting_row(
+                ui,
+                "Vosk runtime bundle",
+                "Local folder containing libvosk.dll and adjacent dependencies.",
+                |ui| {
+                    ui.add(
+                        TextEdit::singleline(&mut state.settings.instant_runtime_path)
+                            .desired_width(360.0),
                     );
                 },
             );

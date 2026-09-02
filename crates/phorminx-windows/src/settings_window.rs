@@ -87,6 +87,12 @@ pub enum SettingsHistoryRetention {
     Indefinite,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingsRecognitionMode {
+    Instant,
+    Accurate,
+}
+
 impl SettingsFormatting {
     fn index(self) -> usize {
         match self {
@@ -152,7 +158,10 @@ indexed_setting!(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsForm {
+    pub recognition_mode: SettingsRecognitionMode,
     pub model_path: String,
+    pub instant_model_path: String,
+    pub instant_runtime_path: String,
     pub model_status: String,
     pub microphone_status: String,
     pub microphones: Vec<String>,
@@ -1200,7 +1209,10 @@ unsafe fn read_form(state: &WindowState) -> Option<SettingsForm> {
     let launch_at_login = unsafe { SendMessageW(state.launch_at_login, BM_GETCHECK, None, None) }.0
         == BST_CHECKED.0 as isize;
     Some(SettingsForm {
+        recognition_mode: state.initial.recognition_mode,
         model_path: unsafe { read_text(state.model) },
+        instant_model_path: state.initial.instant_model_path.clone(),
+        instant_runtime_path: state.initial.instant_runtime_path.clone(),
         model_status: unsafe { read_text(state.model_status) },
         microphone_status: state.initial.microphone_status.clone(),
         microphones: state.initial.microphones.clone(),

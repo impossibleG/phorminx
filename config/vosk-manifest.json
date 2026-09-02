@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "name": "vosk-win64-0.3.45",
+    "source": "https://github.com/alphacep/vosk-api/releases/download/v0.3.45/vosk-win64-0.3.45.zip",
+    "bytes": 14882445,
+    "sha256": "f1dcc9cca460630f81ea8f71794f69c80bed6556d2a4e6237b5785e1d2dff34b",
+    "license": "Apache-2.0",
+    "archive_root": "vosk-win64-0.3.45",
+    "required_files": [
+      "libvosk.dll",
+      "libgcc_s_seh-1.dll",
+      "libstdc++-6.dll",
+      "libwinpthread-1.dll"
+    ]
+  },
+  "models": {
+    "en": {
+      "name": "vosk-model-small-en-us-0.15",
+      "source": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
+      "bytes": 41205931,
+      "sha256": "30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498",
+      "license": "Apache-2.0",
+      "archive_root": "vosk-model-small-en-us-0.15"
+    }
+  }
+}

@@ -16,6 +16,7 @@ pub use gallery::ComponentGallery;
 pub use model::{
     AppearancePreference, ApplicationProfile, FormattingStrength, GalleryScenario, HistoryItem,
     HistoryVariant, InlineNotice, LexiconCasePolicy, LexiconDraft, LexiconEntry, ModelSystem,
-    NoticeKind, OllamaLifecycle, ProfileDraft, ProfileInsertion, Readiness, RecordingMode, Route,
-    RuntimeStatus, SettingsSnapshot, ShellEvent, ShellSnapshot, SystemReadiness,
+    NoticeKind, OllamaLifecycle, ProfileDraft, ProfileInsertion, Readiness, RecognitionMode,
+    RecordingMode, Route, RuntimeStatus, SettingsSnapshot, ShellEvent, ShellSnapshot,
+    SystemReadiness,
 };

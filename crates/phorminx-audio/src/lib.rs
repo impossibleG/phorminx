@@ -19,6 +19,7 @@ pub const WHISPER_SAMPLE_RATE: u32 = 16_000;
 /// Phase 1 rejects longer recordings instead of growing memory without a bound.
 pub const MAX_RECORDING_DURATION: Duration = Duration::from_secs(120);
 const RESAMPLER_CHUNK_FRAMES: usize = 1_024;
+const STREAMING_BUFFER_DURATION: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Debug)]
 pub struct InputDevice {
@@ -49,9 +50,20 @@ pub fn input_devices() -> Result<Vec<InputDevice>, CaptureError> {
 pub struct ActiveRecording {
     stream: cpal::Stream,
     captured: HeapCons<f32>,
+    streaming: HeapCons<f32>,
     dropped_samples: Arc<AtomicU64>,
     backend_warning_count: Arc<AtomicU64>,
     sample_rate: u32,
+    streaming_dropped_samples: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StreamingAudio {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    /// Total samples dropped from the bounded streaming lane during this
+    /// recording. The archival lane remains independent and intact.
+    pub dropped_samples: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +74,20 @@ pub struct CapturedAudio {
 }
 
 impl ActiveRecording {
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Drains at most `maximum_samples` from the bounded streaming lane.
+    /// This method is intended for the decoder worker pump on the app thread.
+    pub fn drain_streaming(&mut self, maximum_samples: usize) -> StreamingAudio {
+        let count = maximum_samples.min(self.streaming.occupied_len());
+        StreamingAudio {
+            samples: self.streaming.pop_iter().take(count).collect(),
+            sample_rate: self.sample_rate,
+            dropped_samples: self.streaming_dropped_samples.load(Ordering::Acquire),
+        }
+    }
     /// Duration captured at one observed ring-buffer position.
     pub fn captured_duration(&self) -> Duration {
         Duration::from_secs_f64(self.captured.occupied_len() as f64 / f64::from(self.sample_rate))
@@ -135,9 +161,11 @@ impl ActiveRecording {
         let Self {
             stream,
             mut captured,
+            streaming: _,
             dropped_samples,
             backend_warning_count,
             sample_rate,
+            streaming_dropped_samples: _,
         } = self;
         drop(stream);
 
@@ -226,11 +254,26 @@ pub fn start_input(device_name: Option<&str>) -> Result<ActiveRecording, Capture
             .ok_or(CaptureError::CaptureCapacityOverflow)?,
     )
     .map_err(|_| CaptureError::CaptureCapacityOverflow)?;
-    let (producer, captured) = HeapRb::<f32>::try_new(capacity)
+    let (archive, captured) = HeapRb::<f32>::try_new(capacity)
+        .map_err(CaptureError::CaptureBufferAllocation)?
+        .split();
+    let streaming_capacity = usize::try_from(
+        u64::from(sample_rate)
+            .checked_mul(STREAMING_BUFFER_DURATION.as_secs())
+            .ok_or(CaptureError::CaptureCapacityOverflow)?,
+    )
+    .map_err(|_| CaptureError::CaptureCapacityOverflow)?;
+    let (streaming_producer, streaming) = HeapRb::<f32>::try_new(streaming_capacity)
         .map_err(CaptureError::CaptureBufferAllocation)?
         .split();
     let dropped_samples = Arc::new(AtomicU64::new(0));
     let backend_warning_count = Arc::new(AtomicU64::new(0));
+    let streaming_dropped_samples = Arc::new(AtomicU64::new(0));
+    let producer = CaptureProducers {
+        archive,
+        streaming: streaming_producer,
+        streaming_dropped_samples: Arc::clone(&streaming_dropped_samples),
+    };
 
     let stream = match sample_format {
         SampleFormat::I8 => build_stream::<i8>(
@@ -337,9 +380,11 @@ pub fn start_input(device_name: Option<&str>) -> Result<ActiveRecording, Capture
     Ok(ActiveRecording {
         stream,
         captured,
+        streaming,
         dropped_samples,
         backend_warning_count,
         sample_rate,
+        streaming_dropped_samples,
     })
 }
 
@@ -354,7 +399,7 @@ fn build_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     channels: usize,
-    mut producer: HeapProd<f32>,
+    mut producer: CaptureProducers,
     dropped_samples: Arc<AtomicU64>,
     backend_warning_count: Arc<AtomicU64>,
 ) -> Result<cpal::Stream, CaptureError>
@@ -377,7 +422,7 @@ where
 }
 
 fn push_mono_frames<T>(
-    producer: &mut HeapProd<f32>,
+    producer: &mut CaptureProducers,
     data: &[T],
     channels: usize,
     dropped_samples: &AtomicU64,
@@ -389,19 +434,27 @@ fn push_mono_frames<T>(
         return;
     }
 
-    let frames = data.chunks_exact(channels);
-    let frame_count = frames.len();
-    let pushed = producer.push_iter(frames.map(|frame| {
-        frame
+    for frame in data.chunks_exact(channels) {
+        let sample = frame
             .iter()
             .map(|sample| sample.to_sample::<f32>())
             .sum::<f32>()
-            / channels as f32
-    }));
-    let dropped = frame_count.saturating_sub(pushed);
-    if dropped != 0 {
-        dropped_samples.fetch_add(dropped as u64, Ordering::Relaxed);
+            / channels as f32;
+        if producer.archive.try_push(sample).is_err() {
+            dropped_samples.fetch_add(1, Ordering::Relaxed);
+        }
+        if producer.streaming.try_push(sample).is_err() {
+            producer
+                .streaming_dropped_samples
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
+}
+
+struct CaptureProducers {
+    archive: HeapProd<f32>,
+    streaming: HeapProd<f32>,
+    streaming_dropped_samples: Arc<AtomicU64>,
 }
 
 /// Converts a complete mono clip with Rubato's band-limited FFT resampler.
@@ -600,14 +653,17 @@ mod tests {
 
     #[test]
     fn bounded_capture_counts_dropped_mono_frames() {
-        let (mut producer, mut consumer) = HeapRb::<f32>::new(2).split();
+        let (mut producer, mut consumer, mut streaming) = test_producers(2);
+        let streaming_dropped = Arc::clone(&producer.streaming_dropped_samples);
         let dropped = AtomicU64::new(0);
         let stereo = [1.0_f32, 3.0, 2.0, 4.0, 10.0, 12.0];
 
         push_mono_frames(&mut producer, &stereo, 2, &dropped);
 
         assert_eq!(consumer.pop_iter().collect::<Vec<_>>(), vec![2.0, 3.0]);
+        assert_eq!(streaming.pop_iter().collect::<Vec<_>>(), vec![2.0, 3.0]);
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(streaming_dropped.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -632,7 +688,7 @@ mod tests {
 
     #[test]
     fn downmixes_more_than_two_channels() {
-        let (mut producer, mut consumer) = HeapRb::<f32>::new(1).split();
+        let (mut producer, mut consumer, _streaming) = test_producers(1);
         let dropped = AtomicU64::new(0);
 
         push_mono_frames(
@@ -679,9 +735,23 @@ mod tests {
         T: Sample,
         f32: FromSample<T>,
     {
-        let (mut producer, mut consumer) = HeapRb::<f32>::new(input.len()).split();
+        let (mut producer, mut consumer, _streaming) = test_producers(input.len());
         push_mono_frames(&mut producer, input, 1, &AtomicU64::new(0));
         consumer.pop_iter().collect()
+    }
+
+    fn test_producers(capacity: usize) -> (CaptureProducers, HeapCons<f32>, HeapCons<f32>) {
+        let (archive, archive_consumer) = HeapRb::<f32>::new(capacity).split();
+        let (streaming, streaming_consumer) = HeapRb::<f32>::new(capacity).split();
+        (
+            CaptureProducers {
+                archive,
+                streaming,
+                streaming_dropped_samples: Arc::new(AtomicU64::new(0)),
+            },
+            archive_consumer,
+            streaming_consumer,
+        )
     }
 
     fn sine_wave(sample_rate: u32, frequency: f32) -> Vec<f32> {

@@ -13,14 +13,15 @@ use phorminx_ui::{
     AppearancePreference as ShellAppearance, ApplicationProfile,
     FormattingStrength as ShellFormatting, HistoryItem, InlineNotice, LexiconCasePolicy,
     LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle as ShellLifecycle, PhorminxUi,
-    ProfileInsertion, Readiness, RecordingMode as ShellRecording, Route, RuntimeStatus,
-    SettingsSnapshot, ShellEvent, ShellSnapshot, SystemReadiness,
+    ProfileInsertion, Readiness, RecognitionMode as ShellRecognitionMode,
+    RecordingMode as ShellRecording, Route, RuntimeStatus, SettingsSnapshot, ShellEvent,
+    ShellSnapshot, SystemReadiness,
 };
 use phorminx_windows::{SystemAppearance, system_appearance};
 
 use crate::settings::{
     AppearancePreference as StoredAppearance, FormattingStrength, HistoryRetention,
-    OllamaLifecycle, RecordingMode, Settings, SettingsStore,
+    OllamaLifecycle, RecognitionMode, RecordingMode, Settings, SettingsStore,
 };
 use crate::ui_bridge::{
     DEFAULT_HISTORY_LIMIT, UiBridge, UiCommand, UiEffect, UiLexiconDraft, UiMutation,
@@ -576,6 +577,7 @@ fn map_snapshot(
         .collect();
     let microphone = &snapshot.readiness.microphone;
     let whisper = &snapshot.readiness.whisper;
+    let vosk = &snapshot.readiness.vosk;
     let ollama = &snapshot.readiness.ollama;
     let whisper_name = snapshot
         .settings
@@ -599,6 +601,7 @@ fn map_snapshot(
                 whisper.message.clone(),
                 map_readiness(whisper.state),
             ),
+            SystemReadiness::new("Vosk", vosk.message.clone(), map_readiness(vosk.state)),
             SystemReadiness::new(
                 "Ollama",
                 ollama.message.clone(),
@@ -614,6 +617,17 @@ fn map_snapshot(
             selected: Some(whisper_name),
             detail: whisper.message.clone(),
             state: map_readiness(whisper.state),
+            installed: Vec::new(),
+        },
+        vosk: ModelSystem {
+            name: "Vosk Instant".to_owned(),
+            selected: vosk
+                .model_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned),
+            detail: vosk.message.clone(),
+            state: map_readiness(vosk.state),
             installed: Vec::new(),
         },
         ollama: ModelSystem {
@@ -659,6 +673,10 @@ fn map_settings(
             "pt-br" => "Português (Brasil)".to_owned(),
             other => other.to_owned(),
         },
+        recognition_mode: match settings.recognition.mode {
+            RecognitionMode::Instant => ShellRecognitionMode::Instant,
+            RecognitionMode::Accurate => ShellRecognitionMode::Accurate,
+        },
         formatting: map_formatting(settings.formatting.strength),
         custom_instruction: settings
             .formatting
@@ -672,6 +690,16 @@ fn map_settings(
             OllamaLifecycle::MemorySaver => ShellLifecycle::MemorySaver,
         },
         model_path: settings.recognition.model_path.display().to_string(),
+        instant_model_path: settings
+            .recognition
+            .instant_model_path
+            .display()
+            .to_string(),
+        instant_runtime_path: settings
+            .recognition
+            .instant_runtime_path
+            .display()
+            .to_string(),
         history_retention: history_label(settings.privacy.history_retention).to_owned(),
         launch_at_login: settings.startup.launch_at_login,
     }
@@ -692,6 +720,10 @@ fn apply_settings_snapshot(current: &Settings, form: &SettingsSnapshot) -> Setti
         other => other,
     }
     .to_owned();
+    settings.recognition.mode = match form.recognition_mode {
+        ShellRecognitionMode::Instant => RecognitionMode::Instant,
+        ShellRecognitionMode::Accurate => RecognitionMode::Accurate,
+    };
     settings.interaction.recording_mode = match form.recording_mode {
         ShellRecording::Hold => RecordingMode::Hold,
         ShellRecording::Toggle => RecordingMode::Toggle,
@@ -706,6 +738,8 @@ fn apply_settings_snapshot(current: &Settings, form: &SettingsSnapshot) -> Setti
         ShellLifecycle::MemorySaver => OllamaLifecycle::MemorySaver,
     };
     settings.recognition.model_path = PathBuf::from(form.model_path.trim());
+    settings.recognition.instant_model_path = PathBuf::from(form.instant_model_path.trim());
+    settings.recognition.instant_runtime_path = PathBuf::from(form.instant_runtime_path.trim());
     settings.privacy.history_retention = match form.history_retention.as_str() {
         "Off" => HistoryRetention::Disabled,
         "1 day" => HistoryRetention::OneDay,

@@ -2544,6 +2544,7 @@ dependencies = [
  "phorminx-ollama",
  "phorminx-persistence",
  "phorminx-ui",
+ "phorminx-vosk",
  "phorminx-whisper",
  "phorminx-windows",
  "serde",
@@ -2612,6 +2613,16 @@ name = "phorminx-ui"
 version = "0.1.0"
 dependencies = [
  "eframe",
+]
+
+[[package]]
+name = "phorminx-vosk"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

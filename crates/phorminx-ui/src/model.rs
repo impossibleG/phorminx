@@ -326,6 +326,13 @@ pub enum AppearancePreference {
     Dark,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RecognitionMode {
+    Instant,
+    #[default]
+    Accurate,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsSnapshot {
     pub appearance: AppearancePreference,
@@ -333,11 +340,14 @@ pub struct SettingsSnapshot {
     pub microphones: Vec<String>,
     pub recording_mode: RecordingMode,
     pub language: String,
+    pub recognition_mode: RecognitionMode,
     pub formatting: FormattingStrength,
     pub custom_instruction: String,
     pub minimum_rms: String,
     pub ollama_lifecycle: OllamaLifecycle,
     pub model_path: String,
+    pub instant_model_path: String,
+    pub instant_runtime_path: String,
     pub history_retention: String,
     pub launch_at_login: bool,
 }
@@ -350,11 +360,14 @@ impl Default for SettingsSnapshot {
             microphones: vec!["Windows default".into()],
             recording_mode: RecordingMode::Hold,
             language: "English".into(),
+            recognition_mode: RecognitionMode::Accurate,
             formatting: FormattingStrength::Balanced,
             custom_instruction: String::new(),
             minimum_rms: "0.003".into(),
             ollama_lifecycle: OllamaLifecycle::Balanced,
             model_path: "models/ggml-base.en.bin".into(),
+            instant_model_path: "models/vosk-model-small-en-us-0.15".into(),
+            instant_runtime_path: "runtime/vosk".into(),
             history_retention: "7 days".into(),
             launch_at_login: false,
         }
@@ -373,6 +386,7 @@ pub struct ShellSnapshot {
     pub lexicon: Vec<LexiconEntry>,
     pub profiles: Vec<ApplicationProfile>,
     pub whisper: ModelSystem,
+    pub vosk: ModelSystem,
     pub ollama: ModelSystem,
     pub settings: SettingsSnapshot,
     pub notice: Option<InlineNotice>,
@@ -539,6 +553,13 @@ impl ShellSnapshot {
                 detail: "English · 141 MB · SHA-256 verified".into(),
                 state: Readiness::Ready,
                 installed: vec!["base.en".into()],
+            },
+            vosk: ModelSystem {
+                name: "Vosk Instant".into(),
+                selected: Some("small-en-us-0.15".into()),
+                detail: "English · local streaming".into(),
+                state: Readiness::Ready,
+                installed: vec!["small-en-us-0.15".into()],
             },
             ollama: ModelSystem {
                 name: "Ollama".into(),

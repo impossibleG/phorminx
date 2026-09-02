@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use phorminx_windows::atomic_replace_file;
 use serde::{Deserialize, Serialize};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 pub const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 pub const MAX_CUSTOM_INSTRUCTIONS_CHARS: usize = 4_096;
 
@@ -51,7 +51,7 @@ impl Settings {
     pub fn validate_and_normalize(&mut self) -> Result<(), SettingsError> {
         match self.schema_version {
             CURRENT_SCHEMA_VERSION => {}
-            1 | 2 => self.schema_version = CURRENT_SCHEMA_VERSION,
+            1..=3 => self.schema_version = CURRENT_SCHEMA_VERSION,
             0 => return Err(SettingsError::MissingOrInvalidVersion),
             version if version > CURRENT_SCHEMA_VERSION => {
                 return Err(SettingsError::FutureVersion {
@@ -64,6 +64,12 @@ impl Settings {
 
         if self.recognition.model_path.as_os_str().is_empty() {
             return Err(SettingsError::EmptyModelPath);
+        }
+        if self.recognition.instant_model_path.as_os_str().is_empty() {
+            return Err(SettingsError::EmptyInstantModelPath);
+        }
+        if self.recognition.instant_runtime_path.as_os_str().is_empty() {
+            return Err(SettingsError::EmptyInstantRuntimePath);
         }
         if !self.recognition.minimum_rms.is_finite()
             || !(0.0..=1.0).contains(&self.recognition.minimum_rms)
@@ -137,7 +143,18 @@ impl Settings {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RecognitionSettings {
+    pub mode: RecognitionMode,
+    /// Whisper GGML model used by Accurate mode. The field name is retained
+    /// so schema 1-3 files migrate without losing their configured path.
     pub model_path: PathBuf,
+    /// Unpacked Vosk model directory matching `language`.
+    pub instant_model_path: PathBuf,
+    /// Vosk runtime bundle directory containing vosk.dll and its dependencies.
+    pub instant_runtime_path: PathBuf,
+    /// Reserved shared selector for Accurate-mode UI without another schema
+    /// migration. `None` means the explicit `model_path` wins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accurate_model_variant: Option<String>,
     pub language: String,
     pub minimum_rms: f32,
     /// Exact CPAL/Windows input-device name. `None` follows the system default.
@@ -147,12 +164,24 @@ pub struct RecognitionSettings {
 impl Default for RecognitionSettings {
     fn default() -> Self {
         Self {
+            mode: RecognitionMode::Accurate,
             model_path: PathBuf::from("models/ggml-base.en.bin"),
+            instant_model_path: PathBuf::from("models/vosk-model-small-en-us-0.15"),
+            instant_runtime_path: PathBuf::from("runtime/vosk"),
+            accurate_model_variant: None,
             language: "en".to_owned(),
             minimum_rms: 0.003,
             microphone: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecognitionMode {
+    Instant,
+    #[default]
+    Accurate,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -421,13 +450,17 @@ impl SettingsStore {
     }
 
     pub fn resolve_model_path(&self, model_path: &Path) -> PathBuf {
-        if model_path.is_absolute() {
-            return model_path.to_path_buf();
+        self.resolve_asset_path(model_path)
+    }
+
+    pub fn resolve_asset_path(&self, asset_path: &Path) -> PathBuf {
+        if asset_path.is_absolute() {
+            return asset_path.to_path_buf();
         }
         self.path
             .parent()
             .expect("validated settings path has a parent")
-            .join(model_path)
+            .join(asset_path)
     }
 
     fn create_temporary_file(&self, directory: &Path) -> Result<(PathBuf, File), SettingsError> {
@@ -475,6 +508,10 @@ pub enum SettingsError {
     UnsupportedOldVersion(u32),
     #[error("recognition.model_path must not be empty")]
     EmptyModelPath,
+    #[error("recognition.instant_model_path must not be empty")]
+    EmptyInstantModelPath,
+    #[error("recognition.instant_runtime_path must not be empty")]
+    EmptyInstantRuntimePath,
     #[error("recognition.minimum_rms must be finite and between 0 and 1, got {0}")]
     InvalidMinimumRms(f32),
     #[error("recognition.language must contain 2-16 ASCII letters or hyphens, got {0:?}")]
@@ -573,6 +610,15 @@ mod tests {
         assert_eq!(settings.recognition.language, "en");
         assert_eq!(settings.recognition.minimum_rms, 0.003);
         assert_eq!(settings.recognition.microphone, None);
+        assert_eq!(settings.recognition.mode, RecognitionMode::Accurate);
+        assert_eq!(
+            settings.recognition.instant_model_path,
+            PathBuf::from("models/vosk-model-small-en-us-0.15")
+        );
+        assert_eq!(
+            settings.recognition.instant_runtime_path,
+            PathBuf::from("runtime/vosk")
+        );
         assert_eq!(settings.formatting.strength, FormattingStrength::Light);
         assert_eq!(
             settings.privacy.history_retention,
@@ -659,6 +705,25 @@ language = "pt-BR"
 
         assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(loaded.appearance.theme, AppearancePreference::System);
+    }
+
+    #[test]
+    fn version_three_files_migrate_to_accurate_without_losing_whisper_path() {
+        let directory = TestDirectory::new("migrate-v3");
+        let path = directory.0.join("settings.toml");
+        fs::write(
+            &path,
+            "schema_version = 3\n[recognition]\nmodel_path = 'models/custom.bin'\n",
+        )
+        .unwrap();
+
+        let loaded = SettingsStore::new(path).unwrap().load().unwrap();
+        assert_eq!(loaded.schema_version, 4);
+        assert_eq!(loaded.recognition.mode, RecognitionMode::Accurate);
+        assert_eq!(
+            loaded.recognition.model_path,
+            PathBuf::from("models/custom.bin")
+        );
     }
 
     #[test]

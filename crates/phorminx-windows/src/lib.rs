@@ -56,7 +56,8 @@ pub use profile_window::{
 #[cfg(windows)]
 pub use settings_window::{
     SettingsForm, SettingsFormatting, SettingsHistoryRetention, SettingsOllamaLifecycle,
-    SettingsRecordingMode, SettingsWindow, SettingsWindowError, SettingsWindowEvent,
+    SettingsRecognitionMode, SettingsRecordingMode, SettingsWindow, SettingsWindowError,
+    SettingsWindowEvent,
 };
 #[cfg(windows)]
 pub use single_instance::{SingleInstance, SingleInstanceError, activate_existing_window};

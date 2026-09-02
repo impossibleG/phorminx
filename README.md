@@ -5,6 +5,8 @@ Phorminx is a privacy-first Windows dictation utility. Hold a shortcut, speak na
 The product is local-first:
 
 - `whisper.cpp` performs speech recognition.
+- An optional resident Vosk stream provides Instant mode when a local runtime
+  bundle and language-matched unpacked model are explicitly configured.
 - Deterministic rules handle safe normalization and explicit aliases.
 - Ollama optionally cleans and formats transcripts.
 - Longer dictations are transcribed incrementally with bounded overlapping

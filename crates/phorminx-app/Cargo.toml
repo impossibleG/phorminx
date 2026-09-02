@@ -22,6 +22,7 @@ phorminx-core = { path = "../phorminx-core" }
 phorminx-ollama = { path = "../phorminx-ollama" }
 phorminx-persistence = { path = "../phorminx-persistence" }
 phorminx-ui = { path = "../phorminx-ui" }
+phorminx-vosk = { path = "../phorminx-vosk" }
 phorminx-whisper = { path = "../phorminx-whisper" }
 phorminx-windows = { path = "../phorminx-windows" }
 serde.workspace = true

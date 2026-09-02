@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,8 +21,8 @@ use phorminx_app::runtime::{
     AppIo, AppRuntime, FinishedAudio, InsertDisposition, RuntimeNotice, UiStatus,
 };
 use phorminx_app::settings::{
-    FormattingStrength, HistoryRetention, OllamaLifecycle, RecordingMode, RuntimeFormatting,
-    Settings, SettingsStore,
+    FormattingStrength, HistoryRetention, OllamaLifecycle, RecognitionMode, RecordingMode,
+    RuntimeFormatting, Settings, SettingsStore,
 };
 use phorminx_app::ui_bridge::{UiMutation, UiRoute, UiRuntimeStatus};
 use phorminx_audio::{ActiveRecording, input_devices, start_input};
@@ -39,15 +39,17 @@ use phorminx_persistence::{
     InsertionPreference, LexiconEntry, NewLexiconEntry, Persistence, RetentionPolicy,
     TimingMetadata,
 };
+use phorminx_vosk::{VoskModel, VoskSession};
 use phorminx_whisper::WhisperRecognizer;
 use phorminx_windows::{
     ClipboardOnlyReason, GlobalHoldHotkey, HistoryItem, HistoryWindow, HistoryWindowEvent,
     HoldEvent, InsertionOutcome, LexiconCasePolicy, LexiconDraft, LexiconItem, LexiconWindow,
     LexiconWindowEvent, OverlayStatus, ProfileFormatting, ProfileInsertion, ProfileItem,
     ProfileWindow, ProfileWindowEvent, SettingsForm, SettingsFormatting, SettingsHistoryRetention,
-    SettingsOllamaLifecycle, SettingsRecordingMode, SettingsWindow, SettingsWindowEvent,
-    SingleInstance, SingleInstanceError, StatusOverlay, SystemTray, TargetSnapshot, TrayEvent,
-    TrayStatus, activate_existing_window, copy_and_maybe_paste, set_launch_at_login,
+    SettingsOllamaLifecycle, SettingsRecognitionMode, SettingsRecordingMode, SettingsWindow,
+    SettingsWindowEvent, SingleInstance, SingleInstanceError, StatusOverlay, SystemTray,
+    TargetSnapshot, TrayEvent, TrayStatus, activate_existing_window, copy_and_maybe_paste,
+    set_launch_at_login,
 };
 
 #[cfg(feature = "desktop")]
@@ -200,6 +202,9 @@ fn run() -> Result<()> {
             .context("failed to resolve the model path from the current directory")?
             .join(model)
     };
+    let instant_model = settings_store.resolve_asset_path(&settings.recognition.instant_model_path);
+    let instant_runtime =
+        settings_store.resolve_asset_path(&settings.recognition.instant_runtime_path);
 
     let tray = SystemTray::start().context("failed to start the system tray")?;
     show_shell_status(&overlay, &tray, OverlayStatus::Loading, TrayStatus::Loading);
@@ -211,7 +216,16 @@ fn run() -> Result<()> {
             .context("failed to install the Ctrl+C handler")?;
     }
 
-    if !model.is_file() {
+    let recognition_ready = match settings.recognition.mode {
+        RecognitionMode::Accurate => model.is_file(),
+        RecognitionMode::Instant => phorminx_vosk::inspect(
+            &instant_runtime,
+            &instant_model,
+            &settings.recognition.language,
+        )
+        .is_ready(),
+    };
+    if !recognition_ready {
         if cli.smoke_test {
             return Err(anyhow!("Whisper model was not found: {}", model.display()));
         }
@@ -263,8 +277,16 @@ fn run() -> Result<()> {
     let worker_formatting = WorkerFormatting::from_settings(&settings)?;
     let mut dictation_context = DictationContext::global(&settings)?;
 
-    println!("Phorminx is loading {}...", model.display());
-    let worker = TranscriptionWorker::start(&model, worker_formatting, aliases)?;
+    println!("Phorminx is loading its local recognition engine...");
+    let recognizer = match settings.recognition.mode {
+        RecognitionMode::Accurate => RecognizerConfig::Accurate(model.clone()),
+        RecognitionMode::Instant => RecognizerConfig::Instant {
+            runtime_bundle: instant_runtime,
+            model: instant_model,
+            language: settings.recognition.language.clone(),
+        },
+    };
+    let worker = TranscriptionWorker::start(recognizer, worker_formatting, aliases)?;
 
     let hotkey = GlobalHoldHotkey::start().context("failed to install the global hotkey")?;
     let mut runtime = AppRuntime::<TargetSnapshot, ActiveRecording>::new_with_formatting(
@@ -273,6 +295,7 @@ fn run() -> Result<()> {
         formatting,
     )?;
     let mut incremental = IncrementalPlanner::default();
+    let mut instant_pump = InstantPump::default();
 
     println!("Ready. Hold Ctrl+Alt+Space to dictate; press Ctrl+C here to exit.");
     log_state(None, runtime.state(), "ready");
@@ -507,13 +530,18 @@ fn run() -> Result<()> {
             }
         }
 
-        poll_incremental_transcription(
-            &runtime,
-            &mut incremental,
-            &worker,
-            &dictation_context.language,
-            settings.recognition.minimum_rms,
-        );
+        match settings.recognition.mode {
+            RecognitionMode::Accurate => poll_incremental_transcription(
+                &runtime,
+                &mut incremental,
+                &worker,
+                &dictation_context.language,
+                settings.recognition.minimum_rms,
+            ),
+            RecognitionMode::Instant => {
+                poll_instant_transcription(&mut runtime, &mut instant_pump, &worker)
+            }
+        }
 
         match poll_shell_events(
             &tray,
@@ -1582,7 +1610,21 @@ fn settings_form(settings: &Settings, effective_model: &Path) -> SettingsForm {
         ollama_models.push(selected.clone());
     }
     SettingsForm {
+        recognition_mode: match settings.recognition.mode {
+            RecognitionMode::Instant => SettingsRecognitionMode::Instant,
+            RecognitionMode::Accurate => SettingsRecognitionMode::Accurate,
+        },
         model_path: effective_model.display().to_string(),
+        instant_model_path: settings
+            .recognition
+            .instant_model_path
+            .display()
+            .to_string(),
+        instant_runtime_path: settings
+            .recognition
+            .instant_runtime_path
+            .display()
+            .to_string(),
         model_status,
         microphone_status,
         microphones,
@@ -1710,7 +1752,13 @@ fn apply_settings_form(
     form: SettingsForm,
 ) -> Result<()> {
     let mut candidate = settings.clone();
+    candidate.recognition.mode = match form.recognition_mode {
+        SettingsRecognitionMode::Instant => RecognitionMode::Instant,
+        SettingsRecognitionMode::Accurate => RecognitionMode::Accurate,
+    };
     candidate.recognition.model_path = PathBuf::from(form.model_path.trim());
+    candidate.recognition.instant_model_path = PathBuf::from(form.instant_model_path.trim());
+    candidate.recognition.instant_runtime_path = PathBuf::from(form.instant_runtime_path.trim());
     candidate.recognition.language = form.language;
     candidate.recognition.minimum_rms = form
         .minimum_rms
@@ -2166,49 +2214,156 @@ fn report_notices(notices: Vec<RuntimeNotice<ClipboardOnlyReason>>) {
 
 fn log_state(id: Option<DictationId>, state: RuntimeState, event: &'static str) {
     let id = id.map_or(0, |id| id.0);
-    eprintln!("dictation_id={id} state={state:?} event={event}");
+    eprintln!(
+        "uptime_ms={} dictation_id={id} state={state:?} event={event}",
+        monotonic_uptime_ms()
+    );
+}
+
+fn monotonic_uptime_ms() -> u128 {
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    STARTED.get_or_init(Instant::now).elapsed().as_millis()
 }
 
 struct TranscriptionWorker {
     commands: Sender<WorkerCommand>,
+    instant_audio: mpsc::SyncSender<InstantAudioCommand>,
     results: Receiver<WorkerEvent>,
     cancellations: Arc<CancellationRegistry>,
     shutting_down: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
+#[derive(Default)]
+struct InstantPump {
+    active_id: Option<DictationId>,
+}
+
+fn poll_instant_transcription(
+    runtime: &mut AppRuntime<TargetSnapshot, ActiveRecording>,
+    pump: &mut InstantPump,
+    worker: &TranscriptionWorker,
+) {
+    if runtime.state() != RuntimeState::Listening {
+        if let Some(id) = pump.active_id.take()
+            && !matches!(
+                runtime.state(),
+                RuntimeState::Transcribing
+                    | RuntimeState::Normalizing
+                    | RuntimeState::Cleaning
+                    | RuntimeState::ReadyToInsert
+                    | RuntimeState::Inserting
+            )
+        {
+            let _ = worker.cancel_incremental(id);
+        }
+        return;
+    }
+    let Some(id) = runtime.active_id() else {
+        return;
+    };
+    let Some(recording) = runtime.active_recording_mut() else {
+        return;
+    };
+    if pump.active_id != Some(id) {
+        if let Some(stale) = pump.active_id.replace(id) {
+            let _ = worker.cancel_incremental(stale);
+        }
+        worker.instant_begin(id, recording.sample_rate());
+    }
+    let batch = recording.drain_streaming(16_384);
+    worker.instant_audio(id, batch.samples, batch.sample_rate, batch.dropped_samples);
+}
+
+enum RecognizerConfig {
+    Accurate(PathBuf),
+    Instant {
+        runtime_bundle: PathBuf,
+        model: PathBuf,
+        language: String,
+    },
+}
+
+enum LoadedRecognizer {
+    Accurate(WhisperRecognizer),
+    Instant(VoskModel),
+}
+
+struct InstantSession {
+    recognizer: VoskSession,
+    sample_rate: u32,
+    accepted_samples: u64,
+    inference_time: Duration,
+    degraded: bool,
+}
+
+enum InstantAudioCommand {
+    Begin {
+        id: DictationId,
+        sample_rate: u32,
+    },
+    Audio {
+        id: DictationId,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        dropped_samples: u64,
+    },
+    Cancel {
+        id: DictationId,
+    },
+}
+
 impl TranscriptionWorker {
     fn start(
-        model: &Path,
+        recognizer: RecognizerConfig,
         formatting: WorkerFormatting,
         aliases: Vec<LexiconEntry>,
     ) -> Result<Self> {
         let (command_tx, command_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
+        let (instant_audio_tx, instant_audio_rx) = mpsc::sync_channel(8);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let cancellations = Arc::new(CancellationRegistry::default());
         let worker_cancellations = Arc::clone(&cancellations);
         let worker_shutting_down = Arc::new(AtomicBool::new(false));
         let thread_shutting_down = Arc::clone(&worker_shutting_down);
-        let model = model.to_path_buf();
         let thread = thread::Builder::new()
             .name("phorminx-transcription".to_owned())
             .spawn(move || {
-                let recognizer = match WhisperRecognizer::load(&model) {
+                let recognizer = match recognizer {
+                    RecognizerConfig::Accurate(model) => {
+                        WhisperRecognizer::load(&model)
+                            .map(LoadedRecognizer::Accurate)
+                            .map_err(|error| error.to_string())
+                    }
+                    RecognizerConfig::Instant {
+                        runtime_bundle,
+                        model,
+                        language,
+                    } => VoskModel::load(&runtime_bundle, &model, &language)
+                        .and_then(|model| {
+                            // Loading the model alone does not prove that the native runtime can
+                            // construct a recognizer. Probe that boundary before advertising Ready.
+                            let probe = model.session(16_000)?;
+                            drop(probe);
+                            Ok(LoadedRecognizer::Instant(model))
+                        })
+                        .map_err(|error| error.to_string()),
+                };
+                let recognizer = match recognizer {
                     Ok(recognizer) => recognizer,
                     Err(error) => {
                         let _ = ready_tx.send(Err(error.to_string()));
                         return;
                     }
                 };
-                if ready_tx.send(Ok(())).is_err() {
-                    return;
-                }
-
                 let ollama = formatting.model.as_ref().map(|_| production_ollama_client());
                 let mut aliases = aliases;
                 let mut incremental_sessions = HashMap::new();
-                if let (Some(client), Some(model)) = (&ollama, &formatting.model) {
+                let mut instant_sessions = HashMap::new();
+                if formatting.uses_ollama()
+                    && let (Some(client), Some(model)) = (&ollama, &formatting.model)
+                {
                     let cancel = CancellationToken::new();
                     if let Err(error) = client.warm_up(model, formatting.keep_alive.clone(), &cancel)
                     {
@@ -2217,8 +2372,21 @@ impl TranscriptionWorker {
                         );
                     }
                 }
+                if ready_tx.send(Ok(())).is_err() {
+                    return;
+                }
 
-                while let Ok(command) = command_rx.recv() {
+                loop {
+                    drain_instant_audio(
+                        &recognizer,
+                        &instant_audio_rx,
+                        &mut instant_sessions,
+                    );
+                    let command = match command_rx.recv_timeout(Duration::from_millis(10)) {
+                        Ok(command) => command,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    };
                     if thread_shutting_down.load(Ordering::Acquire) {
                         match command {
                             WorkerCommand::Shutdown => break,
@@ -2256,8 +2424,11 @@ impl TranscriptionWorker {
                                 }
                                 continue;
                             }
+                            let LoadedRecognizer::Accurate(recognizer) = &recognizer else {
+                                continue;
+                            };
                             let event = process_partial_transcription(
-                                &recognizer,
+                                recognizer,
                                 &mut incremental_sessions,
                                 plan,
                                 clip,
@@ -2283,14 +2454,29 @@ impl TranscriptionWorker {
                                 incremental_sessions.remove(&id);
                                 continue;
                             }
-                            let result = match transcribe_final(
+                            drain_instant_audio(
                                 &recognizer,
-                                incremental_sessions.remove(&id),
-                                &clip,
-                                &language,
-                                audio_context,
-                                id,
-                            ) {
+                                &instant_audio_rx,
+                                &mut instant_sessions,
+                            );
+                            let recognition = match &recognizer {
+                                LoadedRecognizer::Accurate(recognizer) => transcribe_final(
+                                    recognizer,
+                                    incremental_sessions.remove(&id),
+                                    &clip,
+                                    &language,
+                                    audio_context,
+                                    id,
+                                ),
+                                LoadedRecognizer::Instant(model) => transcribe_instant_final(
+                                    model,
+                                    instant_sessions.remove(&id),
+                                    &clip,
+                                    id,
+                                )
+                                .map_err(|error| error.to_string()),
+                            };
+                            let result = match recognition {
                                 Ok(transcript) => {
                                     // Whisper cannot be preempted safely today,
                                     // so cancellation is checked again before
@@ -2362,7 +2548,26 @@ impl TranscriptionWorker {
                         }
                         WorkerCommand::CancelIncremental { id } => {
                             incremental_sessions.remove(&id);
+                            instant_sessions.remove(&id);
                             worker_cancellations.acknowledge(id);
+                        }
+                        WorkerCommand::DegradeInstant { id } => {
+                            if let Some(session) = instant_sessions.get_mut(&id) {
+                                session.degraded = true;
+                            } else if let LoadedRecognizer::Instant(model) = &recognizer
+                                && let Ok(recognizer) = model.session(16_000)
+                            {
+                                instant_sessions.insert(
+                                    id,
+                                    InstantSession {
+                                        recognizer,
+                                        sample_rate: 16_000,
+                                        accepted_samples: 0,
+                                        inference_time: Duration::ZERO,
+                                        degraded: true,
+                                    },
+                                );
+                            }
                         }
                         WorkerCommand::ReloadAliases(updated) => aliases = updated,
                         WorkerCommand::Shutdown => break,
@@ -2373,6 +2578,7 @@ impl TranscriptionWorker {
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 commands: command_tx,
+                instant_audio: instant_audio_tx,
                 results: result_rx,
                 cancellations,
                 shutting_down: worker_shutting_down,
@@ -2425,10 +2631,47 @@ impl TranscriptionWorker {
             .context("transcription worker is unavailable")
     }
 
+    fn instant_begin(&self, id: DictationId, sample_rate: u32) {
+        if self
+            .instant_audio
+            .try_send(InstantAudioCommand::Begin { id, sample_rate })
+            .is_err()
+        {
+            let _ = self.commands.send(WorkerCommand::DegradeInstant { id });
+        }
+    }
+
+    fn instant_audio(
+        &self,
+        id: DictationId,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        dropped_samples: u64,
+    ) {
+        if samples.is_empty() {
+            return;
+        }
+        if self
+            .instant_audio
+            .try_send(InstantAudioCommand::Audio {
+                id,
+                samples,
+                sample_rate,
+                dropped_samples,
+            })
+            .is_err()
+        {
+            let _ = self.commands.send(WorkerCommand::DegradeInstant { id });
+        }
+    }
+
     fn cancel_incremental(&self, id: DictationId) -> Result<()> {
         // Cancellation is visible before this FIFO command reaches the worker,
         // so queued stale audio is dropped without another Whisper invocation.
         self.cancellations.cancel(id);
+        let _ = self
+            .instant_audio
+            .try_send(InstantAudioCommand::Cancel { id });
         self.commands
             .send(WorkerCommand::CancelIncremental { id })
             .context("transcription worker is unavailable")
@@ -2570,6 +2813,9 @@ enum WorkerCommand {
     CancelIncremental {
         id: DictationId,
     },
+    DegradeInstant {
+        id: DictationId,
+    },
     ReloadAliases(Vec<LexiconEntry>),
     Shutdown,
 }
@@ -2601,6 +2847,138 @@ struct PartialAccumulator {
     partial_compute_time: Duration,
     model_load_time: Duration,
     degraded: Option<&'static str>,
+}
+
+fn drain_instant_audio(
+    recognizer: &LoadedRecognizer,
+    receiver: &Receiver<InstantAudioCommand>,
+    sessions: &mut HashMap<DictationId, InstantSession>,
+) {
+    let LoadedRecognizer::Instant(model) = recognizer else {
+        while receiver.try_recv().is_ok() {}
+        return;
+    };
+    while let Ok(command) = receiver.try_recv() {
+        match command {
+            InstantAudioCommand::Begin { id, sample_rate } => {
+                if sessions.contains_key(&id) {
+                    continue;
+                }
+                match model.session(sample_rate) {
+                    Ok(recognizer) => {
+                        sessions.insert(
+                            id,
+                            InstantSession {
+                                recognizer,
+                                sample_rate,
+                                accepted_samples: 0,
+                                inference_time: Duration::ZERO,
+                                degraded: false,
+                            },
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "dictation_id={} state=Listening event=instant_session_degraded reason=create_failed",
+                            id.0
+                        );
+                    }
+                }
+            }
+            InstantAudioCommand::Audio {
+                id,
+                samples,
+                sample_rate,
+                dropped_samples,
+            } => {
+                let Some(session) = sessions.get_mut(&id) else {
+                    continue;
+                };
+                if sample_rate != session.sample_rate || dropped_samples != 0 {
+                    session.degraded = true;
+                    continue;
+                }
+                if session.degraded {
+                    continue;
+                }
+                let started = Instant::now();
+                let accepted = session.recognizer.accept_f32(&samples);
+                session.inference_time += started.elapsed();
+                match accepted {
+                    Ok(_) => session.accepted_samples += samples.len() as u64,
+                    Err(_) => session.degraded = true,
+                }
+            }
+            InstantAudioCommand::Cancel { id } => {
+                sessions.remove(&id);
+            }
+        }
+    }
+}
+
+fn transcribe_instant_final(
+    model: &VoskModel,
+    session: Option<InstantSession>,
+    clip: &AudioClip,
+    id: DictationId,
+) -> Result<Transcript, phorminx_vosk::VoskError> {
+    let audio_duration = clip.duration();
+    let mut session = match session {
+        Some(session) if !session.degraded => session,
+        _ => {
+            eprintln!(
+                "dictation_id={} state=Transcribing event=instant_recovery path=full_clip",
+                id.0
+            );
+            let mut recognizer = model.session(clip.sample_rate)?;
+            let started = Instant::now();
+            recognizer.accept_f32(&clip.samples)?;
+            let text = recognizer.finish()?;
+            return Ok(Transcript {
+                text,
+                backend: "vosk",
+                model_load_time: model.load_time(),
+                inference_time: started.elapsed(),
+                audio_duration,
+            });
+        }
+    };
+
+    let accepted_at_clip_rate = tail_start_at_clip_rate(
+        session.accepted_samples,
+        session.sample_rate,
+        clip.sample_rate,
+    );
+    if accepted_at_clip_rate < clip.samples.len() {
+        let native_tail = phorminx_audio::resample(
+            &clip.samples[accepted_at_clip_rate..],
+            clip.sample_rate,
+            session.sample_rate,
+        )
+        .map_err(|_| phorminx_vosk::VoskError::DecoderFailed)?;
+        let started = Instant::now();
+        session.recognizer.accept_f32(&native_tail)?;
+        session.inference_time += started.elapsed();
+    }
+    let started = Instant::now();
+    let text = session.recognizer.finish()?;
+    session.inference_time += started.elapsed();
+    Ok(Transcript {
+        text,
+        backend: "vosk",
+        model_load_time: model.load_time(),
+        inference_time: session.inference_time,
+        audio_duration,
+    })
+}
+
+fn tail_start_at_clip_rate(
+    accepted_samples: u64,
+    accepted_sample_rate: u32,
+    clip_sample_rate: u32,
+) -> usize {
+    let accepted_seconds = accepted_samples as f64 / f64::from(accepted_sample_rate);
+    (accepted_seconds * f64::from(clip_sample_rate)).floor() as usize
 }
 
 impl Default for PartialAccumulator {
@@ -3788,5 +4166,12 @@ mod composition_tests {
         assert!(!FATAL_STARTUP_MESSAGE.contains("error="));
         assert!(!FATAL_STARTUP_MESSAGE.contains("model"));
         assert!(!FATAL_STARTUP_MESSAGE.contains("transcript"));
+    }
+
+    #[test]
+    fn callback_boundary_tail_maps_native_frames_to_the_archival_clip() {
+        assert_eq!(tail_start_at_clip_rate(48_000, 48_000, 16_000), 16_000);
+        assert_eq!(tail_start_at_clip_rate(47_999, 48_000, 16_000), 15_999);
+        assert_eq!(tail_start_at_clip_rate(16_000, 16_000, 16_000), 16_000);
     }
 }

@@ -157,6 +157,10 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
         self.recording.as_ref()
     }
 
+    pub fn active_recording_mut(&mut self) -> Option<&mut Recording> {
+        self.recording.as_mut()
+    }
+
     pub fn is_clean_idle(&self) -> bool {
         self.machine.state() == RuntimeState::Idle
             && self.machine.active_id().is_none()
@@ -995,5 +999,20 @@ mod tests {
             .unwrap();
         assert_eq!(io.inserted_texts, ["Cleaned output."]);
         assert!(runtime.is_clean_idle());
+    }
+
+    #[test]
+    fn duplicate_final_completion_inserts_exactly_once() {
+        let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".to_owned()).unwrap();
+        let mut io = FakeIo::default();
+        let id = advance_to_transcribing(&mut runtime, &mut io, 1);
+        runtime
+            .transcription_completed(id, Ok(transcript("one result")), &mut io)
+            .unwrap();
+        runtime
+            .transcription_completed(id, Ok(transcript("duplicate")), &mut io)
+            .unwrap();
+        assert_eq!(io.insertions, 1);
+        assert_eq!(io.inserted_texts, ["one result"]);
     }
 }

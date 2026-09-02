@@ -77,6 +77,25 @@ pub struct UiWhisperReadiness {
     pub message: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiVoskReadinessKind {
+    Checking,
+    Ready,
+    MissingRuntime,
+    MissingModel,
+    LoadFailed,
+    UnsupportedLanguage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UiVoskReadiness {
+    pub state: UiReadinessState,
+    pub kind: UiVoskReadinessKind,
+    pub runtime_path: PathBuf,
+    pub model_path: PathBuf,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UiOllamaModel {
     pub name: String,
@@ -96,6 +115,7 @@ pub struct UiOllamaReadiness {
 pub struct UiReadinessSnapshot {
     pub microphone: UiMicrophoneReadiness,
     pub whisper: UiWhisperReadiness,
+    pub vosk: UiVoskReadiness,
     pub ollama: UiOllamaReadiness,
 }
 
@@ -148,6 +168,54 @@ impl UiReadinessSnapshot {
             },
         };
 
+        let vosk_runtime = store.resolve_asset_path(&settings.recognition.instant_runtime_path);
+        let vosk_model = store.resolve_asset_path(&settings.recognition.instant_model_path);
+        let (vosk_state, vosk_kind, vosk_message) = match phorminx_vosk::inspect(
+            &vosk_runtime,
+            &vosk_model,
+            &settings.recognition.language,
+        ) {
+            phorminx_vosk::Readiness::Ready {
+                warning: Some(warning),
+            } => (
+                UiReadinessState::Ready,
+                UiVoskReadinessKind::Ready,
+                warning.to_owned(),
+            ),
+            phorminx_vosk::Readiness::Ready { warning: None } => (
+                UiReadinessState::Ready,
+                UiVoskReadinessKind::Ready,
+                "Vosk Instant model ready.".to_owned(),
+            ),
+            phorminx_vosk::Readiness::MissingRuntime { .. } => (
+                UiReadinessState::NeedsAttention,
+                UiVoskReadinessKind::MissingRuntime,
+                "Vosk runtime bundle not found.".to_owned(),
+            ),
+            phorminx_vosk::Readiness::MissingModel { .. } => (
+                UiReadinessState::NeedsAttention,
+                UiVoskReadinessKind::MissingModel,
+                "Vosk model directory not found.".to_owned(),
+            ),
+            phorminx_vosk::Readiness::LoadFailed { .. } => (
+                UiReadinessState::NeedsAttention,
+                UiVoskReadinessKind::LoadFailed,
+                "Vosk runtime could not be loaded.".to_owned(),
+            ),
+            phorminx_vosk::Readiness::UnsupportedLanguage { .. } => (
+                UiReadinessState::NeedsAttention,
+                UiVoskReadinessKind::UnsupportedLanguage,
+                "Instant mode supports en and pt-br.".to_owned(),
+            ),
+        };
+        let vosk = UiVoskReadiness {
+            state: vosk_state,
+            kind: vosk_kind,
+            runtime_path: vosk_runtime,
+            model_path: vosk_model,
+            message: vosk_message,
+        };
+
         let ollama = match ollama.discover(&CancellationToken::new()) {
             Ok(catalog) => {
                 let models = catalog
@@ -194,6 +262,7 @@ impl UiReadinessSnapshot {
         Self {
             microphone,
             whisper,
+            vosk,
             ollama,
         }
     }
@@ -212,6 +281,13 @@ impl UiReadinessSnapshot {
                 size_bytes: None,
                 language: settings.recognition.language.clone(),
                 message: "Checking Whisper model.".to_owned(),
+            },
+            vosk: UiVoskReadiness {
+                state: UiReadinessState::Checking,
+                kind: UiVoskReadinessKind::Checking,
+                runtime_path: store.resolve_asset_path(&settings.recognition.instant_runtime_path),
+                model_path: store.resolve_asset_path(&settings.recognition.instant_model_path),
+                message: "Checking Vosk Instant assets.".to_owned(),
             },
             ollama: UiOllamaReadiness {
                 state: UiReadinessState::Checking,
@@ -599,14 +675,53 @@ impl UiBridge {
         candidate
             .ensure_runtime_supported()
             .map_err(UiBridgeError::settings)?;
-        let resolved_model = self
-            .store
-            .resolve_model_path(&candidate.recognition.model_path);
-        if !resolved_model.is_file() {
-            return Err(UiBridgeError::validation(
-                "model_path",
-                "Select an existing Whisper model file.",
-            ));
+        match candidate.recognition.mode {
+            crate::settings::RecognitionMode::Accurate => {
+                let resolved_model = self
+                    .store
+                    .resolve_model_path(&candidate.recognition.model_path);
+                if !resolved_model.is_file() {
+                    return Err(UiBridgeError::validation(
+                        "model_path",
+                        "Select an existing Whisper model file.",
+                    ));
+                }
+            }
+            crate::settings::RecognitionMode::Instant => {
+                let runtime = self
+                    .store
+                    .resolve_asset_path(&candidate.recognition.instant_runtime_path);
+                let model = self
+                    .store
+                    .resolve_asset_path(&candidate.recognition.instant_model_path);
+                match phorminx_vosk::inspect(&runtime, &model, &candidate.recognition.language) {
+                    phorminx_vosk::Readiness::Ready { .. } => {}
+                    phorminx_vosk::Readiness::MissingRuntime { .. } => {
+                        return Err(UiBridgeError::validation(
+                            "instant_runtime_path",
+                            "Select a local Vosk runtime bundle containing libvosk.dll.",
+                        ));
+                    }
+                    phorminx_vosk::Readiness::MissingModel { .. } => {
+                        return Err(UiBridgeError::validation(
+                            "instant_model_path",
+                            "Select an unpacked local Vosk model directory.",
+                        ));
+                    }
+                    phorminx_vosk::Readiness::UnsupportedLanguage { .. } => {
+                        return Err(UiBridgeError::validation(
+                            "language",
+                            "Instant mode currently supports en and pt-br.",
+                        ));
+                    }
+                    phorminx_vosk::Readiness::LoadFailed { .. } => {
+                        return Err(UiBridgeError::validation(
+                            "instant_runtime_path",
+                            "The selected Vosk runtime could not be loaded.",
+                        ));
+                    }
+                }
+            }
         }
         if requires_ollama(candidate.formatting.strength) {
             let selected = candidate
@@ -964,6 +1079,13 @@ mod tests {
                 size_bytes: Some(5),
                 language: "en".to_owned(),
                 message: "Whisper model ready.".to_owned(),
+            },
+            vosk: UiVoskReadiness {
+                state: UiReadinessState::NeedsAttention,
+                kind: UiVoskReadinessKind::MissingRuntime,
+                runtime_path: store.resolve_asset_path(&settings.recognition.instant_runtime_path),
+                model_path: store.resolve_asset_path(&settings.recognition.instant_model_path),
+                message: "Vosk runtime bundle not found.".to_owned(),
             },
             ollama: UiOllamaReadiness {
                 state: UiReadinessState::Ready,
