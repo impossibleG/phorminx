@@ -2610,6 +2610,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "phorminx-session"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "phorminx-setup"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "phorminx-ui"
 version = "0.1.0"
 dependencies = [

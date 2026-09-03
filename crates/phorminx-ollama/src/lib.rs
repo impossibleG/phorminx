@@ -5,6 +5,7 @@
 //! behavior when cleanup cannot safely be completed.
 
 mod client;
+mod document;
 mod model;
 mod prompt;
 mod validation;
@@ -12,6 +13,9 @@ mod validation;
 pub use client::{
     CancellationToken, ClientError, ClientTimeouts, FallbackReason, FormatResult, KeepAlive,
     OllamaClient, OllamaEndpoint,
+};
+pub use document::{
+    DocumentChunk, DocumentChunkError, DocumentChunkPolicy, chunk_document, reconstruct_document,
 };
 pub use model::{
     ModelCatalog, ModelDetails, ModelName, ModelSelectionError, OllamaModel, SelectionPolicy,
