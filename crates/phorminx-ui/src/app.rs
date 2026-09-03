@@ -94,6 +94,14 @@ impl PhorminxUi {
         }
     }
 
+    /// Updates the live runtime seal without replacing collection snapshots.
+    ///
+    /// Dictation state changes are frequent and must not force the host to
+    /// re-read history, lexicon, or profile rows merely to repaint one label.
+    pub fn set_runtime_status(&mut self, status: crate::model::RuntimeStatus) {
+        self.snapshot.status = status;
+    }
+
     /// Moves keyboard focus into the destination route on the next paint.
     /// Hosts use this after tray/deep-link navigation so focus does not remain
     /// on the window chrome or on a control from the previous route.
@@ -428,6 +436,33 @@ mod tests {
                 .filter(|item| item.loaded.is_some())
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn runtime_status_updates_preserve_history_and_loaded_exact_text() {
+        let mut snapshot = ShellSnapshot::gallery(GalleryScenario::Populated);
+        snapshot.route = Route::History;
+        let mut app = PhorminxUi::new(snapshot);
+        let selected = app.snapshot().history[0].id;
+        app.select_history(selected);
+        assert!(app.set_history_detail(
+            selected,
+            HistoryVariant::Output,
+            "exact retained text".into()
+        ));
+        let before = app.snapshot().history.clone();
+
+        app.set_runtime_status(crate::model::RuntimeStatus::Listening);
+
+        assert_eq!(
+            app.snapshot().status,
+            crate::model::RuntimeStatus::Listening
+        );
+        assert_eq!(app.snapshot().history, before);
+        assert_eq!(
+            app.snapshot().history[0].text_for(HistoryVariant::Output),
+            Some("exact retained text")
         );
     }
 

@@ -680,10 +680,7 @@ impl eframe::App for ProductShellApp {
                 }
                 ProductShellControl::SetRuntimeStatus(status) => {
                     self.runtime_status = status;
-                    self.refresh();
-                    if self.route == UiRoute::History {
-                        self.ensure_history_detail();
-                    }
+                    self.shell.set_runtime_status(map_runtime_status(status));
                 }
                 ProductShellControl::Refresh => {
                     self.refresh();

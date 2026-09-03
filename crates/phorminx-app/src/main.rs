@@ -780,6 +780,7 @@ fn run() -> Result<()> {
                     let completed = *completed;
                     let is_current = runtime.pending_id() == Some(completed.id);
                     let mut processed_for_history = None;
+                    let mut history_changed = false;
                     let result = completed.result.map(|processed| {
                         if is_current {
                             if let Some(lifecycle) = processed.lifecycle {
@@ -841,23 +842,26 @@ fn run() -> Result<()> {
                                         .as_millis()
                                 );
                             }
-                            if let Err(error) = persist_transcript(
+                            match persist_transcript(
                                 &persistence,
                                 processed,
                                 insertion_started_at,
                                 insertion_completed_at,
                             ) {
-                                eprintln!(
-                                    "dictation_id={} state=Cleaning event=history_write_failed error={error}",
-                                    completed.id.0
-                                );
+                                Ok(inserted) => history_changed = inserted,
+                                Err(error) => {
+                                    eprintln!(
+                                        "dictation_id={} state=Cleaning event=history_write_failed error={error}",
+                                        completed.id.0
+                                    );
+                                }
                             }
                         } else {
                             record_terminal_failure(completed.id, outcome);
                         }
                     }
                     report_notices(notices);
-                    if let Some(shell) = product_shell.as_ref() {
+                    if history_changed && let Some(shell) = product_shell.as_ref() {
                         let _ = shell.send(ProductShellControl::Refresh);
                     }
                 }
@@ -5141,7 +5145,7 @@ fn persist_transcript(
     processed: &ProcessedTranscript,
     insertion_started_at: Instant,
     insertion_completed_at: Instant,
-) -> phorminx_persistence::Result<()> {
+) -> phorminx_persistence::Result<bool> {
     let lifecycle = processed.lifecycle;
     let draft = DictationDraft {
         created_at_ms: now_ms(),
@@ -5195,7 +5199,7 @@ fn persist_transcript(
     persistence
         .history()
         .insert_with_terminal_metadata(&draft, &processed.terminal)
-        .map(|_| ())
+        .map(|inserted| inserted.is_some())
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -6454,13 +6458,15 @@ mod composition_tests {
             worker_started_at: released_at + Duration::from_millis(19),
             worker_completed_at: released_at + Duration::from_millis(73),
         });
-        persist_transcript(
-            &persistence,
-            &processed,
-            released_at + Duration::from_millis(80),
-            released_at + Duration::from_millis(91),
-        )
-        .unwrap();
+        assert!(
+            persist_transcript(
+                &persistence,
+                &processed,
+                released_at + Duration::from_millis(80),
+                released_at + Duration::from_millis(91),
+            )
+            .unwrap()
+        );
         let record = persistence.history().recent(1).unwrap().remove(0);
         assert_eq!(
             record.dictation.timings.audio_finalization_duration_ms,
@@ -6478,6 +6484,38 @@ mod composition_tests {
         );
         drop(persistence);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn successful_clipboard_only_with_disabled_retention_never_claims_history_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = Persistence::open(directory.path().join("history.db")).unwrap();
+        persistence
+            .history()
+            .set_retention(RetentionPolicy::Disabled, now_ms())
+            .unwrap();
+        let now = Instant::now();
+        let processed = process_transcript(
+            transcript("private transient text"),
+            "en",
+            &WorkerFormatting {
+                profile: FormatProfile::Raw,
+                model: None,
+                keep_alive: KeepAlive::UnloadAfterRequest,
+            },
+            None,
+            &[],
+            None,
+            &CancellationToken::new(),
+        );
+        let outcome = terminal_outcome(&[RuntimeNotice::ClipboardReady {
+            id: DictationId(41),
+            reason: "clipboard-only",
+        }]);
+
+        assert!(outcome.is_success());
+        assert!(!persist_transcript(&persistence, &processed, now, now).unwrap());
+        assert_eq!(persistence.history().count().unwrap(), 0);
     }
 
     #[test]
