@@ -40,7 +40,7 @@ pub use asset_dialog::choose_zip_archive;
 #[cfg(windows)]
 pub use dialog::show_error_dialog;
 #[cfg(windows)]
-pub use file::{AtomicReplaceError, atomic_replace_file};
+pub use file::{AtomicReplaceError, atomic_activate_directory, atomic_replace_file};
 #[cfg(windows)]
 pub use history_window::{HistoryItem, HistoryWindow, HistoryWindowError, HistoryWindowEvent};
 #[cfg(windows)]
