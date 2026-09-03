@@ -27,6 +27,7 @@ const DEFAULT_SPOOL_RECORD: Duration = Duration::from_secs(1);
 const DEFAULT_PUMP_BATCH_FRAMES: usize = 8_192;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
+const FINALIZATION_TIMEOUT: Duration = Duration::from_secs(5);
 const RESAMPLER_CHUNK_FRAMES: usize = 1_024;
 const MAX_PUMP_BATCH_FRAMES: usize = 262_144;
 
@@ -49,6 +50,7 @@ pub struct ExtendedCaptureFactory {
     config: ExtendedCaptureConfig,
     bounds: CaptureBounds,
     spool_root: SpoolRoot,
+    finalizer_active: Arc<AtomicBool>,
 }
 
 impl ExtendedCaptureFactory {
@@ -64,6 +66,7 @@ impl ExtendedCaptureFactory {
             config,
             bounds,
             spool_root,
+            finalizer_active: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -76,7 +79,37 @@ impl ExtendedCaptureFactory {
             self.config.clone(),
             self.bounds,
             self.spool_root.clone(),
+            FinalizerPermit::acquire(&self.finalizer_active)?,
         )
+    }
+}
+
+struct FinalizerPermit {
+    active: Arc<AtomicBool>,
+    release_on_drop: bool,
+}
+
+impl FinalizerPermit {
+    fn acquire(active: &Arc<AtomicBool>) -> Result<Self, CaptureError> {
+        active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| CaptureError::Extended(ExtendedCaptureFault::FinalizerBusy))?;
+        Ok(Self {
+            active: Arc::clone(active),
+            release_on_drop: true,
+        })
+    }
+
+    fn block(mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for FinalizerPermit {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.active.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -183,8 +216,12 @@ pub enum ExtendedCaptureFault {
     SampleAccountingOverflow,
     #[error("the requested audio snapshot is invalid or exceeds its configured bound")]
     InvalidSnapshot,
-    #[error("the microphone backend failed before producing audio")]
+    #[error("the microphone backend failed during capture")]
     StreamFailed,
+    #[error("a prior audio finalizer is still stalled")]
+    FinalizerBusy,
+    #[error("audio finalization exceeded its bounded deadline")]
+    FinalizationTimeout,
 }
 
 impl ExtendedCaptureFault {
@@ -201,6 +238,8 @@ impl ExtendedCaptureFault {
             Self::SampleAccountingOverflow => 9,
             Self::InvalidSnapshot => 10,
             Self::StreamFailed => 11,
+            Self::FinalizerBusy => 12,
+            Self::FinalizationTimeout => 13,
         }
     }
 
@@ -217,6 +256,8 @@ impl ExtendedCaptureFault {
             9 => Some(Self::SampleAccountingOverflow),
             10 => Some(Self::InvalidSnapshot),
             11 => Some(Self::StreamFailed),
+            12 => Some(Self::FinalizerBusy),
+            13 => Some(Self::FinalizationTimeout),
             _ => None,
         }
     }
@@ -291,9 +332,11 @@ pub struct ExtendedRecording {
     stream: Option<cpal::Stream>,
     stop: Arc<AtomicBool>,
     commands: SyncSender<PumpCommand>,
-    worker: Option<JoinHandle<Result<EngineFinalized<FileStorage>, ExtendedCaptureFault>>>,
+    worker: Option<JoinHandle<()>>,
+    finalized: Option<Receiver<Result<FinalizedCapture, ExtendedCaptureFault>>>,
     progress: Arc<SharedProgress>,
     streaming_cursor: u64,
+    auto_stopped: bool,
 }
 
 impl ExtendedRecording {
@@ -307,6 +350,14 @@ impl ExtendedRecording {
 
     pub fn progress(&self) -> ExtendedCaptureProgress {
         self.progress.snapshot()
+    }
+
+    pub fn mark_auto_stopped(&mut self) {
+        self.auto_stopped = true;
+    }
+
+    pub const fn was_auto_stopped(&self) -> bool {
+        self.auto_stopped
     }
 
     /// Copies the most recent bounded canonical window for silence detection.
@@ -397,11 +448,10 @@ impl ExtendedRecording {
     }
 
     pub fn finalize(mut self) -> Result<ExtendedCapturedAudio, CaptureError> {
-        self.stop_and_join().map(ExtendedCapturedAudio::from)
+        self.stop_and_resolve().map(ExtendedCapturedAudio::from)
     }
 
-    /// Stops the device immediately and transfers potentially blocking spool
-    /// finalization to the caller's worker thread.
+    /// Stops the device immediately and waits for bounded spool finalization.
     pub fn defer_finalize(mut self) -> Result<DeferredCapturedAudio, CaptureError> {
         self.stream.take();
         self.stop.store(true, Ordering::Release);
@@ -410,38 +460,58 @@ impl ExtendedRecording {
         ))?;
         Ok(DeferredCapturedAudio {
             worker: Some(worker),
+            finalized: self.finalized.take(),
         })
     }
 
-    fn stop_and_join(&mut self) -> Result<EngineFinalized<FileStorage>, CaptureError> {
+    fn stop_and_resolve(&mut self) -> Result<FinalizedCapture, CaptureError> {
         self.stream.take();
         self.stop.store(true, Ordering::Release);
-        let worker = self.worker.take().ok_or(CaptureError::Extended(
+        let _worker = self.worker.take().ok_or(CaptureError::Extended(
             ExtendedCaptureFault::WorkerUnavailable,
         ))?;
-        worker
-            .join()
-            .map_err(|_| CaptureError::Extended(ExtendedCaptureFault::WorkerPanicked))?
-            .map_err(CaptureError::Extended)
+        receive_finalized(&mut self.finalized, FINALIZATION_TIMEOUT)
     }
 }
 
 /// A stopped recording whose disk flush/join has deliberately been moved off
 /// the latency-sensitive app thread.
 pub struct DeferredCapturedAudio {
-    worker: Option<JoinHandle<Result<EngineFinalized<FileStorage>, ExtendedCaptureFault>>>,
+    worker: Option<JoinHandle<()>>,
+    finalized: Option<Receiver<Result<FinalizedCapture, ExtendedCaptureFault>>>,
 }
 
 impl DeferredCapturedAudio {
     pub fn resolve(mut self) -> Result<ExtendedCapturedAudio, CaptureError> {
-        let worker = self.worker.take().ok_or(CaptureError::Extended(
+        self.resolve_with_timeout(FINALIZATION_TIMEOUT)
+    }
+
+    fn resolve_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ExtendedCapturedAudio, CaptureError> {
+        let _worker = self.worker.take().ok_or(CaptureError::Extended(
             ExtendedCaptureFault::WorkerUnavailable,
         ))?;
-        worker
-            .join()
-            .map_err(|_| CaptureError::Extended(ExtendedCaptureFault::WorkerPanicked))?
-            .map(ExtendedCapturedAudio::from)
-            .map_err(CaptureError::Extended)
+        receive_finalized(&mut self.finalized, timeout).map(ExtendedCapturedAudio::from)
+    }
+}
+
+fn receive_finalized(
+    finalized: &mut Option<Receiver<Result<FinalizedCapture, ExtendedCaptureFault>>>,
+    timeout: Duration,
+) -> Result<FinalizedCapture, CaptureError> {
+    let receiver = finalized.take().ok_or(CaptureError::Extended(
+        ExtendedCaptureFault::WorkerUnavailable,
+    ))?;
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result.map_err(CaptureError::Extended),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(CaptureError::Extended(
+            ExtendedCaptureFault::FinalizationTimeout,
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(CaptureError::Extended(ExtendedCaptureFault::WorkerPanicked))
+        }
     }
 }
 
@@ -459,50 +529,160 @@ impl Drop for ExtendedRecording {
 }
 
 pub struct ExtendedCapturedAudio {
-    inner: EngineFinalized<FileStorage>,
+    inner: Option<EngineFinalized<FileStorage>>,
+    finalizer_permit: Option<FinalizerPermit>,
 }
 
-impl From<EngineFinalized<FileStorage>> for ExtendedCapturedAudio {
-    fn from(inner: EngineFinalized<FileStorage>) -> Self {
-        Self { inner }
+struct FinalizedCapture {
+    inner: Option<EngineFinalized<FileStorage>>,
+    finalizer_permit: Option<FinalizerPermit>,
+}
+
+impl From<FinalizedCapture> for ExtendedCapturedAudio {
+    fn from(mut finalized: FinalizedCapture) -> Self {
+        Self {
+            inner: finalized.inner.take(),
+            finalizer_permit: finalized.finalizer_permit.take(),
+        }
+    }
+}
+
+impl Drop for FinalizedCapture {
+    fn drop(&mut self) {
+        if let (Some(inner), Some(permit)) = (self.inner.take(), self.finalizer_permit.take()) {
+            spawn_abandoned_cleanup(inner, permit);
+        }
     }
 }
 
 impl ExtendedCapturedAudio {
     pub const fn total_samples(&self) -> u64 {
-        self.inner.total_samples
+        self.inner
+            .as_ref()
+            .expect("captured audio owns finalized storage")
+            .total_samples
     }
 
     pub const fn backend_warning_count(&self) -> u64 {
-        self.inner.backend_warning_count
+        self.inner
+            .as_ref()
+            .expect("captured audio owns finalized storage")
+            .backend_warning_count
     }
 
     pub const fn is_extended(&self) -> bool {
-        matches!(self.inner.storage, FinalizedStorage::Spool(_))
+        matches!(
+            self.inner
+                .as_ref()
+                .expect("captured audio owns finalized storage")
+                .storage,
+            FinalizedStorage::Spool(_)
+        )
     }
 
     pub fn snapshot(&mut self, range: SampleRange) -> Result<AudioSpan, CaptureError> {
-        self.inner.snapshot(range).map_err(CaptureError::Extended)
+        self.inner
+            .as_mut()
+            .expect("captured audio owns finalized storage")
+            .snapshot(range)
+            .map_err(CaptureError::Extended)
     }
 
     /// Converts only a behavior-compatible short capture into the existing `AudioClip` type.
-    pub fn into_short_clip(self) -> Result<AudioClip, CaptureError> {
-        match self.inner.storage {
+    pub fn into_short_clip(mut self) -> Result<AudioClip, CaptureError> {
+        let inner = self
+            .inner
+            .take()
+            .expect("captured audio owns finalized storage");
+        let finalizer_permit = self
+            .finalizer_permit
+            .take()
+            .expect("captured audio owns a finalizer permit");
+        match inner.storage {
             FinalizedStorage::Memory(mut samples) => {
                 let samples = std::mem::take(&mut *samples);
+                drop(finalizer_permit);
                 AudioClip::new(samples, WHISPER_SAMPLE_RATE).map_err(CaptureError::Audio)
             }
-            FinalizedStorage::Spool(_) => Err(CaptureError::ExtendedCaptureRequiresSnapshots),
+            FinalizedStorage::Spool(_) => {
+                finalizer_permit.block();
+                Err(CaptureError::ExtendedCaptureRequiresSnapshots)
+            }
         }
     }
 
     pub fn cleanup(self) -> Result<(), CaptureError> {
-        match self.inner.storage {
-            FinalizedStorage::Memory(_) => Ok(()),
-            FinalizedStorage::Spool(spool) => spool
-                .cleanup()
-                .map_err(map_spool_error)
-                .map_err(CaptureError::Extended),
+        self.cleanup_with_timeout(FINALIZATION_TIMEOUT)
+    }
+
+    fn cleanup_with_timeout(mut self, timeout: Duration) -> Result<(), CaptureError> {
+        let inner = self
+            .inner
+            .take()
+            .expect("captured audio owns finalized storage");
+        let finalizer_permit = self
+            .finalizer_permit
+            .take()
+            .expect("captured audio owns a finalizer permit");
+        run_cleanup_with_timeout(move || cleanup_finalized(inner), finalizer_permit, timeout)
+    }
+}
+
+impl Drop for ExtendedCapturedAudio {
+    fn drop(&mut self) {
+        if let (Some(inner), Some(permit)) = (self.inner.take(), self.finalizer_permit.take()) {
+            spawn_abandoned_cleanup(inner, permit);
+        }
+    }
+}
+
+fn cleanup_finalized(inner: EngineFinalized<FileStorage>) -> Result<(), CaptureError> {
+    match inner.storage {
+        FinalizedStorage::Memory(_) => Ok(()),
+        FinalizedStorage::Spool(spool) => spool
+            .cleanup()
+            .map_err(map_spool_error)
+            .map_err(CaptureError::Extended),
+    }
+}
+
+fn spawn_abandoned_cleanup(inner: EngineFinalized<FileStorage>, finalizer_permit: FinalizerPermit) {
+    let _ = thread::Builder::new()
+        .name("phorminx-audio-abandoned-cleanup".to_owned())
+        .spawn(move || {
+            if cleanup_finalized(inner).is_ok() {
+                drop(finalizer_permit);
+            } else {
+                finalizer_permit.block();
+            }
+        });
+}
+
+fn run_cleanup_with_timeout(
+    cleanup: impl FnOnce() -> Result<(), CaptureError> + Send + 'static,
+    finalizer_permit: FinalizerPermit,
+    timeout: Duration,
+) -> Result<(), CaptureError> {
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("phorminx-audio-cleanup".to_owned())
+        .spawn(move || {
+            let result = cleanup();
+            if result.is_ok() {
+                drop(finalizer_permit);
+            } else {
+                finalizer_permit.block();
+            }
+            let _ = result_tx.try_send(result);
+        })
+        .map_err(|_| CaptureError::Extended(ExtendedCaptureFault::WorkerUnavailable))?;
+    match result_rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(CaptureError::Extended(
+            ExtendedCaptureFault::FinalizationTimeout,
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(CaptureError::Extended(ExtendedCaptureFault::WorkerPanicked))
         }
     }
 }
@@ -525,6 +705,7 @@ fn start_extended_prepared(
     config: ExtendedCaptureConfig,
     bounds: CaptureBounds,
     spool_root: SpoolRoot,
+    finalizer_permit: FinalizerPermit,
 ) -> Result<ExtendedRecording, CaptureError> {
     let host = cpal::default_host();
     let device = match device_name {
@@ -567,10 +748,11 @@ fn start_extended_prepared(
     let worker_progress = Arc::clone(&progress);
     let worker_stop = Arc::clone(&stop);
     let (pump_ready_tx, pump_ready_rx) = mpsc::sync_channel(1);
+    let (finalized_tx, finalized_rx) = mpsc::sync_channel(1);
     let worker = thread::Builder::new()
         .name("phorminx-audio-pump".to_owned())
         .spawn(move || {
-            run_pump(
+            let result = run_pump(
                 consumer,
                 source_rate,
                 config,
@@ -582,7 +764,19 @@ fn start_extended_prepared(
                     progress: worker_progress,
                 },
                 Some(pump_ready_tx),
-            )
+            );
+            match result {
+                Ok(inner) => {
+                    let _ = finalized_tx.try_send(Ok(FinalizedCapture {
+                        inner: Some(inner),
+                        finalizer_permit: Some(finalizer_permit),
+                    }));
+                }
+                Err(fault) => {
+                    finalizer_permit.block();
+                    let _ = finalized_tx.try_send(Err(fault));
+                }
+            }
         })
         .map_err(CaptureError::PumpSpawn)?;
 
@@ -612,8 +806,10 @@ fn start_extended_prepared(
         stop,
         commands,
         worker: Some(worker),
+        finalized: Some(finalized_rx),
         progress,
         streaming_cursor: 0,
+        auto_stopped: false,
     })
 }
 
@@ -749,14 +945,9 @@ fn run_pump(
         .try_reserve_exact(config.pump_batch_frames)
         .map_err(|_| ExtendedCaptureFault::InvalidConfiguration)?;
     batch.resize(config.pump_batch_frames, 0.0);
-    let mut saw_drop = false;
-
     loop {
         let count = consumer.pop_slice(&mut batch);
-        if progress.dropped_frames.load(Ordering::Acquire) != 0 && !saw_drop {
-            saw_drop = true;
-            engine.set_fault(ExtendedCaptureFault::CallbackOverflow);
-        }
+        propagate_shared_fault(&mut engine, &progress);
         if count != 0
             && engine.fault.is_none()
             && let Err(fault) = engine.ingest_native(&batch[..count])
@@ -790,7 +981,18 @@ fn run_pump(
             thread::sleep(config.pump_poll_interval);
         }
     }
+    propagate_shared_fault(&mut engine, &progress);
     engine.finalize(progress.backend_warnings.load(Ordering::Acquire))
+}
+
+fn propagate_shared_fault<S, C>(engine: &mut CaptureEngine<S, C>, progress: &SharedProgress)
+where
+    S: SpoolStorage,
+    C: FnMut() -> Result<EncryptedAudioSpool<S>, SpoolError>,
+{
+    if let Some(fault) = ExtendedCaptureFault::from_code(progress.fault.load(Ordering::Acquire)) {
+        engine.set_fault(fault);
+    }
 }
 
 enum FinalizedStorage<S: SpoolStorage> {
@@ -955,11 +1157,14 @@ where
         self.store_canonical(&tail)?;
         self.ensure_healthy()?;
 
-        if self.canonical_samples == 0 && backend_warning_count != 0 {
+        if backend_warning_count != 0 {
             return Err(self.set_fault(ExtendedCaptureFault::StreamFailed));
         }
 
         if self.canonical_samples <= self.bounds.short_limit {
+            if let Some(spool) = self.spool.take() {
+                spool.cleanup().map_err(map_spool_error)?;
+            }
             return Ok(EngineFinalized {
                 storage: FinalizedStorage::Memory(self.memory),
                 total_samples: self.canonical_samples,
@@ -1363,6 +1568,8 @@ mod tests {
         cleaned: bool,
         write_limit: Option<usize>,
         write_chunk: Option<usize>,
+        cleanup_failures_remaining: usize,
+        cleanup_attempts: usize,
     }
 
     #[derive(Clone, Default)]
@@ -1454,9 +1661,20 @@ mod tests {
 
         fn cleanup(&mut self) -> io::Result<()> {
             let mut state = self.0.0.lock().unwrap();
+            state.cleanup_attempts += 1;
+            if state.cleanup_failures_remaining != 0 {
+                state.cleanup_failures_remaining -= 1;
+                return Err(io::Error::other("injected cleanup failure"));
+            }
             state.bytes.clear();
             state.cleaned = true;
             Ok(())
+        }
+    }
+
+    impl Drop for MemoryStorage {
+        fn drop(&mut self) {
+            let _ = SpoolStorage::cleanup(self);
         }
     }
 
@@ -1888,14 +2106,121 @@ mod tests {
     }
 
     #[test]
-    fn short_finalize_drops_prepared_spool_and_returns_memory_clip() {
+    fn backend_error_fails_closed_and_drops_prepared_spool() {
         let (mut engine, handles) = test_engine(WHISPER_SAMPLE_RATE, 2.0, SpoolQuota::default());
         feed_zeros(&mut engine, u64::from(WHISPER_SAMPLE_RATE) * 3 / 2, 4_000);
         assert!(engine.spool.is_some());
-        let captured = engine.finalize(4).unwrap();
-        assert!(matches!(captured.storage, FinalizedStorage::Memory(_)));
-        assert_eq!(captured.backend_warning_count, 4);
+        assert!(matches!(
+            engine.finalize(1),
+            Err(ExtendedCaptureFault::StreamFailed)
+        ));
         assert!(handles.lock().unwrap()[0].0.lock().unwrap().cleaned);
+    }
+
+    #[test]
+    fn backend_fault_published_at_stop_is_imported_before_finalization() {
+        let progress = SharedProgress::new();
+        let (mut engine, _) = test_engine(WHISPER_SAMPLE_RATE, 120.0, SpoolQuota::default());
+        feed_zeros(&mut engine, u64::from(WHISPER_SAMPLE_RATE), 4_000);
+
+        // Models the callback publishing a device failure after the app's last
+        // progress snapshot but before the stopped pump returns its result.
+        progress.set_fault(ExtendedCaptureFault::StreamFailed);
+        propagate_shared_fault(&mut engine, &progress);
+
+        assert!(matches!(
+            engine.finalize(1),
+            Err(ExtendedCaptureFault::StreamFailed)
+        ));
+    }
+
+    #[test]
+    fn explicit_extended_cleanup_surfaces_storage_failure() {
+        let handles = Arc::new(Mutex::new(Vec::new()));
+        let captured_handles = Arc::clone(&handles);
+        let creator = move || {
+            let (storage, handle) = MemoryStorage::new();
+            captured_handles.lock().unwrap().push(handle);
+            EncryptedAudioSpool::from_empty_storage(storage, SpoolQuota::default())
+        };
+        let mut engine =
+            CaptureEngine::new(WHISPER_SAMPLE_RATE, test_bounds(2.0), creator, None).unwrap();
+        feed_zeros(
+            &mut engine,
+            u64::from(WHISPER_SAMPLE_RATE) * 3,
+            WHISPER_SAMPLE_RATE as usize,
+        );
+        handles.lock().unwrap()[0]
+            .0
+            .lock()
+            .unwrap()
+            .cleanup_failures_remaining = usize::MAX;
+        let captured = engine.finalize(0).unwrap();
+        let FinalizedStorage::Spool(spool) = captured.storage else {
+            panic!("extended capture must own a spool");
+        };
+        assert!(matches!(spool.cleanup(), Err(SpoolError::Io(_))));
+        assert!(!handles.lock().unwrap()[0].0.lock().unwrap().cleaned);
+    }
+
+    #[test]
+    fn prepared_spool_cleanup_failure_prevents_short_success() {
+        let handles = Arc::new(Mutex::new(Vec::new()));
+        let captured_handles = Arc::clone(&handles);
+        let creator = move || {
+            let (storage, handle) = MemoryStorage::new();
+            captured_handles.lock().unwrap().push(handle);
+            EncryptedAudioSpool::from_empty_storage(storage, SpoolQuota::default())
+        };
+        let mut engine =
+            CaptureEngine::new(WHISPER_SAMPLE_RATE, test_bounds(2.0), creator, None).unwrap();
+        feed_zeros(&mut engine, u64::from(WHISPER_SAMPLE_RATE) * 3 / 2, 4_000);
+        handles.lock().unwrap()[0]
+            .0
+            .lock()
+            .unwrap()
+            .cleanup_failures_remaining = usize::MAX;
+        assert!(matches!(
+            engine.finalize(0),
+            Err(ExtendedCaptureFault::SpoolIo)
+        ));
+    }
+
+    #[test]
+    fn transient_cleanup_failure_is_retried_but_still_fails_closed() {
+        let handles = Arc::new(Mutex::new(Vec::new()));
+        let captured_handles = Arc::clone(&handles);
+        let creator = move || {
+            let (storage, handle) = MemoryStorage::new();
+            captured_handles.lock().unwrap().push(handle);
+            EncryptedAudioSpool::from_empty_storage(storage, SpoolQuota::default())
+        };
+        let mut engine =
+            CaptureEngine::new(WHISPER_SAMPLE_RATE, test_bounds(2.0), creator, None).unwrap();
+        feed_zeros(&mut engine, u64::from(WHISPER_SAMPLE_RATE) * 3 / 2, 4_000);
+        let handle = handles.lock().unwrap()[0].clone();
+        handle.0.lock().unwrap().cleanup_failures_remaining = 1;
+
+        assert!(matches!(
+            engine.finalize(0),
+            Err(ExtendedCaptureFault::SpoolIo)
+        ));
+        let state = handle.0.lock().unwrap();
+        assert!(state.cleaned, "drop must retry a transient cleanup failure");
+        assert!(state.cleanup_attempts >= 2);
+    }
+
+    #[test]
+    fn cancellation_retries_transient_cleanup_without_reporting_success() {
+        let (mut engine, handles) = test_engine(WHISPER_SAMPLE_RATE, 2.0, SpoolQuota::default());
+        feed_zeros(&mut engine, u64::from(WHISPER_SAMPLE_RATE) * 3 / 2, 4_000);
+        let handle = handles.lock().unwrap()[0].clone();
+        handle.0.lock().unwrap().cleanup_failures_remaining = 1;
+        drop(engine);
+
+        let state = handle.0.lock().unwrap();
+        assert!(state.cleaned);
+        assert!(state.cleanup_attempts >= 2);
     }
 
     #[test]
@@ -1914,17 +2239,20 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(SharedProgress::new());
         let (commands, _requests) = mpsc::sync_channel(1);
-        let worker = thread::spawn(|| {
+        let (finalized_tx, finalized_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
             thread::sleep(Duration::from_millis(150));
-            Err(ExtendedCaptureFault::SpoolIo)
+            let _ = finalized_tx.try_send(Err(ExtendedCaptureFault::SpoolIo));
         });
         let recording = ExtendedRecording {
             stream: None,
             stop: Arc::clone(&stop),
             commands,
             worker: Some(worker),
+            finalized: Some(finalized_rx),
             progress,
             streaming_cursor: 0,
+            auto_stopped: false,
         };
         let started = std::time::Instant::now();
         drop(recording);
@@ -1961,16 +2289,96 @@ mod tests {
 
     #[test]
     fn deferred_finalization_drop_never_waits_for_storage_worker() {
-        let worker: JoinHandle<Result<EngineFinalized<FileStorage>, ExtendedCaptureFault>> =
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(150));
-                Err(ExtendedCaptureFault::SpoolIo)
-            });
+        let (finalized_tx, finalized_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            let _ = finalized_tx.try_send(Err(ExtendedCaptureFault::SpoolIo));
+        });
         let deferred = DeferredCapturedAudio {
             worker: Some(worker),
+            finalized: Some(finalized_rx),
         };
         let started = std::time::Instant::now();
         drop(deferred);
         assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn deferred_finalization_has_a_finite_deadline() {
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (finalized_tx, finalized_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _ = release_rx.recv();
+            let _ = finalized_tx.try_send(Err(ExtendedCaptureFault::SpoolIo));
+        });
+        let mut deferred = DeferredCapturedAudio {
+            worker: Some(worker),
+            finalized: Some(finalized_rx),
+        };
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            deferred.resolve_with_timeout(Duration::from_millis(20)),
+            Err(CaptureError::Extended(
+                ExtendedCaptureFault::FinalizationTimeout
+            ))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn one_stalled_finalizer_blocks_repeated_worker_creation_until_release() {
+        let active = Arc::new(AtomicBool::new(false));
+        let permit = FinalizerPermit::acquire(&active).unwrap();
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _permit = permit;
+            let _ = release_rx.recv();
+        });
+        for _ in 0..100 {
+            assert!(matches!(
+                FinalizerPermit::acquire(&active),
+                Err(CaptureError::Extended(ExtendedCaptureFault::FinalizerBusy))
+            ));
+        }
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let replacement = FinalizerPermit::acquire(&active).unwrap();
+        assert!(active.load(Ordering::Acquire));
+        drop(replacement);
+        assert!(!active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cleanup_timeout_detaches_one_owner_and_holds_the_global_permit() {
+        let active = Arc::new(AtomicBool::new(false));
+        let permit = FinalizerPermit::acquire(&active).unwrap();
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            run_cleanup_with_timeout(
+                move || {
+                    let _ = release_rx.recv();
+                    Ok(())
+                },
+                permit,
+                Duration::from_millis(20),
+            ),
+            Err(CaptureError::Extended(
+                ExtendedCaptureFault::FinalizationTimeout
+            ))
+        ));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(active.load(Ordering::Acquire));
+        assert!(matches!(
+            FinalizerPermit::acquire(&active),
+            Err(CaptureError::Extended(ExtendedCaptureFault::FinalizerBusy))
+        ));
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while active.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!active.load(Ordering::Acquire));
     }
 }

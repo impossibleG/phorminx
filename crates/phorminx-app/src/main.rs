@@ -28,8 +28,8 @@ use phorminx_app::settings::{
 };
 use phorminx_app::ui_bridge::{UiMutation, UiRoute, UiRuntimeStatus, UiVoskProbe};
 use phorminx_audio::{
-    DeferredCapturedAudio, ExtendedCaptureConfig, ExtendedCaptureFactory, ExtendedCapturedAudio,
-    ExtendedRecording, input_devices,
+    DeferredCapturedAudio, ExtendedCaptureConfig, ExtendedCaptureFactory, ExtendedCaptureFault,
+    ExtendedCapturedAudio, ExtendedRecording, ExtendedStorageKind, input_devices,
 };
 #[cfg(test)]
 use phorminx_core::recommended_audio_context;
@@ -653,6 +653,16 @@ fn run() -> Result<()> {
                 break Err(anyhow!("the global hotkey thread stopped unexpectedly"));
             }
         }
+
+        auto_stop_failed_capture(
+            &mut runtime,
+            &overlay,
+            &tray,
+            &worker,
+            effective_microphone.as_deref(),
+            &dictation_context,
+            &capture,
+        )?;
 
         match settings.recognition.mode {
             RecognitionMode::Accurate => poll_incremental_transcription(
@@ -2188,6 +2198,7 @@ struct FinalAudioStats {
     total_samples: u64,
     peak_retained_samples: u64,
     rms: f32,
+    auto_stopped: bool,
 }
 
 enum FinalAudioSource {
@@ -2238,6 +2249,29 @@ impl FinalAudioSource {
             | Self::Short { stats, .. }
             | Self::Extended { stats, .. } => *stats,
         }
+    }
+
+    fn cleanup(self) -> Result<(), String> {
+        match self {
+            Self::Pending { .. } => Err("final audio did not resolve before cleanup".to_owned()),
+            Self::Short { .. } => Ok(()),
+            Self::Extended { audio, .. } => audio.cleanup().map_err(|error| error.to_string()),
+        }
+    }
+}
+
+fn require_audio_cleanup<T>(
+    recognition: Result<T, String>,
+    cleanup: Result<(), String>,
+) -> Result<T, String> {
+    match cleanup {
+        Ok(()) => recognition,
+        Err(cleanup_error) => Err(match recognition {
+            Ok(_) => format!("encrypted audio scratch cleanup failed: {cleanup_error}"),
+            Err(recognition_error) => format!(
+                "transcription failed ({recognition_error}); encrypted audio scratch cleanup also failed ({cleanup_error})"
+            ),
+        }),
     }
 }
 
@@ -2292,11 +2326,20 @@ impl AppIo for ProductionIo<'_> {
         recording: Self::Recording,
     ) -> Result<FinishedAudio<FinalAudioSource>, String> {
         let progress = recording.progress();
+        let auto_stopped = recording.was_auto_stopped();
         if let Some(fault) = progress.sticky_fault {
+            // Still drive the stopped pump through its bounded finalization
+            // owner. This confirms or quarantines scratch cleanup instead of
+            // abandoning the session at the first observed backend fault.
+            if let Ok(captured) = recording.finalize() {
+                captured.cleanup().map_err(|error| {
+                    format!("{fault}; encrypted audio scratch cleanup also failed ({error})")
+                })?;
+            }
             return Err(fault.to_string());
         }
         let duration = progress.duration();
-        if progress.canonical_samples <= 16_000 * 120 {
+        if progress.storage == ExtendedStorageKind::Memory {
             let captured = recording.finalize().map_err(|error| error.to_string())?;
             let backend_warning_count = captured.backend_warning_count();
             let clip = captured
@@ -2310,6 +2353,7 @@ impl AppIo for ProductionIo<'_> {
                         total_samples: clip.samples.len() as u64,
                         peak_retained_samples: progress.peak_resident_samples,
                         rms,
+                        auto_stopped,
                     },
                     clip,
                 },
@@ -2334,6 +2378,7 @@ impl AppIo for ProductionIo<'_> {
                 total_samples: progress.canonical_samples,
                 peak_retained_samples: progress.peak_resident_samples,
                 rms,
+                auto_stopped,
             },
         };
         Ok(FinishedAudio {
@@ -2405,6 +2450,98 @@ impl AppIo for ProductionIo<'_> {
             .map_err(|error| error.to_string());
         overlay_result.and(tray_result)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoStopReason {
+    CaptureOverflow,
+    DeviceLoss,
+    Resampling,
+    ScratchQuota,
+    ScratchIntegrity,
+    ScratchIo,
+    CaptureWorker,
+    SampleAccounting,
+}
+
+impl AutoStopReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::CaptureOverflow => "capture_overflow",
+            Self::DeviceLoss => "device_loss",
+            Self::Resampling => "resampling",
+            Self::ScratchQuota => "scratch_quota",
+            Self::ScratchIntegrity => "scratch_integrity",
+            Self::ScratchIo => "scratch_io",
+            Self::CaptureWorker => "capture_worker",
+            Self::SampleAccounting => "sample_accounting",
+        }
+    }
+}
+
+fn auto_stop_reason(fault: ExtendedCaptureFault) -> Option<AutoStopReason> {
+    match fault {
+        ExtendedCaptureFault::CallbackOverflow => Some(AutoStopReason::CaptureOverflow),
+        ExtendedCaptureFault::StreamFailed => Some(AutoStopReason::DeviceLoss),
+        ExtendedCaptureFault::Resampling => Some(AutoStopReason::Resampling),
+        ExtendedCaptureFault::SpoolQuota => Some(AutoStopReason::ScratchQuota),
+        ExtendedCaptureFault::SpoolIntegrity => Some(AutoStopReason::ScratchIntegrity),
+        ExtendedCaptureFault::SpoolIo => Some(AutoStopReason::ScratchIo),
+        ExtendedCaptureFault::WorkerUnavailable
+        | ExtendedCaptureFault::WorkerPanicked
+        | ExtendedCaptureFault::FinalizationTimeout => Some(AutoStopReason::CaptureWorker),
+        ExtendedCaptureFault::SampleAccountingOverflow => Some(AutoStopReason::SampleAccounting),
+        ExtendedCaptureFault::InvalidConfiguration
+        | ExtendedCaptureFault::InvalidSnapshot
+        | ExtendedCaptureFault::FinalizerBusy => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn auto_stop_failed_capture(
+    runtime: &mut AppRuntime<TargetSnapshot, ExtendedRecording>,
+    overlay: &StatusOverlay,
+    tray: &SystemTray,
+    worker: &TranscriptionWorker,
+    microphone: Option<&str>,
+    context: &DictationContext,
+    capture: &ExtendedCaptureFactory,
+) -> Result<()> {
+    if runtime.state() != RuntimeState::Listening {
+        return Ok(());
+    }
+    let Some((id, reason)) = runtime.active_id().zip(
+        runtime
+            .active_recording()
+            .and_then(|recording| recording.progress().sticky_fault)
+            .and_then(auto_stop_reason),
+    ) else {
+        return Ok(());
+    };
+    if let Some(recording) = runtime.active_recording_mut() {
+        recording.mark_auto_stopped();
+    }
+    let stopped_at = Instant::now();
+    eprintln!(
+        "uptime_ms={} dictation_id={} state=FinalizingAudio event=automatic_safe_stop auto_stopped=true reason={}",
+        monotonic_uptime_ms(),
+        id.0,
+        reason.label()
+    );
+    let notices = {
+        let mut io = ProductionIo {
+            overlay,
+            tray,
+            worker,
+            microphone,
+            context,
+            capture,
+            released_at: Some(stopped_at),
+        };
+        runtime.hold_ended_at(stopped_at, &mut io)?
+    };
+    report_notices(notices);
+    Ok(())
 }
 
 fn poll_incremental_transcription(
@@ -3121,20 +3258,24 @@ impl TranscriptionWorker {
                                 }
                                 _ => 0,
                             };
-                            let recognition = (*audio).resolve().and_then(|mut audio| match (&recognizer, &mut audio) {
-                                (LoadedRecognizer::Accurate(recognizer), FinalAudioSource::Short { clip, .. }) => transcribe_final(
-                                    recognizer, incremental, clip, &language, audio_context, id,
-                                ),
-                                (LoadedRecognizer::Accurate(recognizer), FinalAudioSource::Extended { audio, stats }) => transcribe_extended_accurate(
-                                    recognizer, incremental, audio, *stats, &language, id,
-                                ),
-                                (LoadedRecognizer::Instant(model), FinalAudioSource::Short { clip, .. }) => transcribe_instant_final(
-                                    model, instant, clip, id,
-                                ).map_err(|error| error.to_string()),
-                                (LoadedRecognizer::Instant(model), FinalAudioSource::Extended { audio, stats }) => transcribe_extended_instant(
-                                    model, instant, audio, *stats, id,
-                                ).map_err(|error| error.to_string()),
-                                (_, FinalAudioSource::Pending { .. }) => Err("final audio did not resolve".to_owned()),
+                            let recognition = (*audio).resolve().and_then(|mut audio| {
+                                let recognition = match (&recognizer, &mut audio) {
+                                    (LoadedRecognizer::Accurate(recognizer), FinalAudioSource::Short { clip, .. }) => transcribe_final(
+                                        recognizer, incremental, clip, &language, audio_context, id,
+                                    ),
+                                    (LoadedRecognizer::Accurate(recognizer), FinalAudioSource::Extended { audio, stats }) => transcribe_extended_accurate(
+                                        recognizer, incremental, audio, *stats, &language, id,
+                                    ),
+                                    (LoadedRecognizer::Instant(model), FinalAudioSource::Short { clip, .. }) => transcribe_instant_final(
+                                        model, instant, clip, id,
+                                    ).map_err(|error| error.to_string()),
+                                    (LoadedRecognizer::Instant(model), FinalAudioSource::Extended { audio, stats }) => transcribe_extended_instant(
+                                        model, instant, audio, *stats, id,
+                                    ).map_err(|error| error.to_string()),
+                                    (_, FinalAudioSource::Pending { .. }) => Err("final audio did not resolve".to_owned()),
+                                };
+                                let cleanup = audio.cleanup();
+                                require_audio_cleanup(recognition, cleanup)
                             });
                             let result = match recognition {
                                 Ok(transcript) => {
@@ -3198,7 +3339,7 @@ impl TranscriptionWorker {
                                     processed.terminal.peak_retained_audio_ms = Some(
                                         stats.peak_retained_samples.saturating_mul(1_000) / 16_000,
                                     );
-                                    processed.terminal.auto_stopped = Some(false);
+                                    processed.terminal.auto_stopped = Some(stats.auto_stopped);
                                     processed.pre_stt_time = pre_stt_time;
                                     eprintln!(
                                         "dictation_id={} state=Cleaning event=release_pipeline_stages pre_stt_ms={} stt_compute_ms={} formatting_ms={}",
@@ -3302,18 +3443,22 @@ impl TranscriptionWorker {
         // Publish release priority before the FIFO send. A running partial sees
         // this through whisper.cpp's abort callback and yields to the final.
         self.cancellations.prioritize_final(id);
-        if let Err(error) = self.commands.send(WorkerCommand::Transcribe {
-            id,
-            released_at,
-            audio: Box::new(audio),
-            language,
-            audio_context,
-            formatting,
-            app_executable,
-            timing,
-        }) {
+        if self
+            .commands
+            .send(WorkerCommand::Transcribe {
+                id,
+                released_at,
+                audio: Box::new(audio),
+                language,
+                audio_context,
+                formatting,
+                app_executable,
+                timing,
+            })
+            .is_err()
+        {
             self.cancellations.clear_final_priority(id);
-            return Err(anyhow!(error)).context("transcription worker is unavailable");
+            return Err(anyhow!("transcription worker is unavailable"));
         }
         Ok(())
     }
@@ -3334,7 +3479,7 @@ impl TranscriptionWorker {
                 clip,
                 language,
             })
-            .context("transcription worker is unavailable")
+            .map_err(|_| anyhow!("transcription worker is unavailable"))
     }
 
     fn instant_begin(&self, id: DictationId, sample_rate: u32) {
@@ -3384,7 +3529,7 @@ impl TranscriptionWorker {
             .try_send(InstantAudioCommand::Cancel { id });
         self.commands
             .send(WorkerCommand::CancelIncremental { id })
-            .context("transcription worker is unavailable")
+            .map_err(|_| anyhow!("transcription worker is unavailable"))
     }
 
     fn shutdown(mut self) -> Result<()> {
@@ -3394,7 +3539,7 @@ impl TranscriptionWorker {
     fn reload_aliases(&self, aliases: Vec<LexiconEntry>) -> Result<()> {
         self.commands
             .send(WorkerCommand::ReloadAliases(aliases))
-            .context("transcription worker is unavailable")
+            .map_err(|_| anyhow!("transcription worker is unavailable"))
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -4088,6 +4233,13 @@ fn append_timestamp_stable_segments(
         // Freeze the frontier at the first unresolved instant instead of
         // skipping forward and losing the unaccepted suffix.
         if absolute_start < accumulator.accepted_through {
+            accumulator.unresolved_from = Some(accumulator.accepted_through);
+            break;
+        }
+        // A timestamp jump is not proof that the skipped audio was silent.
+        // Freeze at the last contiguous frontier so the final pass re-reads
+        // every unproven sample from the canonical capture source.
+        if absolute_start > accumulator.accepted_through || absolute_end <= absolute_start {
             accumulator.unresolved_from = Some(accumulator.accepted_through);
             break;
         }
@@ -5203,6 +5355,61 @@ mod composition_tests {
     }
 
     #[test]
+    fn cleanup_failure_overrides_success_before_formatting_or_insertion() {
+        let result = require_audio_cleanup::<u8>(Ok(7), Err("injected permission loss".to_owned()));
+        assert_eq!(
+            result.unwrap_err(),
+            "encrypted audio scratch cleanup failed: injected permission loss"
+        );
+    }
+
+    #[test]
+    fn cleanup_is_still_reported_when_recognition_also_fails() {
+        let result = require_audio_cleanup::<u8>(
+            Err("decoder failed".to_owned()),
+            Err("injected permission loss".to_owned()),
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("transcription failed (decoder failed)"));
+        assert!(error.contains("cleanup also failed (injected permission loss)"));
+    }
+
+    #[test]
+    fn recognition_failure_survives_successful_cleanup() {
+        assert_eq!(
+            require_audio_cleanup::<u8>(Err("decoder failed".to_owned()), Ok(())).unwrap_err(),
+            "decoder failed"
+        );
+    }
+
+    #[test]
+    fn every_active_capture_integrity_fault_has_a_content_free_safe_stop_reason() {
+        for (fault, expected) in [
+            (ExtendedCaptureFault::CallbackOverflow, "capture_overflow"),
+            (ExtendedCaptureFault::StreamFailed, "device_loss"),
+            (ExtendedCaptureFault::Resampling, "resampling"),
+            (ExtendedCaptureFault::SpoolQuota, "scratch_quota"),
+            (ExtendedCaptureFault::SpoolIntegrity, "scratch_integrity"),
+            (ExtendedCaptureFault::SpoolIo, "scratch_io"),
+            (ExtendedCaptureFault::WorkerUnavailable, "capture_worker"),
+            (ExtendedCaptureFault::WorkerPanicked, "capture_worker"),
+            (
+                ExtendedCaptureFault::SampleAccountingOverflow,
+                "sample_accounting",
+            ),
+        ] {
+            assert_eq!(auto_stop_reason(fault).unwrap().label(), expected);
+        }
+        for non_active in [
+            ExtendedCaptureFault::InvalidConfiguration,
+            ExtendedCaptureFault::InvalidSnapshot,
+            ExtendedCaptureFault::FinalizerBusy,
+        ] {
+            assert_eq!(auto_stop_reason(non_active), None);
+        }
+    }
+
+    #[test]
     fn timestamp_stability_discards_overlap_without_lexical_guessing() {
         use phorminx_app::incremental::{ChunkPlan, TimeRange};
         use phorminx_whisper::TimedSegment;
@@ -5388,6 +5595,126 @@ mod composition_tests {
                 .start,
             Duration::from_secs(2)
         );
+    }
+
+    #[test]
+    fn first_segment_gap_never_advances_the_canonical_frontier() {
+        use phorminx_app::incremental::{ChunkPlan, TimeRange};
+        use phorminx_whisper::TimedSegment;
+
+        let mut accumulator = PartialAccumulator::default();
+        let plan = ChunkPlan {
+            id: DictationId(12),
+            sequence: 0,
+            range: TimeRange {
+                start: Duration::ZERO,
+                end: Duration::from_secs(3),
+            },
+            stable_end: Duration::from_secs(3),
+            start_overlap: None,
+            boundary: BoundaryKind::Silence,
+        };
+        append_timestamp_stable_segments(
+            &mut accumulator,
+            plan,
+            &[TimedSegment {
+                text: "late speech".to_owned(),
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(2),
+            }],
+        );
+        assert!(accumulator.text.is_empty());
+        assert_eq!(accumulator.accepted_through, Duration::ZERO);
+        assert_eq!(accumulator.unresolved_from, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn internal_timestamp_gap_preserves_only_the_contiguous_prefix() {
+        use phorminx_app::incremental::{ChunkPlan, TimeRange};
+        use phorminx_whisper::TimedSegment;
+
+        let mut accumulator = PartialAccumulator::default();
+        let plan = ChunkPlan {
+            id: DictationId(13),
+            sequence: 0,
+            range: TimeRange {
+                start: Duration::ZERO,
+                end: Duration::from_secs(3),
+            },
+            stable_end: Duration::from_secs(3),
+            start_overlap: None,
+            boundary: BoundaryKind::Silence,
+        };
+        append_timestamp_stable_segments(
+            &mut accumulator,
+            plan,
+            &[
+                TimedSegment {
+                    text: "proven".to_owned(),
+                    start: Duration::ZERO,
+                    end: Duration::from_secs(1),
+                },
+                TimedSegment {
+                    text: "after gap".to_owned(),
+                    start: Duration::from_millis(1_500),
+                    end: Duration::from_secs(2),
+                },
+            ],
+        );
+        assert_eq!(accumulator.text, "proven");
+        assert_eq!(accumulator.accepted_through, Duration::from_secs(1));
+        assert_eq!(accumulator.unresolved_from, Some(Duration::from_secs(1)));
+        accumulator.next_sequence = 1;
+        accumulator.last_boundary = Some(BoundaryKind::Silence);
+        accumulator.timestamp_stable = true;
+        assert_eq!(
+            final_tail_plan(&accumulator, Duration::from_secs(4))
+                .unwrap()
+                .start,
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn overlap_only_segments_and_timestamp_regression_cannot_move_frontier() {
+        use phorminx_app::incremental::{ChunkPlan, TimeRange};
+        use phorminx_whisper::TimedSegment;
+
+        let mut accumulator = PartialAccumulator {
+            text: "accepted prefix".to_owned(),
+            accepted_through: Duration::from_secs(2),
+            ..PartialAccumulator::default()
+        };
+        let plan = ChunkPlan {
+            id: DictationId(14),
+            sequence: 1,
+            range: TimeRange {
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(4),
+            },
+            stable_end: Duration::from_secs(4),
+            start_overlap: Some(MergeExpectation::Silence),
+            boundary: BoundaryKind::Silence,
+        };
+        append_timestamp_stable_segments(
+            &mut accumulator,
+            plan,
+            &[
+                TimedSegment {
+                    text: "overlap only".to_owned(),
+                    start: Duration::ZERO,
+                    end: Duration::from_secs(1),
+                },
+                TimedSegment {
+                    text: "straddles frontier".to_owned(),
+                    start: Duration::from_millis(500),
+                    end: Duration::from_millis(1_500),
+                },
+            ],
+        );
+        assert_eq!(accumulator.text, "accepted prefix");
+        assert_eq!(accumulator.accepted_through, Duration::from_secs(2));
+        assert_eq!(accumulator.unresolved_from, Some(Duration::from_secs(2)));
     }
 
     #[test]
@@ -5968,6 +6295,7 @@ mod composition_tests {
                 total_samples: 16_000 * 130,
                 peak_retained_samples: 16_000 * 120,
                 rms: 0.2,
+                auto_stopped: false,
             },
             "en",
             DictationId(90),
@@ -5998,6 +6326,7 @@ mod composition_tests {
                 total_samples: 16_000 * 130,
                 peak_retained_samples: 16_000 * 120,
                 rms: 0.2,
+                auto_stopped: false,
             },
             "en",
             DictationId(92),
@@ -6044,6 +6373,7 @@ mod composition_tests {
                 total_samples: 16_000 * 130,
                 peak_retained_samples: 16_000 * 120,
                 rms: 0.2,
+                auto_stopped: false,
             },
             "en",
             DictationId(91),

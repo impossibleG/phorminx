@@ -798,6 +798,27 @@ mod tests {
     }
 
     #[test]
+    fn automatic_stop_racing_a_physical_release_finalizes_only_once() {
+        let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".to_owned()).unwrap();
+        let mut io = FakeIo::default();
+        io.reset_plan(1);
+        runtime.hold_started(Some(1), &mut io).unwrap();
+
+        let automatic = runtime.hold_ended_at(Instant::now(), &mut io).unwrap();
+        assert!(
+            automatic
+                .iter()
+                .any(|notice| matches!(notice, RuntimeNotice::TranscriptionStarted { .. }))
+        );
+        let physical = runtime.hold_ended_at(Instant::now(), &mut io).unwrap();
+
+        assert!(physical.is_empty());
+        assert_eq!(io.submitted.len(), 1);
+        assert_eq!(io.recording_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.state(), RuntimeState::Transcribing);
+    }
+
+    #[test]
     fn soaks_500_mixed_cycles_without_stale_state_or_wrong_target_insertion() {
         let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".to_owned()).unwrap();
         let mut io = FakeIo::default();
