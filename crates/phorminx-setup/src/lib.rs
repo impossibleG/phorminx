@@ -10,6 +10,7 @@ mod action;
 mod asset;
 mod benchmark;
 mod capability;
+mod measurement;
 mod planner;
 mod recommendation;
 
@@ -31,6 +32,11 @@ pub use capability::{
     Capability, CapabilityId, CapabilityRecord, CapabilityRecordError, CapabilityValue,
     DegradedReason, Generation, Language, Observation, ReadyAuthority, Remedy, Requirement,
     UnavailableReason, Usability,
+};
+pub use measurement::{
+    AggregationError, BenchmarkCandidate, BenchmarkContext, BenchmarkObservation, CalibrationCase,
+    CalibrationCorpus, CalibrationKind, EphemeralCalibration, QualityCounts, aggregate_evidence,
+    score_transcript,
 };
 pub use planner::{
     DesiredConfiguration, FormattingChoice, PersistedSetupPlan, PlanError, PlannedAction, Planner,

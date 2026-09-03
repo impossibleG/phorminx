@@ -490,6 +490,27 @@ impl SettingsStore {
         let _save_guard = SAVE_LOCK
             .lock()
             .map_err(|_| SettingsError::SaveLockPoisoned)?;
+        self.save_locked(settings)
+    }
+
+    /// Atomically verifies the caller's read snapshot and commits a validated
+    /// replacement under the same process-wide settings lock.
+    pub fn compare_and_save(
+        &self,
+        expected: &Settings,
+        replacement: &Settings,
+    ) -> Result<bool, SettingsError> {
+        let _save_guard = SAVE_LOCK
+            .lock()
+            .map_err(|_| SettingsError::SaveLockPoisoned)?;
+        if self.load()? != *expected {
+            return Ok(false);
+        }
+        self.save_locked(replacement)?;
+        Ok(true)
+    }
+
+    fn save_locked(&self, settings: &Settings) -> Result<(), SettingsError> {
         let mut canonical = settings.clone();
         canonical.validate_and_normalize()?;
         let serialized = toml::to_string_pretty(&canonical).map_err(SettingsError::Serialize)?;

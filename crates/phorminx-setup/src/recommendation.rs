@@ -321,7 +321,7 @@ fn exclusion_reasons(
             }
         }
     }
-    if !evidence.supported_languages.contains(&language) {
+    if evidence.measured_language != language || !evidence.supported_languages.contains(&language) {
         reasons.insert(ExclusionReason::LanguageIncompatible);
     }
     if language == Language::PortugueseBrazil
@@ -481,6 +481,7 @@ mod tests {
                 },
                 model_class: class,
                 model_digest: Sha256Digest::new("a".repeat(64)).unwrap(),
+                measured_language: language,
                 supported_languages: [language].into_iter().collect(),
                 pt_brazil_instant_certified: false,
                 loaded: true,
@@ -664,6 +665,7 @@ mod tests {
             100,
         );
         insufficient.evidence.measurements.speech_samples = 1;
+        insufficient.evidence.measurements.run_count = 2;
         let policy = policy(&[&insufficient]);
         let recommendation = RecommendationEngine::recommend(
             Language::PortugueseBrazil,
@@ -795,6 +797,35 @@ mod tests {
             recommendation.rejected_candidates[0]
                 .reasons
                 .contains(&ExclusionReason::EvidenceContextMismatch)
+        );
+    }
+
+    #[test]
+    fn evidence_measured_in_one_supported_language_cannot_authorize_another() {
+        let mut english = candidate(
+            "multilingual",
+            EngineKind::Accurate,
+            ModelClass::Base,
+            Language::English,
+            0,
+            100,
+        );
+        english
+            .evidence
+            .supported_languages
+            .insert(Language::PortugueseBrazil);
+        let policy = policy(&[&english]);
+        let recommendation = RecommendationEngine::recommend(
+            Language::PortugueseBrazil,
+            RecommendationPreference::Balanced,
+            &policy,
+            [english],
+        );
+        assert_eq!(recommendation.outcome, RecommendationOutcome::Unavailable);
+        assert!(
+            recommendation.rejected_candidates[0]
+                .reasons
+                .contains(&ExclusionReason::LanguageIncompatible)
         );
     }
 

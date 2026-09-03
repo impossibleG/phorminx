@@ -97,6 +97,7 @@ pub enum ContentionCondition {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BenchmarkProtocol {
     pub protocol_id: ContentFreeId,
     pub minimum_speech_samples: u32,
@@ -104,6 +105,7 @@ pub struct BenchmarkProtocol {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BenchmarkSampleSummary {
     pub speech_samples: u32,
     pub silence_samples: u32,
@@ -127,6 +129,7 @@ pub struct BenchmarkSampleSummary {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BenchmarkEvidence {
     pub schema_version: u32,
     pub protocol_id: ContentFreeId,
@@ -138,6 +141,9 @@ pub struct BenchmarkEvidence {
     pub backend: BackendKind,
     pub model_class: ModelClass,
     pub model_digest: Sha256Digest,
+    /// The exact language exercised by this evidence record. Supported
+    /// languages describe the pinned artifact and must not be mistaken for it.
+    pub measured_language: Language,
     pub supported_languages: BTreeSet<Language>,
     /// PT-BR Instant is eligible only after the exact artifact/protocol has a
     /// corpus qualification. Accurate multilingual evidence does not need it.
@@ -147,7 +153,7 @@ pub struct BenchmarkEvidence {
 }
 
 impl BenchmarkEvidence {
-    pub const SCHEMA_VERSION: u32 = 2;
+    pub const SCHEMA_VERSION: u32 = 3;
 
     #[must_use]
     pub fn is_structurally_valid(&self) -> bool {
@@ -158,16 +164,18 @@ impl BenchmarkEvidence {
             && self.measurements.hallucination_per_mille <= 1_000
             && self.measurements.confidence_per_mille <= 1_000
             && self.measurements.release_p50_ms <= self.measurements.release_p95_ms
-            && self.measurements.run_count
-                >= self
-                    .measurements
-                    .speech_samples
-                    .saturating_add(self.measurements.silence_samples)
+            && self
+                .measurements
+                .speech_samples
+                .checked_add(self.measurements.silence_samples)
+                == Some(self.measurements.run_count)
+            && self.measurements.release_dispersion_ms <= self.measurements.release_p95_ms
             && matches!(
                 (self.engine, self.backend),
                 (EngineKind::Instant, BackendKind::VoskNative)
                     | (EngineKind::Accurate, BackendKind::Cpu | BackendKind::Vulkan)
             )
+            && self.supported_languages.contains(&self.measured_language)
     }
 }
 
