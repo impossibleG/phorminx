@@ -20,8 +20,10 @@ pub enum UiStatus {
 }
 
 #[derive(Clone, Debug)]
-pub struct FinishedAudio {
-    pub clip: AudioClip,
+pub struct FinishedAudio<Audio = AudioClip> {
+    pub audio: Audio,
+    pub duration: Duration,
+    pub rms: f32,
     pub backend_warning_count: u64,
 }
 
@@ -50,14 +52,18 @@ pub enum InsertDisposition<R> {
 pub trait AppIo {
     type Target;
     type Recording;
+    type Audio;
     type ClipboardReason;
 
     fn start_recording(&mut self) -> Result<Self::Recording, String>;
-    fn finish_recording(&mut self, recording: Self::Recording) -> Result<FinishedAudio, String>;
+    fn finish_recording(
+        &mut self,
+        recording: Self::Recording,
+    ) -> Result<FinishedAudio<Self::Audio>, String>;
     fn submit_transcription(
         &mut self,
         id: DictationId,
-        clip: AudioClip,
+        audio: Self::Audio,
         language: &str,
         audio_context: u32,
         timing: ReleaseTiming,
@@ -318,9 +324,7 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
             });
         }
 
-        if captured.clip.duration() < Duration::from_millis(200)
-            || captured.clip.rms() < self.minimum_rms
-        {
+        if captured.duration < Duration::from_millis(200) || captured.rms < self.minimum_rms {
             self.machine.cancel()?;
             notices.push(RuntimeNotice::NoSpeech {
                 id,
@@ -333,10 +337,10 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
             return Ok(notices);
         }
 
-        let audio_context = recommended_audio_context(captured.clip.duration());
+        let audio_context = recommended_audio_context(captured.duration);
         self.machine.transition(RuntimeState::Transcribing)?;
         Self::show_status(io, UiStatus::Transcribing, &mut notices);
-        match io.submit_transcription(id, captured.clip, &self.language, audio_context, timing) {
+        match io.submit_transcription(id, captured.audio, &self.language, audio_context, timing) {
             Ok(()) => {
                 self.pending_id = Some(id);
                 notices.push(RuntimeNotice::TranscriptionStarted { id });
@@ -662,6 +666,7 @@ mod tests {
     impl AppIo for FakeIo {
         type Target = u64;
         type Recording = FakeRecording;
+        type Audio = AudioClip;
         type ClipboardReason = FakeReason;
 
         fn start_recording(&mut self) -> Result<Self::Recording, String> {
@@ -683,15 +688,21 @@ mod tests {
             std::thread::sleep(self.finish_delay);
             match self.finish_plan {
                 FinishPlan::Speech => Ok(FinishedAudio {
-                    clip: clip(3_200, 0.1),
+                    audio: clip(3_200, 0.1),
+                    duration: Duration::from_millis(200),
+                    rms: 0.1,
                     backend_warning_count: 0,
                 }),
                 FinishPlan::Short => Ok(FinishedAudio {
-                    clip: clip(1_600, 0.1),
+                    audio: clip(1_600, 0.1),
+                    duration: Duration::from_millis(100),
+                    rms: 0.1,
                     backend_warning_count: 0,
                 }),
                 FinishPlan::Quiet => Ok(FinishedAudio {
-                    clip: clip(3_200, 0.000_1),
+                    audio: clip(3_200, 0.000_1),
+                    duration: Duration::from_millis(200),
+                    rms: 0.000_1,
                     backend_warning_count: 0,
                 }),
                 FinishPlan::Failure => Err("finish failed".to_owned()),

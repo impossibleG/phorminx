@@ -18,7 +18,7 @@ use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Indexing, Resampler};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{CaptureError, WHISPER_SAMPLE_RATE};
+use crate::{CaptureError, StreamingAudio, WHISPER_SAMPLE_RATE};
 
 const DEFAULT_SHORT_LIMIT: Duration = Duration::from_secs(120);
 const DEFAULT_TRANSITION_LEAD: Duration = Duration::from_secs(5);
@@ -247,11 +247,74 @@ pub struct ExtendedRecording {
     commands: Sender<PumpCommand>,
     worker: Option<JoinHandle<Result<EngineFinalized<FileStorage>, ExtendedCaptureFault>>>,
     progress: Arc<SharedProgress>,
+    streaming_cursor: u64,
 }
 
 impl ExtendedRecording {
+    pub const fn sample_rate(&self) -> u32 {
+        WHISPER_SAMPLE_RATE
+    }
+
+    pub fn captured_duration(&self) -> Duration {
+        self.progress().duration()
+    }
+
     pub fn progress(&self) -> ExtendedCaptureProgress {
         self.progress.snapshot()
+    }
+
+    /// Copies the most recent bounded canonical window for silence detection.
+    pub fn recent_rms(&self, window: Duration) -> Result<f32, CaptureError> {
+        let end = self.progress().canonical_samples;
+        if end == 0 {
+            return Ok(0.0);
+        }
+        let requested = canonical_samples(window).max(1);
+        let start = end.saturating_sub(requested);
+        let span = self.snapshot(
+            SampleRange::new(start, end)
+                .map_err(|_| CaptureError::Extended(ExtendedCaptureFault::InvalidSnapshot))?,
+        )?;
+        let mean_square = span
+            .samples()
+            .iter()
+            .map(|sample| f64::from(*sample) * f64::from(*sample))
+            .sum::<f64>()
+            / span.samples().len() as f64;
+        Ok(mean_square.sqrt() as f32)
+    }
+
+    /// Drains a contiguous bounded canonical span for streaming recognizers.
+    pub fn drain_streaming(
+        &mut self,
+        maximum_samples: usize,
+    ) -> Result<StreamingAudio, CaptureError> {
+        let observed = self.progress();
+        if let Some(fault) = observed.sticky_fault {
+            return Err(CaptureError::Extended(fault));
+        }
+        let maximum = u64::try_from(maximum_samples)
+            .map_err(|_| CaptureError::Extended(ExtendedCaptureFault::InvalidSnapshot))?;
+        let end = observed
+            .canonical_samples
+            .min(self.streaming_cursor.saturating_add(maximum));
+        if end <= self.streaming_cursor {
+            return Ok(StreamingAudio {
+                samples: Vec::new(),
+                sample_rate: WHISPER_SAMPLE_RATE,
+                dropped_samples: observed.dropped_native_frames,
+            });
+        }
+        let range = SampleRange::new(self.streaming_cursor, end)
+            .map_err(|_| CaptureError::Extended(ExtendedCaptureFault::InvalidSnapshot))?;
+        let mut guarded = self.snapshot(range)?.into_samples();
+        let samples = std::mem::take(&mut *guarded);
+        self.streaming_cursor = end;
+        Ok(StreamingAudio {
+            samples,
+            sample_rate: WHISPER_SAMPLE_RATE,
+            dropped_samples: observed.dropped_native_frames,
+        })
     }
 
     pub fn snapshot(&self, range: SampleRange) -> Result<AudioSpan, CaptureError> {
@@ -424,6 +487,7 @@ pub fn start_extended_input(
         commands,
         worker: Some(worker),
         progress,
+        streaming_cursor: 0,
     })
 }
 

@@ -2170,6 +2170,7 @@ struct ProductionIo<'a> {
 impl AppIo for ProductionIo<'_> {
     type Target = TargetSnapshot;
     type Recording = ActiveRecording;
+    type Audio = AudioClip;
     type ClipboardReason = ClipboardOnlyReason;
 
     fn start_recording(&mut self) -> Result<Self::Recording, String> {
@@ -2192,9 +2193,15 @@ impl AppIo for ProductionIo<'_> {
     fn finish_recording(&mut self, recording: Self::Recording) -> Result<FinishedAudio, String> {
         recording
             .finish_with_diagnostics()
-            .map(|captured| FinishedAudio {
-                clip: captured.clip,
-                backend_warning_count: captured.backend_warning_count,
+            .map(|captured| {
+                let duration = captured.clip.duration();
+                let rms = captured.clip.rms();
+                FinishedAudio {
+                    audio: captured.clip,
+                    duration,
+                    rms,
+                    backend_warning_count: captured.backend_warning_count,
+                }
             })
             .map_err(|error| error.to_string())
     }
