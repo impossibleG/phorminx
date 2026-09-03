@@ -232,22 +232,62 @@ pub struct HistoryItem {
     pub time: String,
     pub application: String,
     pub language: String,
-    pub output: String,
-    pub raw: Option<String>,
-    pub normalized: Option<String>,
-    pub cleaned: Option<String>,
+    /// Bounded Unicode preview used by Home and the chronology list.
+    pub output_preview: String,
+    pub preview_truncated: bool,
+    pub variants: HistoryVariantAvailability,
+    /// At most one exact variant is retained for the selected detail view.
+    pub loaded: Option<HistoryLoadedText>,
     pub latency: String,
     pub warning: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistoryVariantAvailability {
+    pub output: bool,
+    pub raw: bool,
+    pub normalized: bool,
+    pub cleaned: bool,
+}
+
+impl HistoryVariantAvailability {
+    #[must_use]
+    pub const fn contains(self, variant: HistoryVariant) -> bool {
+        match variant {
+            HistoryVariant::Output => self.output,
+            HistoryVariant::Raw => self.raw,
+            HistoryVariant::Normalized => self.normalized,
+            HistoryVariant::Cleaned => self.cleaned,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryLoadedText {
+    pub variant: HistoryVariant,
+    pub text: String,
 }
 
 impl HistoryItem {
     #[must_use]
     pub fn text_for(&self, variant: HistoryVariant) -> Option<&str> {
-        match variant {
-            HistoryVariant::Output => Some(&self.output),
-            HistoryVariant::Raw => self.raw.as_deref(),
-            HistoryVariant::Normalized => self.normalized.as_deref(),
-            HistoryVariant::Cleaned => self.cleaned.as_deref(),
+        self.loaded
+            .as_ref()
+            .filter(|loaded| loaded.variant == variant)
+            .map(|loaded| loaded.text.as_str())
+    }
+
+    #[must_use]
+    pub const fn has_variant(&self, variant: HistoryVariant) -> bool {
+        self.variants.contains(variant)
+    }
+
+    #[must_use]
+    pub fn preview(&self) -> String {
+        if self.preview_truncated {
+            format!("{}…", self.output_preview)
+        } else {
+            self.output_preview.clone()
         }
     }
 }
@@ -576,17 +616,20 @@ impl ShellSnapshot {
                     time: "14:32".into(),
                     application: "code.exe".into(),
                     language: "EN".into(),
-                    output: "The quieter the interface, the more exact each decision must be."
-                        .into(),
-                    raw: Some(
-                        "the quieter the interface the more exact each decision must be".into(),
-                    ),
-                    normalized: Some(
+                    output_preview:
                         "The quieter the interface, the more exact each decision must be.".into(),
-                    ),
-                    cleaned: Some(
-                        "The quieter the interface, the more exact each decision must be.".into(),
-                    ),
+                    preview_truncated: false,
+                    variants: HistoryVariantAvailability {
+                        output: true,
+                        raw: true,
+                        normalized: true,
+                        cleaned: true,
+                    },
+                    loaded: Some(HistoryLoadedText {
+                        variant: HistoryVariant::Output,
+                        text: "The quieter the interface, the more exact each decision must be."
+                            .into(),
+                    }),
                     latency: "1.84 s".into(),
                     warning: None,
                 },
@@ -595,10 +638,18 @@ impl ShellSnapshot {
                     time: "13:08".into(),
                     application: "notepad.exe".into(),
                     language: "EN".into(),
-                    output: "Keep the local boundary explicit.".into(),
-                    raw: Some("keep the local boundary explicit".into()),
-                    normalized: None,
-                    cleaned: None,
+                    output_preview: "Keep the local boundary explicit.".into(),
+                    preview_truncated: false,
+                    variants: HistoryVariantAvailability {
+                        output: true,
+                        raw: true,
+                        normalized: false,
+                        cleaned: false,
+                    },
+                    loaded: Some(HistoryLoadedText {
+                        variant: HistoryVariant::Output,
+                        text: "Keep the local boundary explicit.".into(),
+                    }),
                     latency: "1.12 s".into(),
                     warning: Some("Copied. Target changed.".into()),
                 },
@@ -812,7 +863,7 @@ pub enum ShellEvent {
     Navigate(Route),
     TestDictation,
     SelectHistory(i64),
-    SelectHistoryVariant(HistoryVariant),
+    SelectHistoryVariant { id: i64, variant: HistoryVariant },
     CopyHistory { id: i64, variant: HistoryVariant },
     ClearHistory,
     NewLexiconEntry,
@@ -856,6 +907,9 @@ mod tests {
     fn history_variant_omits_absent_stages() {
         let item = &ShellSnapshot::gallery(GalleryScenario::Populated).history[1];
         assert!(item.text_for(HistoryVariant::Output).is_some());
+        assert!(item.has_variant(HistoryVariant::Output));
+        assert!(item.has_variant(HistoryVariant::Raw));
+        assert!(!item.has_variant(HistoryVariant::Normalized));
         assert!(item.text_for(HistoryVariant::Normalized).is_none());
     }
 

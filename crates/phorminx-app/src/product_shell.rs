@@ -12,11 +12,12 @@ use phorminx_ui::theme::ThemeMode;
 use phorminx_ui::{
     AccurateBackend as ShellAccurateBackend, AccurateModel as ShellAccurateModel,
     AppearancePreference as ShellAppearance, ApplicationProfile,
-    FormattingStrength as ShellFormatting, HistoryItem, InlineNotice, LexiconCasePolicy,
-    LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle as ShellLifecycle, PhorminxUi,
-    ProfileInsertion, Readiness, RecognitionMode as ShellRecognitionMode,
-    RecordingMode as ShellRecording, Route, RuntimeStatus, SettingsSnapshot, SetupCapability,
-    SetupSnapshot, SetupStage, ShellEvent, ShellSnapshot, SystemReadiness,
+    FormattingStrength as ShellFormatting, HistoryItem, HistoryVariant, HistoryVariantAvailability,
+    InlineNotice, LexiconCasePolicy, LexiconEntry, ModelSystem, NoticeKind,
+    OllamaLifecycle as ShellLifecycle, PhorminxUi, ProfileInsertion, Readiness,
+    RecognitionMode as ShellRecognitionMode, RecordingMode as ShellRecording, Route, RuntimeStatus,
+    SettingsSnapshot, SetupCapability, SetupSnapshot, SetupStage, ShellEvent, ShellSnapshot,
+    SystemReadiness,
 };
 use phorminx_whisper::WhisperReadiness;
 use phorminx_windows::{SystemAppearance, system_appearance};
@@ -27,9 +28,9 @@ use crate::settings::{
     Settings, SettingsStore,
 };
 use crate::ui_bridge::{
-    DEFAULT_HISTORY_LIMIT, UiBridge, UiCommand, UiEffect, UiLexiconDraft, UiMutation,
-    UiProfileDraft, UiReadinessSnapshot, UiReadinessState, UiRoute, UiRuntimeStatus, UiSnapshot,
-    UiVoskProbe,
+    DEFAULT_HISTORY_LIMIT, UiBridge, UiCommand, UiEffect, UiHistoryVariant, UiLexiconDraft,
+    UiMutation, UiProfileDraft, UiReadinessSnapshot, UiReadinessState, UiRoute, UiRuntimeStatus,
+    UiSnapshot, UiVoskProbe,
 };
 
 #[cfg(windows)]
@@ -288,7 +289,7 @@ impl ProductShellApp {
         store: SettingsStore,
         loaded_whisper: Option<WhisperReadiness>,
     ) -> Self {
-        Self {
+        let mut app = Self {
             shell: PhorminxUi::new(map_snapshot(snapshot, route, None)),
             bridge,
             readiness,
@@ -302,7 +303,11 @@ impl ProductShellApp {
             notice: None,
             download_active: false,
             quitting: false,
+        };
+        if route == UiRoute::History {
+            app.ensure_history_detail();
         }
+        app
     }
 
     fn refresh(&mut self) {
@@ -326,6 +331,45 @@ impl ProductShellApp {
             detail: message,
             action: None,
         });
+    }
+
+    fn ensure_history_detail(&mut self) {
+        let Some((id, variant)) = self.shell.history_selection() else {
+            return;
+        };
+        if !self.shell.history_detail_loaded(id, variant) {
+            self.load_history_detail(id, variant);
+        }
+    }
+
+    fn load_history_detail(&mut self, id: i64, variant: HistoryVariant) {
+        self.shell.clear_history_detail();
+        match requested_history_text(&self.bridge, id, variant) {
+            Ok(Some(text)) => {
+                if !self.shell.set_history_detail(id, variant, text) {
+                    self.history_item_missing();
+                }
+            }
+            Ok(None) => self.history_item_missing(),
+            Err(error) => {
+                self.set_error(error.to_string());
+                self.refresh();
+            }
+        }
+    }
+
+    fn history_item_missing(&mut self) {
+        self.shell.clear_history_detail();
+        self.notice = Some(InlineNotice {
+            kind: NoticeKind::Information,
+            title: "History changed.".to_owned(),
+            detail: "That retained dictation or text variant is no longer available.".to_owned(),
+            action: None,
+        });
+        self.refresh();
+        if self.route == UiRoute::History {
+            self.ensure_history_detail();
+        }
     }
 
     fn execute(&mut self, command: UiCommand) -> bool {
@@ -360,6 +404,9 @@ impl ProductShellApp {
                     );
                 }
                 self.refresh();
+                if self.route == UiRoute::History {
+                    self.ensure_history_detail();
+                }
                 true
             }
             Err(error) => {
@@ -371,28 +418,36 @@ impl ProductShellApp {
 
     fn handle_shell_event(&mut self, event: ShellEvent, ctx: &egui::Context) {
         match event {
-            ShellEvent::Navigate(route) => self.route = unmap_route(route),
+            ShellEvent::Navigate(route) => {
+                self.route = unmap_route(route);
+                if self.route != UiRoute::History {
+                    self.shell.clear_history_detail();
+                }
+                self.refresh();
+                if self.route == UiRoute::History {
+                    self.ensure_history_detail();
+                }
+            }
             ShellEvent::TestDictation => {
                 let _ = self.events.send(ProductShellEvent::TestDictation);
             }
             ShellEvent::CopyHistory { id, variant } => {
-                let text = self
-                    .shell
-                    .snapshot()
-                    .history
-                    .iter()
-                    .find(|item| item.id == id)
-                    .and_then(|item| item.text_for(variant))
-                    .map(str::to_owned);
-                if let Some(text) = text {
-                    ctx.copy_text(text);
-                    self.notice = Some(InlineNotice {
-                        kind: NoticeKind::Information,
-                        title: "Copied.".to_owned(),
-                        detail: "The selected transcript text is on the clipboard.".to_owned(),
-                        action: None,
-                    });
-                    self.refresh();
+                match requested_history_text(&self.bridge, id, variant) {
+                    Ok(Some(text)) => {
+                        ctx.copy_text(text);
+                        self.notice = Some(InlineNotice {
+                            kind: NoticeKind::Information,
+                            title: "Copied.".to_owned(),
+                            detail: "The selected transcript text is on the clipboard.".to_owned(),
+                            action: None,
+                        });
+                        self.refresh();
+                    }
+                    Ok(None) => self.history_item_missing(),
+                    Err(error) => {
+                        self.set_error(error.to_string());
+                        self.refresh();
+                    }
                 }
             }
             ShellEvent::ClearHistory => {
@@ -500,9 +555,14 @@ impl ProductShellApp {
                 self.notice = None;
                 self.refresh();
             }
-            ShellEvent::SelectHistory(id) => self.shell.select_history(id),
-            ShellEvent::SelectHistoryVariant(_)
-            | ShellEvent::NewLexiconEntry
+            ShellEvent::SelectHistory(id) => {
+                self.shell.select_history(id);
+                self.load_history_detail(id, HistoryVariant::Output);
+            }
+            ShellEvent::SelectHistoryVariant { id, variant } => {
+                self.load_history_detail(id, variant);
+            }
+            ShellEvent::NewLexiconEntry
             | ShellEvent::EditLexicon(_)
             | ShellEvent::NewProfile
             | ShellEvent::EditProfile(_)
@@ -544,17 +604,31 @@ impl eframe::App for ProductShellApp {
             match control {
                 ProductShellControl::Focus(route) => {
                     self.route = route;
+                    if self.route != UiRoute::History {
+                        self.shell.clear_history_detail();
+                    }
                     self.shell.request_route_focus();
                     ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
                     self.refresh();
+                    if self.route == UiRoute::History {
+                        self.ensure_history_detail();
+                    }
                 }
                 ProductShellControl::SetRuntimeStatus(status) => {
                     self.runtime_status = status;
                     self.refresh();
+                    if self.route == UiRoute::History {
+                        self.ensure_history_detail();
+                    }
                 }
-                ProductShellControl::Refresh => self.refresh(),
+                ProductShellControl::Refresh => {
+                    self.refresh();
+                    if self.route == UiRoute::History {
+                        self.ensure_history_detail();
+                    }
+                }
                 ProductShellControl::ModelDownloadProgress(percent) => {
                     self.download_active = true;
                     self.notice = Some(InlineNotice {
@@ -631,10 +705,15 @@ fn map_snapshot(
                 .target_executable
                 .unwrap_or_else(|| "Unknown application".to_owned()),
             language: item.language.unwrap_or_else(|| "Automatic".to_owned()),
-            output: item.selected_output,
-            raw: Some(item.raw_text),
-            normalized: item.normalized_text,
-            cleaned: item.cleaned_text,
+            output_preview: item.selected_output_preview,
+            preview_truncated: item.preview_truncated,
+            variants: HistoryVariantAvailability {
+                output: item.variants.output,
+                raw: item.variants.raw,
+                normalized: item.variants.normalized,
+                cleaned: item.variants.cleaned,
+            },
+            loaded: None,
             latency: item.release_to_insert_duration_ms.map_or_else(
                 || {
                     format_duration(
@@ -981,6 +1060,24 @@ fn unmap_route(route: Route) -> UiRoute {
         Route::Settings => UiRoute::Settings,
     }
 }
+
+const fn map_history_variant(variant: HistoryVariant) -> UiHistoryVariant {
+    match variant {
+        HistoryVariant::Output => UiHistoryVariant::Output,
+        HistoryVariant::Raw => UiHistoryVariant::Raw,
+        HistoryVariant::Normalized => UiHistoryVariant::Normalized,
+        HistoryVariant::Cleaned => UiHistoryVariant::Cleaned,
+    }
+}
+
+fn requested_history_text(
+    bridge: &UiBridge,
+    id: i64,
+    variant: HistoryVariant,
+) -> Result<Option<String>, crate::ui_bridge::UiBridgeError> {
+    bridge.history_text(id, map_history_variant(variant))
+}
+
 fn map_runtime_status(status: UiRuntimeStatus) -> RuntimeStatus {
     match status {
         UiRuntimeStatus::Starting => RuntimeStatus::Transcribing,
@@ -1124,6 +1221,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phorminx_persistence::{DictationDraft, Persistence, RetentionPolicy, TimingMetadata};
 
     #[test]
     fn automatic_refresh_policy_never_full_loads_vosk() {
@@ -1218,5 +1316,50 @@ mod tests {
     fn history_timestamp_uses_stable_utc_civil_time() {
         assert_eq!(format_timestamp(0), "1970-01-01  00:00 UTC");
         assert_eq!(format_timestamp(1_704_164_645_000), "2024-01-02  03:04 UTC");
+    }
+
+    #[test]
+    fn copy_provider_fetches_the_requested_exact_variant_and_missing_ids_are_safe() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("history.sqlite3");
+        let database = Persistence::open(&database_path).unwrap();
+        database
+            .history()
+            .set_retention(RetentionPolicy::Indefinite, now_ms())
+            .unwrap();
+        let id = database
+            .history()
+            .insert(&DictationDraft {
+                created_at_ms: now_ms(),
+                raw_text: "raw exact 🦀".to_owned(),
+                normalized_text: Some("normalized exact 🦀".to_owned()),
+                cleaned_text: Some("cleaned exact 🦀".to_owned()),
+                selected_output: "output exact 🦀".to_owned(),
+                language: Some("en".to_owned()),
+                target_executable: Some("code.exe".to_owned()),
+                timings: TimingMetadata::default(),
+                warnings: Vec::new(),
+            })
+            .unwrap()
+            .unwrap();
+        drop(database);
+
+        let store = SettingsStore::new(directory.path().join("settings.toml")).unwrap();
+        let bridge = UiBridge::open(store, database_path).unwrap();
+        for (variant, expected) in [
+            (HistoryVariant::Output, "output exact 🦀"),
+            (HistoryVariant::Raw, "raw exact 🦀"),
+            (HistoryVariant::Normalized, "normalized exact 🦀"),
+            (HistoryVariant::Cleaned, "cleaned exact 🦀"),
+        ] {
+            assert_eq!(
+                requested_history_text(&bridge, id, variant).unwrap(),
+                Some(expected.to_owned())
+            );
+        }
+        assert_eq!(
+            requested_history_text(&bridge, i64::MAX, HistoryVariant::Output).unwrap(),
+            None
+        );
     }
 }

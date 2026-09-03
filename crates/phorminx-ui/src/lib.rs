@@ -15,9 +15,9 @@ pub use app::PhorminxUi;
 pub use gallery::ComponentGallery;
 pub use model::{
     AccurateBackend, AccurateModel, AppearancePreference, ApplicationProfile, FormattingStrength,
-    GalleryScenario, HistoryItem, HistoryVariant, InlineNotice, LexiconCasePolicy, LexiconDraft,
-    LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle, ProfileDraft, ProfileInsertion,
-    Readiness, RecognitionMode, RecordingMode, Route, RuntimeStatus, SettingsSnapshot, SetupAction,
-    SetupCapability, SetupRecommendation, SetupSnapshot, SetupStage, ShellEvent, ShellSnapshot,
-    SystemReadiness,
+    GalleryScenario, HistoryItem, HistoryLoadedText, HistoryVariant, HistoryVariantAvailability,
+    InlineNotice, LexiconCasePolicy, LexiconDraft, LexiconEntry, ModelSystem, NoticeKind,
+    OllamaLifecycle, ProfileDraft, ProfileInsertion, Readiness, RecognitionMode, RecordingMode,
+    Route, RuntimeStatus, SettingsSnapshot, SetupAction, SetupCapability, SetupRecommendation,
+    SetupSnapshot, SetupStage, ShellEvent, ShellSnapshot, SystemReadiness,
 };

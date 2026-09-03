@@ -123,6 +123,18 @@ pub struct HistorySummary {
     pub timings: TimingMetadata,
     pub warnings: Vec<String>,
     pub terminal: TerminalMetadata,
+    pub variants: HistoryVariantAvailability,
+}
+
+/// Content-free presence metadata for transcript variants.
+///
+/// SQLite computes these flags without returning or decoding any variant text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryVariantAvailability {
+    pub raw: bool,
+    pub normalized: bool,
+    pub cleaned: bool,
+    pub selected_output: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,23 +285,71 @@ impl<'connection> HistoryRepository<'connection> {
 
     /// Fetches exactly one transcript variant for an explicit detail/copy action.
     pub fn text_variant(&self, id: i64, variant: HistoryTextVariant) -> Result<Option<String>> {
-        let statement = match variant {
-            HistoryTextVariant::Raw => "SELECT raw_text FROM dictation_history WHERE id = ?1",
-            HistoryTextVariant::Normalized => {
-                "SELECT normalized_text FROM dictation_history WHERE id = ?1"
-            }
-            HistoryTextVariant::Cleaned => {
-                "SELECT cleaned_text FROM dictation_history WHERE id = ?1"
-            }
-            HistoryTextVariant::SelectedOutput => {
-                "SELECT selected_output FROM dictation_history WHERE id = ?1"
-            }
+        let (statement, field) = match variant {
+            HistoryTextVariant::Raw => (
+                "SELECT length(CAST(raw_text AS BLOB)), \
+                        CASE WHEN length(CAST(raw_text AS BLOB)) <= ?2 THEN raw_text END \
+                 FROM dictation_history WHERE id = ?1",
+                "raw_text",
+            ),
+            HistoryTextVariant::Normalized => (
+                "SELECT length(CAST(normalized_text AS BLOB)), \
+                            CASE WHEN length(CAST(normalized_text AS BLOB)) <= ?2 \
+                                 THEN normalized_text END \
+                     FROM dictation_history WHERE id = ?1",
+                "normalized_text",
+            ),
+            HistoryTextVariant::Cleaned => (
+                "SELECT length(CAST(cleaned_text AS BLOB)), \
+                            CASE WHEN length(CAST(cleaned_text AS BLOB)) <= ?2 \
+                                 THEN cleaned_text END \
+                     FROM dictation_history WHERE id = ?1",
+                "cleaned_text",
+            ),
+            HistoryTextVariant::SelectedOutput => (
+                "SELECT length(CAST(selected_output AS BLOB)), \
+                            CASE WHEN length(CAST(selected_output AS BLOB)) <= ?2 \
+                                 THEN selected_output END \
+                     FROM dictation_history WHERE id = ?1",
+                "selected_output",
+            ),
         };
-        Ok(self
+        let encoded = self
             .connection
-            .query_row(statement, [id], |row| row.get::<_, Option<String>>(0))
-            .optional()?
-            .flatten())
+            .query_row(statement, params![id, terminal_text_bytes()?], |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .optional()?;
+        let Some((byte_count, text)) = encoded else {
+            return Ok(None);
+        };
+        let Some(byte_count) = byte_count else {
+            return Ok(None);
+        };
+        let actual_bytes =
+            usize::try_from(byte_count).map_err(|_| PersistenceError::Validation {
+                field,
+                reason: "database contains an invalid byte count",
+            })?;
+        if actual_bytes > MAX_TERMINAL_TEXT_BYTES {
+            return Err(PersistenceError::TextLimitExceeded {
+                field,
+                max_bytes: MAX_TERMINAL_TEXT_BYTES,
+                actual_bytes,
+            });
+        }
+        text.map_or_else(
+            || {
+                Err(PersistenceError::Validation {
+                    field,
+                    reason: "database text could not be read",
+                })
+            },
+            |text| Ok(Some(text)),
+        )
     }
 
     /// Convenience accessor for the usual history copy action.
@@ -381,7 +441,8 @@ const SUMMARY_SELECT: &str = "SELECT id, created_at_ms, substr(selected_output, 
             worker_queue_duration_ms, release_to_insert_duration_ms, \
             CASE WHEN length(CAST(warnings_json AS BLOB)) <= ?2 THEN warnings_json ELSE NULL END, \
             checkpoint_count, checkpoint_repair_count, peak_retained_audio_ms, \
-            formatting_chunk_count, auto_stopped \
+            formatting_chunk_count, auto_stopped, raw_text IS NOT NULL, \
+            normalized_text IS NOT NULL, cleaned_text IS NOT NULL, selected_output IS NOT NULL \
      FROM dictation_history";
 
 #[derive(Debug)]
@@ -395,6 +456,7 @@ struct EncodedSummary {
     timings: [Option<i64>; 7],
     warnings_json: Option<String>,
     terminal: [Option<i64>; 5],
+    variants: [bool; 4],
 }
 
 fn map_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<EncodedSummary> {
@@ -422,6 +484,7 @@ fn map_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<EncodedSummary> {
             row.get(17)?,
             row.get(18)?,
         ],
+        variants: [row.get(19)?, row.get(20)?, row.get(21)?, row.get(22)?],
     })
 }
 
@@ -451,6 +514,12 @@ fn decode_summary(encoded: EncodedSummary) -> Result<HistorySummary> {
         },
         warnings,
         terminal: decode_terminal_values(encoded.terminal)?,
+        variants: HistoryVariantAvailability {
+            raw: encoded.variants[0],
+            normalized: encoded.variants[1],
+            cleaned: encoded.variants[2],
+            selected_output: encoded.variants[3],
+        },
     })
 }
 
@@ -642,6 +711,13 @@ fn summary_preview_chars() -> Result<i64> {
 fn warnings_json_bytes() -> Result<i64> {
     i64::try_from(MAX_WARNINGS_JSON_BYTES).map_err(|_| PersistenceError::Validation {
         field: "warnings",
+        reason: "display limit exceeds the supported range",
+    })
+}
+
+fn terminal_text_bytes() -> Result<i64> {
+    i64::try_from(MAX_TERMINAL_TEXT_BYTES).map_err(|_| PersistenceError::Validation {
+        field: "history_text",
         reason: "display limit exceeds the supported range",
     })
 }

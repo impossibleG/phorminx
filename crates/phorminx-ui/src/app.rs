@@ -4,7 +4,7 @@ use crate::components::{
     hairline, inline_notice, nav_id, nav_item, request_page_header_focus, shortcut_chord,
     status_seal, tensioned_p,
 };
-use crate::model::{Route, ShellEvent, ShellSnapshot};
+use crate::model::{HistoryLoadedText, HistoryVariant, Route, ShellEvent, ShellSnapshot};
 use crate::pages::{self, PageState};
 use crate::theme::{self, Space, ThemeMode, UiThemeExt};
 
@@ -56,14 +56,33 @@ impl PhorminxUi {
     }
 
     pub fn apply_snapshot(&mut self, snapshot: ShellSnapshot) {
+        let retained = self
+            .snapshot
+            .history
+            .iter_mut()
+            .find(|item| self.pages.history_id == Some(item.id))
+            .and_then(|item| item.loaded.take())
+            .filter(|loaded| loaded.variant == self.pages.history_variant);
+        let retained_id = self.pages.history_id;
         self.route = snapshot.route;
         self.pages.reconcile(&snapshot);
         self.snapshot = snapshot;
+        if self.route == Route::History
+            && retained_id == self.pages.history_id
+            && let (Some(id), Some(loaded)) = (retained_id, retained)
+            && let Some(item) = self.snapshot.history.iter_mut().find(|item| item.id == id)
+            && item.has_variant(loaded.variant)
+        {
+            item.loaded = Some(loaded);
+        }
     }
 
     pub fn navigate(&mut self, route: Route) {
         if self.route != route {
             self.route = route;
+            if route != Route::History {
+                self.clear_history_detail();
+            }
             self.outbox.push(ShellEvent::Navigate(route));
         }
     }
@@ -99,6 +118,48 @@ impl PhorminxUi {
         if self.snapshot.history.iter().any(|item| item.id == id) {
             self.pages.history_id = Some(id);
             self.pages.history_variant = crate::model::HistoryVariant::Output;
+        }
+    }
+
+    #[must_use]
+    pub const fn history_selection(&self) -> Option<(i64, HistoryVariant)> {
+        match self.pages.history_id {
+            Some(id) => Some((id, self.pages.history_variant)),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub fn history_detail_loaded(&self, id: i64, variant: HistoryVariant) -> bool {
+        self.snapshot
+            .history
+            .iter()
+            .find(|item| item.id == id)
+            .and_then(|item| item.loaded.as_ref())
+            .is_some_and(|loaded| loaded.variant == variant)
+    }
+
+    /// Replaces any prior detail with one exact selected variant.
+    pub fn set_history_detail(&mut self, id: i64, variant: HistoryVariant, text: String) -> bool {
+        for item in &mut self.snapshot.history {
+            item.loaded = None;
+        }
+        if self.pages.history_id != Some(id) || self.pages.history_variant != variant {
+            return false;
+        }
+        let Some(item) = self.snapshot.history.iter_mut().find(|item| item.id == id) else {
+            return false;
+        };
+        if !item.has_variant(variant) {
+            return false;
+        }
+        item.loaded = Some(HistoryLoadedText { variant, text });
+        true
+    }
+
+    pub fn clear_history_detail(&mut self) {
+        for item in &mut self.snapshot.history {
+            item.loaded = None;
         }
     }
 
@@ -314,6 +375,109 @@ mod tests {
             app.pages.history_variant,
             crate::model::HistoryVariant::Output
         );
+    }
+
+    #[test]
+    fn exact_history_detail_is_single_record_bounded_and_survives_safe_refresh() {
+        let mut initial = ShellSnapshot::gallery(GalleryScenario::Populated);
+        initial.route = Route::History;
+        let mut app = PhorminxUi::new(initial);
+        let first = app.snapshot().history[0].id;
+        let second = app.snapshot().history[1].id;
+
+        app.select_history(first);
+        app.pages.history_variant = HistoryVariant::Raw;
+        assert!(app.set_history_detail(first, HistoryVariant::Raw, "exact raw 🦀".into()));
+        assert!(app.history_detail_loaded(first, HistoryVariant::Raw));
+        assert_eq!(
+            app.snapshot()
+                .history
+                .iter()
+                .filter(|item| item.loaded.is_some())
+                .count(),
+            1
+        );
+
+        let mut refreshed = ShellSnapshot::gallery(GalleryScenario::Populated);
+        refreshed.route = Route::History;
+        for item in &mut refreshed.history {
+            item.loaded = None;
+        }
+        app.apply_snapshot(refreshed);
+        assert_eq!(
+            app.snapshot().history[0].text_for(HistoryVariant::Raw),
+            Some("exact raw 🦀")
+        );
+
+        app.select_history(second);
+        assert!(!app.set_history_detail(first, HistoryVariant::Raw, "late stale raw".into()));
+        assert!(app.set_history_detail(second, HistoryVariant::Output, "second exact".into()));
+        assert!(!app.history_detail_loaded(first, HistoryVariant::Raw));
+        assert!(app.history_detail_loaded(second, HistoryVariant::Output));
+        assert_eq!(
+            app.snapshot()
+                .history
+                .iter()
+                .filter(|item| item.loaded.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn refresh_drops_stale_detail_when_selected_record_disappears() {
+        let mut app = PhorminxUi::new(ShellSnapshot::gallery(GalleryScenario::Populated));
+        let selected = app.snapshot().history[1].id;
+        app.select_history(selected);
+        assert!(app.set_history_detail(selected, HistoryVariant::Output, "stale".into()));
+
+        let mut refreshed = ShellSnapshot::gallery(GalleryScenario::Populated);
+        refreshed.history.retain(|item| item.id != selected);
+        for item in &mut refreshed.history {
+            item.loaded = None;
+        }
+        app.apply_snapshot(refreshed);
+
+        assert_ne!(app.history_selection().map(|(id, _)| id), Some(selected));
+        assert!(
+            app.snapshot()
+                .history
+                .iter()
+                .all(|item| item.loaded.is_none())
+        );
+        assert!(!app.set_history_detail(selected, HistoryVariant::Output, "late".into()));
+        assert!(
+            app.snapshot()
+                .history
+                .iter()
+                .all(|item| item.loaded.is_none())
+        );
+    }
+
+    #[test]
+    fn leaving_history_releases_exact_text_while_preserving_previews() {
+        let mut snapshot = ShellSnapshot::gallery(GalleryScenario::Populated);
+        snapshot.route = Route::History;
+        for item in &mut snapshot.history {
+            item.loaded = None;
+        }
+        let mut app = PhorminxUi::new(snapshot);
+        let selected = app.snapshot().history[0].id;
+        assert!(app.set_history_detail(
+            selected,
+            HistoryVariant::Output,
+            "private exact text".into()
+        ));
+
+        app.navigate(Route::Home);
+
+        assert!(
+            app.snapshot()
+                .history
+                .iter()
+                .all(|item| item.loaded.is_none())
+        );
+        assert!(!app.snapshot().history[0].output_preview.is_empty());
     }
 
     #[test]

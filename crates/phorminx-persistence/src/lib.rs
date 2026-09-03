@@ -13,8 +13,9 @@ use std::{fs, path::Path, path::PathBuf, time::Duration};
 
 pub use history::{
     DictationDraft, DictationRecord, HISTORY_PREVIEW_MAX_CHARS, HistoryRepository, HistorySummary,
-    HistoryTextVariant, MAX_TERMINAL_TEXT_BYTES, MAX_TERMINAL_WARNING_BYTES, MAX_TERMINAL_WARNINGS,
-    RetentionPolicy, TerminalMetadata, TimingMetadata,
+    HistoryTextVariant, HistoryVariantAvailability, MAX_TERMINAL_TEXT_BYTES,
+    MAX_TERMINAL_WARNING_BYTES, MAX_TERMINAL_WARNINGS, RetentionPolicy, TerminalMetadata,
+    TimingMetadata,
 };
 pub use lexicon::{CasePolicy, LexiconEntry, LexiconRepository, NewLexiconEntry};
 pub use profile::{

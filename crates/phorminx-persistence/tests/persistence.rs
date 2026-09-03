@@ -347,7 +347,9 @@ fn terminal_metadata_round_trips_without_changing_legacy_records() {
 #[test]
 fn hundreds_of_long_unicode_records_have_strictly_bounded_summaries() {
     const RECORDS: usize = 300;
-    let (_directory, database) = open_temp();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.sqlite3");
+    let database = Persistence::open(&path).unwrap();
     let history = database.history();
     history
         .set_retention(RetentionPolicy::Indefinite, NOW)
@@ -362,6 +364,18 @@ fn hundreds_of_long_unicode_records_have_strictly_bounded_summaries() {
             .unwrap();
     }
 
+    drop(database);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "UPDATE dictation_history SET raw_text = x'80' WHERE id = 1",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+
+    let database = Persistence::open(&path).unwrap();
+    let history = database.history();
+
     let summaries = history.recent_summaries(RECORDS + 100).unwrap();
     assert_eq!(summaries.len(), RECORDS);
     assert!(summaries.iter().all(|summary| {
@@ -369,6 +383,10 @@ fn hundreds_of_long_unicode_records_have_strictly_bounded_summaries() {
             && summary.preview_truncated
             && summary.selected_output_chars > u64::try_from(HISTORY_PREVIEW_MAX_CHARS).unwrap()
             && summary.warnings.len() <= MAX_TERMINAL_WARNINGS
+            && summary.variants.raw
+            && summary.variants.normalized
+            && summary.variants.cleaned
+            && summary.variants.selected_output
     }));
     let newest = &summaries[0];
     assert_eq!(newest.selected_output_preview.chars().count(), 240);
@@ -381,6 +399,7 @@ fn hundreds_of_long_unicode_records_have_strictly_bounded_summaries() {
     let exact = history.selected_output(newest.id).unwrap().unwrap();
     assert_eq!(exact.chars().count() as u64, newest.selected_output_chars);
     assert!(exact.ends_with("🛡️漢字"));
+    assert!(history.text_variant(1, HistoryTextVariant::Raw).is_err());
 }
 
 #[test]
@@ -413,6 +432,10 @@ fn summary_queries_do_not_decode_unrequested_full_variants() {
     let history = database.history();
     let summary = history.summary(1).unwrap().unwrap();
     assert_eq!(summary.selected_output_preview, "selected lazy");
+    assert!(summary.variants.raw);
+    assert!(summary.variants.normalized);
+    assert!(summary.variants.cleaned);
+    assert!(summary.variants.selected_output);
     assert_eq!(summary.warnings.len(), MAX_TERMINAL_WARNINGS);
     assert_eq!(
         summary.warnings.last().unwrap(),
@@ -423,6 +446,48 @@ fn summary_queries_do_not_decode_unrequested_full_variants() {
         Some("selected lazy".into())
     );
     assert!(history.get(1).is_err());
+}
+
+#[test]
+fn oversized_legacy_variant_is_rejected_without_returning_its_payload() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.sqlite3");
+    let database = Persistence::open(&path).unwrap();
+    database
+        .history()
+        .set_retention(RetentionPolicy::Indefinite, NOW)
+        .unwrap();
+    database.history().insert(&draft(NOW, "legacy")).unwrap();
+    drop(database);
+
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "UPDATE dictation_history SET cleaned_text = zeroblob(?1) WHERE id = 1",
+        [i64::try_from(MAX_TERMINAL_TEXT_BYTES + 1).unwrap()],
+    )
+    .unwrap();
+    drop(raw);
+
+    let database = Persistence::open(&path).unwrap();
+    assert!(matches!(
+        database
+            .history()
+            .text_variant(1, HistoryTextVariant::Cleaned),
+        Err(PersistenceError::TextLimitExceeded {
+            field: "cleaned_text",
+            actual_bytes,
+            ..
+        }) if actual_bytes == MAX_TERMINAL_TEXT_BYTES + 1
+    ));
+    assert!(
+        database
+            .history()
+            .summary(1)
+            .unwrap()
+            .unwrap()
+            .variants
+            .cleaned
+    );
 }
 
 #[test]

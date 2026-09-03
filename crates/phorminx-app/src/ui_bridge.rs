@@ -11,8 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use phorminx_audio::input_devices;
 use phorminx_ollama::{CancellationToken, OllamaClient};
 use phorminx_persistence::{
-    AppProfile, CasePolicy, DictationRecord, ExecutableIdentity, FormattingStyle,
-    InsertionPreference, LexiconEntry, NewLexiconEntry, Persistence, RetentionPolicy,
+    AppProfile, CasePolicy, ExecutableIdentity, FormattingStyle, HistorySummary,
+    HistoryTextVariant, InsertionPreference, LexiconEntry, NewLexiconEntry, Persistence,
+    RetentionPolicy,
 };
 #[cfg(test)]
 use phorminx_whisper::WhisperBackend;
@@ -485,10 +486,10 @@ pub struct UiSettingsSnapshot {
 pub struct UiHistoryItem {
     pub id: i64,
     pub created_at_ms: i64,
-    pub raw_text: String,
-    pub normalized_text: Option<String>,
-    pub cleaned_text: Option<String>,
-    pub selected_output: String,
+    pub selected_output_preview: String,
+    pub selected_output_chars: u64,
+    pub preview_truncated: bool,
+    pub variants: UiHistoryVariantAvailability,
     pub language: Option<String>,
     /// Basename only; paths and window titles cannot cross this boundary.
     pub target_executable: Option<String>,
@@ -500,6 +501,22 @@ pub struct UiHistoryItem {
     pub worker_queue_duration_ms: Option<u64>,
     pub release_to_insert_duration_ms: Option<u64>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiHistoryVariantAvailability {
+    pub output: bool,
+    pub raw: bool,
+    pub normalized: bool,
+    pub cleaned: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiHistoryVariant {
+    Output,
+    Raw,
+    Normalized,
+    Cleaned,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -660,7 +677,7 @@ impl UiBridge {
         let history = self
             .persistence
             .history()
-            .recent(history_limit)
+            .recent_summaries(history_limit)
             .map_err(UiBridgeError::persistence)?
             .into_iter()
             .map(history_item)
@@ -695,6 +712,18 @@ impl UiBridge {
             lexicon,
             profiles,
         })
+    }
+
+    /// Loads one exact transcript variant only after a detail or copy request.
+    pub fn history_text(
+        &self,
+        id: i64,
+        variant: UiHistoryVariant,
+    ) -> Result<Option<String>, UiBridgeError> {
+        self.persistence
+            .history()
+            .text_variant(id, history_variant(variant))
+            .map_err(UiBridgeError::persistence)
     }
 
     pub fn execute(
@@ -994,28 +1023,41 @@ fn outcome(mutation: UiMutation) -> UiCommandOutcome {
     }
 }
 
-fn history_item(record: DictationRecord) -> UiHistoryItem {
-    let draft = record.dictation;
+fn history_item(summary: HistorySummary) -> UiHistoryItem {
     UiHistoryItem {
-        id: record.id,
-        created_at_ms: draft.created_at_ms,
-        raw_text: draft.raw_text,
-        normalized_text: draft.normalized_text,
-        cleaned_text: draft.cleaned_text,
-        selected_output: draft.selected_output,
-        language: draft.language,
+        id: summary.id,
+        created_at_ms: summary.created_at_ms,
+        selected_output_preview: summary.selected_output_preview,
+        selected_output_chars: summary.selected_output_chars,
+        preview_truncated: summary.preview_truncated,
+        variants: UiHistoryVariantAvailability {
+            output: summary.variants.selected_output,
+            raw: summary.variants.raw,
+            normalized: summary.variants.normalized,
+            cleaned: summary.variants.cleaned,
+        },
+        language: summary.language,
         // Defense in depth for databases created by an older build.
-        target_executable: draft
+        target_executable: summary
             .target_executable
             .filter(|value| ExecutableIdentity::new(value.clone()).is_ok()),
-        audio_duration_ms: draft.timings.audio_duration_ms,
-        stt_duration_ms: draft.timings.stt_duration_ms,
-        formatting_duration_ms: draft.timings.formatting_duration_ms,
-        insertion_duration_ms: draft.timings.insertion_duration_ms,
-        audio_finalization_duration_ms: draft.timings.audio_finalization_duration_ms,
-        worker_queue_duration_ms: draft.timings.worker_queue_duration_ms,
-        release_to_insert_duration_ms: draft.timings.release_to_insert_duration_ms,
-        warnings: draft.warnings,
+        audio_duration_ms: summary.timings.audio_duration_ms,
+        stt_duration_ms: summary.timings.stt_duration_ms,
+        formatting_duration_ms: summary.timings.formatting_duration_ms,
+        insertion_duration_ms: summary.timings.insertion_duration_ms,
+        audio_finalization_duration_ms: summary.timings.audio_finalization_duration_ms,
+        worker_queue_duration_ms: summary.timings.worker_queue_duration_ms,
+        release_to_insert_duration_ms: summary.timings.release_to_insert_duration_ms,
+        warnings: summary.warnings,
+    }
+}
+
+const fn history_variant(variant: UiHistoryVariant) -> HistoryTextVariant {
+    match variant {
+        UiHistoryVariant::Output => HistoryTextVariant::SelectedOutput,
+        UiHistoryVariant::Raw => HistoryTextVariant::Raw,
+        UiHistoryVariant::Normalized => HistoryTextVariant::Normalized,
+        UiHistoryVariant::Cleaned => HistoryTextVariant::Cleaned,
     }
 }
 
@@ -1226,7 +1268,7 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use phorminx_persistence::{DictationDraft, TimingMetadata};
+    use phorminx_persistence::{DictationDraft, HISTORY_PREVIEW_MAX_CHARS, TimingMetadata};
 
     use super::*;
 
@@ -1822,12 +1864,110 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.runtime_status, UiRuntimeStatus::Refining);
         assert_eq!(snapshot.history.len(), 1);
-        assert_eq!(snapshot.history[0].cleaned_text.as_deref(), Some("cleaned"));
+        assert_eq!(snapshot.history[0].selected_output_preview, "selected");
+        assert!(!snapshot.history[0].preview_truncated);
+        assert_eq!(snapshot.history[0].selected_output_chars, 8);
+        assert_eq!(
+            snapshot.history[0].variants,
+            UiHistoryVariantAvailability {
+                output: true,
+                raw: true,
+                normalized: true,
+                cleaned: true,
+            }
+        );
         assert_eq!(
             snapshot.history[0].target_executable.as_deref(),
             Some("code.exe")
         );
         assert_eq!(snapshot.history[0].formatting_duration_ms, Some(3));
+    }
+
+    #[test]
+    fn large_snapshot_is_preview_only_and_exact_variants_are_loaded_on_demand() {
+        const RECORDS: usize = 300;
+        let test = TestBridge::new();
+        let long_output = format!("opening 🛡️漢字 {} closing", "é🦀".repeat(400));
+        let expected_preview: String = long_output
+            .chars()
+            .take(HISTORY_PREVIEW_MAX_CHARS)
+            .collect();
+        let mut exact_id = None;
+
+        for index in 0..RECORDS {
+            let draft = DictationDraft {
+                created_at_ms: 2_000_000_000_000 + i64::try_from(index).unwrap(),
+                raw_text: format!("raw-{index}-{}", "r".repeat(900)),
+                normalized_text: Some(format!("normalized-{index}-{}", "n".repeat(900))),
+                cleaned_text: Some(format!("cleaned-{index}-{}", "c".repeat(900))),
+                selected_output: long_output.clone(),
+                language: Some("pt-br".to_owned()),
+                target_executable: Some("code.exe".to_owned()),
+                timings: TimingMetadata::default(),
+                warnings: Vec::new(),
+            };
+            let id = test
+                .bridge
+                .persistence
+                .history()
+                .insert(&draft)
+                .unwrap()
+                .unwrap();
+            if index == RECORDS - 1 {
+                exact_id = Some(id);
+            }
+        }
+        let exact_id = exact_id.unwrap();
+
+        let snapshot = test
+            .bridge
+            .snapshot(UiRuntimeStatus::Ready, test.readiness(), RECORDS + 1)
+            .unwrap();
+        assert_eq!(snapshot.history.len(), RECORDS);
+        assert!(snapshot.history.iter().all(|item| {
+            item.selected_output_preview.chars().count() <= HISTORY_PREVIEW_MAX_CHARS
+                && item.preview_truncated
+                && item.variants.output
+                && item.variants.raw
+                && item.variants.normalized
+                && item.variants.cleaned
+        }));
+        assert_eq!(snapshot.history[0].id, exact_id);
+        assert_eq!(
+            snapshot.history[0].selected_output_preview,
+            expected_preview
+        );
+
+        assert_eq!(
+            test.bridge
+                .history_text(exact_id, UiHistoryVariant::Output)
+                .unwrap(),
+            Some(long_output)
+        );
+        assert_eq!(
+            test.bridge
+                .history_text(exact_id, UiHistoryVariant::Raw)
+                .unwrap(),
+            Some(format!("raw-{}-{}", RECORDS - 1, "r".repeat(900)))
+        );
+        assert_eq!(
+            test.bridge
+                .history_text(exact_id, UiHistoryVariant::Normalized)
+                .unwrap(),
+            Some(format!("normalized-{}-{}", RECORDS - 1, "n".repeat(900)))
+        );
+        assert_eq!(
+            test.bridge
+                .history_text(exact_id, UiHistoryVariant::Cleaned)
+                .unwrap(),
+            Some(format!("cleaned-{}-{}", RECORDS - 1, "c".repeat(900)))
+        );
+        assert_eq!(
+            test.bridge
+                .history_text(i64::MAX, UiHistoryVariant::Output)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

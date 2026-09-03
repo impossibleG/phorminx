@@ -53,9 +53,20 @@ impl PageState {
     pub fn reconcile(&mut self, snapshot: &ShellSnapshot) {
         if self
             .history_id
-            .is_some_and(|id| !snapshot.history.iter().any(|item| item.id == id))
+            .is_none_or(|id| !snapshot.history.iter().any(|item| item.id == id))
         {
             self.history_id = snapshot.history.first().map(|item| item.id);
+            self.history_variant = HistoryVariant::Output;
+        }
+        if self.history_id.and_then(|id| {
+            snapshot
+                .history
+                .iter()
+                .find(|item| item.id == id)
+                .map(|item| item.has_variant(self.history_variant))
+        }) == Some(false)
+        {
+            self.history_variant = HistoryVariant::Output;
         }
         if self
             .lexicon_id
@@ -244,7 +255,7 @@ fn home(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
                 );
                 if ui
                     .add(
-                        Button::new(RichText::new(&item.output).color(tokens.text))
+                        Button::new(RichText::new(item.preview()).color(tokens.text))
                             .wrap()
                             .fill(egui::Color32::TRANSPARENT)
                             .stroke(Stroke::NONE),
@@ -349,7 +360,9 @@ fn history(
                         Button::new(
                             RichText::new(format!(
                                 "{}  {}\n{}",
-                                item.time, item.application, item.output
+                                item.time,
+                                item.application,
+                                item.preview()
                             ))
                             .color(if selected {
                                 tokens.text
@@ -382,17 +395,22 @@ fn history(
         {
             let available = HistoryVariant::ALL
                 .into_iter()
-                .filter(|variant| item.text_for(*variant).is_some());
+                .filter(|variant| item.has_variant(*variant));
             if let Some(variant) = segmented(
                 &mut columns[1],
                 available,
                 &mut state.history_variant,
                 HistoryVariant::label,
             ) {
-                outbox.push(ShellEvent::SelectHistoryVariant(variant));
+                outbox.push(ShellEvent::SelectHistoryVariant {
+                    id: item.id,
+                    variant,
+                });
             }
             columns[1].add_space(Space::LG);
-            let text = item.text_for(state.history_variant).unwrap_or(&item.output);
+            let text = item
+                .text_for(state.history_variant)
+                .unwrap_or("Loading transcript…");
             columns[1].label(
                 RichText::new(text)
                     .size(21.0)
@@ -409,7 +427,9 @@ fn history(
                         variant: HistoryVariant::Output,
                     });
                 }
-                if item.raw.is_some() && action(ui, "Copy raw", ActionTone::Quiet).clicked() {
+                if item.has_variant(HistoryVariant::Raw)
+                    && action(ui, "Copy raw", ActionTone::Quiet).clicked()
+                {
                     outbox.push(ShellEvent::CopyHistory {
                         id: item.id,
                         variant: HistoryVariant::Raw,
