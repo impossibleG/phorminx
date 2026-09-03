@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionError, ActionId, ActionKey, CapabilityId, CapabilityRecord, CapabilityValue,
-    ContentFreeId, EngineKind, Language, Remedy, SetupAction, Sha256Digest, Usability,
+    ActionError, ActionId, ActionKey, CapabilityId, CapabilityRecord, CapabilityRecordError,
+    CapabilityValue, ContentFreeId, EngineKind, Language, Remedy, SetupAction, Sha256Digest,
+    Usability,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -93,25 +94,68 @@ impl SetupPlan {
     }
 }
 
-#[derive(Deserialize)]
-struct SetupPlanWire {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PersistedSetupPlan {
     schema_version: u32,
     policy_version: ContentFreeId,
     actions: Vec<PlannedAction>,
 }
 
-impl<'de> Deserialize<'de> for SetupPlan {
+#[derive(Deserialize)]
+struct PersistedSetupPlanWire {
+    schema_version: u32,
+    policy_version: ContentFreeId,
+    actions: Vec<PlannedAction>,
+}
+
+impl PersistedSetupPlan {
+    pub fn authorize(
+        self,
+        desired: &DesiredConfiguration,
+        capabilities: impl IntoIterator<Item = CapabilityRecord>,
+    ) -> Result<SetupPlan, PlanError> {
+        let candidate = SetupPlan {
+            schema_version: self.schema_version,
+            policy_version: self.policy_version,
+            actions: self.actions,
+        };
+        candidate.validate()?;
+        let recomputed = Planner::plan(desired, capabilities)?;
+        if candidate != recomputed {
+            return Err(PlanError::PersistedPlanMismatch);
+        }
+        Ok(recomputed)
+    }
+}
+
+impl From<&SetupPlan> for PersistedSetupPlan {
+    fn from(plan: &SetupPlan) -> Self {
+        Self {
+            schema_version: plan.schema_version,
+            policy_version: plan.policy_version.clone(),
+            actions: plan.actions.clone(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PersistedSetupPlan {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let wire = SetupPlanWire::deserialize(deserializer)?;
+        let wire = PersistedSetupPlanWire::deserialize(deserializer)?;
         let plan = Self {
             schema_version: wire.schema_version,
             policy_version: wire.policy_version,
             actions: wire.actions,
         };
-        plan.validate().map_err(serde::de::Error::custom)?;
+        SetupPlan {
+            schema_version: plan.schema_version,
+            policy_version: plan.policy_version.clone(),
+            actions: plan.actions.clone(),
+        }
+        .validate()
+        .map_err(serde::de::Error::custom)?;
         Ok(plan)
     }
 }
@@ -126,7 +170,8 @@ impl Planner {
     ) -> Result<SetupPlan, PlanError> {
         let mut inventory = BTreeMap::new();
         for capability in capabilities {
-            match inventory.entry(capability.id.clone()) {
+            capability.validate()?;
+            match inventory.entry(capability.id().clone()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(capability);
                 }
@@ -205,14 +250,14 @@ impl Planner {
             let probe = SetupAction::for_key(ActionKey::Probe(capability))?;
             return graph.insert(probe, BTreeSet::new()).map(Some);
         };
-        if record.usability.is_ready() {
+        if record.usability().is_ready() {
             return Ok(None);
         }
 
-        let remedies = if record.remedies.is_empty() {
-            [default_remedy(&record.usability)].into_iter().collect()
+        let remedies = if record.remedies().is_empty() {
+            [default_remedy(record.usability())].into_iter().collect()
         } else {
-            record.remedies.clone()
+            record.remedies().clone()
         };
         let Some(selected) = remedies
             .iter()
@@ -239,10 +284,7 @@ impl Planner {
                     BTreeSet::new(),
                 )
                 .map(Some),
-            Remedy::AcquireManagedAssets {
-                artifacts,
-                loads_native_code,
-            } => {
+            Remedy::AcquireManagedAssets { artifacts } => {
                 if artifacts.is_empty() {
                     return Err(PlanError::EmptyAssetSet);
                 }
@@ -250,17 +292,16 @@ impl Planner {
                     .into_iter()
                     .map(|artifact| {
                         graph.insert(
-                            SetupAction::for_key(ActionKey::DownloadArtifact { artifact })?,
+                            SetupAction::for_key(ActionKey::DownloadArtifact {
+                                artifact: Box::new(artifact),
+                            })?,
                             BTreeSet::new(),
                         )
                     })
                     .collect::<Result<BTreeSet<_>, _>>()?;
-                Self::validate_and_activate(graph, capability, dependencies, loads_native_code)
+                Self::validate_and_activate(graph, capability, dependencies)
             }
-            Remedy::ImportVerifiedAssets {
-                artifacts,
-                loads_native_code,
-            } => {
+            Remedy::ImportVerifiedAssets { artifacts } => {
                 if artifacts.is_empty() {
                     return Err(PlanError::EmptyAssetSet);
                 }
@@ -268,19 +309,11 @@ impl Planner {
                     SetupAction::for_key(ActionKey::ImportVerifiedAssets { artifacts })?,
                     BTreeSet::new(),
                 )?;
-                Self::validate_and_activate(
-                    graph,
-                    capability,
-                    [imported].into_iter().collect(),
-                    loads_native_code,
-                )
+                Self::validate_and_activate(graph, capability, [imported].into_iter().collect())
             }
-            Remedy::ValidateInstalled => Self::validate_and_activate(
-                graph,
-                capability,
-                BTreeSet::new(),
-                is_native(capability),
-            ),
+            Remedy::ValidateInstalled => {
+                Self::validate_and_activate(graph, capability, BTreeSet::new())
+            }
             Remedy::ActivateRecognition => Self::activate(graph, capability, BTreeSet::new()),
             Remedy::GrantMicrophoneAccess => graph
                 .insert(
@@ -331,13 +364,9 @@ impl Planner {
         graph: &mut ActionGraph,
         capability: &CapabilityId,
         dependencies: BTreeSet<ActionId>,
-        loads_native_code: bool,
     ) -> Result<Option<ActionId>, PlanError> {
         let validation = graph.insert(
-            SetupAction::for_key(ActionKey::Validate {
-                capability: capability.clone(),
-                loads_native_code,
-            })?,
+            SetupAction::for_key(ActionKey::Validate(capability.clone()))?,
             dependencies,
         )?;
         if matches!(
@@ -419,22 +448,16 @@ fn remedy_priority(capability: &CapabilityId, remedy: &Remedy) -> Option<u8> {
 
 fn launch_at_login_needs_action(desired: bool, record: Option<&CapabilityRecord>) -> bool {
     match record {
-        Some(CapabilityRecord {
-            value:
-                Some(CapabilityValue::LaunchAtLogin {
-                    enabled,
-                    exact_command,
-                }),
-            usability,
-            ..
-        }) => !usability.is_ready() || *enabled != desired || !*exact_command,
-        Some(record) => desired || !record.usability.is_ready(),
-        None => desired,
+        Some(record) => match record.value() {
+            Some(CapabilityValue::LaunchAtLogin {
+                enabled,
+                exact_command,
+            }) => !record.usability().is_ready() || *enabled != desired || !*exact_command,
+            Some(_) => true,
+            None => true,
+        },
+        None => true,
     }
-}
-
-fn is_native(capability: &CapabilityId) -> bool {
-    matches!(capability, CapabilityId::InstantRecognition { .. })
 }
 
 #[derive(Default)]
@@ -523,6 +546,10 @@ pub enum PlanError {
     UnsupportedPlanVersion,
     #[error("plan contains an invalid action: {0}")]
     InvalidAction(#[from] ActionError),
+    #[error("capability inventory contains an invalid record: {0}")]
+    InvalidCapability(#[from] CapabilityRecordError),
+    #[error("persisted plan does not exactly match a fresh plan from validated inputs")]
+    PersistedPlanMismatch,
     #[error("capability inventory contains conflicting duplicate observations")]
     ConflictingCapability,
     #[error("plan contains conflicting duplicate actions")]
@@ -545,7 +572,12 @@ mod tests {
         UnavailableReason,
     };
 
-    fn artifact(id: &str, byte: char) -> ArtifactDescriptor {
+    fn artifact_for(
+        id: &str,
+        byte: char,
+        engine: EngineKind,
+        language: Language,
+    ) -> ArtifactDescriptor {
         ArtifactDescriptor::new(
             AssetId::new(id).unwrap(),
             Sha256Digest::new(byte.to_string().repeat(64)).unwrap(),
@@ -556,27 +588,74 @@ mod tests {
             format!("https://example.invalid/{id}.bin"),
             ArtifactKind::Data,
             None,
+            engine,
+            [language],
         )
         .unwrap()
     }
 
+    fn artifact(id: &str, byte: char) -> ArtifactDescriptor {
+        artifact_for(id, byte, EngineKind::Accurate, Language::English)
+    }
+
     fn ready(id: CapabilityId) -> CapabilityRecord {
-        CapabilityRecord::new(
-            id,
-            Usability::Ready {
-                authority: ReadyAuthority::FullProbe,
-            },
-        )
+        let (value, authority) = match &id {
+            CapabilityId::Microphone => (
+                CapabilityValue::Microphone {
+                    selected_is_available: true,
+                },
+                ReadyAuthority::FullProbe,
+            ),
+            CapabilityId::AccurateRecognition { language } => (
+                CapabilityValue::Recognition {
+                    engine: EngineKind::Accurate,
+                    language: *language,
+                    model_digest: Some(Sha256Digest::new("a".repeat(64)).unwrap()),
+                },
+                ReadyAuthority::FullProbe,
+            ),
+            CapabilityId::InstantRecognition { language } => (
+                CapabilityValue::Recognition {
+                    engine: EngineKind::Instant,
+                    language: *language,
+                    model_digest: Some(Sha256Digest::new("a".repeat(64)).unwrap()),
+                },
+                ReadyAuthority::ResidentWorker,
+            ),
+            CapabilityId::OllamaDaemon => (
+                CapabilityValue::ExternalTool {
+                    version: Some(ContentFreeId::new("v1").unwrap()),
+                },
+                ReadyAuthority::LoopbackHealth,
+            ),
+            CapabilityId::OllamaModel { digest } => (
+                CapabilityValue::Model {
+                    digest: digest.clone(),
+                },
+                ReadyAuthority::FullProbe,
+            ),
+            CapabilityId::LaunchAtLogin => (
+                CapabilityValue::LaunchAtLogin {
+                    enabled: false,
+                    exact_command: true,
+                },
+                ReadyAuthority::OperatingSystemReadback,
+            ),
+        };
+        CapabilityRecord::new(id, Some(value), Usability::Ready { authority }).unwrap()
     }
 
     fn missing(id: CapabilityId, remedy: Remedy) -> CapabilityRecord {
         CapabilityRecord::new(
             id,
+            None,
             Usability::Unavailable {
                 reason: UnavailableReason::Missing,
             },
         )
+        .unwrap()
         .with_remedies([remedy])
+        .unwrap()
     }
 
     fn desired() -> DesiredConfiguration {
@@ -600,7 +679,6 @@ mod tests {
                 },
                 Remedy::AcquireManagedAssets {
                     artifacts: [model].into_iter().collect(),
-                    loads_native_code: false,
                 },
             ),
         ];
@@ -623,7 +701,6 @@ mod tests {
                 capability,
                 Remedy::AcquireManagedAssets {
                     artifacts: [artifact("base-en", 'a')].into_iter().collect(),
-                    loads_native_code: false,
                 },
             ),
         ];
@@ -656,7 +733,12 @@ mod tests {
             ),
         ];
         let plan = Planner::plan(&desired(), records).unwrap();
-        assert!(plan.actions.is_empty());
+        assert!(plan.actions().iter().all(|planned| !matches!(
+            planned.action().key(),
+            ActionKey::GuidedExternalInstall { .. }
+                | ActionKey::StartExternalTool { .. }
+                | ActionKey::PullOllamaModel { .. }
+        )));
     }
 
     #[test]
@@ -719,8 +801,8 @@ mod tests {
             language: Language::English,
         };
         let artifacts = [
-            artifact("vosk-runtime", 'a'),
-            artifact("vosk-en-model", 'b'),
+            artifact_for("vosk-runtime", 'a', EngineKind::Instant, Language::English),
+            artifact_for("vosk-en-model", 'b', EngineKind::Instant, Language::English),
         ]
         .into_iter()
         .collect();
@@ -728,13 +810,7 @@ mod tests {
             &desired,
             [
                 ready(CapabilityId::Microphone),
-                missing(
-                    instant,
-                    Remedy::AcquireManagedAssets {
-                        artifacts,
-                        loads_native_code: true,
-                    },
-                ),
+                missing(instant, Remedy::AcquireManagedAssets { artifacts }),
             ],
         )
         .unwrap();
@@ -753,25 +829,67 @@ mod tests {
 
     #[test]
     fn persisted_plan_revalidates_action_identity_and_policy_version() {
-        let plan = Planner::plan(
-            &desired(),
+        let inventory = || {
             [
                 missing(CapabilityId::Microphone, Remedy::SelectMicrophone),
                 ready(CapabilityId::AccurateRecognition {
                     language: Language::English,
                 }),
-            ],
-        )
-        .unwrap();
+            ]
+        };
+        let plan = Planner::plan(&desired(), inventory()).unwrap();
+        let persisted: PersistedSetupPlan =
+            serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+        assert_eq!(persisted.authorize(&desired(), inventory()).unwrap(), plan);
         let mut relabelled = serde_json::to_value(&plan).unwrap();
         relabelled["actions"][0]["action"]["id"] = serde_json::json!(ActionId::for_key(
             &ActionKey::Probe(CapabilityId::Microphone)
         ));
-        assert!(serde_json::from_value::<SetupPlan>(relabelled).is_err());
+        assert!(serde_json::from_value::<PersistedSetupPlan>(relabelled).is_err());
 
         let mut wrong_policy = serde_json::to_value(&plan).unwrap();
         wrong_policy["policy_version"] = serde_json::json!("setup-policy-v999");
-        assert!(serde_json::from_value::<SetupPlan>(wrong_policy).is_err());
+        assert!(serde_json::from_value::<PersistedSetupPlan>(wrong_policy).is_err());
+
+        let mut incomplete = serde_json::to_value(&plan).unwrap();
+        incomplete["actions"].as_array_mut().unwrap().pop();
+        let persisted: PersistedSetupPlan = serde_json::from_value(incomplete).unwrap();
+        assert_eq!(
+            persisted.authorize(
+                &desired(),
+                [
+                    missing(CapabilityId::Microphone, Remedy::SelectMicrophone),
+                    ready(CapabilityId::AccurateRecognition {
+                        language: Language::English,
+                    }),
+                ],
+            ),
+            Err(PlanError::PersistedPlanMismatch)
+        );
+    }
+
+    #[test]
+    fn artifact_language_and_engine_must_match_recognition_capability() {
+        let wrong_language = artifact_for(
+            "base-pt",
+            'a',
+            EngineKind::Accurate,
+            Language::PortugueseBrazil,
+        );
+        let result = CapabilityRecord::new(
+            CapabilityId::AccurateRecognition {
+                language: Language::English,
+            },
+            None,
+            Usability::Unavailable {
+                reason: UnavailableReason::Missing,
+            },
+        )
+        .unwrap()
+        .with_remedies([Remedy::AcquireManagedAssets {
+            artifacts: [wrong_language].into_iter().collect(),
+        }]);
+        assert_eq!(result, Err(CapabilityRecordError::IncompatibleRemedy));
     }
 
     #[test]
@@ -785,16 +903,43 @@ mod tests {
                 ready(CapabilityId::AccurateRecognition {
                     language: Language::English,
                 }),
-                ready(CapabilityId::LaunchAtLogin).with_value(CapabilityValue::LaunchAtLogin {
-                    enabled: true,
-                    exact_command: true,
-                }),
+                CapabilityRecord::new(
+                    CapabilityId::LaunchAtLogin,
+                    Some(CapabilityValue::LaunchAtLogin {
+                        enabled: true,
+                        exact_command: true,
+                    }),
+                    Usability::Ready {
+                        authority: ReadyAuthority::OperatingSystemReadback,
+                    },
+                )
+                .unwrap(),
             ],
         )
         .unwrap();
         assert!(plan.actions().iter().any(|planned| matches!(
             planned.action().key(),
             ActionKey::ApplyLaunchAtLogin { enabled: false }
+        )));
+    }
+
+    #[test]
+    fn unknown_launch_at_login_is_probed_even_when_desired_is_disabled() {
+        let mut configuration = desired();
+        configuration.launch_at_login = false;
+        let plan = Planner::plan(
+            &configuration,
+            [
+                ready(CapabilityId::Microphone),
+                ready(CapabilityId::AccurateRecognition {
+                    language: Language::English,
+                }),
+            ],
+        )
+        .unwrap();
+        assert!(plan.actions().iter().any(|planned| matches!(
+            planned.action().key(),
+            ActionKey::Probe(CapabilityId::LaunchAtLogin)
         )));
     }
 
@@ -806,20 +951,21 @@ mod tests {
         let model = artifact("base-en", 'a');
         let record = CapabilityRecord::new(
             capability.clone(),
+            None,
             Usability::Unavailable {
                 reason: UnavailableReason::Missing,
             },
         )
+        .unwrap()
         .with_remedies([
             Remedy::AcquireManagedAssets {
                 artifacts: [model.clone()].into_iter().collect(),
-                loads_native_code: false,
             },
             Remedy::ImportVerifiedAssets {
                 artifacts: [model].into_iter().collect(),
-                loads_native_code: false,
             },
-        ]);
+        ])
+        .unwrap();
         let plan = Planner::plan(&desired(), [ready(CapabilityId::Microphone), record]).unwrap();
         assert!(matches!(
             plan.actions()[0].action().key(),
@@ -845,7 +991,6 @@ mod tests {
                     },
                     Remedy::AcquireManagedAssets {
                         artifacts: [artifact("base-en", 'a')].into_iter().collect(),
-                        loads_native_code: false,
                     },
                 ),
                 missing(

@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,11 @@ pub enum RecommendationPreference {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RecommendationPolicy {
     pub protocol: BenchmarkProtocol,
+    pub expected_build_id: ContentFreeId,
+    pub expected_device_id: ContentFreeId,
+    pub expected_driver_id: ContentFreeId,
+    pub allowed_artifact_digests: BTreeSet<crate::Sha256Digest>,
+    pub allowed_engine_backends: BTreeSet<(EngineKind, BackendKind)>,
     pub minimum_protected_token_exact_per_mille: u16,
     pub maximum_word_error_per_mille: u16,
     pub maximum_hallucination_per_mille: u16,
@@ -34,13 +39,25 @@ pub struct RecommendationPolicy {
 
 impl RecommendationPolicy {
     #[must_use]
-    pub fn interactive(protocol_id: ContentFreeId) -> Self {
+    pub fn interactive(
+        protocol_id: ContentFreeId,
+        expected_build_id: ContentFreeId,
+        expected_device_id: ContentFreeId,
+        expected_driver_id: ContentFreeId,
+        allowed_artifact_digests: impl IntoIterator<Item = crate::Sha256Digest>,
+        allowed_engine_backends: impl IntoIterator<Item = (EngineKind, BackendKind)>,
+    ) -> Self {
         Self {
             protocol: BenchmarkProtocol {
                 protocol_id,
                 minimum_speech_samples: 3,
                 minimum_silence_samples: 1,
             },
+            expected_build_id,
+            expected_device_id,
+            expected_driver_id,
+            allowed_artifact_digests: allowed_artifact_digests.into_iter().collect(),
+            allowed_engine_backends: allowed_engine_backends.into_iter().collect(),
             minimum_protected_token_exact_per_mille: 1_000,
             maximum_word_error_per_mille: 250,
             maximum_hallucination_per_mille: 0,
@@ -81,6 +98,10 @@ pub enum ExclusionReason {
     DispersionTooHigh,
     ThermalStateUnacceptable,
     SystemContentionObserved,
+    EvidenceContextMismatch,
+    ArtifactNotAllowed,
+    BackendNotAllowed,
+    ConflictingEvidence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -125,21 +146,33 @@ impl RecommendationEngine {
         policy: &RecommendationPolicy,
         candidates: impl IntoIterator<Item = CandidateEvidence>,
     ) -> Recommendation {
-        let mut candidates = candidates.into_iter().collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            left.evidence
-                .candidate_id
-                .cmp(&right.evidence.candidate_id)
-                .then_with(|| left.evidence.cmp(&right.evidence))
-        });
-        // Repeated observations for one candidate do not get extra voting
-        // weight. Keep the lexicographically first complete evidence record.
-        candidates
-            .dedup_by(|left, right| left.evidence.candidate_id == right.evidence.candidate_id);
-
-        let mut eligible = Vec::new();
-        let mut rejected = Vec::new();
+        let mut unique = BTreeMap::<ContentFreeId, CandidateEvidence>::new();
+        let mut conflicts = BTreeSet::new();
         for candidate in candidates {
+            let id = candidate.evidence.candidate_id.clone();
+            match unique.entry(id.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(candidate);
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get() == &candidate => {}
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    conflicts.insert(id);
+                }
+            }
+        }
+        let mut eligible = Vec::new();
+        let mut rejected = conflicts
+            .iter()
+            .map(|candidate_id| RejectedCandidate {
+                candidate_id: candidate_id.clone(),
+                reasons: [ExclusionReason::ConflictingEvidence].into_iter().collect(),
+            })
+            .collect::<Vec<_>>();
+        for (id, candidate) in unique {
+            if conflicts.contains(&id) {
+                continue;
+            }
             let reasons = exclusion_reasons(language, policy, &candidate.evidence);
             if reasons.is_empty() {
                 eligible.push(candidate);
@@ -200,6 +233,24 @@ fn exclusion_reasons(
     }
     if evidence.protocol_id != policy.protocol.protocol_id {
         reasons.insert(ExclusionReason::ProtocolMismatch);
+    }
+    if evidence.build_id != policy.expected_build_id
+        || evidence.device_id != policy.expected_device_id
+        || evidence.driver_id != policy.expected_driver_id
+    {
+        reasons.insert(ExclusionReason::EvidenceContextMismatch);
+    }
+    if !policy
+        .allowed_artifact_digests
+        .contains(&evidence.model_digest)
+    {
+        reasons.insert(ExclusionReason::ArtifactNotAllowed);
+    }
+    if !policy
+        .allowed_engine_backends
+        .contains(&(evidence.engine, evidence.backend))
+    {
+        reasons.insert(ExclusionReason::BackendNotAllowed);
     }
     if !evidence.supported_languages.contains(&language) {
         reasons.insert(ExclusionReason::LanguageIncompatible);
@@ -316,7 +367,17 @@ mod tests {
     use crate::{BenchmarkSampleSummary, Sha256Digest};
 
     fn policy() -> RecommendationPolicy {
-        RecommendationPolicy::interactive(ContentFreeId::new("setup-v1").unwrap())
+        RecommendationPolicy::interactive(
+            ContentFreeId::new("setup-v1").unwrap(),
+            ContentFreeId::new("build-1").unwrap(),
+            ContentFreeId::new("device-class-1").unwrap(),
+            ContentFreeId::new("driver-1").unwrap(),
+            [Sha256Digest::new("a".repeat(64)).unwrap()],
+            [
+                (EngineKind::Accurate, BackendKind::Vulkan),
+                (EngineKind::Instant, BackendKind::VoskNative),
+            ],
+        )
     }
 
     fn candidate(
@@ -625,5 +686,103 @@ mod tests {
         assert!(reasons.contains(&ExclusionReason::InvalidEvidence));
         assert!(reasons.contains(&ExclusionReason::ThermalStateUnacceptable));
         assert!(reasons.contains(&ExclusionReason::SystemContentionObserved));
+    }
+
+    #[test]
+    fn stale_machine_or_build_evidence_is_never_recommended() {
+        let mut stale = candidate(
+            "stale",
+            EngineKind::Accurate,
+            ModelClass::Base,
+            Language::English,
+            0,
+            100,
+        );
+        stale.evidence.driver_id = ContentFreeId::new("old-driver").unwrap();
+        let recommendation = RecommendationEngine::recommend(
+            Language::English,
+            RecommendationPreference::Balanced,
+            &policy(),
+            [stale],
+        );
+        assert_eq!(recommendation.outcome, RecommendationOutcome::Unavailable);
+        assert!(
+            recommendation.rejected_candidates[0]
+                .reasons
+                .contains(&ExclusionReason::EvidenceContextMismatch)
+        );
+    }
+
+    #[test]
+    fn artifact_and_backend_must_belong_to_current_trusted_context() {
+        let mut wrong_artifact = candidate(
+            "wrong-artifact",
+            EngineKind::Accurate,
+            ModelClass::Base,
+            Language::English,
+            0,
+            100,
+        );
+        wrong_artifact.evidence.model_digest = Sha256Digest::new("b".repeat(64)).unwrap();
+
+        let valid_artifact_wrong_policy_backend = candidate(
+            "wrong-backend-policy",
+            EngineKind::Accurate,
+            ModelClass::Base,
+            Language::English,
+            0,
+            100,
+        );
+        let mut restricted = policy();
+        restricted.allowed_engine_backends = [(EngineKind::Instant, BackendKind::VoskNative)]
+            .into_iter()
+            .collect();
+
+        let recommendation = RecommendationEngine::recommend(
+            Language::English,
+            RecommendationPreference::Balanced,
+            &restricted,
+            [wrong_artifact, valid_artifact_wrong_policy_backend],
+        );
+        assert_eq!(recommendation.outcome, RecommendationOutcome::Unavailable);
+        assert!(recommendation.rejected_candidates.iter().any(|candidate| {
+            candidate.candidate_id.as_str() == "wrong-artifact"
+                && candidate
+                    .reasons
+                    .contains(&ExclusionReason::ArtifactNotAllowed)
+        }));
+        assert!(recommendation.rejected_candidates.iter().any(|candidate| {
+            candidate.candidate_id.as_str() == "wrong-backend-policy"
+                && candidate
+                    .reasons
+                    .contains(&ExclusionReason::BackendNotAllowed)
+        }));
+    }
+
+    #[test]
+    fn conflicting_duplicate_candidate_evidence_is_rejected_not_discarded() {
+        let first = candidate(
+            "same-candidate",
+            EngineKind::Accurate,
+            ModelClass::Base,
+            Language::English,
+            0,
+            100,
+        );
+        let mut conflicting = first.clone();
+        conflicting.evidence.measurements.release_p95_ms = 200;
+        let recommendation = RecommendationEngine::recommend(
+            Language::English,
+            RecommendationPreference::Balanced,
+            &policy(),
+            [first, conflicting],
+        );
+        assert_eq!(recommendation.outcome, RecommendationOutcome::Unavailable);
+        assert_eq!(recommendation.rejected_candidates.len(), 1);
+        assert!(
+            recommendation.rejected_candidates[0]
+                .reasons
+                .contains(&ExclusionReason::ConflictingEvidence)
+        );
     }
 }

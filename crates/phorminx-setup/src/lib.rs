@@ -16,24 +16,25 @@ mod recommendation;
 pub use action::{
     ActionCommand, ActionError, ActionFailure, ActionId, ActionKey, ActionPhase, ActionProgress,
     ActionRuntime, ActionState, CancellationOutcome, ConsentCategory, Coordinator,
-    CoordinatorError, ProbeTicket, RollbackCause, RollbackPolicy, SetupAction,
+    CoordinatorError, ProbeTicket, RollbackCause, RollbackPolicy, RollbackResidue, SetupAction,
 };
 pub use asset::{
     AcquiredArtifact, ArtifactDescriptor, ArtifactKind, AssetId, AssetLocation, AssetReceipt,
-    AssetRegistry, CrashJournal, JournalError, ManagedAsset, ManagedSlot, OwnershipError,
-    Sha256Digest, SignerRequirement,
+    AssetRegistry, CrashJournal, JournalError, ManagedAsset, ManagedSlot, OwnerMarker,
+    OwnershipError, Sha256Digest, SignerRequirement,
 };
 pub use benchmark::{
     BackendKind, BenchmarkEvidence, BenchmarkProtocol, BenchmarkSampleSummary, ContentFreeId,
     ContentionCondition, EngineKind, ModelClass, ThermalCondition,
 };
 pub use capability::{
-    Capability, CapabilityId, CapabilityRecord, CapabilityValue, DegradedReason, Generation,
-    Language, Observation, ReadyAuthority, Remedy, Requirement, UnavailableReason, Usability,
+    Capability, CapabilityId, CapabilityRecord, CapabilityRecordError, CapabilityValue,
+    DegradedReason, Generation, Language, Observation, ReadyAuthority, Remedy, Requirement,
+    UnavailableReason, Usability,
 };
 pub use planner::{
-    DesiredConfiguration, FormattingChoice, PlanError, PlannedAction, Planner, RecognitionChoice,
-    SetupPlan,
+    DesiredConfiguration, FormattingChoice, PersistedSetupPlan, PlanError, PlannedAction, Planner,
+    RecognitionChoice, SetupPlan,
 };
 pub use recommendation::{
     CandidateEvidence, ExclusionReason, Recommendation, RecommendationEngine,

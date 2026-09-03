@@ -5,19 +5,19 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::{ArtifactDescriptor, CapabilityId, ContentFreeId, Generation, Language, Sha256Digest};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+// Keep the action discriminator distinct from the internally tagged
+// `CapabilityId` carried by probe/validate actions. Reusing `kind` for both
+// makes Serde emit an ambiguous object that cannot be read back.
+#[serde(rename_all = "snake_case", tag = "action_kind")]
 pub enum ActionKey {
     Probe(CapabilityId),
     DownloadArtifact {
-        artifact: ArtifactDescriptor,
+        artifact: Box<ArtifactDescriptor>,
     },
     ImportVerifiedAssets {
         artifacts: BTreeSet<ArtifactDescriptor>,
     },
-    Validate {
-        capability: CapabilityId,
-        loads_native_code: bool,
-    },
+    Validate(CapabilityId),
     ActivateRecognition {
         engine: crate::EngineKind,
         language: Language,
@@ -53,14 +53,7 @@ impl ActionKey {
             Self::ImportVerifiedAssets { artifacts } => {
                 format!("import:{}", canonical_artifacts(artifacts))
             }
-            Self::Validate {
-                capability,
-                loads_native_code,
-            } => format!(
-                "validate:{}:{}",
-                capability_key(capability),
-                if *loads_native_code { "native" } else { "data" }
-            ),
+            Self::Validate(capability) => format!("validate:{}", capability_key(capability)),
             Self::ActivateRecognition { engine, language } => {
                 format!("activate:{}:{}", engine_key(*engine), language.code())
             }
@@ -82,10 +75,7 @@ impl ActionKey {
             Self::DownloadArtifact { .. } | Self::PullOllamaModel { .. } => {
                 [ConsentCategory::NetworkDownload].into_iter().collect()
             }
-            Self::Validate {
-                loads_native_code: true,
-                ..
-            }
+            Self::Validate(CapabilityId::InstantRecognition { .. })
             | Self::ActivateRecognition {
                 engine: crate::EngineKind::Instant,
                 ..
@@ -108,7 +98,7 @@ impl ActionKey {
                 .collect(),
             Self::Probe(_)
             | Self::ImportVerifiedAssets { .. }
-            | Self::Validate { .. }
+            | Self::Validate(_)
             | Self::ActivateRecognition { .. }
             | Self::GrantMicrophoneAccess
             | Self::SelectMicrophone => BTreeSet::new(),
@@ -125,7 +115,7 @@ impl ActionKey {
                 RollbackPolicy::CompensatingWrite
             }
             Self::Probe(_)
-            | Self::Validate { .. }
+            | Self::Validate(_)
             | Self::GrantMicrophoneAccess
             | Self::SelectMicrophone
             | Self::GuidedExternalInstall { .. }
@@ -135,43 +125,46 @@ impl ActionKey {
     }
 
     #[must_use]
-    pub const fn permits_phase(&self, phase: ActionPhase) -> bool {
-        match phase {
-            ActionPhase::Preparing | ActionPhase::Finalizing => true,
-            ActionPhase::Downloading => matches!(
-                self,
-                Self::DownloadArtifact { .. }
-                    | Self::GuidedExternalInstall { .. }
-                    | Self::PullOllamaModel { .. }
-            ),
-            ActionPhase::Importing => matches!(self, Self::ImportVerifiedAssets { .. }),
-            ActionPhase::Verifying => matches!(
-                self,
-                Self::DownloadArtifact { .. }
-                    | Self::ImportVerifiedAssets { .. }
-                    | Self::Validate { .. }
-                    | Self::PullOllamaModel { .. }
-                    | Self::ApplyLaunchAtLogin { .. }
-            ),
-            ActionPhase::Loading => matches!(
-                self,
-                Self::Validate { .. }
-                    | Self::ActivateRecognition { .. }
-                    | Self::GuidedExternalInstall { .. }
-                    | Self::StartExternalTool { .. }
-            ),
-            ActionPhase::Benchmarking => matches!(self, Self::RunBenchmark { .. }),
-            ActionPhase::Committing => matches!(
-                self,
-                Self::DownloadArtifact { .. }
-                    | Self::ImportVerifiedAssets { .. }
-                    | Self::ActivateRecognition { .. }
-                    | Self::GrantMicrophoneAccess
-                    | Self::SelectMicrophone
-                    | Self::GuidedExternalInstall { .. }
-                    | Self::PullOllamaModel { .. }
-                    | Self::ApplyLaunchAtLogin { .. }
-            ),
+    pub fn permits_phase(&self, phase: ActionPhase) -> bool {
+        self.phase_index(phase).is_some()
+    }
+
+    fn phase_index(&self, phase: ActionPhase) -> Option<usize> {
+        self.required_phases()
+            .iter()
+            .position(|candidate| *candidate == phase)
+    }
+
+    #[must_use]
+    pub const fn required_phases(&self) -> &'static [ActionPhase] {
+        use ActionPhase::{
+            Benchmarking, Committing, Downloading, Finalizing, Importing, Loading, Preparing,
+            Verifying,
+        };
+        match self {
+            Self::Probe(_) => &[Preparing, Finalizing],
+            Self::DownloadArtifact { .. } | Self::PullOllamaModel { .. } => {
+                &[Preparing, Downloading, Verifying, Committing, Finalizing]
+            }
+            Self::ImportVerifiedAssets { .. } => {
+                &[Preparing, Importing, Verifying, Committing, Finalizing]
+            }
+            Self::Validate(_) => &[Preparing, Verifying, Loading, Finalizing],
+            Self::ActivateRecognition { .. } => &[Preparing, Loading, Committing, Finalizing],
+            Self::GrantMicrophoneAccess | Self::SelectMicrophone => {
+                &[Preparing, Committing, Finalizing]
+            }
+            Self::GuidedExternalInstall { .. } => &[
+                Preparing,
+                Downloading,
+                Verifying,
+                Loading,
+                Committing,
+                Finalizing,
+            ],
+            Self::StartExternalTool { .. } => &[Preparing, Loading, Finalizing],
+            Self::ApplyLaunchAtLogin { .. } => &[Preparing, Committing, Verifying, Finalizing],
+            Self::RunBenchmark { .. } => &[Preparing, Benchmarking, Finalizing],
         }
     }
 
@@ -376,19 +369,6 @@ pub enum ActionPhase {
     Finalizing,
 }
 
-impl ActionPhase {
-    const fn rank(self) -> u8 {
-        match self {
-            Self::Preparing => 0,
-            Self::Downloading | Self::Importing => 1,
-            Self::Verifying => 2,
-            Self::Loading | Self::Benchmarking => 3,
-            Self::Committing => 4,
-            Self::Finalizing => 5,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ActionProgress {
     pub phase: ActionPhase,
@@ -448,12 +428,26 @@ pub enum ActionState {
         retryable: bool,
     },
     FailedPendingRollback {
-        failure: ActionFailure,
+        original_failure: ActionFailure,
         retryable: bool,
         cause: RollbackCause,
     },
     RollbackPending {
         cause: RollbackCause,
+        original_failure: Option<ActionFailure>,
+        retryable_after_rollback: bool,
+    },
+    RollbackRetryPending {
+        cause: RollbackCause,
+        original_failure: Option<ActionFailure>,
+        rollback_failure: ActionFailure,
+        retryable_after_rollback: bool,
+    },
+    RollbackBlocked {
+        cause: RollbackCause,
+        original_failure: Option<ActionFailure>,
+        rollback_failure: ActionFailure,
+        residue: RollbackResidue,
     },
     Cancelled {
         outcome: CancellationOutcome,
@@ -477,17 +471,33 @@ pub enum RollbackCause {
     UserRequested,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackResidue {
+    ManagedAssetsMayRemain,
+    ConfigurationMayRemain,
+}
+
 impl ActionState {
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::Succeeded
-                | Self::Failed { .. }
-                | Self::FailedExternalSideEffectsMayRemain { .. }
-                | Self::Cancelled { .. }
-                | Self::RolledBack
-        )
+            | Self::Failed { .. }
+            | Self::RollbackBlocked { .. }
+            | Self::RolledBack => true,
+            Self::Cancelled { outcome } => {
+                !matches!(outcome, CancellationOutcome::ExternalSideEffectsMayRemain)
+            }
+            Self::AwaitingConsent { .. }
+            | Self::Queued
+            | Self::Running { .. }
+            | Self::Cancelling
+            | Self::FailedExternalSideEffectsMayRemain { .. }
+            | Self::FailedPendingRollback { .. }
+            | Self::RollbackPending { .. }
+            | Self::RollbackRetryPending { .. } => false,
+        }
     }
 }
 
@@ -506,6 +516,7 @@ pub enum ActionCommand {
     Retry,
     RequestRollback,
     RollbackCompleted,
+    ExternalStateReconciled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -544,11 +555,17 @@ impl ActionRuntime {
                 progress: ActionProgress::new(ActionPhase::Preparing, 0, None)?,
             },
             (ActionState::Running { progress }, ActionCommand::Progress(next)) => {
-                if !self.action.key.permits_phase(next.phase) {
-                    return Err(ActionError::PhaseIncompatible);
-                }
-                if next.phase.rank() < progress.phase.rank()
-                    || (next.phase.rank() == progress.phase.rank() && next.phase != progress.phase)
+                let current_index = self
+                    .action
+                    .key
+                    .phase_index(progress.phase)
+                    .ok_or(ActionError::PhaseIncompatible)?;
+                let next_index = self
+                    .action
+                    .key
+                    .phase_index(next.phase)
+                    .ok_or(ActionError::PhaseIncompatible)?;
+                if next_index < current_index
                     || (next.phase == progress.phase
                         && next.completed_units < progress.completed_units)
                     || (next.phase == progress.phase
@@ -561,6 +578,9 @@ impl ActionRuntime {
                         && next.total_units.is_none())
                 {
                     return Err(ActionError::ProgressRegressed);
+                }
+                if next_index > current_index.saturating_add(1) {
+                    return Err(ActionError::PhaseSkipped);
                 }
                 ActionState::Running { progress: next }
             }
@@ -579,7 +599,7 @@ impl ActionRuntime {
                 ActionCommand::Fail { failure, retryable },
             ) if self.action.rollback != RollbackPolicy::None => {
                 ActionState::FailedPendingRollback {
-                    failure,
+                    original_failure: failure,
                     retryable,
                     cause: if matches!(self.state, ActionState::Cancelling) {
                         RollbackCause::Cancellation
@@ -589,13 +609,29 @@ impl ActionRuntime {
                 }
             }
             (
-                ActionState::RollbackPending { cause },
+                ActionState::RollbackPending {
+                    cause,
+                    original_failure,
+                    retryable_after_rollback,
+                },
                 ActionCommand::Fail { failure, retryable },
-            ) => ActionState::FailedPendingRollback {
-                failure,
-                retryable,
-                cause: *cause,
-            },
+            ) => {
+                if retryable {
+                    ActionState::RollbackRetryPending {
+                        cause: *cause,
+                        original_failure: *original_failure,
+                        rollback_failure: failure,
+                        retryable_after_rollback: *retryable_after_rollback,
+                    }
+                } else {
+                    ActionState::RollbackBlocked {
+                        cause: *cause,
+                        original_failure: *original_failure,
+                        rollback_failure: failure,
+                        residue: rollback_residue(self.action.rollback),
+                    }
+                }
+            }
             (
                 ActionState::Running { .. } | ActionState::Cancelling,
                 ActionCommand::Fail { failure, retryable },
@@ -617,6 +653,8 @@ impl ActionRuntime {
             {
                 ActionState::RollbackPending {
                     cause: RollbackCause::Cancellation,
+                    original_failure: None,
+                    retryable_after_rollback: true,
                 }
             }
             (ActionState::Cancelling, ActionCommand::CancellationCompleted) => {
@@ -631,13 +669,18 @@ impl ActionRuntime {
             (
                 ActionState::Failed {
                     retryable: true, ..
-                }
-                | ActionState::FailedExternalSideEffectsMayRemain {
-                    retryable: true, ..
                 },
                 ActionCommand::Retry,
             )
-            | (ActionState::RolledBack | ActionState::Cancelled { .. }, ActionCommand::Retry) => {
+            | (ActionState::RolledBack, ActionCommand::Retry)
+            | (
+                ActionState::Cancelled {
+                    outcome:
+                        CancellationOutcome::NoLocalRollbackNeeded
+                        | CancellationOutcome::RollbackCompleted,
+                },
+                ActionCommand::Retry,
+            ) => {
                 self.attempt = self.attempt.saturating_add(1);
                 if self.action.consent.is_empty() || self.consent_granted {
                     ActionState::Queued
@@ -652,26 +695,81 @@ impl ActionRuntime {
             {
                 ActionState::RollbackPending {
                     cause: RollbackCause::UserRequested,
+                    original_failure: None,
+                    retryable_after_rollback: true,
                 }
             }
-            (ActionState::FailedPendingRollback { cause, .. }, ActionCommand::RequestRollback)
-                if self.action.rollback != RollbackPolicy::None =>
-            {
-                ActionState::RollbackPending { cause: *cause }
-            }
-            (ActionState::RollbackPending { cause }, ActionCommand::RollbackCompleted) => {
-                if *cause == RollbackCause::Cancellation {
-                    ActionState::Cancelled {
-                        outcome: CancellationOutcome::RollbackCompleted,
-                    }
-                } else {
+            (
+                ActionState::FailedPendingRollback {
+                    cause,
+                    original_failure,
+                    retryable,
+                },
+                ActionCommand::RequestRollback,
+            ) if self.action.rollback != RollbackPolicy::None => ActionState::RollbackPending {
+                cause: *cause,
+                original_failure: Some(*original_failure),
+                retryable_after_rollback: *retryable,
+            },
+            (
+                ActionState::RollbackRetryPending {
+                    cause,
+                    original_failure,
+                    retryable_after_rollback,
+                    ..
+                },
+                ActionCommand::RequestRollback,
+            ) => ActionState::RollbackPending {
+                cause: *cause,
+                original_failure: *original_failure,
+                retryable_after_rollback: *retryable_after_rollback,
+            },
+            (
+                ActionState::RollbackPending {
+                    cause,
+                    original_failure,
+                    retryable_after_rollback,
+                },
+                ActionCommand::RollbackCompleted,
+            ) => match (*cause, *original_failure, *retryable_after_rollback) {
+                (RollbackCause::Cancellation, _, _) => ActionState::Cancelled {
+                    outcome: CancellationOutcome::RollbackCompleted,
+                },
+                (RollbackCause::Failure, Some(failure), false) => ActionState::Failed {
+                    failure,
+                    retryable: false,
+                },
+                (RollbackCause::Failure | RollbackCause::UserRequested, _, _) => {
                     ActionState::RolledBack
                 }
-            }
+            },
+            (
+                ActionState::FailedExternalSideEffectsMayRemain { failure, retryable },
+                ActionCommand::ExternalStateReconciled,
+            ) => ActionState::Failed {
+                failure: *failure,
+                retryable: *retryable,
+            },
+            (
+                ActionState::Cancelled {
+                    outcome: CancellationOutcome::ExternalSideEffectsMayRemain,
+                },
+                ActionCommand::ExternalStateReconciled,
+            ) => ActionState::Cancelled {
+                outcome: CancellationOutcome::NoLocalRollbackNeeded,
+            },
             _ => return Err(ActionError::IllegalTransition),
         };
         self.state = next;
         Ok(())
+    }
+}
+
+fn rollback_residue(policy: RollbackPolicy) -> RollbackResidue {
+    match policy {
+        RollbackPolicy::ManagedAssetsOnly => RollbackResidue::ManagedAssetsMayRemain,
+        RollbackPolicy::CompensatingWrite => RollbackResidue::ConfigurationMayRemain,
+        RollbackPolicy::None => unreachable!("rollback residue requires rollback authority"),
     }
 }
 
@@ -758,6 +856,8 @@ pub enum ActionError {
     InvalidProgress,
     #[error("action progress cannot move backward")]
     ProgressRegressed,
+    #[error("action progress cannot skip a required phase")]
+    PhaseSkipped,
     #[error("action lifecycle transition is illegal")]
     IllegalTransition,
 }
@@ -790,6 +890,8 @@ mod tests {
             format!("https://example.invalid/{id}.zip"),
             ArtifactKind::Data,
             None,
+            crate::EngineKind::Accurate,
+            [Language::English],
         )
         .unwrap()
     }
@@ -800,7 +902,7 @@ mod tests {
 
     fn download() -> SetupAction {
         SetupAction::for_key(ActionKey::DownloadArtifact {
-            artifact: artifact("vosk-runtime", 'a'),
+            artifact: Box::new(artifact("vosk-runtime", 'a')),
         })
         .unwrap()
     }
@@ -813,11 +915,14 @@ mod tests {
     }
 
     fn finish(runtime: &mut ActionRuntime) {
-        runtime
-            .apply(ActionCommand::Progress(
-                ActionProgress::new(ActionPhase::Finalizing, 1, Some(1)).unwrap(),
-            ))
-            .unwrap();
+        let remaining = runtime.action.key().required_phases()[1..].to_vec();
+        for phase in remaining {
+            runtime
+                .apply(ActionCommand::Progress(
+                    ActionProgress::new(phase, 1, Some(1)).unwrap(),
+                ))
+                .unwrap();
+        }
         runtime.apply(ActionCommand::Succeed).unwrap();
     }
 
@@ -857,12 +962,9 @@ mod tests {
             .into_iter()
             .collect()
         );
-        let native = SetupAction::for_key(ActionKey::Validate {
-            capability: CapabilityId::AccurateRecognition {
-                language: Language::English,
-            },
-            loads_native_code: true,
-        })
+        let native = SetupAction::for_key(ActionKey::Validate(CapabilityId::InstantRecognition {
+            language: Language::English,
+        }))
         .unwrap();
         assert_eq!(
             native.consent(),
@@ -881,7 +983,9 @@ mod tests {
         assert_eq!(
             runtime.state,
             ActionState::RollbackPending {
-                cause: RollbackCause::Cancellation
+                cause: RollbackCause::Cancellation,
+                original_failure: None,
+                retryable_after_rollback: true,
             }
         );
         runtime.apply(ActionCommand::RollbackCompleted).unwrap();
@@ -993,7 +1097,7 @@ mod tests {
         let probe_id = ActionId::for_key(&ActionKey::Probe(CapabilityId::Microphone));
         let relabelled = serde_json::json!({
             "id": probe_id,
-            "key": {"kind": "guided_external_install", "tool": "ollama"},
+            "key": {"action_kind": "guided_external_install", "tool": "ollama"},
             "consent": [],
             "rollback": "none"
         });
@@ -1056,6 +1160,62 @@ mod tests {
     }
 
     #[test]
+    fn irrecoverable_rollback_converges_to_terminal_blocked_with_residue() {
+        let mut runtime = ActionRuntime::new(download());
+        runtime.apply(ActionCommand::GrantConsent).unwrap();
+        runtime.apply(ActionCommand::Start).unwrap();
+        runtime
+            .apply(ActionCommand::Fail {
+                failure: ActionFailure::VerificationFailed,
+                retryable: false,
+            })
+            .unwrap();
+        runtime.apply(ActionCommand::RequestRollback).unwrap();
+        runtime
+            .apply(ActionCommand::Fail {
+                failure: ActionFailure::PermissionDenied,
+                retryable: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime.state,
+            ActionState::RollbackBlocked {
+                original_failure: Some(ActionFailure::VerificationFailed),
+                rollback_failure: ActionFailure::PermissionDenied,
+                residue: RollbackResidue::ManagedAssetsMayRemain,
+                ..
+            }
+        ));
+        assert!(runtime.state.is_terminal());
+    }
+
+    #[test]
+    fn non_retryable_failure_stays_non_retryable_after_successful_rollback() {
+        let mut runtime = ActionRuntime::new(download());
+        runtime.apply(ActionCommand::GrantConsent).unwrap();
+        runtime.apply(ActionCommand::Start).unwrap();
+        runtime
+            .apply(ActionCommand::Fail {
+                failure: ActionFailure::VerificationFailed,
+                retryable: false,
+            })
+            .unwrap();
+        runtime.apply(ActionCommand::RequestRollback).unwrap();
+        runtime.apply(ActionCommand::RollbackCompleted).unwrap();
+        assert_eq!(
+            runtime.state,
+            ActionState::Failed {
+                failure: ActionFailure::VerificationFailed,
+                retryable: false,
+            }
+        );
+        assert_eq!(
+            runtime.apply(ActionCommand::Retry),
+            Err(ActionError::IllegalTransition)
+        );
+    }
+
+    #[test]
     fn external_cancellation_does_not_claim_rollback() {
         let mut runtime = ActionRuntime::new(external_install());
         runtime.apply(ActionCommand::GrantConsent).unwrap();
@@ -1068,6 +1228,15 @@ mod tests {
                 outcome: CancellationOutcome::ExternalSideEffectsMayRemain
             }
         );
+        assert!(!runtime.state.is_terminal());
+        assert_eq!(
+            runtime.apply(ActionCommand::Retry),
+            Err(ActionError::IllegalTransition)
+        );
+        runtime
+            .apply(ActionCommand::ExternalStateReconciled)
+            .unwrap();
+        runtime.apply(ActionCommand::Retry).unwrap();
     }
 
     #[test]
@@ -1085,6 +1254,14 @@ mod tests {
             runtime.state,
             ActionState::FailedExternalSideEffectsMayRemain { .. }
         ));
+        assert_eq!(
+            runtime.apply(ActionCommand::Retry),
+            Err(ActionError::IllegalTransition)
+        );
+        runtime
+            .apply(ActionCommand::ExternalStateReconciled)
+            .unwrap();
+        runtime.apply(ActionCommand::Retry).unwrap();
     }
 
     #[test]
@@ -1097,6 +1274,57 @@ mod tests {
             )),
             Err(ActionError::PhaseIncompatible)
         );
+    }
+
+    #[test]
+    fn mutating_action_cannot_skip_required_phases() {
+        let mut runtime = ActionRuntime::new(download());
+        runtime.apply(ActionCommand::GrantConsent).unwrap();
+        runtime.apply(ActionCommand::Start).unwrap();
+        assert_eq!(
+            runtime.apply(ActionCommand::Progress(
+                ActionProgress::new(ActionPhase::Finalizing, 1, Some(1)).unwrap()
+            )),
+            Err(ActionError::PhaseSkipped)
+        );
+    }
+
+    #[test]
+    fn rollback_blocked_releases_the_single_operation_coordinator() {
+        let mut coordinator = Coordinator::default();
+        let action = download();
+        let id = action.id().clone();
+        coordinator.start(action).unwrap();
+        coordinator
+            .command(&id, ActionCommand::GrantConsent)
+            .unwrap();
+        coordinator.command(&id, ActionCommand::Start).unwrap();
+        coordinator
+            .command(
+                &id,
+                ActionCommand::Fail {
+                    failure: ActionFailure::VerificationFailed,
+                    retryable: false,
+                },
+            )
+            .unwrap();
+        coordinator
+            .command(&id, ActionCommand::RequestRollback)
+            .unwrap();
+        coordinator
+            .command(
+                &id,
+                ActionCommand::Fail {
+                    failure: ActionFailure::PermissionDenied,
+                    retryable: false,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            coordinator.active().map(|runtime| &runtime.state),
+            Some(ActionState::RollbackBlocked { .. })
+        ));
+        coordinator.start(probe()).unwrap();
     }
 
     #[test]

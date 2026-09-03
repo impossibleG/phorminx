@@ -3,7 +3,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{ActionId, ActionKey, ActionPhase, ContentFreeId, Generation};
+use crate::{ActionId, ActionKey, ActionPhase, ContentFreeId, EngineKind, Generation, Language};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -67,6 +67,8 @@ pub struct ArtifactDescriptor {
     source_url: String,
     kind: ArtifactKind,
     signer: Option<SignerRequirement>,
+    engine: EngineKind,
+    supported_languages: std::collections::BTreeSet<Language>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +82,8 @@ struct ArtifactDescriptorWire {
     source_url: String,
     kind: ArtifactKind,
     signer: Option<SignerRequirement>,
+    engine: EngineKind,
+    supported_languages: std::collections::BTreeSet<Language>,
 }
 
 impl ArtifactDescriptor {
@@ -94,6 +98,8 @@ impl ArtifactDescriptor {
         source_url: impl Into<String>,
         kind: ArtifactKind,
         signer: Option<SignerRequirement>,
+        engine: EngineKind,
+        supported_languages: impl IntoIterator<Item = Language>,
     ) -> Result<Self, OwnershipError> {
         let descriptor = Self {
             asset_id,
@@ -105,6 +111,8 @@ impl ArtifactDescriptor {
             source_url: source_url.into(),
             kind,
             signer,
+            engine,
+            supported_languages: supported_languages.into_iter().collect(),
         };
         descriptor.validate()?;
         Ok(descriptor)
@@ -119,8 +127,11 @@ impl ArtifactDescriptor {
                 .source_url
                 .bytes()
                 .any(|byte| byte.is_ascii_whitespace())
-            || (self.kind == ArtifactKind::Executable && self.signer.is_none())
-            || (self.kind != ArtifactKind::Executable && self.signer.is_some())
+            || (matches!(
+                self.kind,
+                ArtifactKind::Executable | ArtifactKind::NativeLibrary
+            ) && self.signer.is_none())
+            || (self.kind == ArtifactKind::Data && self.signer.is_some())
         {
             return Err(OwnershipError::InvalidArtifactDescriptor);
         }
@@ -168,6 +179,23 @@ impl ArtifactDescriptor {
     }
 
     #[must_use]
+    pub const fn engine(&self) -> EngineKind {
+        self.engine
+    }
+
+    /// Empty means the artifact is language-neutral (for example, a runtime).
+    #[must_use]
+    pub const fn supported_languages(&self) -> &std::collections::BTreeSet<Language> {
+        &self.supported_languages
+    }
+
+    #[must_use]
+    pub fn supports(&self, engine: EngineKind, language: Language) -> bool {
+        self.engine == engine
+            && (self.supported_languages.is_empty() || self.supported_languages.contains(&language))
+    }
+
+    #[must_use]
     pub const fn signer(&self) -> Option<&SignerRequirement> {
         self.signer.as_ref()
     }
@@ -200,6 +228,8 @@ impl<'de> Deserialize<'de> for ArtifactDescriptor {
             wire.source_url,
             wire.kind,
             wire.signer,
+            wire.engine,
+            wire.supported_languages,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -363,31 +393,57 @@ pub enum AssetLocation {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AssetReceipt {
-    pub schema_version: u32,
-    pub asset: ManagedAsset,
-    pub installed_at_epoch_ms: u64,
+    schema_version: u32,
+    transaction_id: ContentFreeId,
+    asset: ManagedAsset,
+    installed_at_epoch_ms: u64,
 }
 
 impl AssetReceipt {
     pub const SCHEMA_VERSION: u32 = 1;
 
     #[must_use]
-    pub const fn new(asset: ManagedAsset, installed_at_epoch_ms: u64) -> Self {
+    pub const fn new(
+        transaction_id: ContentFreeId,
+        asset: ManagedAsset,
+        installed_at_epoch_ms: u64,
+    ) -> Self {
         Self {
             schema_version: Self::SCHEMA_VERSION,
+            transaction_id,
             asset,
             installed_at_epoch_ms,
         }
+    }
+
+    #[must_use]
+    pub const fn transaction_id(&self) -> &ContentFreeId {
+        &self.transaction_id
+    }
+
+    #[must_use]
+    pub const fn asset(&self) -> &ManagedAsset {
+        &self.asset
     }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct AssetRegistry {
     receipts: BTreeMap<AssetId, AssetReceipt>,
+    /// Process-local authority restored only after the host verifies the
+    /// matching atomic owner marker on disk. Never serialized.
+    #[serde(skip)]
+    reconciled: std::collections::BTreeSet<AssetId>,
 }
 
 impl AssetRegistry {
-    pub fn insert(&mut self, receipt: AssetReceipt) -> Result<(), OwnershipError> {
+    pub fn record_promotion(&mut self, receipt: AssetReceipt) -> Result<(), OwnershipError> {
+        let id = self.insert_untrusted(receipt)?;
+        self.reconciled.insert(id);
+        Ok(())
+    }
+
+    fn insert_untrusted(&mut self, receipt: AssetReceipt) -> Result<AssetId, OwnershipError> {
         if receipt.schema_version != AssetReceipt::SCHEMA_VERSION {
             return Err(OwnershipError::UnsupportedReceiptVersion);
         }
@@ -402,8 +458,8 @@ impl AssetRegistry {
         {
             return Err(OwnershipError::SlotAlreadyOwned);
         }
-        self.receipts.insert(id, receipt);
-        Ok(())
+        self.receipts.insert(id.clone(), receipt);
+        Ok(id)
     }
 
     pub fn validate(&self) -> Result<(), OwnershipError> {
@@ -431,6 +487,9 @@ impl AssetRegistry {
     /// installed managed receipt. Custom paths can never enter this API.
     #[must_use]
     pub fn cleanup_target(&self, asset: &ManagedAsset) -> Option<&ManagedSlot> {
+        if !self.reconciled.contains(asset.asset_id()) {
+            return None;
+        }
         self.receipts
             .get(asset.asset_id())
             .filter(|receipt| receipt.asset == *asset)
@@ -441,9 +500,53 @@ impl AssetRegistry {
         if self.cleanup_target(asset).is_none() {
             return Err(OwnershipError::NotOwned);
         }
+        self.reconciled.remove(asset.asset_id());
         self.receipts
             .remove(asset.asset_id())
             .ok_or(OwnershipError::NotOwned)
+    }
+
+    /// Grants cleanup authority only after the host has loaded this marker
+    /// from the managed slot and verified it was created atomically with the
+    /// promotion transaction.
+    pub fn reconcile_owner_marker(&mut self, marker: &OwnerMarker) -> Result<(), OwnershipError> {
+        let receipt = self
+            .receipts
+            .get(&marker.asset_id)
+            .ok_or(OwnershipError::NotOwned)?;
+        if marker.schema_version != OwnerMarker::SCHEMA_VERSION
+            || marker.transaction_id != receipt.transaction_id
+            || marker.digest != *receipt.asset.digest()
+            || marker.slot != *receipt.asset.slot()
+        {
+            return Err(OwnershipError::OwnerMarkerMismatch);
+        }
+        self.reconciled.insert(marker.asset_id.clone());
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OwnerMarker {
+    schema_version: u32,
+    transaction_id: ContentFreeId,
+    asset_id: AssetId,
+    digest: Sha256Digest,
+    slot: ManagedSlot,
+}
+
+impl OwnerMarker {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    #[must_use]
+    pub fn for_receipt(receipt: &AssetReceipt) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            transaction_id: receipt.transaction_id.clone(),
+            asset_id: receipt.asset.asset_id().clone(),
+            digest: receipt.asset.digest().clone(),
+            slot: receipt.asset.slot().clone(),
+        }
     }
 }
 
@@ -460,6 +563,7 @@ impl<'de> Deserialize<'de> for AssetRegistry {
         let wire = AssetRegistryWire::deserialize(deserializer)?;
         let registry = Self {
             receipts: wire.receipts,
+            reconciled: std::collections::BTreeSet::new(),
         };
         registry.validate().map_err(serde::de::Error::custom)?;
         Ok(registry)
@@ -610,7 +714,7 @@ pub enum OwnershipError {
     InvalidAssetId,
     #[error("SHA-256 digest must contain exactly 64 hexadecimal characters")]
     InvalidDigest,
-    #[error("artifact descriptor must pin HTTPS source, nonzero size, and executable signer")]
+    #[error("artifact descriptor must pin HTTPS source, nonzero size, and native-code signer")]
     InvalidArtifactDescriptor,
     #[error("acquired artifact does not match the pinned digest and size")]
     ArtifactIdentityMismatch,
@@ -628,6 +732,8 @@ pub enum OwnershipError {
     ReceiptIdentityMismatch,
     #[error("asset is not owned by this registry")]
     NotOwned,
+    #[error("on-disk owner marker does not match the promotion receipt")]
+    OwnerMarkerMismatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -661,6 +767,8 @@ mod tests {
             format!("https://example.invalid/{id}.zip"),
             ArtifactKind::Data,
             None,
+            EngineKind::Accurate,
+            [Language::English],
         )
         .unwrap()
     }
@@ -677,6 +785,14 @@ mod tests {
             signer: descriptor.signer().cloned(),
         };
         ManagedAsset::from_verified(descriptor, &acquired, ManagedSlot::new(slot).unwrap()).unwrap()
+    }
+
+    fn receipt(asset: ManagedAsset, installed_at: u64) -> AssetReceipt {
+        AssetReceipt::new(
+            ContentFreeId::new(format!("txn-{installed_at}")).unwrap(),
+            asset,
+            installed_at,
+        )
     }
 
     #[test]
@@ -720,6 +836,8 @@ mod tests {
             "https://example.invalid/ollama.exe",
             ArtifactKind::Executable,
             Some(signer.clone()),
+            EngineKind::Accurate,
+            [],
         )
         .unwrap();
         assert_eq!(
@@ -753,6 +871,27 @@ mod tests {
     }
 
     #[test]
+    fn native_library_requires_pinned_signer_identity() {
+        let result = ArtifactDescriptor::new(
+            AssetId::new("vosk-native").unwrap(),
+            digest('a'),
+            4096,
+            ContentFreeId::new("vendor").unwrap(),
+            ContentFreeId::new("v1").unwrap(),
+            ContentFreeId::new("apache-2.0").unwrap(),
+            "https://example.invalid/vosk.dll",
+            ArtifactKind::NativeLibrary,
+            None,
+            EngineKind::Instant,
+            [],
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            OwnershipError::InvalidArtifactDescriptor
+        );
+    }
+
+    #[test]
     fn deserialization_revalidates_artifact_descriptor() {
         let invalid = serde_json::json!({
             "asset_id": "installer",
@@ -778,7 +917,7 @@ mod tests {
         let mut registry = AssetRegistry::default();
         let recorded = managed("whisper-base-en", "assets/whisper/base-en");
         registry
-            .insert(AssetReceipt::new(recorded.clone(), 10))
+            .record_promotion(receipt(recorded.clone(), 10))
             .unwrap();
 
         let impostor_descriptor = ArtifactDescriptor::new(
@@ -791,6 +930,8 @@ mod tests {
             "https://example.invalid/impostor.zip",
             ArtifactKind::Data,
             None,
+            EngineKind::Accurate,
+            [Language::English],
         )
         .unwrap();
         let impostor_acquired = AcquiredArtifact {
@@ -812,7 +953,7 @@ mod tests {
     fn receipt_slots_cannot_be_shared() {
         let mut registry = AssetRegistry::default();
         registry
-            .insert(AssetReceipt::new(managed("one", "assets/shared"), 1))
+            .record_promotion(receipt(managed("one", "assets/shared"), 1))
             .unwrap();
         let descriptor = ArtifactDescriptor::new(
             AssetId::new("two").unwrap(),
@@ -824,6 +965,8 @@ mod tests {
             "https://example.invalid/two.zip",
             ArtifactKind::Data,
             None,
+            EngineKind::Accurate,
+            [Language::English],
         )
         .unwrap();
         let acquired = AcquiredArtifact {
@@ -838,7 +981,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            registry.insert(AssetReceipt::new(other, 2)).unwrap_err(),
+            registry.record_promotion(receipt(other, 2)).unwrap_err(),
             OwnershipError::SlotAlreadyOwned
         );
     }
@@ -846,7 +989,7 @@ mod tests {
     #[test]
     fn journal_can_only_name_owned_staging_namespace() {
         let action = crate::SetupAction::for_key(ActionKey::DownloadArtifact {
-            artifact: descriptor("runtime"),
+            artifact: Box::new(descriptor("runtime")),
         })
         .unwrap();
         let result = CrashJournal::new(
@@ -869,9 +1012,33 @@ mod tests {
     }
 
     #[test]
+    fn deserialized_registry_has_no_cleanup_authority_until_owner_marker_reconciles() {
+        let asset = managed("runtime", "assets/runtime");
+        let receipt = receipt(asset.clone(), 7);
+        let marker = OwnerMarker::for_receipt(&receipt);
+        let mut original = AssetRegistry::default();
+        original.record_promotion(receipt).unwrap();
+        assert_eq!(original.cleanup_target(&asset), Some(asset.slot()));
+
+        let mut restored: AssetRegistry =
+            serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+        assert_eq!(restored.cleanup_target(&asset), None);
+        restored.reconcile_owner_marker(&marker).unwrap();
+        assert_eq!(restored.cleanup_target(&asset), Some(asset.slot()));
+
+        let mut forged = serde_json::to_value(marker).unwrap();
+        forged["transaction_id"] = serde_json::json!("txn-forged");
+        let forged: OwnerMarker = serde_json::from_value(forged).unwrap();
+        assert_eq!(
+            restored.reconcile_owner_marker(&forged),
+            Err(OwnershipError::OwnerMarkerMismatch)
+        );
+    }
+
+    #[test]
     fn persisted_journal_rejects_non_staging_cleanup_target() {
         let action_key = ActionKey::DownloadArtifact {
-            artifact: descriptor("runtime"),
+            artifact: Box::new(descriptor("runtime")),
         };
         let journal = serde_json::json!({
             "schema_version": 1,
@@ -891,7 +1058,7 @@ mod tests {
         let relabelled = serde_json::json!({
             "schema_version": 1,
             "action_id": ActionId::for_key(&probe),
-            "action_key": {"kind": "guided_external_install", "tool": "ollama"},
+            "action_key": {"action_kind": "guided_external_install", "tool": "ollama"},
             "generation": 1,
             "phase": "loading",
             "staging_slot": null,
@@ -914,7 +1081,7 @@ mod tests {
     #[test]
     fn staging_slot_is_unambiguously_namespaced_by_action_identity() {
         let action = crate::SetupAction::for_key(ActionKey::DownloadArtifact {
-            artifact: descriptor("runtime"),
+            artifact: Box::new(descriptor("runtime")),
         })
         .unwrap();
         let expected = ManagedSlot::staging_for(action.id());
