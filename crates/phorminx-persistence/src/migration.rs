@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::Result;
 
-// The timing extension is deliberately additive and keeps schema version 1.
+// History metadata extensions are deliberately additive and keep schema version 1.
 // Older Phorminx binaries use explicit column lists, so nullable extra columns
 // are backward-compatible for both reads and writes.
 const LATEST_VERSION: u32 = 1;
@@ -60,7 +60,7 @@ CREATE TABLE app_profiles (
 );
 "#;
 
-const TIMING_COLUMNS: [(&str, &str); 3] = [
+const ADDITIVE_HISTORY_COLUMNS: [(&str, &str); 8] = [
     (
         "audio_finalization_duration_ms",
         "ALTER TABLE dictation_history ADD COLUMN audio_finalization_duration_ms INTEGER",
@@ -72,6 +72,26 @@ const TIMING_COLUMNS: [(&str, &str); 3] = [
     (
         "release_to_insert_duration_ms",
         "ALTER TABLE dictation_history ADD COLUMN release_to_insert_duration_ms INTEGER",
+    ),
+    (
+        "checkpoint_count",
+        "ALTER TABLE dictation_history ADD COLUMN checkpoint_count INTEGER",
+    ),
+    (
+        "checkpoint_repair_count",
+        "ALTER TABLE dictation_history ADD COLUMN checkpoint_repair_count INTEGER",
+    ),
+    (
+        "peak_retained_audio_ms",
+        "ALTER TABLE dictation_history ADD COLUMN peak_retained_audio_ms INTEGER",
+    ),
+    (
+        "formatting_chunk_count",
+        "ALTER TABLE dictation_history ADD COLUMN formatting_chunk_count INTEGER",
+    ),
+    (
+        "auto_stopped",
+        "ALTER TABLE dictation_history ADD COLUMN auto_stopped INTEGER CHECK (auto_stopped IN (0, 1))",
     ),
 ];
 
@@ -97,7 +117,7 @@ pub(crate) fn apply(connection: &Connection) -> Result<()> {
     }
 
     let transaction = connection.unchecked_transaction()?;
-    for (name, statement) in TIMING_COLUMNS {
+    for (name, statement) in ADDITIVE_HISTORY_COLUMNS {
         let exists: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('dictation_history') WHERE name = ?1)",
             [name],

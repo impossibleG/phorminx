@@ -12,7 +12,9 @@ use std::ffi::OsString;
 use std::{fs, path::Path, path::PathBuf, time::Duration};
 
 pub use history::{
-    DictationDraft, DictationRecord, HistoryRepository, RetentionPolicy, TimingMetadata,
+    DictationDraft, DictationRecord, HISTORY_PREVIEW_MAX_CHARS, HistoryRepository, HistorySummary,
+    HistoryTextVariant, MAX_TERMINAL_TEXT_BYTES, MAX_TERMINAL_WARNING_BYTES, MAX_TERMINAL_WARNINGS,
+    RetentionPolicy, TerminalMetadata, TimingMetadata,
 };
 pub use lexicon::{CasePolicy, LexiconEntry, LexiconRepository, NewLexiconEntry};
 pub use profile::{
@@ -35,6 +37,18 @@ pub enum PersistenceError {
     Validation {
         field: &'static str,
         reason: &'static str,
+    },
+    #[error("{field} exceeds its terminal text limit ({actual_bytes} bytes; maximum {max_bytes})")]
+    TextLimitExceeded {
+        field: &'static str,
+        max_bytes: usize,
+        actual_bytes: usize,
+    },
+    #[error("{field} contains too many items ({actual_items}; maximum {max_items})")]
+    CollectionLimitExceeded {
+        field: &'static str,
+        max_items: usize,
+        actual_items: usize,
     },
     #[error("an obsolete privacy-unsafe rollback artifact could not be removed")]
     PrivacyCleanup(#[source] std::io::Error),

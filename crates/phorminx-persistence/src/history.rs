@@ -5,6 +5,20 @@ use crate::{PersistenceError, Result};
 
 const HOUR_MS: i64 = 60 * 60 * 1_000;
 
+/// Maximum UTF-8 payload accepted for each terminal transcript variant.
+///
+/// This matches the default transcript-ledger text budget. Enforcing it here
+/// keeps history writes bounded even when a caller did not use that ledger.
+pub const MAX_TERMINAL_TEXT_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum Unicode scalar values returned in a history-list preview.
+pub const HISTORY_PREVIEW_MAX_CHARS: usize = 240;
+/// Maximum number of content-free warnings retained for one terminal record.
+pub const MAX_TERMINAL_WARNINGS: usize = 64;
+/// Maximum UTF-8 payload accepted for one content-free warning.
+pub const MAX_TERMINAL_WARNING_BYTES: usize = 1_024;
+const MAX_WARNINGS_JSON_BYTES: usize = MAX_TERMINAL_WARNINGS * (MAX_TERMINAL_WARNING_BYTES + 8);
+const OVERSIZED_WARNINGS_NOTICE: &str = "stored warning metadata exceeds the current display limit";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetentionPolicy {
     /// Do not save future dictations. Existing records are removed immediately.
@@ -61,6 +75,19 @@ pub struct TimingMetadata {
     pub release_to_insert_duration_ms: Option<u64>,
 }
 
+/// Content-free terminal facts emitted by the extended-dictation pipeline.
+///
+/// Every field is optional so records written by older binaries remain
+/// distinguishable from sessions that observed a value of zero or `false`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalMetadata {
+    pub checkpoint_count: Option<u64>,
+    pub checkpoint_repair_count: Option<u64>,
+    pub peak_retained_audio_ms: Option<u64>,
+    pub formatting_chunk_count: Option<u64>,
+    pub auto_stopped: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DictationDraft {
     pub created_at_ms: i64,
@@ -79,6 +106,31 @@ pub struct DictationDraft {
 pub struct DictationRecord {
     pub id: i64,
     pub dictation: DictationDraft,
+}
+
+/// A bounded row for history-list rendering.
+///
+/// The query producing this type never selects a full transcript variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorySummary {
+    pub id: i64,
+    pub created_at_ms: i64,
+    pub selected_output_preview: String,
+    pub selected_output_chars: u64,
+    pub preview_truncated: bool,
+    pub language: Option<String>,
+    pub target_executable: Option<String>,
+    pub timings: TimingMetadata,
+    pub warnings: Vec<String>,
+    pub terminal: TerminalMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryTextVariant {
+    Raw,
+    Normalized,
+    Cleaned,
+    SelectedOutput,
 }
 
 pub struct HistoryRepository<'connection> {
@@ -127,7 +179,17 @@ impl<'connection> HistoryRepository<'connection> {
 
     /// Saves a dictation if history is enabled, returning `None` when disabled.
     pub fn insert(&self, draft: &DictationDraft) -> Result<Option<i64>> {
+        self.insert_with_terminal_metadata(draft, &TerminalMetadata::default())
+    }
+
+    /// Saves a terminal dictation and its content-free extended-session facts.
+    pub fn insert_with_terminal_metadata(
+        &self,
+        draft: &DictationDraft,
+        terminal: &TerminalMetadata,
+    ) -> Result<Option<i64>> {
         validate_draft(draft)?;
+        validate_terminal_metadata(terminal)?;
         let retention = self.retention()?;
         if retention == RetentionPolicy::Disabled {
             return Ok(None);
@@ -148,8 +210,13 @@ impl<'connection> HistoryRepository<'connection> {
                  language, target_executable, audio_duration_ms, stt_duration_ms, \
                  formatting_duration_ms, insertion_duration_ms, \
                  audio_finalization_duration_ms, worker_queue_duration_ms, \
-                 release_to_insert_duration_ms, warnings_json\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 release_to_insert_duration_ms, warnings_json, checkpoint_count, \
+                 checkpoint_repair_count, peak_retained_audio_ms, formatting_chunk_count, \
+                 auto_stopped\
+             ) VALUES (\
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                 ?16, ?17, ?18, ?19, ?20\
+             )",
             params![
                 draft.created_at_ms,
                 draft.raw_text,
@@ -166,11 +233,83 @@ impl<'connection> HistoryRepository<'connection> {
                 u64_to_i64(draft.timings.worker_queue_duration_ms)?,
                 u64_to_i64(draft.timings.release_to_insert_duration_ms)?,
                 warnings,
+                u64_to_i64(terminal.checkpoint_count)?,
+                u64_to_i64(terminal.checkpoint_repair_count)?,
+                u64_to_i64(terminal.peak_retained_audio_ms)?,
+                u64_to_i64(terminal.formatting_chunk_count)?,
+                terminal.auto_stopped.map(i64::from),
             ],
         )?;
         let id = transaction.last_insert_rowid();
         transaction.commit()?;
         Ok(Some(id))
+    }
+
+    /// Returns one bounded history-list row without selecting any full text variant.
+    pub fn summary(&self, id: i64) -> Result<Option<HistorySummary>> {
+        self.connection
+            .query_row(
+                &(SUMMARY_SELECT.to_owned() + " WHERE id = ?3"),
+                params![summary_preview_chars()?, warnings_json_bytes()?, id],
+                map_summary,
+            )
+            .optional()?
+            .map(decode_summary)
+            .transpose()
+    }
+
+    /// Returns bounded history-list rows without loading full transcripts.
+    pub fn recent_summaries(&self, limit: usize) -> Result<Vec<HistorySummary>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self.connection.prepare(
+            &(SUMMARY_SELECT.to_owned() + " ORDER BY created_at_ms DESC, id DESC LIMIT ?3"),
+        )?;
+        let rows = statement.query_map(
+            params![summary_preview_chars()?, warnings_json_bytes()?, limit],
+            map_summary,
+        )?;
+        rows.map(|row| decode_summary(row?)).collect()
+    }
+
+    /// Fetches exactly one transcript variant for an explicit detail/copy action.
+    pub fn text_variant(&self, id: i64, variant: HistoryTextVariant) -> Result<Option<String>> {
+        let statement = match variant {
+            HistoryTextVariant::Raw => "SELECT raw_text FROM dictation_history WHERE id = ?1",
+            HistoryTextVariant::Normalized => {
+                "SELECT normalized_text FROM dictation_history WHERE id = ?1"
+            }
+            HistoryTextVariant::Cleaned => {
+                "SELECT cleaned_text FROM dictation_history WHERE id = ?1"
+            }
+            HistoryTextVariant::SelectedOutput => {
+                "SELECT selected_output FROM dictation_history WHERE id = ?1"
+            }
+        };
+        Ok(self
+            .connection
+            .query_row(statement, [id], |row| row.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten())
+    }
+
+    /// Convenience accessor for the usual history copy action.
+    pub fn selected_output(&self, id: i64) -> Result<Option<String>> {
+        self.text_variant(id, HistoryTextVariant::SelectedOutput)
+    }
+
+    /// Loads extended-session facts independently of transcript content.
+    pub fn terminal_metadata(&self, id: i64) -> Result<Option<TerminalMetadata>> {
+        self.connection
+            .query_row(
+                "SELECT checkpoint_count, checkpoint_repair_count, peak_retained_audio_ms, \
+                        formatting_chunk_count, auto_stopped \
+                 FROM dictation_history WHERE id = ?1",
+                [id],
+                map_terminal_metadata,
+            )
+            .optional()?
+            .map(decode_terminal_metadata)
+            .transpose()
     }
 
     pub fn get(&self, id: i64) -> Result<Option<DictationRecord>> {
@@ -234,6 +373,135 @@ impl<'connection> HistoryRepository<'connection> {
                 row.get(0)
             })?)
     }
+}
+
+const SUMMARY_SELECT: &str = "SELECT id, created_at_ms, substr(selected_output, 1, ?1), length(selected_output), \
+            language, target_executable, audio_duration_ms, stt_duration_ms, \
+            formatting_duration_ms, insertion_duration_ms, audio_finalization_duration_ms, \
+            worker_queue_duration_ms, release_to_insert_duration_ms, \
+            CASE WHEN length(CAST(warnings_json AS BLOB)) <= ?2 THEN warnings_json ELSE NULL END, \
+            checkpoint_count, checkpoint_repair_count, peak_retained_audio_ms, \
+            formatting_chunk_count, auto_stopped \
+     FROM dictation_history";
+
+#[derive(Debug)]
+struct EncodedSummary {
+    id: i64,
+    created_at_ms: i64,
+    preview: String,
+    character_count: i64,
+    language: Option<String>,
+    target_executable: Option<String>,
+    timings: [Option<i64>; 7],
+    warnings_json: Option<String>,
+    terminal: [Option<i64>; 5],
+}
+
+fn map_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<EncodedSummary> {
+    Ok(EncodedSummary {
+        id: row.get(0)?,
+        created_at_ms: row.get(1)?,
+        preview: row.get(2)?,
+        character_count: row.get(3)?,
+        language: row.get(4)?,
+        target_executable: row.get(5)?,
+        timings: [
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+            row.get(10)?,
+            row.get(11)?,
+            row.get(12)?,
+        ],
+        warnings_json: row.get(13)?,
+        terminal: [
+            row.get(14)?,
+            row.get(15)?,
+            row.get(16)?,
+            row.get(17)?,
+            row.get(18)?,
+        ],
+    })
+}
+
+fn decode_summary(encoded: EncodedSummary) -> Result<HistorySummary> {
+    let selected_output_chars =
+        u64::try_from(encoded.character_count).map_err(|_| PersistenceError::Validation {
+            field: "selected_output",
+            reason: "database contains an invalid character count",
+        })?;
+    let warnings = decode_summary_warnings(encoded.warnings_json)?;
+    Ok(HistorySummary {
+        id: encoded.id,
+        created_at_ms: encoded.created_at_ms,
+        selected_output_preview: encoded.preview,
+        selected_output_chars,
+        preview_truncated: selected_output_chars > HISTORY_PREVIEW_MAX_CHARS as u64,
+        language: encoded.language,
+        target_executable: encoded.target_executable,
+        timings: TimingMetadata {
+            audio_duration_ms: i64_to_u64(encoded.timings[0])?,
+            stt_duration_ms: i64_to_u64(encoded.timings[1])?,
+            formatting_duration_ms: i64_to_u64(encoded.timings[2])?,
+            insertion_duration_ms: i64_to_u64(encoded.timings[3])?,
+            audio_finalization_duration_ms: i64_to_u64(encoded.timings[4])?,
+            worker_queue_duration_ms: i64_to_u64(encoded.timings[5])?,
+            release_to_insert_duration_ms: i64_to_u64(encoded.timings[6])?,
+        },
+        warnings,
+        terminal: decode_terminal_values(encoded.terminal)?,
+    })
+}
+
+fn decode_summary_warnings(json: Option<String>) -> Result<Vec<String>> {
+    let Some(json) = json else {
+        return Ok(vec![OVERSIZED_WARNINGS_NOTICE.to_owned()]);
+    };
+    let mut warnings: Vec<String> = serde_json::from_str(&json)?;
+    let omitted = warnings.len() > MAX_TERMINAL_WARNINGS;
+    warnings.truncate(MAX_TERMINAL_WARNINGS);
+    for warning in &mut warnings {
+        if warning.len() > MAX_TERMINAL_WARNING_BYTES {
+            let mut boundary = MAX_TERMINAL_WARNING_BYTES;
+            while !warning.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            warning.truncate(boundary);
+        }
+    }
+    if omitted {
+        if let Some(last) = warnings.last_mut() {
+            *last = OVERSIZED_WARNINGS_NOTICE.to_owned();
+        } else {
+            warnings.push(OVERSIZED_WARNINGS_NOTICE.to_owned());
+        }
+    }
+    Ok(warnings)
+}
+
+fn map_terminal_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<[Option<i64>; 5]> {
+    Ok([
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ])
+}
+
+fn decode_terminal_metadata(encoded: [Option<i64>; 5]) -> Result<TerminalMetadata> {
+    decode_terminal_values(encoded)
+}
+
+fn decode_terminal_values(encoded: [Option<i64>; 5]) -> Result<TerminalMetadata> {
+    Ok(TerminalMetadata {
+        checkpoint_count: i64_to_u64(encoded[0])?,
+        checkpoint_repair_count: i64_to_u64(encoded[1])?,
+        peak_retained_audio_ms: i64_to_u64(encoded[2])?,
+        formatting_chunk_count: i64_to_u64(encoded[3])?,
+        auto_stopped: encoded[4].map(bool_from_i64).transpose()?,
+    })
 }
 
 type EncodedRecord = (
@@ -314,7 +582,68 @@ fn validate_draft(draft: &DictationDraft) -> Result<()> {
     if let Some(executable) = &draft.target_executable {
         super::profile::validate_executable(executable)?;
     }
+    validate_text("raw_text", &draft.raw_text)?;
+    if let Some(text) = &draft.normalized_text {
+        validate_text("normalized_text", text)?;
+    }
+    if let Some(text) = &draft.cleaned_text {
+        validate_text("cleaned_text", text)?;
+    }
+    validate_text("selected_output", &draft.selected_output)?;
+    if draft.warnings.len() > MAX_TERMINAL_WARNINGS {
+        return Err(PersistenceError::CollectionLimitExceeded {
+            field: "warnings",
+            max_items: MAX_TERMINAL_WARNINGS,
+            actual_items: draft.warnings.len(),
+        });
+    }
+    for warning in &draft.warnings {
+        if warning.len() > MAX_TERMINAL_WARNING_BYTES {
+            return Err(PersistenceError::TextLimitExceeded {
+                field: "warning",
+                max_bytes: MAX_TERMINAL_WARNING_BYTES,
+                actual_bytes: warning.len(),
+            });
+        }
+    }
     Ok(())
+}
+
+fn validate_text(field: &'static str, value: &str) -> Result<()> {
+    if value.len() > MAX_TERMINAL_TEXT_BYTES {
+        return Err(PersistenceError::TextLimitExceeded {
+            field,
+            max_bytes: MAX_TERMINAL_TEXT_BYTES,
+            actual_bytes: value.len(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_terminal_metadata(metadata: &TerminalMetadata) -> Result<()> {
+    for value in [
+        metadata.checkpoint_count,
+        metadata.checkpoint_repair_count,
+        metadata.peak_retained_audio_ms,
+        metadata.formatting_chunk_count,
+    ] {
+        let _ = u64_to_i64(value)?;
+    }
+    Ok(())
+}
+
+fn summary_preview_chars() -> Result<i64> {
+    i64::try_from(HISTORY_PREVIEW_MAX_CHARS).map_err(|_| PersistenceError::Validation {
+        field: "history_preview",
+        reason: "exceeds the supported range",
+    })
+}
+
+fn warnings_json_bytes() -> Result<i64> {
+    i64::try_from(MAX_WARNINGS_JSON_BYTES).map_err(|_| PersistenceError::Validation {
+        field: "warnings",
+        reason: "display limit exceeds the supported range",
+    })
 }
 
 fn u64_to_i64(value: Option<u64>) -> Result<Option<i64>> {
@@ -337,4 +666,15 @@ fn i64_to_u64(value: Option<i64>) -> Result<Option<u64>> {
             })
         })
         .transpose()
+}
+
+fn bool_from_i64(value: i64) -> Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(PersistenceError::Validation {
+            field: "auto_stopped",
+            reason: "database contains a non-boolean value",
+        }),
+    }
 }

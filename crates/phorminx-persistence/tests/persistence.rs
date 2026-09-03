@@ -2,8 +2,9 @@ use std::path::Path;
 
 use phorminx_persistence::{
     AppProfile, CasePolicy, DictationDraft, ExecutableIdentity, FormattingStyle,
-    InsertionPreference, NewLexiconEntry, Persistence, PersistenceError, RetentionPolicy,
-    TimingMetadata,
+    HISTORY_PREVIEW_MAX_CHARS, HistoryTextVariant, InsertionPreference, MAX_TERMINAL_TEXT_BYTES,
+    MAX_TERMINAL_WARNING_BYTES, MAX_TERMINAL_WARNINGS, NewLexiconEntry, Persistence,
+    PersistenceError, RetentionPolicy, TerminalMetadata, TimingMetadata,
 };
 use tempfile::TempDir;
 
@@ -35,6 +36,16 @@ fn draft(created_at_ms: i64, text: &str) -> DictationDraft {
             release_to_insert_duration_ms: Some(362),
         },
         warnings: vec!["low confidence".into(), "clipboard fallback".into()],
+    }
+}
+
+fn terminal_metadata() -> TerminalMetadata {
+    TerminalMetadata {
+        checkpoint_count: Some(47),
+        checkpoint_repair_count: Some(2),
+        peak_retained_audio_ms: Some(31_250),
+        formatting_chunk_count: Some(8),
+        auto_stopped: Some(false),
     }
 }
 
@@ -99,13 +110,18 @@ fn additive_timings_are_compatible_with_old_schema_one_reads_and_writes() {
              WHERE name IN (
                  'audio_finalization_duration_ms',
                  'worker_queue_duration_ms',
-                 'release_to_insert_duration_ms'
+                 'release_to_insert_duration_ms',
+                 'checkpoint_count',
+                 'checkpoint_repair_count',
+                 'peak_retained_audio_ms',
+                 'formatting_chunk_count',
+                 'auto_stopped'
              )",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(timing_column_count, 3);
+    assert_eq!(timing_column_count, 8);
     old_binary
         .execute(
             "INSERT INTO dictation_history(
@@ -146,6 +162,10 @@ fn additive_timings_are_compatible_with_old_schema_one_reads_and_writes() {
     let record = normalized.history().recent(1).unwrap().remove(0);
     assert_eq!(record.dictation.selected_output, "old selected");
     assert_eq!(record.dictation.timings.release_to_insert_duration_ms, None);
+    assert_eq!(
+        normalized.history().terminal_metadata(record.id).unwrap(),
+        Some(TerminalMetadata::default())
+    );
     drop(normalized);
 
     let old_binary = rusqlite::Connection::open(&path).unwrap();
@@ -292,6 +312,218 @@ fn history_round_trips_all_text_metadata_timings_and_warnings() {
     let record = history.get(id).unwrap().unwrap();
     assert_eq!(record.id, id);
     assert_eq!(record.dictation, expected);
+}
+
+#[test]
+fn terminal_metadata_round_trips_without_changing_legacy_records() {
+    let (_directory, database) = open_temp();
+    let history = database.history();
+    history
+        .set_retention(RetentionPolicy::Indefinite, NOW)
+        .unwrap();
+
+    let legacy_id = history.insert(&draft(NOW, "legacy")).unwrap().unwrap();
+    assert_eq!(
+        history.terminal_metadata(legacy_id).unwrap(),
+        Some(TerminalMetadata::default())
+    );
+
+    let metadata = terminal_metadata();
+    let extended_id = history
+        .insert_with_terminal_metadata(&draft(NOW + 1, "extended"), &metadata)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        history.terminal_metadata(extended_id).unwrap(),
+        Some(metadata)
+    );
+    assert_eq!(
+        history.summary(extended_id).unwrap().unwrap().terminal,
+        metadata
+    );
+    assert_eq!(history.terminal_metadata(i64::MAX).unwrap(), None);
+}
+
+#[test]
+fn hundreds_of_long_unicode_records_have_strictly_bounded_summaries() {
+    const RECORDS: usize = 300;
+    let (_directory, database) = open_temp();
+    let history = database.history();
+    history
+        .set_retention(RetentionPolicy::Indefinite, NOW)
+        .unwrap();
+
+    let tail = "🛡️漢字".repeat(HISTORY_PREVIEW_MAX_CHARS + 1);
+    for offset in 0..RECORDS {
+        let mut record = draft(NOW + offset as i64, "summary-load");
+        record.selected_output = format!("record-{offset}-{tail}");
+        history
+            .insert_with_terminal_metadata(&record, &terminal_metadata())
+            .unwrap();
+    }
+
+    let summaries = history.recent_summaries(RECORDS + 100).unwrap();
+    assert_eq!(summaries.len(), RECORDS);
+    assert!(summaries.iter().all(|summary| {
+        summary.selected_output_preview.chars().count() <= HISTORY_PREVIEW_MAX_CHARS
+            && summary.preview_truncated
+            && summary.selected_output_chars > u64::try_from(HISTORY_PREVIEW_MAX_CHARS).unwrap()
+            && summary.warnings.len() <= MAX_TERMINAL_WARNINGS
+    }));
+    let newest = &summaries[0];
+    assert_eq!(newest.selected_output_preview.chars().count(), 240);
+    assert!(
+        newest
+            .selected_output_preview
+            .is_char_boundary(newest.selected_output_preview.len())
+    );
+
+    let exact = history.selected_output(newest.id).unwrap().unwrap();
+    assert_eq!(exact.chars().count() as u64, newest.selected_output_chars);
+    assert!(exact.ends_with("🛡️漢字"));
+}
+
+#[test]
+fn summary_queries_do_not_decode_unrequested_full_variants() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.sqlite3");
+    let database = Persistence::open(&path).unwrap();
+    database
+        .history()
+        .set_retention(RetentionPolicy::Indefinite, NOW)
+        .unwrap();
+    database.history().insert(&draft(NOW, "lazy")).unwrap();
+    drop(database);
+
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "UPDATE dictation_history SET raw_text = x'80' WHERE id = 1",
+        [],
+    )
+    .unwrap();
+    let legacy_warnings = serde_json::to_string(&vec!["old warning"; 1_000]).unwrap();
+    raw.execute(
+        "UPDATE dictation_history SET warnings_json = ?1 WHERE id = 1",
+        [legacy_warnings],
+    )
+    .unwrap();
+    drop(raw);
+
+    let database = Persistence::open(&path).unwrap();
+    let history = database.history();
+    let summary = history.summary(1).unwrap().unwrap();
+    assert_eq!(summary.selected_output_preview, "selected lazy");
+    assert_eq!(summary.warnings.len(), MAX_TERMINAL_WARNINGS);
+    assert_eq!(
+        summary.warnings.last().unwrap(),
+        "stored warning metadata exceeds the current display limit"
+    );
+    assert_eq!(
+        history.selected_output(1).unwrap(),
+        Some("selected lazy".into())
+    );
+    assert!(history.get(1).is_err());
+}
+
+#[test]
+fn direct_variant_fetches_are_exact_and_lazy() {
+    let (_directory, database) = open_temp();
+    let history = database.history();
+    history
+        .set_retention(RetentionPolicy::Indefinite, NOW)
+        .unwrap();
+    let expected = draft(NOW, "copy precisely 🦀");
+    let id = history.insert(&expected).unwrap().unwrap();
+
+    assert_eq!(
+        history.text_variant(id, HistoryTextVariant::Raw).unwrap(),
+        Some(expected.raw_text)
+    );
+    assert_eq!(
+        history
+            .text_variant(id, HistoryTextVariant::Normalized)
+            .unwrap(),
+        expected.normalized_text
+    );
+    assert_eq!(
+        history
+            .text_variant(id, HistoryTextVariant::Cleaned)
+            .unwrap(),
+        expected.cleaned_text
+    );
+    assert_eq!(
+        history
+            .text_variant(id, HistoryTextVariant::SelectedOutput)
+            .unwrap(),
+        Some(expected.selected_output)
+    );
+    assert_eq!(history.selected_output(i64::MAX).unwrap(), None);
+}
+
+#[test]
+fn terminal_text_and_warning_caps_fail_with_typed_errors_before_sql_insert() {
+    let (_directory, database) = open_temp();
+    let history = database.history();
+    history
+        .set_retention(RetentionPolicy::Indefinite, NOW)
+        .unwrap();
+
+    let mut exact = draft(NOW, "exact cap");
+    exact.selected_output = "🛡".repeat(MAX_TERMINAL_TEXT_BYTES / "🛡".len());
+    let exact_id = history.insert(&exact).unwrap().unwrap();
+    let exact_summary = history.summary(exact_id).unwrap().unwrap();
+    assert_eq!(
+        exact_summary.selected_output_preview.chars().count(),
+        HISTORY_PREVIEW_MAX_CHARS
+    );
+    assert!(exact_summary.preview_truncated);
+
+    let mut too_long = draft(NOW + 1, "too long");
+    too_long.cleaned_text = Some("é".repeat(MAX_TERMINAL_TEXT_BYTES / 2 + 1));
+    assert!(matches!(
+        history.insert(&too_long),
+        Err(PersistenceError::TextLimitExceeded {
+            field: "cleaned_text",
+            max_bytes: MAX_TERMINAL_TEXT_BYTES,
+            ..
+        })
+    ));
+
+    let mut too_many_warnings = draft(NOW + 2, "warnings");
+    too_many_warnings.warnings = vec!["bounded".into(); MAX_TERMINAL_WARNINGS + 1];
+    assert!(matches!(
+        history.insert(&too_many_warnings),
+        Err(PersistenceError::CollectionLimitExceeded {
+            field: "warnings",
+            ..
+        })
+    ));
+
+    let mut oversized_warning = draft(NOW + 3, "warning bytes");
+    oversized_warning.warnings = vec!["é".repeat(MAX_TERMINAL_WARNING_BYTES / 2 + 1)];
+    assert!(matches!(
+        history.insert(&oversized_warning),
+        Err(PersistenceError::TextLimitExceeded {
+            field: "warning",
+            ..
+        })
+    ));
+    assert_eq!(history.count().unwrap(), 1);
+}
+
+#[test]
+fn disabled_retention_discards_extended_terminal_records() {
+    let (_directory, database) = open_temp();
+    let history = database.history();
+    assert_eq!(history.retention().unwrap(), RetentionPolicy::Disabled);
+    assert_eq!(
+        history
+            .insert_with_terminal_metadata(&draft(NOW, "never store"), &terminal_metadata())
+            .unwrap(),
+        None
+    );
+    assert_eq!(history.count().unwrap(), 0);
+    assert!(history.recent_summaries(100).unwrap().is_empty());
 }
 
 #[test]
