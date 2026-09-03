@@ -216,8 +216,13 @@ impl OutputValidator {
         {
             return Err(ValidationError::ModelCommentary);
         }
+        let actual_tokens = ProtectedTokens::extract(output);
         for token in protected.tokens() {
-            let actual = output.match_indices(&token.value).count();
+            let actual = actual_tokens
+                .tokens()
+                .binary_search_by(|candidate| candidate.value.cmp(&token.value))
+                .ok()
+                .map_or(0, |index| actual_tokens.tokens()[index].occurrences);
             if actual != token.occurrences {
                 return Err(ValidationError::ProtectedTokenChanged {
                     token: token.value.clone(),
@@ -301,6 +306,23 @@ mod tests {
             validator.validate(input, "Version 2.0 talks to https://example.com", &tokens),
             Err(ValidationError::ProtectedTokenChanged { .. })
         ));
+    }
+
+    #[test]
+    fn overlapping_protected_values_use_the_same_occurrence_semantics() {
+        for input in [
+            "Use v2 and v2beta exactly.",
+            "Compare `v2` with v2.",
+            "Keep {{API_KEY}} beside API_KEY.",
+        ] {
+            let tokens = ProtectedTokens::extract(input);
+            assert!(
+                OutputValidator::default()
+                    .validate(input, input, &tokens)
+                    .is_ok(),
+                "unchanged source rejected: {input}"
+            );
+        }
     }
 
     #[test]

@@ -2,6 +2,8 @@ use std::fmt;
 use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +22,7 @@ const MAX_DISCOVERY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_GENERATE_RESPONSE_BYTES: usize = 1024 * 1024;
 const DOCUMENT_RESPONSE_DEADLINE: Duration = Duration::from_secs(8);
 const DOCUMENT_OVERALL_DEADLINE: Duration = Duration::from_secs(12);
+const DOCUMENT_CANCELLATION_POLL: Duration = Duration::from_millis(20);
 
 /// An Ollama base address guaranteed to resolve to an IP loopback literal.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -520,8 +523,7 @@ impl OllamaClient {
         }) else {
             return DocumentChunkAttempt::PromptRejected;
         };
-        let generated = match self.generate_request_with_agent(
-            &self.document_agent,
+        let generated = match self.generate_document_request_interruptibly(
             model,
             &prompt.user,
             Some(&prompt.system),
@@ -543,6 +545,50 @@ impl OllamaClient {
         {
             Ok(text) => DocumentChunkAttempt::Formatted(text),
             Err(_) => DocumentChunkAttempt::OutputRejected,
+        }
+    }
+
+    fn generate_document_request_interruptibly(
+        &self,
+        model: &ModelName,
+        prompt: &str,
+        system: Option<&str>,
+        keep_alive: KeepAlive,
+        cancel: &CancellationToken,
+    ) -> Result<String, ClientError> {
+        cancel.check()?;
+        let client = self.clone();
+        let model = model.clone();
+        let prompt = prompt.to_owned();
+        let system = system.map(str::to_owned);
+        let worker_cancel = cancel.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("phorminx-ollama-document-request".to_owned())
+            .spawn(move || {
+                let result = client.generate_request_with_agent(
+                    &client.document_agent,
+                    &model,
+                    &prompt,
+                    system.as_deref(),
+                    keep_alive,
+                    &worker_cancel,
+                );
+                let _ = sender.send(result);
+            })
+            .map_err(|_| ClientError::WorkerUnavailable)?;
+
+        loop {
+            match receiver.recv_timeout(DOCUMENT_CANCELLATION_POLL) {
+                Ok(result) => {
+                    cancel.check()?;
+                    return result;
+                }
+                Err(RecvTimeoutError::Timeout) => cancel.check()?,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(ClientError::WorkerUnavailable);
+                }
+            }
         }
     }
 
@@ -769,6 +815,8 @@ pub enum ClientError {
     InvalidTimeout,
     #[error("Ollama operation was cancelled")]
     Cancelled,
+    #[error("Ollama request worker is unavailable")]
+    WorkerUnavailable,
     #[error("Ollama request timed out")]
     Timeout,
     #[error("Ollama transport failed: {0}")]
