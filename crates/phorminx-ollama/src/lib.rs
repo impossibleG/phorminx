@@ -15,7 +15,9 @@ pub use client::{
     OllamaClient, OllamaEndpoint,
 };
 pub use document::{
-    DocumentChunk, DocumentChunkError, DocumentChunkPolicy, chunk_document, reconstruct_document,
+    DocumentChunk, DocumentChunkError, DocumentChunkOutcome, DocumentChunkPolicy,
+    DocumentChunkReport, DocumentFormatDisposition, DocumentFormatError, DocumentFormatResult,
+    DocumentOutcomeCounts, MAXIMUM_DOCUMENT_OUTPUT_BYTES, chunk_document, reconstruct_document,
 };
 pub use model::{
     ModelCatalog, ModelDetails, ModelName, ModelSelectionError, OllamaModel, SelectionPolicy,

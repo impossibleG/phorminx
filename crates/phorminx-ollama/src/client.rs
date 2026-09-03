@@ -6,6 +6,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::document::{
+    DocumentChunk, DocumentChunkOutcome, DocumentChunkPolicy, DocumentChunkReport,
+    DocumentFormatDisposition, DocumentFormatError, DocumentFormatResult,
+    MAXIMUM_DOCUMENT_OUTPUT_BYTES, chunk_document,
+};
 use crate::model::{ModelCatalog, ModelName, ModelSelectionError, TagsResponse};
 use crate::prompt::{FormatProfile, PromptError, PromptPlan, build_prompt};
 use crate::validation::{OutputValidator, ValidationError};
@@ -313,6 +318,227 @@ impl OllamaClient {
         }
     }
 
+    /// Formats a bounded document as independent ordered chunks while keeping
+    /// exact source separators outside the model boundary.
+    ///
+    /// Every unsafe or failed chunk contributes its exact source text. A
+    /// cancellation or lost service prevents all subsequent requests. The
+    /// existing short [`Self::format`] operation is intentionally unchanged.
+    pub fn format_document(
+        &self,
+        model: &ModelName,
+        document: &str,
+        profile: &FormatProfile,
+        keep_alive: KeepAlive,
+        cancel: &CancellationToken,
+    ) -> Result<DocumentFormatResult, DocumentFormatError> {
+        self.format_document_with_policy(
+            model,
+            document,
+            profile,
+            keep_alive,
+            cancel,
+            DocumentChunkPolicy::default(),
+        )
+    }
+
+    /// Policy-controlled variant used by deterministic tests and callers that
+    /// need a smaller chunk target. The document must remain small enough that
+    /// an exact-source fallback fits under the cumulative output bound.
+    pub fn format_document_with_policy(
+        &self,
+        model: &ModelName,
+        document: &str,
+        profile: &FormatProfile,
+        keep_alive: KeepAlive,
+        cancel: &CancellationToken,
+        policy: DocumentChunkPolicy,
+    ) -> Result<DocumentFormatResult, DocumentFormatError> {
+        let chunks = chunk_document(document, policy)?;
+        if document.len() > MAXIMUM_DOCUMENT_OUTPUT_BYTES {
+            return Err(DocumentFormatError::SourceExceedsOutputLimit {
+                actual: document.len(),
+                maximum: MAXIMUM_DOCUMENT_OUTPUT_BYTES,
+            });
+        }
+        if matches!(profile, FormatProfile::Raw) {
+            let reports = chunks
+                .iter()
+                .map(|chunk| source_report(chunk, DocumentChunkOutcome::RawBypass))
+                .collect();
+            return Ok(DocumentFormatResult::new(
+                document.to_owned(),
+                None,
+                DocumentFormatDisposition::RawBypass,
+                reports,
+            ));
+        }
+
+        let mut output = String::with_capacity(document.len());
+        let mut reports = Vec::with_capacity(chunks.len());
+        let mut disposition = DocumentFormatDisposition::Completed;
+        let mut index = 0;
+        while index < chunks.len() {
+            let chunk = &chunks[index];
+            if cancel.is_cancelled() {
+                append_source_tail(
+                    &chunks[index..],
+                    &mut output,
+                    &mut reports,
+                    DocumentChunkOutcome::SourceAfterCancellation,
+                );
+                disposition = DocumentFormatDisposition::Cancelled;
+                break;
+            }
+            if chunk.text.is_empty() {
+                output.push_str(&chunk.separator_after);
+                reports.push(source_report(chunk, DocumentChunkOutcome::SeparatorOnly));
+                index += 1;
+                continue;
+            }
+
+            let attempt =
+                self.format_document_chunk(model, &chunk.text, profile, keep_alive.clone(), cancel);
+            let (text, outcome, stop) = match attempt {
+                DocumentChunkAttempt::Formatted(text) => {
+                    (text, DocumentChunkOutcome::Formatted, None)
+                }
+                DocumentChunkAttempt::PromptRejected => (
+                    chunk.text.clone(),
+                    DocumentChunkOutcome::FallbackPromptRejected,
+                    None,
+                ),
+                DocumentChunkAttempt::RequestFailed => (
+                    chunk.text.clone(),
+                    DocumentChunkOutcome::FallbackRequestFailed,
+                    None,
+                ),
+                DocumentChunkAttempt::OutputRejected => (
+                    chunk.text.clone(),
+                    DocumentChunkOutcome::FallbackOutputRejected,
+                    None,
+                ),
+                DocumentChunkAttempt::Cancelled => (
+                    chunk.text.clone(),
+                    DocumentChunkOutcome::FallbackCancelled,
+                    Some(DocumentStop::Cancelled),
+                ),
+                DocumentChunkAttempt::ServiceLost => (
+                    chunk.text.clone(),
+                    DocumentChunkOutcome::FallbackServiceUnavailable,
+                    Some(DocumentStop::ServiceLost),
+                ),
+            };
+
+            let remaining_source_bytes = document.len().saturating_sub(chunk.source_range.end);
+            let projected = output
+                .len()
+                .checked_add(text.len())
+                .and_then(|size| size.checked_add(chunk.separator_after.len()))
+                .and_then(|size| size.checked_add(remaining_source_bytes));
+            if projected.is_none_or(|size| size > MAXIMUM_DOCUMENT_OUTPUT_BYTES) {
+                let reports = chunks
+                    .iter()
+                    .map(|chunk| source_report(chunk, DocumentChunkOutcome::SourceAfterOutputLimit))
+                    .collect();
+                return Ok(DocumentFormatResult::new(
+                    document.to_owned(),
+                    None,
+                    DocumentFormatDisposition::SourceFallbackOutputLimit,
+                    reports,
+                ));
+            }
+
+            output.push_str(&text);
+            output.push_str(&chunk.separator_after);
+            reports.push(DocumentChunkReport {
+                sequence: chunk.sequence,
+                source_bytes: chunk.source_range.len(),
+                output_bytes: text.len() + chunk.separator_after.len(),
+                outcome,
+            });
+
+            if let Some(stop) = stop {
+                let tail_outcome = match stop {
+                    DocumentStop::Cancelled => {
+                        disposition = DocumentFormatDisposition::Cancelled;
+                        DocumentChunkOutcome::SourceAfterCancellation
+                    }
+                    DocumentStop::ServiceLost => {
+                        disposition = DocumentFormatDisposition::ServiceLost;
+                        DocumentChunkOutcome::SourceAfterServiceLoss
+                    }
+                };
+                append_source_tail(
+                    &chunks[index + 1..],
+                    &mut output,
+                    &mut reports,
+                    tail_outcome,
+                );
+                break;
+            }
+            index += 1;
+        }
+
+        if disposition == DocumentFormatDisposition::Completed
+            && reports.iter().any(|report| {
+                !matches!(
+                    report.outcome,
+                    DocumentChunkOutcome::Formatted | DocumentChunkOutcome::SeparatorOnly
+                )
+            })
+        {
+            disposition = DocumentFormatDisposition::PartiallyFormatted;
+        }
+        debug_assert!(output.len() <= MAXIMUM_DOCUMENT_OUTPUT_BYTES);
+        debug_assert_eq!(reports.len(), chunks.len());
+        Ok(DocumentFormatResult::new(
+            output,
+            Some(model.clone()),
+            disposition,
+            reports,
+        ))
+    }
+
+    fn format_document_chunk(
+        &self,
+        model: &ModelName,
+        source: &str,
+        profile: &FormatProfile,
+        keep_alive: KeepAlive,
+        cancel: &CancellationToken,
+    ) -> DocumentChunkAttempt {
+        let PromptPlan::Generate(prompt) = (match build_prompt(source, profile) {
+            Ok(plan) => plan,
+            Err(_) => return DocumentChunkAttempt::PromptRejected,
+        }) else {
+            return DocumentChunkAttempt::PromptRejected;
+        };
+        let generated = match self.generate_request(
+            model,
+            &prompt.user,
+            Some(&prompt.system),
+            keep_alive,
+            cancel,
+        ) {
+            Ok(output) => output,
+            Err(ClientError::Cancelled) => return DocumentChunkAttempt::Cancelled,
+            Err(
+                ClientError::Transport(_) | ClientError::Timeout | ClientError::ReadResponse(_),
+            ) => {
+                return DocumentChunkAttempt::ServiceLost;
+            }
+            Err(_) => return DocumentChunkAttempt::RequestFailed,
+        };
+        match self
+            .validator
+            .validate(source, &generated, &prompt.protected_tokens)
+        {
+            Ok(text) => DocumentChunkAttempt::Formatted(text),
+            Err(_) => DocumentChunkAttempt::OutputRejected,
+        }
+    }
+
     /// Low-level generation for integrations that need a prebuilt prompt.
     pub fn generate(
         &self,
@@ -359,6 +585,43 @@ impl OllamaClient {
             return Err(ClientError::IncompleteResponse);
         }
         Ok(response.response)
+    }
+}
+
+enum DocumentChunkAttempt {
+    Formatted(String),
+    PromptRejected,
+    RequestFailed,
+    OutputRejected,
+    Cancelled,
+    ServiceLost,
+}
+
+#[derive(Clone, Copy)]
+enum DocumentStop {
+    Cancelled,
+    ServiceLost,
+}
+
+fn source_report(chunk: &DocumentChunk, outcome: DocumentChunkOutcome) -> DocumentChunkReport {
+    DocumentChunkReport {
+        sequence: chunk.sequence,
+        source_bytes: chunk.source_range.len(),
+        output_bytes: chunk.source_range.len(),
+        outcome,
+    }
+}
+
+fn append_source_tail(
+    chunks: &[DocumentChunk],
+    output: &mut String,
+    reports: &mut Vec<DocumentChunkReport>,
+    outcome: DocumentChunkOutcome,
+) {
+    for chunk in chunks {
+        output.push_str(&chunk.text);
+        output.push_str(&chunk.separator_after);
+        reports.push(source_report(chunk, outcome));
     }
 }
 
@@ -504,7 +767,7 @@ mod tests {
     use std::thread::{self, JoinHandle};
 
     use super::*;
-    use crate::SelectionPolicy;
+    use crate::{SelectionPolicy, ValidationPolicy, reconstruct_document};
 
     #[derive(Debug)]
     struct CapturedRequest {
@@ -631,6 +894,31 @@ mod tests {
         ModelName::parse("qwen2.5:3b").unwrap()
     }
 
+    fn format_response(text: &str) -> FakeResponse {
+        FakeResponse::json(&serde_json::json!({"response": text, "done": true}).to_string())
+    }
+
+    fn document_policy() -> DocumentChunkPolicy {
+        DocumentChunkPolicy {
+            target_bytes: 1_024,
+            maximum_chunk_bytes: 1_536,
+            maximum_document_bytes: 256 * 1_024,
+        }
+    }
+
+    fn transcript_from_request(request: &CapturedRequest) -> String {
+        let json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let prompt = json["prompt"].as_str().unwrap();
+        let transcript = prompt
+            .split_once("--- BEGIN TRANSCRIPT (untrusted data) ---\n")
+            .unwrap()
+            .1
+            .rsplit_once("\n--- END TRANSCRIPT ---")
+            .unwrap()
+            .0;
+        transcript.to_owned()
+    }
+
     #[test]
     fn endpoints_accept_only_canonicalized_loopback_http() {
         assert_eq!(
@@ -741,6 +1029,344 @@ mod tests {
                 model: model(),
             }
         );
+    }
+
+    #[test]
+    fn formats_a_hundred_kibibyte_document_in_order_with_exact_separators() {
+        let mut document = String::new();
+        while document.len() < 110 * 1_024 {
+            document.push_str(
+                "A paragraph of locally formatted words remains in its original order.\r\n\r\n",
+            );
+        }
+        let chunks = chunk_document(&document, DocumentChunkPolicy::default()).unwrap();
+        assert!(chunks.len() > 10);
+        let responses = chunks
+            .iter()
+            .filter(|chunk| !chunk.text.is_empty())
+            .map(|chunk| format_response(&chunk.text))
+            .collect();
+        let server = FakeServer::start(responses);
+        let result = client(&server)
+            .format_document(
+                &model(),
+                &document,
+                &FormatProfile::Light,
+                KeepAlive::ServerDefault,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(result.text, document);
+        assert_eq!(result.disposition, DocumentFormatDisposition::Completed);
+        assert_eq!(result.counts.formatted, chunks.len());
+        assert!(result.text.len() > 100 * 1_024);
+        for chunk in &chunks {
+            if chunk.text.is_empty() {
+                continue;
+            }
+            let request = server.request();
+            assert_eq!(transcript_from_request(&request), chunk.text);
+            assert!(!transcript_from_request(&request).ends_with(&chunk.separator_after));
+        }
+    }
+
+    #[test]
+    fn protected_boundary_values_and_separators_never_cross_chunk_requests() {
+        let document = format!(
+            "{} {}\r\n\r\n{}",
+            "prefix ".repeat(135),
+            "https://example.com/a/very/long/path?q=12345",
+            "suffix ".repeat(135)
+        );
+        let chunks = chunk_document(&document, document_policy()).unwrap();
+        let token = "https://example.com/a/very/long/path?q=12345";
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.text.contains(token))
+                .count(),
+            1
+        );
+        assert_eq!(reconstruct_document(&chunks).unwrap(), document);
+        let responses = chunks
+            .iter()
+            .filter(|chunk| !chunk.text.is_empty())
+            .map(|chunk| format_response(&chunk.text))
+            .collect();
+        let server = FakeServer::start(responses);
+        let result = client(&server)
+            .format_document_with_policy(
+                &model(),
+                &document,
+                &FormatProfile::Light,
+                KeepAlive::ServerDefault,
+                &CancellationToken::new(),
+                document_policy(),
+            )
+            .unwrap();
+        assert_eq!(result.text, document);
+        for chunk in &chunks {
+            if chunk.text.is_empty() {
+                continue;
+            }
+            let request = server.request();
+            assert_eq!(transcript_from_request(&request), chunk.text);
+        }
+    }
+
+    #[test]
+    fn one_rejected_chunk_falls_back_without_discarding_successful_neighbors() {
+        let document = "alpha words continue. ".repeat(180);
+        let chunks = chunk_document(&document, document_policy()).unwrap();
+        assert!(chunks.len() >= 3);
+        let failed = 1;
+        let mut expected = String::new();
+        let responses = chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, chunk)| !chunk.text.is_empty())
+            .map(|(index, chunk)| {
+                let generated = if index == failed {
+                    String::new()
+                } else {
+                    chunk.text.to_uppercase()
+                };
+                expected.push_str(if index == failed {
+                    &chunk.text
+                } else {
+                    &generated
+                });
+                expected.push_str(&chunk.separator_after);
+                format_response(&generated)
+            })
+            .collect();
+        let server = FakeServer::start(responses);
+        let result = client(&server)
+            .format_document_with_policy(
+                &model(),
+                &document,
+                &FormatProfile::Light,
+                KeepAlive::ServerDefault,
+                &CancellationToken::new(),
+                document_policy(),
+            )
+            .unwrap();
+        assert_eq!(result.text, expected);
+        assert_eq!(
+            result.disposition,
+            DocumentFormatDisposition::PartiallyFormatted
+        );
+        assert_eq!(result.counts.output_rejected, 1);
+        assert_eq!(result.counts.formatted, chunks.len() - 1);
+    }
+
+    #[test]
+    fn one_http_failed_chunk_does_not_poison_later_chunks() {
+        let document = "ordered neighbors survive a failed request. ".repeat(150);
+        let chunks = chunk_document(&document, document_policy()).unwrap();
+        assert!(chunks.len() >= 3);
+        let failed = 1;
+        let mut expected = String::new();
+        let responses = chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, chunk)| !chunk.text.is_empty())
+            .map(|(index, chunk)| {
+                let generated = chunk.text.to_uppercase();
+                expected.push_str(if index == failed {
+                    &chunk.text
+                } else {
+                    &generated
+                });
+                expected.push_str(&chunk.separator_after);
+                if index == failed {
+                    FakeResponse {
+                        status: 500,
+                        body: b"{}".to_vec(),
+                        delay: Duration::ZERO,
+                    }
+                } else {
+                    format_response(&generated)
+                }
+            })
+            .collect();
+        let server = FakeServer::start(responses);
+        let result = client(&server)
+            .format_document_with_policy(
+                &model(),
+                &document,
+                &FormatProfile::Light,
+                KeepAlive::ServerDefault,
+                &CancellationToken::new(),
+                document_policy(),
+            )
+            .unwrap();
+        assert_eq!(result.text, expected);
+        assert_eq!(result.counts.request_failed, 1);
+        assert_eq!(result.counts.formatted, chunks.len() - 1);
+        assert_eq!(
+            result.disposition,
+            DocumentFormatDisposition::PartiallyFormatted
+        );
+    }
+
+    #[test]
+    fn cancellation_mid_document_stops_requests_and_preserves_the_source_tail() {
+        let document = "one phrase keeps moving. ".repeat(220);
+        let chunks = chunk_document(&document, document_policy()).unwrap();
+        assert!(chunks.len() > 3);
+        let server = FakeServer::start(vec![
+            format_response(&chunks[0].text.to_uppercase()),
+            FakeResponse {
+                status: 200,
+                body: serde_json::to_vec(
+                    &serde_json::json!({"response": chunks[1].text.to_uppercase(), "done": true}),
+                )
+                .unwrap(),
+                delay: Duration::from_millis(150),
+            },
+        ]);
+        let client = client(&server);
+        let cancel = CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let worker_model = model();
+        let worker_document = document.clone();
+        let worker = thread::spawn(move || {
+            client.format_document_with_policy(
+                &worker_model,
+                &worker_document,
+                &FormatProfile::Light,
+                KeepAlive::ServerDefault,
+                &worker_cancel,
+                document_policy(),
+            )
+        });
+        let _first = server.request();
+        let _second = server.request();
+        cancel.cancel();
+        let result = worker.join().unwrap().unwrap();
+        assert_eq!(result.disposition, DocumentFormatDisposition::Cancelled);
+        assert_eq!(result.counts.formatted, 1);
+        assert_eq!(result.counts.cancelled, 1);
+        assert_eq!(result.counts.source_after_cancellation, chunks.len() - 2);
+        let expected = format!(
+            "{}{}{}",
+            chunks[0].text.to_uppercase(),
+            chunks[0].separator_after,
+            &document[chunks[1].source_range.start..]
+        );
+        assert_eq!(result.text, expected);
+    }
+
+    #[test]
+    fn service_loss_stops_followup_requests_and_preserves_the_source_tail() {
+        let document = "service loss must remain recoverable. ".repeat(170);
+        let chunks = chunk_document(&document, document_policy()).unwrap();
+        assert!(chunks.len() > 3);
+        let server = FakeServer::start(vec![format_response(&chunks[0].text.to_uppercase())]);
+        let result = client(&server)
+            .format_document_with_policy(
+                &model(),
+                &document,
+                &FormatProfile::Light,
+                KeepAlive::ServerDefault,
+                &CancellationToken::new(),
+                document_policy(),
+            )
+            .unwrap();
+        assert_eq!(result.disposition, DocumentFormatDisposition::ServiceLost);
+        assert_eq!(result.counts.formatted, 1);
+        assert_eq!(result.counts.service_unavailable, 1);
+        assert_eq!(result.counts.source_after_service_loss, chunks.len() - 2);
+        assert_eq!(
+            result.text,
+            format!(
+                "{}{}{}",
+                chunks[0].text.to_uppercase(),
+                chunks[0].separator_after,
+                &document[chunks[1].source_range.start..]
+            )
+        );
+    }
+
+    #[test]
+    fn cumulative_output_growth_attack_falls_back_to_the_exact_document() {
+        let document = "source words ".repeat(2_400);
+        let policy = DocumentChunkPolicy {
+            target_bytes: 8 * 1_024,
+            maximum_chunk_bytes: 10 * 1_024,
+            maximum_document_bytes: 64 * 1_024,
+        };
+        let chunks = chunk_document(&document, policy).unwrap();
+        assert!(chunks.len() >= 3);
+        let server = FakeServer::start(vec![
+            format_response(&"b".repeat(700 * 1_024)),
+            format_response(&"c".repeat(100 * 1_024)),
+        ]);
+        let client = client(&server).with_validator(OutputValidator::new(ValidationPolicy {
+            maximum_output_bytes: 750 * 1_024,
+            maximum_growth_factor: 100,
+            maximum_extra_bytes: 0,
+        }));
+        let result = client
+            .format_document_with_policy(
+                &model(),
+                &document,
+                &FormatProfile::Light,
+                KeepAlive::ServerDefault,
+                &CancellationToken::new(),
+                policy,
+            )
+            .unwrap();
+        assert_eq!(result.text, document);
+        assert!(result.text.len() <= MAXIMUM_DOCUMENT_OUTPUT_BYTES);
+        assert_eq!(
+            result.disposition,
+            DocumentFormatDisposition::SourceFallbackOutputLimit
+        );
+        assert_eq!(result.counts.source_after_output_limit, chunks.len());
+        assert_eq!(result.model, None);
+        let _first = server.request();
+        let _second = server.request();
+    }
+
+    #[test]
+    fn raw_document_bypasses_the_network_even_when_cancelled() {
+        let document = "raw text\r\n\r\nwith exact separation";
+        let server = FakeServer::start(Vec::new());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = client(&server)
+            .format_document(
+                &model(),
+                document,
+                &FormatProfile::Raw,
+                KeepAlive::ServerDefault,
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(result.text, document);
+        assert_eq!(result.model, None);
+        assert_eq!(result.disposition, DocumentFormatDisposition::RawBypass);
+        assert_eq!(result.counts.raw_bypass, result.chunks.len());
+    }
+
+    #[test]
+    fn separator_only_document_never_issues_a_model_request() {
+        let document = " \t\r\n\r\n ";
+        let server = FakeServer::start(Vec::new());
+        let result = client(&server)
+            .format_document(
+                &model(),
+                document,
+                &FormatProfile::Strong,
+                KeepAlive::ServerDefault,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(result.text, document);
+        assert_eq!(result.counts.separator_only, 1);
+        assert_eq!(result.disposition, DocumentFormatDisposition::Completed);
     }
 
     #[test]
