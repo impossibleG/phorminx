@@ -18,6 +18,8 @@ use crate::validation::{OutputValidator, ValidationError};
 const DEFAULT_PORT: u16 = 11_434;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_GENERATE_RESPONSE_BYTES: usize = 1024 * 1024;
+const DOCUMENT_RESPONSE_DEADLINE: Duration = Duration::from_secs(8);
+const DOCUMENT_OVERALL_DEADLINE: Duration = Duration::from_secs(12);
 
 /// An Ollama base address guaranteed to resolve to an IP loopback literal.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,25 +197,23 @@ impl CancellationToken {
 pub struct OllamaClient {
     endpoint: OllamaEndpoint,
     agent: ureq::Agent,
+    document_agent: ureq::Agent,
     validator: OutputValidator,
 }
 
 impl OllamaClient {
     pub fn new(endpoint: OllamaEndpoint, timeouts: ClientTimeouts) -> Result<Self, ClientError> {
         timeouts.validate()?;
-        let config = ureq::Agent::config_builder()
-            .proxy(None)
-            .max_redirects(0)
-            .max_redirects_will_error(false)
-            .http_status_as_error(false)
-            .timeout_connect(Some(timeouts.connect))
-            .timeout_recv_response(Some(timeouts.response_headers))
-            .timeout_recv_body(Some(timeouts.response_body))
-            .timeout_global(Some(timeouts.overall))
-            .build();
+        let document_timeouts = ClientTimeouts {
+            connect: timeouts.connect.min(DOCUMENT_RESPONSE_DEADLINE),
+            response_headers: timeouts.response_headers.min(DOCUMENT_RESPONSE_DEADLINE),
+            response_body: timeouts.response_body.min(DOCUMENT_RESPONSE_DEADLINE),
+            overall: timeouts.overall.min(DOCUMENT_OVERALL_DEADLINE),
+        };
         Ok(Self {
             endpoint,
-            agent: config.into(),
+            agent: build_agent(&timeouts),
+            document_agent: build_agent(&document_timeouts),
             validator: OutputValidator::default(),
         })
     }
@@ -354,7 +354,6 @@ impl OllamaClient {
         cancel: &CancellationToken,
         policy: DocumentChunkPolicy,
     ) -> Result<DocumentFormatResult, DocumentFormatError> {
-        let chunks = chunk_document(document, policy)?;
         if document.len() > MAXIMUM_DOCUMENT_OUTPUT_BYTES {
             return Err(DocumentFormatError::SourceExceedsOutputLimit {
                 actual: document.len(),
@@ -362,10 +361,12 @@ impl OllamaClient {
             });
         }
         if matches!(profile, FormatProfile::Raw) {
-            let reports = chunks
-                .iter()
-                .map(|chunk| source_report(chunk, DocumentChunkOutcome::RawBypass))
-                .collect();
+            let reports = vec![DocumentChunkReport {
+                sequence: 0,
+                source_bytes: document.len(),
+                output_bytes: document.len(),
+                outcome: DocumentChunkOutcome::RawBypass,
+            }];
             return Ok(DocumentFormatResult::new(
                 document.to_owned(),
                 None,
@@ -373,6 +374,7 @@ impl OllamaClient {
                 reports,
             ));
         }
+        let chunks = chunk_document(document, policy)?;
 
         let mut output = String::with_capacity(document.len());
         let mut reports = Vec::with_capacity(chunks.len());
@@ -492,9 +494,13 @@ impl OllamaClient {
         }
         debug_assert!(output.len() <= MAXIMUM_DOCUMENT_OUTPUT_BYTES);
         debug_assert_eq!(reports.len(), chunks.len());
+        let model = reports
+            .iter()
+            .any(|report| report.outcome == DocumentChunkOutcome::Formatted)
+            .then(|| model.clone());
         Ok(DocumentFormatResult::new(
             output,
-            Some(model.clone()),
+            model,
             disposition,
             reports,
         ))
@@ -514,7 +520,8 @@ impl OllamaClient {
         }) else {
             return DocumentChunkAttempt::PromptRejected;
         };
-        let generated = match self.generate_request(
+        let generated = match self.generate_request_with_agent(
+            &self.document_agent,
             model,
             &prompt.user,
             Some(&prompt.system),
@@ -559,6 +566,18 @@ impl OllamaClient {
         keep_alive: KeepAlive,
         cancel: &CancellationToken,
     ) -> Result<String, ClientError> {
+        self.generate_request_with_agent(&self.agent, model, prompt, system, keep_alive, cancel)
+    }
+
+    fn generate_request_with_agent(
+        &self,
+        agent: &ureq::Agent,
+        model: &ModelName,
+        prompt: &str,
+        system: Option<&str>,
+        keep_alive: KeepAlive,
+        cancel: &CancellationToken,
+    ) -> Result<String, ClientError> {
         cancel.check()?;
         let request = GenerateRequest {
             model: model.as_str(),
@@ -569,8 +588,7 @@ impl OllamaClient {
             options: GenerateOptions { temperature: 0.0 },
         };
         let request_body = serde_json::to_vec(&request).map_err(ClientError::SerializeRequest)?;
-        let response = self
-            .agent
+        let response = agent
             .post(&self.endpoint.api_url("/api/generate"))
             .content_type("application/json")
             .send(request_body.as_slice())
@@ -586,6 +604,20 @@ impl OllamaClient {
         }
         Ok(response.response)
     }
+}
+
+fn build_agent(timeouts: &ClientTimeouts) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .proxy(None)
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .http_status_as_error(false)
+        .timeout_connect(Some(timeouts.connect))
+        .timeout_recv_response(Some(timeouts.response_headers))
+        .timeout_recv_body(Some(timeouts.response_body))
+        .timeout_global(Some(timeouts.overall))
+        .build()
+        .into()
 }
 
 enum DocumentChunkAttempt {
@@ -1349,6 +1381,29 @@ mod tests {
         assert_eq!(result.model, None);
         assert_eq!(result.disposition, DocumentFormatDisposition::RawBypass);
         assert_eq!(result.counts.raw_bypass, result.chunks.len());
+    }
+
+    #[test]
+    fn raw_document_bypasses_chunk_policy_validation() {
+        let document = "raw text remains exact";
+        let server = FakeServer::start(Vec::new());
+        let result = client(&server)
+            .format_document_with_policy(
+                &model(),
+                document,
+                &FormatProfile::Raw,
+                KeepAlive::ServerDefault,
+                &CancellationToken::new(),
+                DocumentChunkPolicy {
+                    target_bytes: 0,
+                    maximum_chunk_bytes: 0,
+                    maximum_document_bytes: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(result.text, document);
+        assert_eq!(result.model, None);
+        assert_eq!(result.disposition, DocumentFormatDisposition::RawBypass);
     }
 
     #[test]

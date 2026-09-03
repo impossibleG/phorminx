@@ -5,6 +5,9 @@ use crate::{ModelName, ProtectedTokens};
 const DEFAULT_TARGET_BYTES: usize = 8 * 1024;
 const DEFAULT_MAXIMUM_CHUNK_BYTES: usize = 12 * 1024;
 const DEFAULT_MAXIMUM_DOCUMENT_BYTES: usize = 256 * 1024;
+const MINIMUM_TARGET_BYTES: usize = 32;
+const MINIMUM_CHUNK_BYTES: usize = 48;
+const MAXIMUM_CHUNK_COUNT: usize = 2_048;
 pub const MAXIMUM_DOCUMENT_OUTPUT_BYTES: usize = 768 * 1024;
 
 /// Bounded policy for splitting a long transcript before local formatting.
@@ -27,11 +30,12 @@ impl Default for DocumentChunkPolicy {
 
 impl DocumentChunkPolicy {
     fn validate(self) -> Result<Self, DocumentChunkError> {
-        if self.target_bytes == 0
-            || self.maximum_chunk_bytes == 0
+        if self.target_bytes < MINIMUM_TARGET_BYTES
+            || self.maximum_chunk_bytes < MINIMUM_CHUNK_BYTES
             || self.maximum_document_bytes == 0
             || self.target_bytes > self.maximum_chunk_bytes
             || self.maximum_chunk_bytes > self.maximum_document_bytes
+            || self.maximum_document_bytes > DEFAULT_MAXIMUM_DOCUMENT_BYTES
         {
             return Err(DocumentChunkError::InvalidPolicy);
         }
@@ -201,15 +205,42 @@ pub fn chunk_document(
 
     let protected = protected_ranges(input);
     let mut chunks = Vec::new();
+    let estimated_chunks = input
+        .len()
+        .div_ceil(policy.target_bytes)
+        .min(MAXIMUM_CHUNK_COUNT);
+    chunks
+        .try_reserve(estimated_chunks)
+        .map_err(|_| DocumentChunkError::AllocationFailed)?;
     let mut start = 0;
     while start < input.len() {
+        if chunks.len() == MAXIMUM_CHUNK_COUNT {
+            return Err(DocumentChunkError::TooManyChunks);
+        }
+        if input[start..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+        {
+            let end = whitespace_run_end(input, start);
+            let sequence =
+                u32::try_from(chunks.len()).map_err(|_| DocumentChunkError::TooManyChunks)?;
+            chunks.push(DocumentChunk {
+                sequence,
+                source_range: start..end,
+                text: String::new(),
+                separator_after: input[start..end].to_owned(),
+            });
+            start = end;
+            continue;
+        }
         let remaining = input.len() - start;
         let split = if remaining <= policy.maximum_chunk_bytes {
             input.len()
         } else {
             choose_boundary(input, start, policy, &protected)?
         };
-        let (text_end, end) = isolate_separator(input, start, split, policy.maximum_chunk_bytes);
+        let (text_end, end) = isolate_separator(input, start, split);
         let sequence =
             u32::try_from(chunks.len()).map_err(|_| DocumentChunkError::TooManyChunks)?;
         chunks.push(DocumentChunk {
@@ -242,12 +273,7 @@ pub fn reconstruct_document(chunks: &[DocumentChunk]) -> Result<String, Document
     Ok(output)
 }
 
-fn isolate_separator(
-    input: &str,
-    start: usize,
-    split: usize,
-    maximum_chunk_bytes: usize,
-) -> (usize, usize) {
+fn isolate_separator(input: &str, start: usize, split: usize) -> (usize, usize) {
     let mut text_end = split;
     if input[start..split]
         .chars()
@@ -265,20 +291,33 @@ fn isolate_separator(
             text_end -= previous.len_utf8();
         }
     }
-    if text_end == start {
-        return (start, split);
-    }
-
-    let hard_end = start.saturating_add(maximum_chunk_bytes).min(input.len());
+    // Separators never enter the model. Keep a whitespace run indivisible even
+    // when the requested boundary lands in its middle; its size is still
+    // bounded by the document limit.
     let mut end = split;
-    while end < hard_end {
+    if text_end < split {
+        end = text_end;
+    }
+    while end < input.len() {
         let character = input[end..].chars().next().expect("nonempty suffix");
-        if !character.is_whitespace() || end + character.len_utf8() > hard_end {
+        if !character.is_whitespace() {
             break;
         }
         end += character.len_utf8();
     }
     (text_end, end)
+}
+
+fn whitespace_run_end(input: &str, start: usize) -> usize {
+    let mut end = start;
+    while end < input.len() {
+        let character = input[end..].chars().next().expect("nonempty suffix");
+        if !character.is_whitespace() {
+            break;
+        }
+        end += character.len_utf8();
+    }
+    end
 }
 
 fn choose_boundary(
@@ -357,17 +396,7 @@ fn preferred_boundary(
 }
 
 fn protected_ranges(input: &str) -> Vec<Range<usize>> {
-    let mut ranges = ProtectedTokens::extract(input)
-        .tokens()
-        .iter()
-        .flat_map(|token| {
-            input
-                .match_indices(&token.value)
-                .map(|(start, value)| start..start + value.len())
-        })
-        .collect::<Vec<_>>();
-    ranges.sort_by_key(|range| (range.start, range.end));
-    ranges
+    ProtectedTokens::extract_with_ranges(input).1
 }
 
 fn inside_protected(boundary: usize, protected: &[Range<usize>]) -> bool {
@@ -400,6 +429,8 @@ pub enum DocumentChunkError {
     DocumentTooLarge { actual: usize, maximum: usize },
     #[error("document requires too many chunks")]
     TooManyChunks,
+    #[error("memory could not be reserved for document chunks")]
+    AllocationFailed,
     #[error("cannot split source at byte {start} within the {maximum}-byte chunk bound")]
     UnsplittableSpan { start: usize, maximum: usize },
     #[error("document chunks are missing, reordered, overlapping, or malformed")]
@@ -447,6 +478,32 @@ mod tests {
         assert_eq!(only[0].text, "");
         assert_eq!(only[0].separator_after, " \t\r\n");
         assert_eq!(reconstruct_document(&only).unwrap(), " \t\r\n");
+    }
+
+    #[test]
+    fn whitespace_runs_crossing_the_hard_boundary_are_never_sent_to_the_model() {
+        let input = format!("{}\r\nnext", "a".repeat(47));
+        let chunks = chunk_document(&input, tiny_policy()).unwrap();
+        assert_eq!(reconstruct_document(&chunks).unwrap(), input);
+        assert!(chunks.iter().all(|chunk| {
+            chunk.text.is_empty()
+                || (!chunk.text.chars().next().is_some_and(char::is_whitespace)
+                    && !chunk
+                        .text
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace))
+        }));
+        assert!(chunks.iter().any(|chunk| chunk.separator_after == "\r\n"));
+    }
+
+    #[test]
+    fn leading_whitespace_is_always_a_separator_only_unit() {
+        let input = " \t\r\nwords remain";
+        let chunks = chunk_document(input, tiny_policy()).unwrap();
+        assert!(chunks[0].text.is_empty());
+        assert_eq!(chunks[0].separator_after, " \t\r\n");
+        assert_eq!(reconstruct_document(&chunks).unwrap(), input);
     }
 
     #[test]
@@ -501,6 +558,36 @@ mod tests {
             chunk_document(&"x".repeat(4_097), tiny_policy()),
             Err(DocumentChunkError::DocumentTooLarge { .. })
         ));
+        assert_eq!(
+            chunk_document(
+                "text",
+                DocumentChunkPolicy {
+                    target_bytes: 1,
+                    maximum_chunk_bytes: 1,
+                    maximum_document_bytes: 4,
+                },
+            ),
+            Err(DocumentChunkError::InvalidPolicy)
+        );
+    }
+
+    #[test]
+    fn adversarial_chunk_counts_are_bounded() {
+        assert_eq!(
+            chunk_document(&"x".repeat(100_000), tiny_policy()),
+            Err(DocumentChunkError::DocumentTooLarge {
+                actual: 100_000,
+                maximum: 4_096,
+            })
+        );
+        let policy = DocumentChunkPolicy {
+            maximum_document_bytes: 256 * 1_024,
+            ..tiny_policy()
+        };
+        assert_eq!(
+            chunk_document(&"x".repeat(100_000), policy),
+            Err(DocumentChunkError::TooManyChunks)
+        );
     }
 
     #[test]

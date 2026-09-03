@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 /// A value whose spelling and multiplicity must survive model formatting.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,35 +15,32 @@ pub struct ProtectedTokens {
 
 impl ProtectedTokens {
     pub fn extract(input: &str) -> Self {
-        let mut candidates = Vec::new();
-        collect_delimited(input, '`', '`', &mut candidates);
-        collect_pair(input, "{{", "}}", &mut candidates);
-        collect_pair(input, "${", "}", &mut candidates);
+        Self::extract_with_ranges(input).0
+    }
 
-        for raw in input.split_whitespace() {
-            let token = trim_sentence_punctuation(raw);
-            if is_protected_word(token) {
-                candidates.push(token.to_owned());
-            }
-        }
+    pub(crate) fn extract_with_ranges(input: &str) -> (Self, Vec<Range<usize>>) {
+        let mut occurrences = BTreeSet::<(usize, usize)>::new();
+        collect_delimited(input, '`', '`', &mut occurrences);
+        collect_pair(input, "{{", "}}", &mut occurrences);
+        collect_pair(input, "${", "}", &mut occurrences);
+        collect_protected_words(input, &mut occurrences);
 
         let mut counts = BTreeMap::<String, usize>::new();
-        for candidate in candidates {
-            if candidate.is_empty() {
-                continue;
-            }
-            counts.entry(candidate).or_insert_with(|| 0);
+        let mut ranges = Vec::new();
+        for (start, end) in occurrences {
+            let candidate = &input[start..end];
+            *counts.entry(candidate.to_owned()).or_default() += 1;
+            ranges.push(start..end);
         }
-        for (candidate, count) in &mut counts {
-            *count = input.match_indices(candidate.as_str()).count();
-        }
-        Self {
-            tokens: counts
-                .into_iter()
-                .filter(|(_, occurrences)| *occurrences > 0)
-                .map(|(value, occurrences)| ProtectedToken { value, occurrences })
-                .collect(),
-        }
+        (
+            Self {
+                tokens: counts
+                    .into_iter()
+                    .map(|(value, occurrences)| ProtectedToken { value, occurrences })
+                    .collect(),
+            },
+            ranges,
+        )
     }
 
     pub fn tokens(&self) -> &[ProtectedToken] {
@@ -54,35 +52,78 @@ impl ProtectedTokens {
     }
 }
 
-fn collect_delimited(input: &str, opening: char, closing: char, output: &mut Vec<String>) {
+fn collect_delimited(
+    input: &str,
+    opening: char,
+    closing: char,
+    output: &mut BTreeSet<(usize, usize)>,
+) {
     let opening = opening.to_string();
     let closing = closing.to_string();
     collect_pair(input, &opening, &closing, output);
 }
 
-fn collect_pair(input: &str, opening: &str, closing: &str, output: &mut Vec<String>) {
-    let mut remainder = input;
-    while let Some(start) = remainder.find(opening) {
-        let after_open = &remainder[start + opening.len()..];
+fn collect_pair(input: &str, opening: &str, closing: &str, output: &mut BTreeSet<(usize, usize)>) {
+    let mut cursor = 0;
+    while let Some(relative_start) = input[cursor..].find(opening) {
+        let start = cursor + relative_start;
+        let after_open = &input[start + opening.len()..];
         let Some(end) = after_open.find(closing) else {
             break;
         };
         let full_end = start + opening.len() + end + closing.len();
-        let candidate = &remainder[start..full_end];
-        if candidate.len() > opening.len() + closing.len() && candidate.len() <= 512 {
-            output.push(candidate.to_owned());
+        if full_end - start > opening.len() + closing.len() && full_end - start <= 512 {
+            output.insert((start, full_end));
         }
-        remainder = &remainder[full_end..];
+        cursor = full_end;
     }
 }
 
-fn trim_sentence_punctuation(value: &str) -> &str {
-    value.trim_matches(|character: char| {
-        matches!(
-            character,
-            '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.' | '!' | '?' | ';'
-        )
-    })
+fn collect_protected_words(input: &str, output: &mut BTreeSet<(usize, usize)>) {
+    let mut start = None;
+    for (index, character) in input
+        .char_indices()
+        .chain(std::iter::once((input.len(), ' ')))
+    {
+        if character.is_whitespace() {
+            if let Some(word_start) = start.take() {
+                let range = trim_sentence_range(input, word_start, index);
+                if range.start < range.end && is_protected_word(&input[range.clone()]) {
+                    output.insert((range.start, range.end));
+                }
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+}
+
+fn trim_sentence_range(input: &str, mut start: usize, mut end: usize) -> Range<usize> {
+    while start < end {
+        let character = input[start..end].chars().next().expect("nonempty word");
+        if !is_sentence_punctuation(character) {
+            break;
+        }
+        start += character.len_utf8();
+    }
+    while start < end {
+        let character = input[start..end]
+            .chars()
+            .next_back()
+            .expect("nonempty word");
+        if !is_sentence_punctuation(character) {
+            break;
+        }
+        end -= character.len_utf8();
+    }
+    start..end
+}
+
+fn is_sentence_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.' | '!' | '?' | ';'
+    )
 }
 
 fn is_protected_word(value: &str) -> bool {
