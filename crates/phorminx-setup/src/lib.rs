@@ -15,16 +15,17 @@ mod recommendation;
 
 pub use action::{
     ActionCommand, ActionError, ActionFailure, ActionId, ActionKey, ActionPhase, ActionProgress,
-    ActionRuntime, ActionState, ConsentCategory, Coordinator, CoordinatorError, ProbeTicket,
-    RollbackPolicy, SetupAction,
+    ActionRuntime, ActionState, CancellationOutcome, ConsentCategory, Coordinator,
+    CoordinatorError, ProbeTicket, RollbackCause, RollbackPolicy, SetupAction,
 };
 pub use asset::{
-    AssetId, AssetLocation, AssetReceipt, AssetRegistry, CrashJournal, JournalError, ManagedAsset,
-    ManagedSlot, OwnershipError, Sha256Digest,
+    AcquiredArtifact, ArtifactDescriptor, ArtifactKind, AssetId, AssetLocation, AssetReceipt,
+    AssetRegistry, CrashJournal, JournalError, ManagedAsset, ManagedSlot, OwnershipError,
+    Sha256Digest, SignerRequirement,
 };
 pub use benchmark::{
     BackendKind, BenchmarkEvidence, BenchmarkProtocol, BenchmarkSampleSummary, ContentFreeId,
-    EngineKind, ModelClass,
+    ContentionCondition, EngineKind, ModelClass, ThermalCondition,
 };
 pub use capability::{
     Capability, CapabilityId, CapabilityRecord, CapabilityValue, DegradedReason, Generation,
@@ -51,7 +52,11 @@ pub trait ArtifactStore {
     type Error;
 
     fn stage(&self, asset: &AssetId, action: &ActionId) -> Result<ManagedSlot, Self::Error>;
-    fn verify(&self, asset: &AssetId, slot: &ManagedSlot) -> Result<Sha256Digest, Self::Error>;
+    fn verify(
+        &self,
+        descriptor: &ArtifactDescriptor,
+        slot: &ManagedSlot,
+    ) -> Result<AcquiredArtifact, Self::Error>;
     fn promote(&self, asset: &ManagedAsset) -> Result<AssetReceipt, Self::Error>;
     fn rollback(&self, asset: &ManagedAsset) -> Result<(), Self::Error>;
 }
@@ -61,7 +66,11 @@ pub trait ArtifactStore {
 pub trait ArtifactSource {
     type Error;
 
-    fn acquire(&self, asset: &AssetId, staging: &ManagedSlot) -> Result<Sha256Digest, Self::Error>;
+    fn acquire(
+        &self,
+        descriptor: &ArtifactDescriptor,
+        staging: &ManagedSlot,
+    ) -> Result<AcquiredArtifact, Self::Error>;
 }
 
 /// Adapter for full recognizer validation and activation. Layout checks alone

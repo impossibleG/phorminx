@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AssetId, ContentFreeId, Sha256Digest};
+use crate::{ArtifactDescriptor, ContentFreeId, Sha256Digest};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,11 +154,11 @@ pub enum CapabilityValue {
 pub enum Remedy {
     Probe,
     AcquireManagedAssets {
-        assets: BTreeSet<AssetId>,
+        artifacts: BTreeSet<ArtifactDescriptor>,
         loads_native_code: bool,
     },
     ImportVerifiedAssets {
-        assets: BTreeSet<AssetId>,
+        artifacts: BTreeSet<ArtifactDescriptor>,
         loads_native_code: bool,
     },
     ValidateInstalled,
@@ -186,6 +186,8 @@ pub enum Remedy {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityRecord {
     pub id: CapabilityId,
+    #[serde(default)]
+    pub value: Option<CapabilityValue>,
     pub usability: Usability,
     #[serde(default)]
     pub remedies: BTreeSet<Remedy>,
@@ -196,9 +198,16 @@ impl CapabilityRecord {
     pub fn new(id: CapabilityId, usability: Usability) -> Self {
         Self {
             id,
+            value: None,
             usability,
             remedies: BTreeSet::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_value(mut self, value: CapabilityValue) -> Self {
+        self.value = Some(value);
+        self
     }
 
     #[must_use]

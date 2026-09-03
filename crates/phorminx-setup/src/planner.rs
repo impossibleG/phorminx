@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionId, ActionKey, CapabilityId, CapabilityRecord, ConsentCategory, ContentFreeId,
-    EngineKind, Language, Remedy, RollbackPolicy, SetupAction, Sha256Digest, Usability,
+    ActionError, ActionId, ActionKey, CapabilityId, CapabilityRecord, CapabilityValue,
+    ContentFreeId, EngineKind, Language, Remedy, SetupAction, Sha256Digest, Usability,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -32,22 +32,53 @@ pub struct DesiredConfiguration {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PlannedAction {
-    pub action: SetupAction,
-    pub dependencies: BTreeSet<ActionId>,
+    action: SetupAction,
+    dependencies: BTreeSet<ActionId>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+impl PlannedAction {
+    #[must_use]
+    pub const fn action(&self) -> &SetupAction {
+        &self.action
+    }
+
+    #[must_use]
+    pub const fn dependencies(&self) -> &BTreeSet<ActionId> {
+        &self.dependencies
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SetupPlan {
+    schema_version: u32,
+    policy_version: ContentFreeId,
     /// Stable topological order. Actions with no dependency relationship are
     /// ordered by their stable action IDs.
-    pub actions: Vec<PlannedAction>,
+    actions: Vec<PlannedAction>,
 }
 
 impl SetupPlan {
+    pub const SCHEMA_VERSION: u32 = 1;
+    pub const POLICY_VERSION: &'static str = "setup-policy-v1";
+
+    #[must_use]
+    pub fn actions(&self) -> &[PlannedAction] {
+        &self.actions
+    }
+
     pub fn validate(&self) -> Result<(), PlanError> {
+        if self.schema_version != Self::SCHEMA_VERSION
+            || self.policy_version.as_str() != Self::POLICY_VERSION
+        {
+            return Err(PlanError::UnsupportedPlanVersion);
+        }
         let mut seen = BTreeSet::new();
         for planned in &self.actions {
-            if !seen.insert(planned.action.id.clone()) {
+            planned
+                .action
+                .validate()
+                .map_err(PlanError::InvalidAction)?;
+            if !seen.insert(planned.action.id().clone()) {
                 return Err(PlanError::DuplicateAction);
             }
             if !planned
@@ -59,6 +90,29 @@ impl SetupPlan {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct SetupPlanWire {
+    schema_version: u32,
+    policy_version: ContentFreeId,
+    actions: Vec<PlannedAction>,
+}
+
+impl<'de> Deserialize<'de> for SetupPlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = SetupPlanWire::deserialize(deserializer)?;
+        let plan = Self {
+            schema_version: wire.schema_version,
+            policy_version: wire.policy_version,
+            actions: wire.actions,
+        };
+        plan.validate().map_err(serde::de::Error::custom)?;
+        Ok(plan)
     }
 }
 
@@ -99,6 +153,10 @@ impl Planner {
         let recognition_tail =
             Self::plan_capability(&mut graph, inventory.get(&recognition), recognition.clone())?;
 
+        let mut benchmark_dependencies = BTreeSet::new();
+        if let Some(tail) = recognition_tail {
+            benchmark_dependencies.insert(tail);
+        }
         if let FormattingChoice::Ollama { model_digest } = &desired.formatting {
             let daemon = CapabilityId::OllamaDaemon;
             let daemon_tail =
@@ -108,32 +166,31 @@ impl Planner {
             };
             let model_tail =
                 Self::plan_capability(&mut graph, inventory.get(&model), model.clone())?;
-            if let (Some(daemon_tail), Some(model_tail)) = (daemon_tail, model_tail) {
-                graph.add_dependency(&model_tail, daemon_tail)?;
+            if let (Some(daemon_tail), Some(model_tail)) = (&daemon_tail, &model_tail) {
+                graph.add_dependency(model_tail, daemon_tail.clone())?;
             }
+            benchmark_dependencies.extend([daemon_tail, model_tail].into_iter().flatten());
         }
 
         let startup = CapabilityId::LaunchAtLogin;
-        if desired.launch_at_login
-            || inventory
-                .get(&startup)
-                .is_some_and(|record| !record.usability.is_ready())
-        {
-            Self::plan_capability(&mut graph, inventory.get(&startup), startup)?;
+        if launch_at_login_needs_action(desired.launch_at_login, inventory.get(&startup)) {
+            if inventory.contains_key(&startup) {
+                graph.insert(
+                    SetupAction::for_key(ActionKey::ApplyLaunchAtLogin {
+                        enabled: desired.launch_at_login,
+                    })?,
+                    BTreeSet::new(),
+                )?;
+            } else {
+                Self::plan_capability(&mut graph, inventory.get(&startup), startup)?;
+            }
         }
 
         if let Some(protocol) = &desired.benchmark_protocol {
-            let benchmark = SetupAction::new(
-                ActionKey::RunBenchmark {
-                    protocol: protocol.clone(),
-                },
-                [ConsentCategory::RecordTransientCalibration],
-                RollbackPolicy::None,
-            );
-            let benchmark_id = graph.insert(benchmark, BTreeSet::new())?;
-            if let Some(recognition_tail) = recognition_tail {
-                graph.add_dependency(&benchmark_id, recognition_tail)?;
-            }
+            let benchmark = SetupAction::for_key(ActionKey::RunBenchmark {
+                protocol: protocol.clone(),
+            })?;
+            graph.insert(benchmark, benchmark_dependencies)?;
         }
 
         graph.finish()
@@ -145,7 +202,7 @@ impl Planner {
         capability: CapabilityId,
     ) -> Result<Option<ActionId>, PlanError> {
         let Some(record) = record else {
-            let probe = SetupAction::new(ActionKey::Probe(capability), [], RollbackPolicy::None);
+            let probe = SetupAction::for_key(ActionKey::Probe(capability))?;
             return graph.insert(probe, BTreeSet::new()).map(Some);
         };
         if record.usability.is_ready() {
@@ -159,8 +216,11 @@ impl Planner {
         };
         let Some(selected) = remedies
             .iter()
-            .find(|remedy| is_actionable(remedy))
-            .cloned()
+            .filter_map(|remedy| remedy_priority(&capability, remedy).map(|rank| (rank, remedy)))
+            .min_by(|(left_rank, left), (right_rank, right)| {
+                left_rank.cmp(right_rank).then_with(|| left.cmp(right))
+            })
+            .map(|(_, remedy)| remedy.clone())
         else {
             return Ok(None);
         };
@@ -175,30 +235,22 @@ impl Planner {
         match remedy {
             Remedy::Probe => graph
                 .insert(
-                    SetupAction::new(
-                        ActionKey::Probe(capability.clone()),
-                        [],
-                        RollbackPolicy::None,
-                    ),
+                    SetupAction::for_key(ActionKey::Probe(capability.clone()))?,
                     BTreeSet::new(),
                 )
                 .map(Some),
             Remedy::AcquireManagedAssets {
-                assets,
+                artifacts,
                 loads_native_code,
             } => {
-                if assets.is_empty() {
+                if artifacts.is_empty() {
                     return Err(PlanError::EmptyAssetSet);
                 }
-                let dependencies = assets
+                let dependencies = artifacts
                     .into_iter()
-                    .map(|asset| {
+                    .map(|artifact| {
                         graph.insert(
-                            SetupAction::new(
-                                ActionKey::DownloadArtifact { asset },
-                                [ConsentCategory::NetworkDownload],
-                                RollbackPolicy::ManagedAssetsOnly,
-                            ),
+                            SetupAction::for_key(ActionKey::DownloadArtifact { artifact })?,
                             BTreeSet::new(),
                         )
                     })
@@ -206,18 +258,14 @@ impl Planner {
                 Self::validate_and_activate(graph, capability, dependencies, loads_native_code)
             }
             Remedy::ImportVerifiedAssets {
-                assets,
+                artifacts,
                 loads_native_code,
             } => {
-                if assets.is_empty() {
+                if artifacts.is_empty() {
                     return Err(PlanError::EmptyAssetSet);
                 }
                 let imported = graph.insert(
-                    SetupAction::new(
-                        ActionKey::ImportVerifiedAssets { assets },
-                        [],
-                        RollbackPolicy::ManagedAssetsOnly,
-                    ),
+                    SetupAction::for_key(ActionKey::ImportVerifiedAssets { artifacts })?,
                     BTreeSet::new(),
                 )?;
                 Self::validate_and_activate(
@@ -236,65 +284,42 @@ impl Planner {
             Remedy::ActivateRecognition => Self::activate(graph, capability, BTreeSet::new()),
             Remedy::GrantMicrophoneAccess => graph
                 .insert(
-                    SetupAction::new(ActionKey::GrantMicrophoneAccess, [], RollbackPolicy::None),
+                    SetupAction::for_key(ActionKey::GrantMicrophoneAccess)?,
                     BTreeSet::new(),
                 )
                 .map(Some),
             Remedy::SelectMicrophone => graph
                 .insert(
-                    SetupAction::new(ActionKey::SelectMicrophone, [], RollbackPolicy::None),
+                    SetupAction::for_key(ActionKey::SelectMicrophone)?,
                     BTreeSet::new(),
                 )
                 .map(Some),
             Remedy::GuidedExternalInstall { tool } => {
                 let install = graph.insert(
-                    SetupAction::new(
-                        ActionKey::GuidedExternalInstall { tool: tool.clone() },
-                        [
-                            ConsentCategory::NetworkDownload,
-                            ConsentCategory::ExecuteInstaller,
-                        ],
-                        RollbackPolicy::None,
-                    ),
+                    SetupAction::for_key(ActionKey::GuidedExternalInstall { tool: tool.clone() })?,
                     BTreeSet::new(),
                 )?;
                 let start = graph.insert(
-                    SetupAction::new(
-                        ActionKey::StartExternalTool { tool },
-                        [ConsentCategory::StartBackgroundProcess],
-                        RollbackPolicy::None,
-                    ),
+                    SetupAction::for_key(ActionKey::StartExternalTool { tool })?,
                     [install].into_iter().collect(),
                 )?;
                 Ok(Some(start))
             }
             Remedy::StartExternalTool { tool } => graph
                 .insert(
-                    SetupAction::new(
-                        ActionKey::StartExternalTool { tool },
-                        [ConsentCategory::StartBackgroundProcess],
-                        RollbackPolicy::None,
-                    ),
+                    SetupAction::for_key(ActionKey::StartExternalTool { tool })?,
                     BTreeSet::new(),
                 )
                 .map(Some),
             Remedy::PullOllamaModel { digest } => graph
                 .insert(
-                    SetupAction::new(
-                        ActionKey::PullOllamaModel { digest },
-                        [ConsentCategory::NetworkDownload],
-                        RollbackPolicy::ManagedAssetsOnly,
-                    ),
+                    SetupAction::for_key(ActionKey::PullOllamaModel { digest })?,
                     BTreeSet::new(),
                 )
                 .map(Some),
             Remedy::ApplyLaunchAtLogin { enabled } => graph
                 .insert(
-                    SetupAction::new(
-                        ActionKey::ApplyLaunchAtLogin { enabled },
-                        [ConsentCategory::PersistLaunchAtLogin],
-                        RollbackPolicy::CompensatingWrite,
-                    ),
+                    SetupAction::for_key(ActionKey::ApplyLaunchAtLogin { enabled })?,
                     BTreeSet::new(),
                 )
                 .map(Some),
@@ -309,11 +334,10 @@ impl Planner {
         loads_native_code: bool,
     ) -> Result<Option<ActionId>, PlanError> {
         let validation = graph.insert(
-            SetupAction::new(
-                ActionKey::Validate(capability.clone()),
-                loads_native_code.then_some(ConsentCategory::LoadNativeCode),
-                RollbackPolicy::None,
-            ),
+            SetupAction::for_key(ActionKey::Validate {
+                capability: capability.clone(),
+                loads_native_code,
+            })?,
             dependencies,
         )?;
         if matches!(
@@ -338,11 +362,7 @@ impl Planner {
         };
         graph
             .insert(
-                SetupAction::new(
-                    ActionKey::ActivateRecognition { engine, language },
-                    (engine == EngineKind::Instant).then_some(ConsentCategory::LoadNativeCode),
-                    RollbackPolicy::CompensatingWrite,
-                ),
+                SetupAction::for_key(ActionKey::ActivateRecognition { engine, language })?,
                 dependencies,
             )
             .map(Some)
@@ -358,11 +378,59 @@ fn default_remedy(usability: &Usability) -> Remedy {
     }
 }
 
-fn is_actionable(remedy: &Remedy) -> bool {
-    !matches!(
-        remedy,
-        Remedy::ChooseAlternative { .. } | Remedy::UseDeterministicFormatting
-    )
+fn remedy_priority(capability: &CapabilityId, remedy: &Remedy) -> Option<u8> {
+    match (capability, remedy) {
+        (_, Remedy::Probe) => Some(90),
+        (
+            CapabilityId::AccurateRecognition { .. } | CapabilityId::InstantRecognition { .. },
+            Remedy::ImportVerifiedAssets { .. },
+        ) => Some(10),
+        (
+            CapabilityId::AccurateRecognition { .. } | CapabilityId::InstantRecognition { .. },
+            Remedy::AcquireManagedAssets { .. },
+        ) => Some(20),
+        (
+            CapabilityId::AccurateRecognition { .. } | CapabilityId::InstantRecognition { .. },
+            Remedy::ValidateInstalled,
+        ) => Some(30),
+        (
+            CapabilityId::AccurateRecognition { .. } | CapabilityId::InstantRecognition { .. },
+            Remedy::ActivateRecognition,
+        ) => Some(40),
+        (CapabilityId::Microphone, Remedy::GrantMicrophoneAccess) => Some(10),
+        (CapabilityId::Microphone, Remedy::SelectMicrophone) => Some(20),
+        (CapabilityId::OllamaDaemon, Remedy::StartExternalTool { .. }) => Some(10),
+        (CapabilityId::OllamaDaemon, Remedy::GuidedExternalInstall { .. }) => Some(20),
+        (CapabilityId::OllamaModel { .. }, Remedy::PullOllamaModel { .. }) => Some(10),
+        (CapabilityId::LaunchAtLogin, Remedy::ApplyLaunchAtLogin { .. }) => Some(10),
+        (_, Remedy::ChooseAlternative { .. } | Remedy::UseDeterministicFormatting)
+        | (_, Remedy::ImportVerifiedAssets { .. })
+        | (_, Remedy::AcquireManagedAssets { .. })
+        | (_, Remedy::ValidateInstalled)
+        | (_, Remedy::ActivateRecognition)
+        | (_, Remedy::GrantMicrophoneAccess)
+        | (_, Remedy::SelectMicrophone)
+        | (_, Remedy::GuidedExternalInstall { .. })
+        | (_, Remedy::StartExternalTool { .. })
+        | (_, Remedy::PullOllamaModel { .. })
+        | (_, Remedy::ApplyLaunchAtLogin { .. }) => None,
+    }
+}
+
+fn launch_at_login_needs_action(desired: bool, record: Option<&CapabilityRecord>) -> bool {
+    match record {
+        Some(CapabilityRecord {
+            value:
+                Some(CapabilityValue::LaunchAtLogin {
+                    enabled,
+                    exact_command,
+                }),
+            usability,
+            ..
+        }) => !usability.is_ready() || *enabled != desired || !*exact_command,
+        Some(record) => desired || !record.usability.is_ready(),
+        None => desired,
+    }
 }
 
 fn is_native(capability: &CapabilityId) -> bool {
@@ -380,7 +448,7 @@ impl ActionGraph {
         action: SetupAction,
         dependencies: BTreeSet<ActionId>,
     ) -> Result<ActionId, PlanError> {
-        let id = action.id.clone();
+        let id = action.id().clone();
         match self.nodes.entry(id.clone()) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(PlannedAction {
@@ -438,7 +506,12 @@ impl ActionGraph {
             emitted.insert(next);
             actions.push(node);
         }
-        let plan = SetupPlan { actions };
+        let plan = SetupPlan {
+            schema_version: SetupPlan::SCHEMA_VERSION,
+            policy_version: ContentFreeId::new(SetupPlan::POLICY_VERSION)
+                .expect("static setup policy version is valid"),
+            actions,
+        };
         plan.validate()?;
         Ok(plan)
     }
@@ -446,6 +519,10 @@ impl ActionGraph {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PlanError {
+    #[error("plan schema or policy version is unsupported")]
+    UnsupportedPlanVersion,
+    #[error("plan contains an invalid action: {0}")]
+    InvalidAction(#[from] ActionError),
     #[error("capability inventory contains conflicting duplicate observations")]
     ConflictingCapability,
     #[error("plan contains conflicting duplicate actions")]
@@ -463,7 +540,25 @@ pub enum PlanError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AssetId, ReadyAuthority, UnavailableReason};
+    use crate::{
+        ArtifactDescriptor, ArtifactKind, AssetId, ConsentCategory, ReadyAuthority,
+        UnavailableReason,
+    };
+
+    fn artifact(id: &str, byte: char) -> ArtifactDescriptor {
+        ArtifactDescriptor::new(
+            AssetId::new(id).unwrap(),
+            Sha256Digest::new(byte.to_string().repeat(64)).unwrap(),
+            1024,
+            ContentFreeId::new("vendor").unwrap(),
+            ContentFreeId::new("v1").unwrap(),
+            ContentFreeId::new("apache-2.0").unwrap(),
+            format!("https://example.invalid/{id}.bin"),
+            ArtifactKind::Data,
+            None,
+        )
+        .unwrap()
+    }
 
     fn ready(id: CapabilityId) -> CapabilityRecord {
         CapabilityRecord::new(
@@ -496,7 +591,7 @@ mod tests {
 
     #[test]
     fn plan_is_invariant_to_inventory_enumeration_order() {
-        let model = AssetId::new("whisper-base-en-f16").unwrap();
+        let model = artifact("whisper-base-en-f16", 'a');
         let records = vec![
             ready(CapabilityId::Microphone),
             missing(
@@ -504,7 +599,7 @@ mod tests {
                     language: Language::English,
                 },
                 Remedy::AcquireManagedAssets {
-                    assets: [model].into_iter().collect(),
+                    artifacts: [model].into_iter().collect(),
                     loads_native_code: false,
                 },
             ),
@@ -527,7 +622,7 @@ mod tests {
             missing(
                 capability,
                 Remedy::AcquireManagedAssets {
-                    assets: [AssetId::new("base-en").unwrap()].into_iter().collect(),
+                    artifacts: [artifact("base-en", 'a')].into_iter().collect(),
                     loads_native_code: false,
                 },
             ),
@@ -537,11 +632,11 @@ mod tests {
         assert_eq!(first, second);
         first.validate().unwrap();
         assert!(matches!(
-            first.actions[0].action.key,
+            first.actions[0].action.key(),
             ActionKey::DownloadArtifact { .. }
         ));
         assert!(matches!(
-            first.actions.last().unwrap().action.key,
+            first.actions.last().unwrap().action.key(),
             ActionKey::ActivateRecognition { .. }
         ));
     }
@@ -594,12 +689,12 @@ mod tests {
         let start_index = plan
             .actions
             .iter()
-            .position(|action| matches!(action.action.key, ActionKey::StartExternalTool { .. }))
+            .position(|action| matches!(action.action.key(), ActionKey::StartExternalTool { .. }))
             .unwrap();
         let pull_index = plan
             .actions
             .iter()
-            .position(|action| matches!(action.action.key, ActionKey::PullOllamaModel { .. }))
+            .position(|action| matches!(action.action.key(), ActionKey::PullOllamaModel { .. }))
             .unwrap();
         assert!(start_index < pull_index);
     }
@@ -623,9 +718,9 @@ mod tests {
         let instant = CapabilityId::InstantRecognition {
             language: Language::English,
         };
-        let assets = [
-            AssetId::new("vosk-runtime").unwrap(),
-            AssetId::new("vosk-en-model").unwrap(),
+        let artifacts = [
+            artifact("vosk-runtime", 'a'),
+            artifact("vosk-en-model", 'b'),
         ]
         .into_iter()
         .collect();
@@ -636,7 +731,7 @@ mod tests {
                 missing(
                     instant,
                     Remedy::AcquireManagedAssets {
-                        assets,
+                        artifacts,
                         loads_native_code: true,
                     },
                 ),
@@ -649,10 +744,150 @@ mod tests {
             .filter(|action| {
                 action
                     .action
-                    .consent
+                    .consent()
                     .contains(&ConsentCategory::LoadNativeCode)
             })
             .count();
         assert_eq!(native_actions, 2);
+    }
+
+    #[test]
+    fn persisted_plan_revalidates_action_identity_and_policy_version() {
+        let plan = Planner::plan(
+            &desired(),
+            [
+                missing(CapabilityId::Microphone, Remedy::SelectMicrophone),
+                ready(CapabilityId::AccurateRecognition {
+                    language: Language::English,
+                }),
+            ],
+        )
+        .unwrap();
+        let mut relabelled = serde_json::to_value(&plan).unwrap();
+        relabelled["actions"][0]["action"]["id"] = serde_json::json!(ActionId::for_key(
+            &ActionKey::Probe(CapabilityId::Microphone)
+        ));
+        assert!(serde_json::from_value::<SetupPlan>(relabelled).is_err());
+
+        let mut wrong_policy = serde_json::to_value(&plan).unwrap();
+        wrong_policy["policy_version"] = serde_json::json!("setup-policy-v999");
+        assert!(serde_json::from_value::<SetupPlan>(wrong_policy).is_err());
+    }
+
+    #[test]
+    fn launch_at_login_compares_actual_value_not_only_ready_badge() {
+        let mut configuration = desired();
+        configuration.launch_at_login = false;
+        let plan = Planner::plan(
+            &configuration,
+            [
+                ready(CapabilityId::Microphone),
+                ready(CapabilityId::AccurateRecognition {
+                    language: Language::English,
+                }),
+                ready(CapabilityId::LaunchAtLogin).with_value(CapabilityValue::LaunchAtLogin {
+                    enabled: true,
+                    exact_command: true,
+                }),
+            ],
+        )
+        .unwrap();
+        assert!(plan.actions().iter().any(|planned| matches!(
+            planned.action().key(),
+            ActionKey::ApplyLaunchAtLogin { enabled: false }
+        )));
+    }
+
+    #[test]
+    fn explicit_policy_prefers_verified_import_over_download_regardless_of_enum_order() {
+        let capability = CapabilityId::AccurateRecognition {
+            language: Language::English,
+        };
+        let model = artifact("base-en", 'a');
+        let record = CapabilityRecord::new(
+            capability.clone(),
+            Usability::Unavailable {
+                reason: UnavailableReason::Missing,
+            },
+        )
+        .with_remedies([
+            Remedy::AcquireManagedAssets {
+                artifacts: [model.clone()].into_iter().collect(),
+                loads_native_code: false,
+            },
+            Remedy::ImportVerifiedAssets {
+                artifacts: [model].into_iter().collect(),
+                loads_native_code: false,
+            },
+        ]);
+        let plan = Planner::plan(&desired(), [ready(CapabilityId::Microphone), record]).unwrap();
+        assert!(matches!(
+            plan.actions()[0].action().key(),
+            ActionKey::ImportVerifiedAssets { .. }
+        ));
+    }
+
+    #[test]
+    fn benchmark_waits_for_recognition_and_every_requested_ollama_tail() {
+        let digest = Sha256Digest::new("c".repeat(64)).unwrap();
+        let mut configuration = desired();
+        configuration.benchmark_protocol = Some(ContentFreeId::new("setup-v1").unwrap());
+        configuration.formatting = FormattingChoice::Ollama {
+            model_digest: digest.clone(),
+        };
+        let plan = Planner::plan(
+            &configuration,
+            [
+                ready(CapabilityId::Microphone),
+                missing(
+                    CapabilityId::AccurateRecognition {
+                        language: Language::English,
+                    },
+                    Remedy::AcquireManagedAssets {
+                        artifacts: [artifact("base-en", 'a')].into_iter().collect(),
+                        loads_native_code: false,
+                    },
+                ),
+                missing(
+                    CapabilityId::OllamaDaemon,
+                    Remedy::StartExternalTool {
+                        tool: ContentFreeId::new("ollama").unwrap(),
+                    },
+                ),
+                missing(
+                    CapabilityId::OllamaModel {
+                        digest: digest.clone(),
+                    },
+                    Remedy::PullOllamaModel { digest },
+                ),
+            ],
+        )
+        .unwrap();
+        let benchmark = plan
+            .actions()
+            .iter()
+            .find(|planned| matches!(planned.action().key(), ActionKey::RunBenchmark { .. }))
+            .unwrap();
+        let dependency_keys = plan
+            .actions()
+            .iter()
+            .filter(|planned| benchmark.dependencies().contains(planned.action().id()))
+            .map(|planned| planned.action().key())
+            .collect::<Vec<_>>();
+        assert!(
+            dependency_keys
+                .iter()
+                .any(|key| matches!(key, ActionKey::ActivateRecognition { .. }))
+        );
+        assert!(
+            dependency_keys
+                .iter()
+                .any(|key| matches!(key, ActionKey::StartExternalTool { .. }))
+        );
+        assert!(
+            dependency_keys
+                .iter()
+                .any(|key| matches!(key, ActionKey::PullOllamaModel { .. }))
+        );
     }
 }

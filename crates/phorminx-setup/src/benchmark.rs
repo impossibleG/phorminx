@@ -80,6 +80,22 @@ pub enum ModelClass {
     Other,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThermalCondition {
+    Nominal,
+    Elevated,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentionCondition {
+    Idle,
+    Contended,
+    Unknown,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct BenchmarkProtocol {
     pub protocol_id: ContentFreeId,
@@ -91,9 +107,13 @@ pub struct BenchmarkProtocol {
 pub struct BenchmarkSampleSummary {
     pub speech_samples: u32,
     pub silence_samples: u32,
-    pub load_ms: u64,
+    pub run_count: u32,
+    pub cold_load_ms: u64,
+    pub warm_load_ms: u64,
     pub release_p50_ms: u64,
     pub release_p95_ms: u64,
+    pub release_dispersion_ms: u64,
+    pub confidence_per_mille: u16,
     pub realtime_factor_milli: u32,
     pub word_error_per_mille: u16,
     pub character_error_per_mille: u16,
@@ -102,6 +122,8 @@ pub struct BenchmarkSampleSummary {
     pub peak_working_set_mib: u32,
     pub available_memory_mib: u32,
     pub fallback_count: u32,
+    pub thermal_condition: ThermalCondition,
+    pub contention_condition: ContentionCondition,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -110,6 +132,8 @@ pub struct BenchmarkEvidence {
     pub protocol_id: ContentFreeId,
     pub build_id: ContentFreeId,
     pub candidate_id: ContentFreeId,
+    pub device_id: ContentFreeId,
+    pub driver_id: ContentFreeId,
     pub engine: EngineKind,
     pub backend: BackendKind,
     pub model_class: ModelClass,
@@ -123,7 +147,7 @@ pub struct BenchmarkEvidence {
 }
 
 impl BenchmarkEvidence {
-    pub const SCHEMA_VERSION: u32 = 1;
+    pub const SCHEMA_VERSION: u32 = 2;
 
     #[must_use]
     pub fn is_structurally_valid(&self) -> bool {
@@ -132,6 +156,18 @@ impl BenchmarkEvidence {
             && self.measurements.character_error_per_mille <= 1_000
             && self.measurements.protected_token_exact_per_mille <= 1_000
             && self.measurements.hallucination_per_mille <= 1_000
+            && self.measurements.confidence_per_mille <= 1_000
+            && self.measurements.release_p50_ms <= self.measurements.release_p95_ms
+            && self.measurements.run_count
+                >= self
+                    .measurements
+                    .speech_samples
+                    .saturating_add(self.measurements.silence_samples)
+            && matches!(
+                (self.engine, self.backend),
+                (EngineKind::Instant, BackendKind::VoskNative)
+                    | (EngineKind::Accurate, BackendKind::Cpu | BackendKind::Vulkan)
+            )
     }
 }
 

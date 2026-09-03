@@ -42,6 +42,176 @@ impl fmt::Display for AssetId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    Data,
+    NativeLibrary,
+    Executable,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SignerRequirement {
+    pub publisher: ContentFreeId,
+    pub certificate_sha256: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ArtifactDescriptor {
+    asset_id: AssetId,
+    digest: Sha256Digest,
+    size_bytes: u64,
+    vendor: ContentFreeId,
+    version: ContentFreeId,
+    license: ContentFreeId,
+    source_url: String,
+    kind: ArtifactKind,
+    signer: Option<SignerRequirement>,
+}
+
+#[derive(Deserialize)]
+struct ArtifactDescriptorWire {
+    asset_id: AssetId,
+    digest: Sha256Digest,
+    size_bytes: u64,
+    vendor: ContentFreeId,
+    version: ContentFreeId,
+    license: ContentFreeId,
+    source_url: String,
+    kind: ArtifactKind,
+    signer: Option<SignerRequirement>,
+}
+
+impl ArtifactDescriptor {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        asset_id: AssetId,
+        digest: Sha256Digest,
+        size_bytes: u64,
+        vendor: ContentFreeId,
+        version: ContentFreeId,
+        license: ContentFreeId,
+        source_url: impl Into<String>,
+        kind: ArtifactKind,
+        signer: Option<SignerRequirement>,
+    ) -> Result<Self, OwnershipError> {
+        let descriptor = Self {
+            asset_id,
+            digest,
+            size_bytes,
+            vendor,
+            version,
+            license,
+            source_url: source_url.into(),
+            kind,
+            signer,
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    fn validate(&self) -> Result<(), OwnershipError> {
+        if self.size_bytes == 0
+            || self.source_url.len() > 2_048
+            || !self.source_url.starts_with("https://")
+            || !self.source_url.is_ascii()
+            || self
+                .source_url
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace())
+            || (self.kind == ArtifactKind::Executable && self.signer.is_none())
+            || (self.kind != ArtifactKind::Executable && self.signer.is_some())
+        {
+            return Err(OwnershipError::InvalidArtifactDescriptor);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn asset_id(&self) -> &AssetId {
+        &self.asset_id
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+
+    #[must_use]
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    #[must_use]
+    pub const fn vendor(&self) -> &ContentFreeId {
+        &self.vendor
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> &ContentFreeId {
+        &self.version
+    }
+
+    #[must_use]
+    pub const fn license(&self) -> &ContentFreeId {
+        &self.license
+    }
+
+    #[must_use]
+    pub fn source_url(&self) -> &str {
+        &self.source_url
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> ArtifactKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn signer(&self) -> Option<&SignerRequirement> {
+        self.signer.as_ref()
+    }
+
+    pub fn verify_acquired(&self, acquired: &AcquiredArtifact) -> Result<(), OwnershipError> {
+        if self.digest != acquired.digest || self.size_bytes != acquired.size_bytes {
+            return Err(OwnershipError::ArtifactIdentityMismatch);
+        }
+        match (&self.signer, &acquired.signer) {
+            (Some(expected), Some(actual)) if expected == actual => Ok(()),
+            (None, None) => Ok(()),
+            _ => Err(OwnershipError::SignerMismatch),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ArtifactDescriptor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ArtifactDescriptorWire::deserialize(deserializer)?;
+        Self::new(
+            wire.asset_id,
+            wire.digest,
+            wire.size_bytes,
+            wire.vendor,
+            wire.version,
+            wire.license,
+            wire.source_url,
+            wire.kind,
+            wire.signer,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcquiredArtifact {
+    pub digest: Sha256Digest,
+    pub size_bytes: u64,
+    pub signer: Option<SignerRequirement>,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Sha256Digest(String);
@@ -81,7 +251,7 @@ pub struct ManagedSlot(String);
 
 impl ManagedSlot {
     pub fn new(value: impl Into<String>) -> Result<Self, OwnershipError> {
-        let value = value.into().replace('\\', "/");
+        let value = value.into().replace('\\', "/").to_ascii_lowercase();
         let valid = !value.is_empty()
             && !value.starts_with('/')
             && !value.ends_with('/')
@@ -90,6 +260,8 @@ impl ManagedSlot {
                 !part.is_empty()
                     && part != "."
                     && part != ".."
+                    && !part.ends_with('.')
+                    && !is_windows_device_name(part)
                     && part.bytes().all(|byte| {
                         byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
                     })
@@ -101,9 +273,31 @@ impl ManagedSlot {
     }
 
     #[must_use]
+    pub fn staging_for(action: &ActionId) -> Self {
+        let mut encoded = String::with_capacity(action.as_str().len() * 2);
+        for byte in action.as_str().bytes() {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        Self(format!("staging/action-{encoded}"))
+    }
+
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn is_windows_device_name(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or_default();
+    matches!(stem, "con" | "prn" | "aux" | "nul")
+        || stem.strip_prefix("com").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        })
+        || stem.strip_prefix("lpt").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        })
 }
 
 impl TryFrom<String> for ManagedSlot {
@@ -122,41 +316,45 @@ impl From<ManagedSlot> for String {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManagedAsset {
-    asset_id: AssetId,
-    digest: Sha256Digest,
+    descriptor: ArtifactDescriptor,
     slot: ManagedSlot,
 }
 
 impl ManagedAsset {
-    #[must_use]
-    pub const fn new(asset_id: AssetId, digest: Sha256Digest, slot: ManagedSlot) -> Self {
-        Self {
-            asset_id,
-            digest,
-            slot,
-        }
+    pub fn from_verified(
+        descriptor: ArtifactDescriptor,
+        acquired: &AcquiredArtifact,
+        slot: ManagedSlot,
+    ) -> Result<Self, OwnershipError> {
+        descriptor.verify_acquired(acquired)?;
+        Ok(Self { descriptor, slot })
     }
 
     #[must_use]
     pub const fn asset_id(&self) -> &AssetId {
-        &self.asset_id
+        self.descriptor.asset_id()
     }
 
     #[must_use]
     pub const fn digest(&self) -> &Sha256Digest {
-        &self.digest
+        self.descriptor.digest()
     }
 
     #[must_use]
     pub const fn slot(&self) -> &ManagedSlot {
         &self.slot
     }
+
+    #[must_use]
+    pub const fn descriptor(&self) -> &ArtifactDescriptor {
+        &self.descriptor
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "ownership")]
 pub enum AssetLocation {
-    Managed(ManagedAsset),
+    Managed(Box<ManagedAsset>),
     /// A user-owned path. It is selectable, but never becomes cleanup authority.
     Custom {
         path: String,
@@ -193,7 +391,7 @@ impl AssetRegistry {
         if receipt.schema_version != AssetReceipt::SCHEMA_VERSION {
             return Err(OwnershipError::UnsupportedReceiptVersion);
         }
-        let id = receipt.asset.asset_id.clone();
+        let id = receipt.asset.asset_id().clone();
         if self.receipts.contains_key(&id) {
             return Err(OwnershipError::DuplicateReceipt);
         }
@@ -270,13 +468,13 @@ impl<'de> Deserialize<'de> for AssetRegistry {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CrashJournal {
-    pub schema_version: u32,
-    pub action_id: ActionId,
-    pub action_key: ActionKey,
-    pub generation: Generation,
-    pub phase: ActionPhase,
-    pub staging_slot: Option<ManagedSlot>,
-    pub started_at_epoch_ms: u64,
+    schema_version: u32,
+    action_id: ActionId,
+    action_key: ActionKey,
+    generation: Generation,
+    phase: ActionPhase,
+    staging_slot: Option<ManagedSlot>,
+    started_at_epoch_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -299,7 +497,7 @@ impl<'de> Deserialize<'de> for CrashJournal {
         if wire.schema_version != Self::SCHEMA_VERSION {
             return Err(serde::de::Error::custom(JournalError::UnsupportedVersion));
         }
-        Self::new(
+        Self::restore(
             wire.action_id,
             wire.action_key,
             wire.generation,
@@ -315,6 +513,24 @@ impl CrashJournal {
     pub const SCHEMA_VERSION: u32 = 1;
 
     pub fn new(
+        action: &crate::SetupAction,
+        generation: Generation,
+        phase: ActionPhase,
+        staging_slot: Option<ManagedSlot>,
+        started_at_epoch_ms: u64,
+    ) -> Result<Self, JournalError> {
+        action.validate().map_err(|_| JournalError::InvalidAction)?;
+        Self::restore(
+            action.id().clone(),
+            action.key().clone(),
+            generation,
+            phase,
+            staging_slot,
+            started_at_epoch_ms,
+        )
+    }
+
+    fn restore(
         action_id: ActionId,
         action_key: ActionKey,
         generation: Generation,
@@ -322,13 +538,7 @@ impl CrashJournal {
         staging_slot: Option<ManagedSlot>,
         started_at_epoch_ms: u64,
     ) -> Result<Self, JournalError> {
-        if staging_slot
-            .as_ref()
-            .is_some_and(|slot| !slot.as_str().starts_with("staging/"))
-        {
-            return Err(JournalError::NotAStagingSlot);
-        }
-        Ok(Self {
+        let journal = Self {
             schema_version: Self::SCHEMA_VERSION,
             action_id,
             action_key,
@@ -336,21 +546,61 @@ impl CrashJournal {
             phase,
             staging_slot,
             started_at_epoch_ms,
-        })
+        };
+        journal.validate()?;
+        Ok(journal)
     }
 
     pub fn validate(&self) -> Result<(), JournalError> {
         if self.schema_version != Self::SCHEMA_VERSION {
             return Err(JournalError::UnsupportedVersion);
         }
-        if self
-            .staging_slot
-            .as_ref()
-            .is_some_and(|slot| !slot.as_str().starts_with("staging/"))
-        {
-            return Err(JournalError::NotAStagingSlot);
+        if self.action_id != ActionId::for_key(&self.action_key) {
+            return Err(JournalError::ActionIdentityMismatch);
+        }
+        if !self.action_key.permits_phase(self.phase) {
+            return Err(JournalError::PhaseIncompatible);
+        }
+        match (&self.staging_slot, self.action_key.rollback_policy()) {
+            (Some(slot), crate::RollbackPolicy::ManagedAssetsOnly)
+                if *slot == ManagedSlot::staging_for(&self.action_id) => {}
+            (Some(_), crate::RollbackPolicy::ManagedAssetsOnly) => {
+                return Err(JournalError::StagingOwnershipMismatch);
+            }
+            (Some(_), _) => return Err(JournalError::StagingNotAllowed),
+            (None, _) => {}
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub const fn action_id(&self) -> &ActionId {
+        &self.action_id
+    }
+
+    #[must_use]
+    pub const fn action_key(&self) -> &ActionKey {
+        &self.action_key
+    }
+
+    #[must_use]
+    pub const fn phase(&self) -> ActionPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub const fn staging_slot(&self) -> Option<&ManagedSlot> {
+        self.staging_slot.as_ref()
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn started_at_epoch_ms(&self) -> u64 {
+        self.started_at_epoch_ms
     }
 }
 
@@ -360,6 +610,12 @@ pub enum OwnershipError {
     InvalidAssetId,
     #[error("SHA-256 digest must contain exactly 64 hexadecimal characters")]
     InvalidDigest,
+    #[error("artifact descriptor must pin HTTPS source, nonzero size, and executable signer")]
+    InvalidArtifactDescriptor,
+    #[error("acquired artifact does not match the pinned digest and size")]
+    ArtifactIdentityMismatch,
+    #[error("acquired executable signer does not match the pinned signer")]
+    SignerMismatch,
     #[error("managed slots must be normalized relative identifiers")]
     InvalidManagedSlot,
     #[error("receipt schema is unsupported")]
@@ -378,34 +634,138 @@ pub enum OwnershipError {
 pub enum JournalError {
     #[error("journal schema is unsupported")]
     UnsupportedVersion,
-    #[error("journal cleanup target is not in the staging namespace")]
-    NotAStagingSlot,
+    #[error("journal action is invalid")]
+    InvalidAction,
+    #[error("journal action ID does not match its key")]
+    ActionIdentityMismatch,
+    #[error("journal phase is incompatible with its action")]
+    PhaseIncompatible,
+    #[error("journal action is not allowed to own staging data")]
+    StagingNotAllowed,
+    #[error("journal staging slot is not bound to this action")]
+    StagingOwnershipMismatch,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn descriptor(id: &str) -> ArtifactDescriptor {
+        ArtifactDescriptor::new(
+            AssetId::new(id).unwrap(),
+            digest('a'),
+            1024,
+            ContentFreeId::new("vendor").unwrap(),
+            ContentFreeId::new("v1").unwrap(),
+            ContentFreeId::new("apache-2.0").unwrap(),
+            format!("https://example.invalid/{id}.zip"),
+            ArtifactKind::Data,
+            None,
+        )
+        .unwrap()
+    }
+
     fn digest(byte: char) -> Sha256Digest {
         Sha256Digest::new(byte.to_string().repeat(64)).unwrap()
     }
 
     fn managed(id: &str, slot: &str) -> ManagedAsset {
-        ManagedAsset::new(
-            AssetId::new(id).unwrap(),
-            digest('a'),
-            ManagedSlot::new(slot).unwrap(),
-        )
+        let descriptor = descriptor(id);
+        let acquired = AcquiredArtifact {
+            digest: descriptor.digest().clone(),
+            size_bytes: descriptor.size_bytes(),
+            signer: descriptor.signer().cloned(),
+        };
+        ManagedAsset::from_verified(descriptor, &acquired, ManagedSlot::new(slot).unwrap()).unwrap()
     }
 
     #[test]
     fn managed_slots_reject_escape_and_absolute_forms() {
-        for path in ["", "../x", "assets/../x", "/assets/x", "C:/x", "assets//x"] {
+        for path in [
+            "",
+            "../x",
+            "assets/../x",
+            "/assets/x",
+            "C:/x",
+            "assets//x",
+            "assets/name.",
+            "assets/CON",
+            "assets/com1.dll",
+            "assets/LPT9",
+        ] {
             assert_eq!(
                 ManagedSlot::new(path).unwrap_err(),
                 OwnershipError::InvalidManagedSlot
             );
         }
+        assert_eq!(
+            ManagedSlot::new(r"Assets\VOSK\Model").unwrap().as_str(),
+            "assets/vosk/model"
+        );
+    }
+
+    #[test]
+    fn executable_descriptor_requires_exact_signer_and_acquired_identity() {
+        let signer = SignerRequirement {
+            publisher: ContentFreeId::new("ollama-inc").unwrap(),
+            certificate_sha256: digest('b'),
+        };
+        let descriptor = ArtifactDescriptor::new(
+            AssetId::new("ollama-installer").unwrap(),
+            digest('a'),
+            4096,
+            ContentFreeId::new("ollama-inc").unwrap(),
+            ContentFreeId::new("1.0.0").unwrap(),
+            ContentFreeId::new("mit").unwrap(),
+            "https://example.invalid/ollama.exe",
+            ArtifactKind::Executable,
+            Some(signer.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            descriptor.verify_acquired(&AcquiredArtifact {
+                digest: digest('a'),
+                size_bytes: 4095,
+                signer: Some(signer.clone()),
+            }),
+            Err(OwnershipError::ArtifactIdentityMismatch)
+        );
+        assert_eq!(
+            descriptor.verify_acquired(&AcquiredArtifact {
+                digest: digest('a'),
+                size_bytes: 4096,
+                signer: None,
+            }),
+            Err(OwnershipError::SignerMismatch)
+        );
+        assert!(
+            ManagedAsset::from_verified(
+                descriptor,
+                &AcquiredArtifact {
+                    digest: digest('a'),
+                    size_bytes: 4096,
+                    signer: Some(signer),
+                },
+                ManagedSlot::new("assets/ollama-installer").unwrap(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn deserialization_revalidates_artifact_descriptor() {
+        let invalid = serde_json::json!({
+            "asset_id": "installer",
+            "digest": "a".repeat(64),
+            "size_bytes": 1,
+            "vendor": "vendor",
+            "version": "v1",
+            "license": "mit",
+            "source_url": "http://insecure.invalid/installer.exe",
+            "kind": "executable",
+            "signer": null
+        });
+        assert!(serde_json::from_value::<ArtifactDescriptor>(invalid).is_err());
     }
 
     #[test]
@@ -421,11 +781,29 @@ mod tests {
             .insert(AssetReceipt::new(recorded.clone(), 10))
             .unwrap();
 
-        let impostor = ManagedAsset::new(
+        let impostor_descriptor = ArtifactDescriptor::new(
             recorded.asset_id().clone(),
             digest('b'),
+            1024,
+            ContentFreeId::new("vendor").unwrap(),
+            ContentFreeId::new("v1").unwrap(),
+            ContentFreeId::new("apache-2.0").unwrap(),
+            "https://example.invalid/impostor.zip",
+            ArtifactKind::Data,
+            None,
+        )
+        .unwrap();
+        let impostor_acquired = AcquiredArtifact {
+            digest: impostor_descriptor.digest().clone(),
+            size_bytes: impostor_descriptor.size_bytes(),
+            signer: None,
+        };
+        let impostor = ManagedAsset::from_verified(
+            impostor_descriptor,
+            &impostor_acquired,
             recorded.slot().clone(),
-        );
+        )
+        .unwrap();
         assert_eq!(registry.cleanup_target(&impostor), None);
         assert_eq!(registry.cleanup_target(&recorded), Some(recorded.slot()));
     }
@@ -436,11 +814,29 @@ mod tests {
         registry
             .insert(AssetReceipt::new(managed("one", "assets/shared"), 1))
             .unwrap();
-        let other = ManagedAsset::new(
+        let descriptor = ArtifactDescriptor::new(
             AssetId::new("two").unwrap(),
             digest('b'),
+            1024,
+            ContentFreeId::new("vendor").unwrap(),
+            ContentFreeId::new("v1").unwrap(),
+            ContentFreeId::new("apache-2.0").unwrap(),
+            "https://example.invalid/two.zip",
+            ArtifactKind::Data,
+            None,
+        )
+        .unwrap();
+        let acquired = AcquiredArtifact {
+            digest: descriptor.digest().clone(),
+            size_bytes: descriptor.size_bytes(),
+            signer: None,
+        };
+        let other = ManagedAsset::from_verified(
+            descriptor,
+            &acquired,
             ManagedSlot::new("assets/shared").unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             registry.insert(AssetReceipt::new(other, 2)).unwrap_err(),
             OwnershipError::SlotAlreadyOwned
@@ -449,15 +845,18 @@ mod tests {
 
     #[test]
     fn journal_can_only_name_owned_staging_namespace() {
+        let action = crate::SetupAction::for_key(ActionKey::DownloadArtifact {
+            artifact: descriptor("runtime"),
+        })
+        .unwrap();
         let result = CrashJournal::new(
-            ActionId::for_key(&ActionKey::Probe(CapabilityId::Microphone)),
-            ActionKey::Probe(CapabilityId::Microphone),
+            &action,
             Generation(1),
             ActionPhase::Downloading,
             Some(ManagedSlot::new("assets/not-staging").unwrap()),
             1,
         );
-        assert_eq!(result.unwrap_err(), JournalError::NotAStagingSlot);
+        assert_eq!(result.unwrap_err(), JournalError::StagingOwnershipMismatch);
     }
 
     #[test]
@@ -471,7 +870,9 @@ mod tests {
 
     #[test]
     fn persisted_journal_rejects_non_staging_cleanup_target() {
-        let action_key = ActionKey::Probe(CapabilityId::Microphone);
+        let action_key = ActionKey::DownloadArtifact {
+            artifact: descriptor("runtime"),
+        };
         let journal = serde_json::json!({
             "schema_version": 1,
             "action_id": ActionId::for_key(&action_key),
@@ -482,6 +883,64 @@ mod tests {
             "started_at_epoch_ms": 1
         });
         assert!(serde_json::from_value::<CrashJournal>(journal).is_err());
+    }
+
+    #[test]
+    fn persisted_journal_rejects_relabelled_action_and_impossible_phase() {
+        let probe = ActionKey::Probe(CapabilityId::Microphone);
+        let relabelled = serde_json::json!({
+            "schema_version": 1,
+            "action_id": ActionId::for_key(&probe),
+            "action_key": {"kind": "guided_external_install", "tool": "ollama"},
+            "generation": 1,
+            "phase": "loading",
+            "staging_slot": null,
+            "started_at_epoch_ms": 1
+        });
+        assert!(serde_json::from_value::<CrashJournal>(relabelled).is_err());
+
+        let impossible = serde_json::json!({
+            "schema_version": 1,
+            "action_id": ActionId::for_key(&probe),
+            "action_key": probe,
+            "generation": 1,
+            "phase": "downloading",
+            "staging_slot": null,
+            "started_at_epoch_ms": 1
+        });
+        assert!(serde_json::from_value::<CrashJournal>(impossible).is_err());
+    }
+
+    #[test]
+    fn staging_slot_is_unambiguously_namespaced_by_action_identity() {
+        let action = crate::SetupAction::for_key(ActionKey::DownloadArtifact {
+            artifact: descriptor("runtime"),
+        })
+        .unwrap();
+        let expected = ManagedSlot::staging_for(action.id());
+        let journal = CrashJournal::new(
+            &action,
+            Generation(1),
+            ActionPhase::Downloading,
+            Some(expected.clone()),
+            1,
+        )
+        .unwrap();
+        assert_eq!(journal.staging_slot(), Some(&expected));
+
+        let probe =
+            crate::SetupAction::for_key(ActionKey::Probe(CapabilityId::Microphone)).unwrap();
+        assert_eq!(
+            CrashJournal::new(
+                &probe,
+                Generation(1),
+                ActionPhase::Preparing,
+                Some(ManagedSlot::staging_for(probe.id())),
+                1,
+            )
+            .unwrap_err(),
+            JournalError::StagingNotAllowed
+        );
     }
 
     use crate::CapabilityId;

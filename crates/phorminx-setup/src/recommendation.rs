@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BackendKind, BenchmarkEvidence, BenchmarkProtocol, ContentFreeId, EngineKind, Language,
-    ModelClass,
+    BackendKind, BenchmarkEvidence, BenchmarkProtocol, ContentFreeId, ContentionCondition,
+    EngineKind, Language, ModelClass, ThermalCondition,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -25,6 +25,11 @@ pub struct RecommendationPolicy {
     pub maximum_release_p95_ms: u64,
     pub maximum_realtime_factor_milli: u32,
     pub minimum_memory_reserve_mib: u32,
+    pub minimum_run_count: u32,
+    pub minimum_confidence_per_mille: u16,
+    pub maximum_cold_load_ms: u64,
+    pub maximum_warm_load_ms: u64,
+    pub maximum_release_dispersion_ms: u64,
 }
 
 impl RecommendationPolicy {
@@ -42,6 +47,11 @@ impl RecommendationPolicy {
             maximum_release_p95_ms: 900,
             maximum_realtime_factor_milli: 250,
             minimum_memory_reserve_mib: 512,
+            minimum_run_count: 4,
+            minimum_confidence_per_mille: 900,
+            maximum_cold_load_ms: 10_000,
+            maximum_warm_load_ms: 2_000,
+            maximum_release_dispersion_ms: 300,
         }
     }
 }
@@ -66,6 +76,11 @@ pub enum ExclusionReason {
     InsufficientMemory,
     ReleaseLatencyTooHigh,
     RealtimeFactorTooHigh,
+    FallbackObserved,
+    LoadLatencyTooHigh,
+    DispersionTooHigh,
+    ThermalStateUnacceptable,
+    SystemContentionObserved,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -200,6 +215,8 @@ fn exclusion_reasons(
     }
     if evidence.measurements.speech_samples < policy.protocol.minimum_speech_samples
         || evidence.measurements.silence_samples < policy.protocol.minimum_silence_samples
+        || evidence.measurements.run_count < policy.minimum_run_count
+        || evidence.measurements.confidence_per_mille < policy.minimum_confidence_per_mille
     {
         reasons.insert(ExclusionReason::InsufficientConfidence);
     }
@@ -227,6 +244,23 @@ fn exclusion_reasons(
     }
     if evidence.measurements.realtime_factor_milli > policy.maximum_realtime_factor_milli {
         reasons.insert(ExclusionReason::RealtimeFactorTooHigh);
+    }
+    if evidence.measurements.fallback_count > 0 {
+        reasons.insert(ExclusionReason::FallbackObserved);
+    }
+    if evidence.measurements.cold_load_ms > policy.maximum_cold_load_ms
+        || evidence.measurements.warm_load_ms > policy.maximum_warm_load_ms
+    {
+        reasons.insert(ExclusionReason::LoadLatencyTooHigh);
+    }
+    if evidence.measurements.release_dispersion_ms > policy.maximum_release_dispersion_ms {
+        reasons.insert(ExclusionReason::DispersionTooHigh);
+    }
+    if evidence.measurements.thermal_condition != ThermalCondition::Nominal {
+        reasons.insert(ExclusionReason::ThermalStateUnacceptable);
+    }
+    if evidence.measurements.contention_condition != ContentionCondition::Idle {
+        reasons.insert(ExclusionReason::SystemContentionObserved);
     }
     reasons
 }
@@ -299,6 +333,8 @@ mod tests {
                 protocol_id: ContentFreeId::new("setup-v1").unwrap(),
                 build_id: ContentFreeId::new("build-1").unwrap(),
                 candidate_id: ContentFreeId::new(id).unwrap(),
+                device_id: ContentFreeId::new("device-class-1").unwrap(),
+                driver_id: ContentFreeId::new("driver-1").unwrap(),
                 engine,
                 backend: if engine == EngineKind::Instant {
                     BackendKind::VoskNative
@@ -313,9 +349,13 @@ mod tests {
                 measurements: BenchmarkSampleSummary {
                     speech_samples: 3,
                     silence_samples: 1,
-                    load_ms: 400,
+                    run_count: 4,
+                    cold_load_ms: 400,
+                    warm_load_ms: 100,
                     release_p50_ms: release_ms / 2,
                     release_p95_ms: release_ms,
+                    release_dispersion_ms: 50,
+                    confidence_per_mille: 950,
                     realtime_factor_milli: 100,
                     word_error_per_mille: word_error,
                     character_error_per_mille: word_error,
@@ -324,6 +364,8 @@ mod tests {
                     peak_working_set_mib: 500,
                     available_memory_mib: 4_000,
                     fallback_count: 0,
+                    thermal_condition: ThermalCondition::Nominal,
+                    contention_condition: ContentionCondition::Idle,
                 },
             },
         }
@@ -517,5 +559,71 @@ mod tests {
             [unsafe_candidate],
         );
         assert_eq!(recommendation.outcome, RecommendationOutcome::Unavailable);
+    }
+
+    #[test]
+    fn fallback_or_invalid_engine_backend_evidence_is_never_recommended() {
+        let mut fallback = candidate(
+            "fallback",
+            EngineKind::Accurate,
+            ModelClass::Base,
+            Language::English,
+            0,
+            100,
+        );
+        fallback.evidence.measurements.fallback_count = 1;
+        let mut impossible = candidate(
+            "impossible",
+            EngineKind::Accurate,
+            ModelClass::Base,
+            Language::English,
+            0,
+            100,
+        );
+        impossible.evidence.backend = BackendKind::VoskNative;
+        let recommendation = RecommendationEngine::recommend(
+            Language::English,
+            RecommendationPreference::Balanced,
+            &policy(),
+            [fallback, impossible],
+        );
+        assert_eq!(recommendation.outcome, RecommendationOutcome::Unavailable);
+        assert!(recommendation.rejected_candidates.iter().any(|candidate| {
+            candidate
+                .reasons
+                .contains(&ExclusionReason::FallbackObserved)
+        }));
+        assert!(recommendation.rejected_candidates.iter().any(|candidate| {
+            candidate
+                .reasons
+                .contains(&ExclusionReason::InvalidEvidence)
+        }));
+    }
+
+    #[test]
+    fn noisy_or_thermally_biased_measurements_are_hard_excluded() {
+        let mut candidate = candidate(
+            "biased",
+            EngineKind::Accurate,
+            ModelClass::Base,
+            Language::English,
+            0,
+            100,
+        );
+        candidate.evidence.measurements.release_p50_ms = 101;
+        candidate.evidence.measurements.release_p95_ms = 100;
+        candidate.evidence.measurements.thermal_condition = ThermalCondition::Elevated;
+        candidate.evidence.measurements.contention_condition = ContentionCondition::Contended;
+        let recommendation = RecommendationEngine::recommend(
+            Language::English,
+            RecommendationPreference::Balanced,
+            &policy(),
+            [candidate],
+        );
+        assert_eq!(recommendation.outcome, RecommendationOutcome::Unavailable);
+        let reasons = &recommendation.rejected_candidates[0].reasons;
+        assert!(reasons.contains(&ExclusionReason::InvalidEvidence));
+        assert!(reasons.contains(&ExclusionReason::ThermalStateUnacceptable));
+        assert!(reasons.contains(&ExclusionReason::SystemContentionObserved));
     }
 }
