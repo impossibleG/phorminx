@@ -21,7 +21,7 @@ pub use lexicon::{CasePolicy, LexiconEntry, LexiconRepository, NewLexiconEntry};
 pub use profile::{
     AppProfile, AppProfileRepository, ExecutableIdentity, FormattingStyle, InsertionPreference,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, functions::FunctionFlags, types::ValueRef};
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, PersistenceError>;
@@ -65,6 +65,14 @@ pub struct Persistence {
 
 impl Persistence {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_busy_timeout(path, Duration::from_secs(5))
+    }
+
+    /// Opens a database with a caller-selected upper bound for lock waits.
+    ///
+    /// Interactive background readers use a shorter timeout so shutdown and
+    /// navigation cancellation cannot be held hostage by another connection.
+    pub fn open_with_busy_timeout(path: impl AsRef<Path>, busy_timeout: Duration) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path
             .parent()
@@ -75,7 +83,8 @@ impl Persistence {
         remove_obsolete_rollback_artifact(path)?;
 
         let connection = Connection::open(path)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        register_read_guards(&connection)?;
+        connection.busy_timeout(busy_timeout)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
@@ -99,6 +108,21 @@ impl Persistence {
     pub fn schema_version(&self) -> Result<u32> {
         migration::current_version(&self.connection)
     }
+}
+
+fn register_read_guards(connection: &Connection) -> Result<()> {
+    connection.create_scalar_function(
+        "phorminx_is_valid_text",
+        1,
+        FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
+        |context| {
+            Ok(matches!(
+                context.get_raw(0),
+                ValueRef::Text(bytes) if std::str::from_utf8(bytes).is_ok()
+            ))
+        },
+    )?;
+    Ok(())
 }
 
 fn obsolete_rollback_artifact_path(database_path: &Path) -> PathBuf {

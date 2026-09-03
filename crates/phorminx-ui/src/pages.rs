@@ -17,6 +17,7 @@ use crate::theme::{Space, UiThemeExt};
 pub(crate) struct PageState {
     pub history_id: Option<i64>,
     pub history_variant: HistoryVariant,
+    pub history_page: usize,
     pub confirm_clear_history: bool,
     pub lexicon_id: Option<i64>,
     pub lexicon_draft: Option<LexiconDraft>,
@@ -31,9 +32,13 @@ pub(crate) struct PageState {
 
 impl PageState {
     pub fn from_snapshot(snapshot: &ShellSnapshot) -> Self {
+        let first_history = snapshot.history.first();
         Self {
-            history_id: snapshot.history.first().map(|item| item.id),
-            history_variant: HistoryVariant::Output,
+            history_id: first_history.map(|item| item.id),
+            history_variant: first_history
+                .and_then(super::model::HistoryItem::first_available_variant)
+                .unwrap_or(HistoryVariant::Output),
+            history_page: 0,
             confirm_clear_history: false,
             lexicon_id: snapshot.lexicon.first().map(|item| item.id),
             lexicon_draft: None,
@@ -56,7 +61,12 @@ impl PageState {
             .is_none_or(|id| !snapshot.history.iter().any(|item| item.id == id))
         {
             self.history_id = snapshot.history.first().map(|item| item.id);
-            self.history_variant = HistoryVariant::Output;
+            self.history_variant = snapshot
+                .history
+                .first()
+                .and_then(super::model::HistoryItem::first_available_variant)
+                .unwrap_or(HistoryVariant::Output);
+            self.history_page = 0;
         }
         if self.history_id.and_then(|id| {
             snapshot
@@ -66,7 +76,12 @@ impl PageState {
                 .map(|item| item.has_variant(self.history_variant))
         }) == Some(false)
         {
-            self.history_variant = HistoryVariant::Output;
+            self.history_variant = self
+                .history_id
+                .and_then(|id| snapshot.history.iter().find(|item| item.id == id))
+                .and_then(super::model::HistoryItem::first_available_variant)
+                .unwrap_or(HistoryVariant::Output);
+            self.history_page = 0;
         }
         if self
             .lexicon_id
@@ -381,7 +396,10 @@ fn history(
                     );
                     if response.clicked() {
                         state.history_id = Some(item.id);
-                        state.history_variant = HistoryVariant::Output;
+                        state.history_variant = item
+                            .first_available_variant()
+                            .unwrap_or(HistoryVariant::Output);
+                        state.history_page = 0;
                         outbox.push(ShellEvent::SelectHistory(item.id));
                     }
                     hairline(ui);
@@ -402,15 +420,41 @@ fn history(
                 &mut state.history_variant,
                 HistoryVariant::label,
             ) {
+                state.history_page = 0;
                 outbox.push(ShellEvent::SelectHistoryVariant {
                     id: item.id,
                     variant,
                 });
             }
             columns[1].add_space(Space::LG);
-            let text = item
-                .text_for(state.history_variant)
-                .unwrap_or("Loading transcript…");
+            let loaded = item.loaded_for(state.history_variant);
+            let page_count = loaded.map_or(1, super::model::HistoryLoadedText::page_count);
+            state.history_page = state.history_page.min(page_count.saturating_sub(1));
+            if page_count > 1 {
+                columns[1].horizontal(|ui| {
+                    if action(ui, "Previous page", ActionTone::Quiet).clicked() {
+                        state.history_page = state.history_page.saturating_sub(1);
+                    }
+                    metadata(
+                        ui,
+                        &format!("Page {} of {page_count}", state.history_page + 1),
+                    );
+                    if action(ui, "Next page", ActionTone::Quiet).clicked() {
+                        state.history_page =
+                            state.history_page.saturating_add(1).min(page_count - 1);
+                    }
+                });
+                columns[1].add_space(Space::SM);
+            }
+            let text = loaded
+                .map(|loaded| loaded.page(state.history_page))
+                .unwrap_or_else(|| {
+                    if item.has_variant(state.history_variant) {
+                        "Loading transcript…"
+                    } else {
+                        "This retained transcript is unavailable."
+                    }
+                });
             columns[1].label(
                 RichText::new(text)
                     .size(21.0)
@@ -421,7 +465,9 @@ fn history(
             hairline(&mut columns[1]);
             columns[1].add_space(Space::MD);
             columns[1].horizontal(|ui| {
-                if action(ui, "Copy output", ActionTone::Primary).clicked() {
+                if item.has_variant(HistoryVariant::Output)
+                    && action(ui, "Copy output", ActionTone::Primary).clicked()
+                {
                     outbox.push(ShellEvent::CopyHistory {
                         id: item.id,
                         variant: HistoryVariant::Output,
@@ -1380,6 +1426,15 @@ mod tests {
         assert_eq!(state.history_id, None);
         assert_eq!(state.lexicon_id, None);
         assert_eq!(state.profile_name, None);
+    }
+
+    #[test]
+    fn unavailable_output_falls_back_to_the_first_readable_variant() {
+        let mut snapshot = ShellSnapshot::gallery(GalleryScenario::Populated);
+        snapshot.history[0].variants.output = false;
+        snapshot.history[0].variants.raw = true;
+        let state = PageState::from_snapshot(&snapshot);
+        assert_eq!(state.history_variant, HistoryVariant::Raw);
     }
 
     #[test]

@@ -268,13 +268,58 @@ pub struct HistoryLoadedText {
     pub text: String,
 }
 
+/// Maximum UTF-8 bytes laid out for a history detail in one frame.
+pub const HISTORY_DETAIL_PAGE_BYTES: usize = 16 * 1024;
+
+impl HistoryLoadedText {
+    #[must_use]
+    pub fn page_count(&self) -> usize {
+        self.text.len().max(1).div_ceil(HISTORY_DETAIL_PAGE_BYTES)
+    }
+
+    /// Returns one contiguous, Unicode-safe page. Adjacent pages neither skip
+    /// nor repeat scalar values, even when a nominal byte edge splits UTF-8.
+    #[must_use]
+    pub fn page(&self, page: usize) -> &str {
+        let page = page.min(self.page_count().saturating_sub(1));
+        let mut start = page
+            .saturating_mul(HISTORY_DETAIL_PAGE_BYTES)
+            .min(self.text.len());
+        while start > 0 && !self.text.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = page
+            .saturating_add(1)
+            .saturating_mul(HISTORY_DETAIL_PAGE_BYTES)
+            .min(self.text.len());
+        while end > start && !self.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &self.text[start..end]
+    }
+}
+
 impl HistoryItem {
+    #[must_use]
+    pub fn first_available_variant(&self) -> Option<HistoryVariant> {
+        HistoryVariant::ALL
+            .into_iter()
+            .find(|variant| self.has_variant(*variant))
+    }
+
     #[must_use]
     pub fn text_for(&self, variant: HistoryVariant) -> Option<&str> {
         self.loaded
             .as_ref()
             .filter(|loaded| loaded.variant == variant)
             .map(|loaded| loaded.text.as_str())
+    }
+
+    #[must_use]
+    pub fn loaded_for(&self, variant: HistoryVariant) -> Option<&HistoryLoadedText> {
+        self.loaded
+            .as_ref()
+            .filter(|loaded| loaded.variant == variant)
     }
 
     #[must_use]

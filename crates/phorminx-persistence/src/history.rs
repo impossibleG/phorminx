@@ -17,7 +17,8 @@ pub const MAX_TERMINAL_WARNINGS: usize = 64;
 /// Maximum UTF-8 payload accepted for one content-free warning.
 pub const MAX_TERMINAL_WARNING_BYTES: usize = 1_024;
 const MAX_WARNINGS_JSON_BYTES: usize = MAX_TERMINAL_WARNINGS * (MAX_TERMINAL_WARNING_BYTES + 8);
-const OVERSIZED_WARNINGS_NOTICE: &str = "stored warning metadata exceeds the current display limit";
+const MAX_SUMMARY_METADATA_BYTES: usize = 1_024;
+const UNAVAILABLE_WARNINGS_NOTICE: &str = "stored warning metadata is unavailable";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetentionPolicy {
@@ -116,6 +117,7 @@ pub struct HistorySummary {
     pub id: i64,
     pub created_at_ms: i64,
     pub selected_output_preview: String,
+    /// Exact through the preview limit, then saturated at limit + 1.
     pub selected_output_chars: u64,
     pub preview_truncated: bool,
     pub language: Option<String>,
@@ -261,8 +263,14 @@ impl<'connection> HistoryRepository<'connection> {
     pub fn summary(&self, id: i64) -> Result<Option<HistorySummary>> {
         self.connection
             .query_row(
-                &(SUMMARY_SELECT.to_owned() + " WHERE id = ?3"),
-                params![summary_preview_chars()?, warnings_json_bytes()?, id],
+                &(SUMMARY_SELECT.to_owned() + " WHERE id = ?5"),
+                params![
+                    summary_preview_chars()?,
+                    warnings_json_bytes()?,
+                    terminal_text_bytes()?,
+                    summary_metadata_bytes()?,
+                    id
+                ],
                 map_summary,
             )
             .optional()?
@@ -274,10 +282,16 @@ impl<'connection> HistoryRepository<'connection> {
     pub fn recent_summaries(&self, limit: usize) -> Result<Vec<HistorySummary>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut statement = self.connection.prepare(
-            &(SUMMARY_SELECT.to_owned() + " ORDER BY created_at_ms DESC, id DESC LIMIT ?3"),
+            &(SUMMARY_SELECT.to_owned() + " ORDER BY created_at_ms DESC, id DESC LIMIT ?5"),
         )?;
         let rows = statement.query_map(
-            params![summary_preview_chars()?, warnings_json_bytes()?, limit],
+            params![
+                summary_preview_chars()?,
+                warnings_json_bytes()?,
+                terminal_text_bytes()?,
+                summary_metadata_bytes()?,
+                limit
+            ],
             map_summary,
         )?;
         rows.map(|row| decode_summary(row?)).collect()
@@ -287,28 +301,33 @@ impl<'connection> HistoryRepository<'connection> {
     pub fn text_variant(&self, id: i64, variant: HistoryTextVariant) -> Result<Option<String>> {
         let (statement, field) = match variant {
             HistoryTextVariant::Raw => (
-                "SELECT length(CAST(raw_text AS BLOB)), \
-                        CASE WHEN length(CAST(raw_text AS BLOB)) <= ?2 THEN raw_text END \
+                "SELECT typeof(raw_text), length(CAST(raw_text AS BLOB)), \
+                        CASE WHEN phorminx_is_valid_text(raw_text) \
+                                       AND length(CAST(raw_text AS BLOB)) <= ?2 \
+                             THEN raw_text END \
                  FROM dictation_history WHERE id = ?1",
                 "raw_text",
             ),
             HistoryTextVariant::Normalized => (
-                "SELECT length(CAST(normalized_text AS BLOB)), \
-                            CASE WHEN length(CAST(normalized_text AS BLOB)) <= ?2 \
+                "SELECT typeof(normalized_text), length(CAST(normalized_text AS BLOB)), \
+                            CASE WHEN phorminx_is_valid_text(normalized_text) \
+                                      AND length(CAST(normalized_text AS BLOB)) <= ?2 \
                                  THEN normalized_text END \
                      FROM dictation_history WHERE id = ?1",
                 "normalized_text",
             ),
             HistoryTextVariant::Cleaned => (
-                "SELECT length(CAST(cleaned_text AS BLOB)), \
-                            CASE WHEN length(CAST(cleaned_text AS BLOB)) <= ?2 \
+                "SELECT typeof(cleaned_text), length(CAST(cleaned_text AS BLOB)), \
+                            CASE WHEN phorminx_is_valid_text(cleaned_text) \
+                                      AND length(CAST(cleaned_text AS BLOB)) <= ?2 \
                                  THEN cleaned_text END \
                      FROM dictation_history WHERE id = ?1",
                 "cleaned_text",
             ),
             HistoryTextVariant::SelectedOutput => (
-                "SELECT length(CAST(selected_output AS BLOB)), \
-                            CASE WHEN length(CAST(selected_output AS BLOB)) <= ?2 \
+                "SELECT typeof(selected_output), length(CAST(selected_output AS BLOB)), \
+                            CASE WHEN phorminx_is_valid_text(selected_output) \
+                                      AND length(CAST(selected_output AS BLOB)) <= ?2 \
                                  THEN selected_output END \
                      FROM dictation_history WHERE id = ?1",
                 "selected_output",
@@ -318,16 +337,23 @@ impl<'connection> HistoryRepository<'connection> {
             .connection
             .query_row(statement, params![id, terminal_text_bytes()?], |row| {
                 Ok((
-                    row.get::<_, Option<i64>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
                 ))
             })
             .optional()?;
-        let Some((byte_count, text)) = encoded else {
+        let Some((storage_type, byte_count, text)) = encoded else {
             return Ok(None);
         };
-        let Some(byte_count) = byte_count else {
+        if storage_type == "null" {
             return Ok(None);
+        }
+        let Some(byte_count) = byte_count else {
+            return Err(PersistenceError::Validation {
+                field,
+                reason: "database contains an invalid text value",
+            });
         };
         let actual_bytes =
             usize::try_from(byte_count).map_err(|_| PersistenceError::Validation {
@@ -339,6 +365,12 @@ impl<'connection> HistoryRepository<'connection> {
                 field,
                 max_bytes: MAX_TERMINAL_TEXT_BYTES,
                 actual_bytes,
+            });
+        }
+        if storage_type != "text" {
+            return Err(PersistenceError::Validation {
+                field,
+                reason: "database contains an invalid text value",
             });
         }
         text.map_or_else(
@@ -435,14 +467,56 @@ impl<'connection> HistoryRepository<'connection> {
     }
 }
 
-const SUMMARY_SELECT: &str = "SELECT id, created_at_ms, substr(selected_output, 1, ?1), length(selected_output), \
-            language, target_executable, audio_duration_ms, stt_duration_ms, \
-            formatting_duration_ms, insertion_duration_ms, audio_finalization_duration_ms, \
-            worker_queue_duration_ms, release_to_insert_duration_ms, \
-            CASE WHEN length(CAST(warnings_json AS BLOB)) <= ?2 THEN warnings_json ELSE NULL END, \
-            checkpoint_count, checkpoint_repair_count, peak_retained_audio_ms, \
-            formatting_chunk_count, auto_stopped, raw_text IS NOT NULL, \
-            normalized_text IS NOT NULL, cleaned_text IS NOT NULL, selected_output IS NOT NULL \
+const SUMMARY_SELECT: &str = "SELECT id, \
+            CASE WHEN typeof(created_at_ms) = 'integer' AND created_at_ms >= 0 \
+                 THEN created_at_ms ELSE 0 END, \
+            CASE WHEN phorminx_is_valid_text(selected_output) \
+                 THEN substr(selected_output, 1, ?1) ELSE '[Unreadable retained dictation]' END, \
+            CASE WHEN phorminx_is_valid_text(selected_output) \
+                 THEN length(substr(selected_output, 1, ?1 + 1)) ELSE 0 END, \
+            CASE WHEN phorminx_is_valid_text(language) AND length(CAST(language AS BLOB)) <= ?4 \
+                 THEN language END, \
+            CASE WHEN phorminx_is_valid_text(target_executable) \
+                           AND length(CAST(target_executable AS BLOB)) <= ?4 \
+                 THEN target_executable END, \
+            CASE WHEN typeof(audio_duration_ms) = 'integer' AND audio_duration_ms >= 0 \
+                 THEN audio_duration_ms END, \
+            CASE WHEN typeof(stt_duration_ms) = 'integer' AND stt_duration_ms >= 0 \
+                 THEN stt_duration_ms END, \
+            CASE WHEN typeof(formatting_duration_ms) = 'integer' AND formatting_duration_ms >= 0 \
+                 THEN formatting_duration_ms END, \
+            CASE WHEN typeof(insertion_duration_ms) = 'integer' AND insertion_duration_ms >= 0 \
+                 THEN insertion_duration_ms END, \
+            CASE WHEN typeof(audio_finalization_duration_ms) = 'integer' \
+                           AND audio_finalization_duration_ms >= 0 \
+                 THEN audio_finalization_duration_ms END, \
+            CASE WHEN typeof(worker_queue_duration_ms) = 'integer' \
+                           AND worker_queue_duration_ms >= 0 \
+                 THEN worker_queue_duration_ms END, \
+            CASE WHEN typeof(release_to_insert_duration_ms) = 'integer' \
+                           AND release_to_insert_duration_ms >= 0 \
+                 THEN release_to_insert_duration_ms END, \
+            CASE WHEN phorminx_is_valid_text(warnings_json) \
+                           AND length(CAST(warnings_json AS BLOB)) <= ?2 \
+                 THEN warnings_json END, \
+            CASE WHEN typeof(checkpoint_count) = 'integer' AND checkpoint_count >= 0 \
+                 THEN checkpoint_count END, \
+            CASE WHEN typeof(checkpoint_repair_count) = 'integer' \
+                           AND checkpoint_repair_count >= 0 \
+                 THEN checkpoint_repair_count END, \
+            CASE WHEN typeof(peak_retained_audio_ms) = 'integer' AND peak_retained_audio_ms >= 0 \
+                 THEN peak_retained_audio_ms END, \
+            CASE WHEN typeof(formatting_chunk_count) = 'integer' \
+                           AND formatting_chunk_count >= 0 \
+                 THEN formatting_chunk_count END, \
+            CASE WHEN typeof(auto_stopped) = 'integer' AND auto_stopped IN (0, 1) \
+                 THEN auto_stopped END, \
+            phorminx_is_valid_text(raw_text) AND length(CAST(raw_text AS BLOB)) <= ?3, \
+            phorminx_is_valid_text(normalized_text) \
+                AND length(CAST(normalized_text AS BLOB)) <= ?3, \
+            phorminx_is_valid_text(cleaned_text) AND length(CAST(cleaned_text AS BLOB)) <= ?3, \
+            phorminx_is_valid_text(selected_output) \
+                AND length(CAST(selected_output AS BLOB)) <= ?3 \
      FROM dictation_history";
 
 #[derive(Debug)]
@@ -525,9 +599,11 @@ fn decode_summary(encoded: EncodedSummary) -> Result<HistorySummary> {
 
 fn decode_summary_warnings(json: Option<String>) -> Result<Vec<String>> {
     let Some(json) = json else {
-        return Ok(vec![OVERSIZED_WARNINGS_NOTICE.to_owned()]);
+        return Ok(vec![UNAVAILABLE_WARNINGS_NOTICE.to_owned()]);
     };
-    let mut warnings: Vec<String> = serde_json::from_str(&json)?;
+    let Ok(mut warnings) = serde_json::from_str::<Vec<String>>(&json) else {
+        return Ok(vec![UNAVAILABLE_WARNINGS_NOTICE.to_owned()]);
+    };
     let omitted = warnings.len() > MAX_TERMINAL_WARNINGS;
     warnings.truncate(MAX_TERMINAL_WARNINGS);
     for warning in &mut warnings {
@@ -541,9 +617,9 @@ fn decode_summary_warnings(json: Option<String>) -> Result<Vec<String>> {
     }
     if omitted {
         if let Some(last) = warnings.last_mut() {
-            *last = OVERSIZED_WARNINGS_NOTICE.to_owned();
+            *last = UNAVAILABLE_WARNINGS_NOTICE.to_owned();
         } else {
-            warnings.push(OVERSIZED_WARNINGS_NOTICE.to_owned());
+            warnings.push(UNAVAILABLE_WARNINGS_NOTICE.to_owned());
         }
     }
     Ok(warnings)
@@ -711,6 +787,13 @@ fn summary_preview_chars() -> Result<i64> {
 fn warnings_json_bytes() -> Result<i64> {
     i64::try_from(MAX_WARNINGS_JSON_BYTES).map_err(|_| PersistenceError::Validation {
         field: "warnings",
+        reason: "display limit exceeds the supported range",
+    })
+}
+
+fn summary_metadata_bytes() -> Result<i64> {
+    i64::try_from(MAX_SUMMARY_METADATA_BYTES).map_err(|_| PersistenceError::Validation {
+        field: "history_metadata",
         reason: "display limit exceeds the supported range",
     })
 }

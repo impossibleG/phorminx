@@ -2548,6 +2548,7 @@ dependencies = [
  "phorminx-vosk",
  "phorminx-whisper",
  "phorminx-windows",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

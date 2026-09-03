@@ -383,7 +383,7 @@ fn hundreds_of_long_unicode_records_have_strictly_bounded_summaries() {
             && summary.preview_truncated
             && summary.selected_output_chars > u64::try_from(HISTORY_PREVIEW_MAX_CHARS).unwrap()
             && summary.warnings.len() <= MAX_TERMINAL_WARNINGS
-            && summary.variants.raw
+            && (summary.id != 1 || !summary.variants.raw)
             && summary.variants.normalized
             && summary.variants.cleaned
             && summary.variants.selected_output
@@ -397,7 +397,7 @@ fn hundreds_of_long_unicode_records_have_strictly_bounded_summaries() {
     );
 
     let exact = history.selected_output(newest.id).unwrap().unwrap();
-    assert_eq!(exact.chars().count() as u64, newest.selected_output_chars);
+    assert_eq!(newest.selected_output_chars, 241);
     assert!(exact.ends_with("🛡️漢字"));
     assert!(history.text_variant(1, HistoryTextVariant::Raw).is_err());
 }
@@ -432,14 +432,14 @@ fn summary_queries_do_not_decode_unrequested_full_variants() {
     let history = database.history();
     let summary = history.summary(1).unwrap().unwrap();
     assert_eq!(summary.selected_output_preview, "selected lazy");
-    assert!(summary.variants.raw);
+    assert!(!summary.variants.raw);
     assert!(summary.variants.normalized);
     assert!(summary.variants.cleaned);
     assert!(summary.variants.selected_output);
     assert_eq!(summary.warnings.len(), MAX_TERMINAL_WARNINGS);
     assert_eq!(
         summary.warnings.last().unwrap(),
-        "stored warning metadata exceeds the current display limit"
+        "stored warning metadata is unavailable"
     );
     assert_eq!(
         history.selected_output(1).unwrap(),
@@ -480,7 +480,7 @@ fn oversized_legacy_variant_is_rejected_without_returning_its_payload() {
         }) if actual_bytes == MAX_TERMINAL_TEXT_BYTES + 1
     ));
     assert!(
-        database
+        !database
             .history()
             .summary(1)
             .unwrap()
@@ -488,6 +488,96 @@ fn oversized_legacy_variant_is_rejected_without_returning_its_payload() {
             .variants
             .cleaned
     );
+}
+
+#[test]
+fn hostile_legacy_summary_fields_are_isolated_and_sanitized_per_row() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.sqlite3");
+    let database = Persistence::open(&path).unwrap();
+    let history = database.history();
+    history
+        .set_retention(RetentionPolicy::Indefinite, NOW)
+        .unwrap();
+    history.insert(&draft(NOW, "healthy")).unwrap();
+    history.insert(&draft(NOW + 1, "hostile")).unwrap();
+    drop(database);
+
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute_batch(
+        "UPDATE dictation_history
+         SET selected_output = x'80',
+             raw_text = x'80',
+             language = zeroblob(2048),
+             target_executable = zeroblob(2048),
+             audio_duration_ms = 'not-an-integer',
+             checkpoint_count = -1,
+             warnings_json = '{not json}'
+         WHERE id = 2;",
+    )
+    .unwrap();
+    drop(raw);
+
+    let database = Persistence::open(&path).unwrap();
+    let summaries = database.history().recent_summaries(100).unwrap();
+    assert_eq!(summaries.len(), 2);
+    let hostile = summaries.iter().find(|summary| summary.id == 2).unwrap();
+    assert_eq!(
+        hostile.selected_output_preview,
+        "[Unreadable retained dictation]"
+    );
+    assert!(!hostile.variants.selected_output);
+    assert!(!hostile.variants.raw);
+    assert_eq!(hostile.language, None);
+    assert_eq!(hostile.target_executable, None);
+    assert_eq!(hostile.timings.audio_duration_ms, None);
+    assert_eq!(hostile.terminal.checkpoint_count, None);
+    assert_eq!(
+        hostile.warnings,
+        vec!["stored warning metadata is unavailable"]
+    );
+    assert_eq!(
+        summaries
+            .iter()
+            .find(|summary| summary.id == 1)
+            .unwrap()
+            .selected_output_preview,
+        "selected healthy"
+    );
+}
+
+#[test]
+fn invalid_utf8_tagged_as_sqlite_text_cannot_break_the_summary_list() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.sqlite3");
+    let database = Persistence::open(&path).unwrap();
+    database
+        .history()
+        .set_retention(RetentionPolicy::Indefinite, NOW)
+        .unwrap();
+    database.history().insert(&draft(NOW, "utf8")).unwrap();
+    drop(database);
+
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute_batch(
+        "UPDATE dictation_history
+         SET selected_output = CAST(x'80' AS TEXT),
+             language = CAST(x'80' AS TEXT),
+             warnings_json = CAST(x'80' AS TEXT)
+         WHERE id = 1;",
+    )
+    .unwrap();
+    drop(raw);
+
+    let database = Persistence::open(&path).unwrap();
+    let summary = database.history().summary(1).unwrap().unwrap();
+    assert_eq!(
+        summary.selected_output_preview,
+        "[Unreadable retained dictation]"
+    );
+    assert_eq!(summary.language, None);
+    assert!(!summary.variants.selected_output);
+    assert!(database.history().selected_output(1).is_err());
 }
 
 #[test]

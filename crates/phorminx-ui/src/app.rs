@@ -115,18 +115,23 @@ impl PhorminxUi {
     }
 
     pub fn select_history(&mut self, id: i64) {
-        if self.snapshot.history.iter().any(|item| item.id == id) {
+        if let Some(item) = self.snapshot.history.iter().find(|item| item.id == id) {
             self.pages.history_id = Some(id);
-            self.pages.history_variant = crate::model::HistoryVariant::Output;
+            self.pages.history_variant = item
+                .first_available_variant()
+                .unwrap_or(crate::model::HistoryVariant::Output);
+            self.pages.history_page = 0;
         }
     }
 
     #[must_use]
-    pub const fn history_selection(&self) -> Option<(i64, HistoryVariant)> {
-        match self.pages.history_id {
-            Some(id) => Some((id, self.pages.history_variant)),
-            None => None,
-        }
+    pub fn history_selection(&self) -> Option<(i64, HistoryVariant)> {
+        let id = self.pages.history_id?;
+        self.snapshot
+            .history
+            .iter()
+            .find(|item| item.id == id && item.has_variant(self.pages.history_variant))
+            .map(|_| (id, self.pages.history_variant))
     }
 
     #[must_use]
@@ -154,6 +159,7 @@ impl PhorminxUi {
             return false;
         }
         item.loaded = Some(HistoryLoadedText { variant, text });
+        self.pages.history_page = 0;
         true
     }
 
@@ -161,6 +167,7 @@ impl PhorminxUi {
         for item in &mut self.snapshot.history {
             item.loaded = None;
         }
+        self.pages.history_page = 0;
     }
 
     #[must_use]
