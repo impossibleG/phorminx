@@ -2543,6 +2543,7 @@ dependencies = [
  "phorminx-core",
  "phorminx-ollama",
  "phorminx-persistence",
+ "phorminx-session",
  "phorminx-ui",
  "phorminx-vosk",
  "phorminx-whisper",

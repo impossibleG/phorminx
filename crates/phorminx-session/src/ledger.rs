@@ -265,6 +265,9 @@ impl TranscriptLedger {
         from_sample: u64,
     ) -> Result<ApplyOutcome, LedgerError> {
         self.ensure_open()?;
+        if self.expected_final_end.is_some() {
+            return Err(LedgerError::DeferredAfterSeal);
+        }
         self.validate_generation(generation)?;
         if let Some(outcome) = self.replayed_defer(sequence, from_sample)? {
             return Ok(outcome);
@@ -568,6 +571,8 @@ pub enum LedgerError {
     AlreadyAssembled,
     #[error("capture frontier must be sealed before transcript assembly")]
     Unsealed,
+    #[error("recognition failure cannot be deferred after the capture frontier is sealed")]
+    DeferredAfterSeal,
     #[error(
         "transcript coverage ends at {committed_through}, but capture ended at {expected_final_end}"
     )]
@@ -927,6 +932,16 @@ mod tests {
         assert_eq!(ledger.expected_final_end(), None);
         ledger.seal(150).unwrap();
         assert_eq!(ledger.expected_final_end(), Some(150));
+    }
+
+    #[test]
+    fn defer_after_seal_is_rejected_without_mutating_receipts() {
+        let mut ledger = ledger();
+        ledger.seal(100).unwrap();
+        assert_eq!(ledger.defer(7, 0, 0), Err(LedgerError::DeferredAfterSeal));
+        assert_eq!(ledger.next_sequence(), 0);
+        assert_eq!(ledger.unresolved_frontier(), None);
+        assert_eq!(ledger.expected_final_end(), Some(100));
     }
 
     #[test]

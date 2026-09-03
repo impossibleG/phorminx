@@ -21,6 +21,7 @@ phorminx-audio = { path = "../phorminx-audio" }
 phorminx-core = { path = "../phorminx-core" }
 phorminx-ollama = { path = "../phorminx-ollama" }
 phorminx-persistence = { path = "../phorminx-persistence" }
+phorminx-session = { path = "../phorminx-session" }
 phorminx-ui = { path = "../phorminx-ui" }
 phorminx-vosk = { path = "../phorminx-vosk" }
 phorminx-whisper = { path = "../phorminx-whisper" }

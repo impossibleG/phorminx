@@ -27,7 +27,10 @@ use phorminx_app::settings::{
     OllamaLifecycle, RecognitionMode, RecordingMode, RuntimeFormatting, Settings, SettingsStore,
 };
 use phorminx_app::ui_bridge::{UiMutation, UiRoute, UiRuntimeStatus, UiVoskProbe};
-use phorminx_audio::{ActiveRecording, input_devices, start_input};
+use phorminx_audio::{
+    DeferredCapturedAudio, ExtendedCaptureConfig, ExtendedCaptureFactory, ExtendedCapturedAudio,
+    ExtendedRecording, input_devices,
+};
 #[cfg(test)]
 use phorminx_core::recommended_audio_context;
 use phorminx_core::{
@@ -35,14 +38,15 @@ use phorminx_core::{
     normalize_transcript,
 };
 use phorminx_ollama::{
-    CancellationToken, ClientTimeouts, FormatProfile, FormatResult, KeepAlive, ModelName,
-    OllamaClient, OllamaEndpoint, SelectionPolicy,
+    CancellationToken, ClientTimeouts, DocumentFormatDisposition, FormatProfile, FormatResult,
+    KeepAlive, ModelName, OllamaClient, OllamaEndpoint, SelectionPolicy,
 };
 use phorminx_persistence::{
     AppProfile, CasePolicy, DictationDraft, ExecutableIdentity, FormattingStyle,
     InsertionPreference, LexiconEntry, NewLexiconEntry, Persistence, RetentionPolicy,
-    TimingMetadata,
+    TerminalMetadata, TimingMetadata,
 };
+use phorminx_session::SampleRange;
 use phorminx_vosk::{AssetLayout as VoskAssetLayout, VoskModel, VoskSession};
 use phorminx_whisper::{
     WhisperBackendPreference, WhisperError, WhisperReadiness, WhisperRecognizer,
@@ -349,7 +353,16 @@ fn run() -> Result<()> {
     };
 
     let hotkey = GlobalHoldHotkey::start().context("failed to install the global hotkey")?;
-    let mut runtime = AppRuntime::<TargetSnapshot, ActiveRecording>::new_with_formatting(
+    let capture = ExtendedCaptureFactory::new(ExtendedCaptureConfig::new(
+        settings_store
+            .path()
+            .parent()
+            .context("settings path has no parent directory")?
+            .join("temp")
+            .join("audio-spool"),
+    ))
+    .context("failed to prepare extended audio capture")?;
+    let mut runtime = AppRuntime::<TargetSnapshot, ExtendedRecording>::new_with_formatting(
         settings.recognition.minimum_rms,
         settings.recognition.language.clone(),
         formatting,
@@ -366,6 +379,7 @@ fn run() -> Result<()> {
             worker: &worker,
             microphone: effective_microphone.as_deref(),
             context: &dictation_context,
+            capture: &capture,
             released_at: None,
         };
         report_notices(runtime.announce_ready(&mut io));
@@ -439,6 +453,7 @@ fn run() -> Result<()> {
                     &mut incremental,
                     effective_microphone.as_deref(),
                     &dictation_context,
+                    &capture,
                 ) {
                     break Err(error);
                 }
@@ -453,6 +468,7 @@ fn run() -> Result<()> {
                     effective_microphone.as_deref(),
                     &mut dictation_context,
                     &settings,
+                    &capture,
                 )?;
             }
             Ok(ShellAction::ReloadAliases) => {
@@ -502,6 +518,7 @@ fn run() -> Result<()> {
                     &mut incremental,
                     effective_microphone.as_deref(),
                     &dictation_context,
+                    &capture,
                 ) {
                     break Err(error);
                 }
@@ -516,6 +533,7 @@ fn run() -> Result<()> {
                     effective_microphone.as_deref(),
                     &mut dictation_context,
                     &settings,
+                    &capture,
                 )?;
             }
             Ok(ShellAction::ReloadAliases) => {
@@ -587,6 +605,7 @@ fn run() -> Result<()> {
                         worker: &worker,
                         microphone: effective_microphone.as_deref(),
                         context: &dictation_context,
+                        capture: &capture,
                         released_at: release_received_at,
                     };
                     let action = if let Some(released_at) = release_received_at {
@@ -619,6 +638,7 @@ fn run() -> Result<()> {
                         worker: &worker,
                         microphone: effective_microphone.as_deref(),
                         context: &dictation_context,
+                        capture: &capture,
                         released_at: Some(released_at),
                     };
                     match runtime.hold_ended_at(released_at, &mut io) {
@@ -678,6 +698,7 @@ fn run() -> Result<()> {
                     &mut incremental,
                     effective_microphone.as_deref(),
                     &dictation_context,
+                    &capture,
                 ) {
                     break Err(error);
                 }
@@ -692,6 +713,7 @@ fn run() -> Result<()> {
                     effective_microphone.as_deref(),
                     &mut dictation_context,
                     &settings,
+                    &capture,
                 )?;
             }
             Ok(ShellAction::ReloadAliases) => {
@@ -734,6 +756,7 @@ fn run() -> Result<()> {
                             worker: &worker,
                             microphone: effective_microphone.as_deref(),
                             context: &dictation_context,
+                            capture: &capture,
                             released_at: None,
                         };
                         match runtime.cleanup_started(id, &mut io) {
@@ -782,6 +805,7 @@ fn run() -> Result<()> {
                             worker: &worker,
                             microphone: effective_microphone.as_deref(),
                             context: &dictation_context,
+                            capture: &capture,
                             released_at: None,
                         };
                         match runtime.transcription_completed(completed.id, result, &mut io) {
@@ -836,6 +860,7 @@ fn run() -> Result<()> {
                             worker: &worker,
                             microphone: effective_microphone.as_deref(),
                             context: &dictation_context,
+                            capture: &capture,
                             released_at: None,
                         };
                         match runtime.worker_disconnected(&mut io) {
@@ -2158,29 +2183,101 @@ fn show_status(overlay: &StatusOverlay, status: OverlayStatus) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct FinalAudioStats {
+    total_samples: u64,
+    peak_retained_samples: u64,
+    rms: f32,
+}
+
+enum FinalAudioSource {
+    Pending {
+        audio: DeferredCapturedAudio,
+        stats: FinalAudioStats,
+    },
+    Short {
+        clip: AudioClip,
+        stats: FinalAudioStats,
+    },
+    Extended {
+        audio: Box<ExtendedCapturedAudio>,
+        stats: FinalAudioStats,
+    },
+}
+
+impl FinalAudioSource {
+    fn resolve(self) -> Result<Self, String> {
+        match self {
+            Self::Pending { audio, stats } => {
+                let captured = audio.resolve().map_err(|error| error.to_string())?;
+                let stats = FinalAudioStats {
+                    total_samples: captured.total_samples(),
+                    ..stats
+                };
+                if captured.is_extended() {
+                    Ok(Self::Extended {
+                        audio: Box::new(captured),
+                        stats,
+                    })
+                } else {
+                    Ok(Self::Short {
+                        clip: captured
+                            .into_short_clip()
+                            .map_err(|error| error.to_string())?,
+                        stats,
+                    })
+                }
+            }
+            resolved => Ok(resolved),
+        }
+    }
+
+    fn stats(&self) -> FinalAudioStats {
+        match self {
+            Self::Pending { stats, .. }
+            | Self::Short { stats, .. }
+            | Self::Extended { stats, .. } => *stats,
+        }
+    }
+}
+
+fn sample_range_for_duration(start: Duration, end: Duration) -> Result<SampleRange, String> {
+    let samples = |duration: Duration| (duration.as_secs_f64() * 16_000.0).floor() as u64;
+    SampleRange::new(samples(start), samples(end)).map_err(|error| error.to_string())
+}
+
+fn audio_span_to_clip(
+    span: phorminx_session::AudioSpan,
+) -> Result<AudioClip, phorminx_audio::CaptureError> {
+    let mut guarded = span.into_samples();
+    let samples = std::mem::take(&mut *guarded);
+    AudioClip::new(samples, 16_000).map_err(phorminx_audio::CaptureError::Audio)
+}
+
 struct ProductionIo<'a> {
     overlay: &'a StatusOverlay,
     tray: &'a SystemTray,
     worker: &'a TranscriptionWorker,
     microphone: Option<&'a str>,
     context: &'a DictationContext,
+    capture: &'a ExtendedCaptureFactory,
     released_at: Option<Instant>,
 }
 
 impl AppIo for ProductionIo<'_> {
     type Target = TargetSnapshot;
-    type Recording = ActiveRecording;
-    type Audio = AudioClip;
+    type Recording = ExtendedRecording;
+    type Audio = FinalAudioSource;
     type ClipboardReason = ClipboardOnlyReason;
 
     fn start_recording(&mut self) -> Result<Self::Recording, String> {
-        match start_input(self.microphone) {
+        match self.capture.start_input(self.microphone) {
             Ok(recording) => Ok(recording),
             Err(selected_error) if self.microphone.is_some() => {
                 eprintln!(
                     "dictation_id=0 state=Listening event=selected_microphone_failed recovery=windows_default"
                 );
-                start_input(None).map_err(|fallback_error| {
+                self.capture.start_input(None).map_err(|fallback_error| {
                     format!(
                         "selected microphone failed ({selected_error}); Windows default recovery failed ({fallback_error})"
                     )
@@ -2190,26 +2287,67 @@ impl AppIo for ProductionIo<'_> {
         }
     }
 
-    fn finish_recording(&mut self, recording: Self::Recording) -> Result<FinishedAudio, String> {
-        recording
-            .finish_with_diagnostics()
-            .map(|captured| {
-                let duration = captured.clip.duration();
-                let rms = captured.clip.rms();
-                FinishedAudio {
-                    audio: captured.clip,
-                    duration,
-                    rms,
-                    backend_warning_count: captured.backend_warning_count,
-                }
-            })
-            .map_err(|error| error.to_string())
+    fn finish_recording(
+        &mut self,
+        recording: Self::Recording,
+    ) -> Result<FinishedAudio<FinalAudioSource>, String> {
+        let progress = recording.progress();
+        if let Some(fault) = progress.sticky_fault {
+            return Err(fault.to_string());
+        }
+        let duration = progress.duration();
+        if progress.canonical_samples <= 16_000 * 120 {
+            let captured = recording.finalize().map_err(|error| error.to_string())?;
+            let backend_warning_count = captured.backend_warning_count();
+            let clip = captured
+                .into_short_clip()
+                .map_err(|error| error.to_string())?;
+            let duration = clip.duration();
+            let rms = clip.rms();
+            return Ok(FinishedAudio {
+                audio: FinalAudioSource::Short {
+                    stats: FinalAudioStats {
+                        total_samples: clip.samples.len() as u64,
+                        peak_retained_samples: progress.peak_resident_samples,
+                        rms,
+                    },
+                    clip,
+                },
+                duration,
+                rms,
+                backend_warning_count,
+            });
+        }
+        let rms = if progress.canonical_samples == 0 {
+            0.0
+        } else {
+            recording
+                .recent_rms(Duration::from_secs(2))
+                .map_err(|error| error.to_string())?
+        };
+        let backend_warning_count = progress.backend_warning_count;
+        let audio = FinalAudioSource::Pending {
+            audio: recording
+                .defer_finalize()
+                .map_err(|error| error.to_string())?,
+            stats: FinalAudioStats {
+                total_samples: progress.canonical_samples,
+                peak_retained_samples: progress.peak_resident_samples,
+                rms,
+            },
+        };
+        Ok(FinishedAudio {
+            audio,
+            duration,
+            rms,
+            backend_warning_count,
+        })
     }
 
     fn submit_transcription(
         &mut self,
         id: DictationId,
-        clip: AudioClip,
+        audio: FinalAudioSource,
         language: &str,
         audio_context: u32,
         timing: ReleaseTiming,
@@ -2218,7 +2356,7 @@ impl AppIo for ProductionIo<'_> {
             .transcribe(TranscriptionRequest {
                 id,
                 released_at: self.released_at.unwrap_or_else(Instant::now),
-                clip,
+                audio,
                 language: language.to_owned(),
                 audio_context,
                 formatting: self.context.formatting.clone(),
@@ -2270,7 +2408,7 @@ impl AppIo for ProductionIo<'_> {
 }
 
 fn poll_incremental_transcription(
-    runtime: &AppRuntime<TargetSnapshot, ActiveRecording>,
+    runtime: &AppRuntime<TargetSnapshot, ExtendedRecording>,
     planner: &mut IncrementalPlanner,
     worker: &TranscriptionWorker,
     language: &str,
@@ -2322,11 +2460,25 @@ fn poll_incremental_transcription(
     // This is a boundary hint, not endpoint trimming. The overlap is as long as
     // the entire probe, and the untouched full recording remains the fallback.
     let silence_threshold = minimum_rms.clamp(0.000_8, 0.003);
-    let silence_observed = recording.recent_rms(SILENCE_PROBE_DURATION) <= silence_threshold;
+    let silence_observed = recording
+        .recent_rms(SILENCE_PROBE_DURATION)
+        .is_ok_and(|rms| rms <= silence_threshold);
     let Some(plan) = planner.observe(id, captured, silence_observed) else {
         return;
     };
-    let clip = match recording.snapshot_range(plan.range.start, plan.range.end) {
+    let range = match sample_range_for_duration(plan.range.start, plan.range.end) {
+        Ok(range) => range,
+        Err(error) => {
+            planner.degrade(id);
+            let _ = worker.cancel_incremental(id);
+            eprintln!(
+                "dictation_id={} state=Listening event=incremental_fallback reason=invalid_range error={error}",
+                id.0
+            );
+            return;
+        }
+    };
+    let clip = match recording.snapshot(range).and_then(audio_span_to_clip) {
         Ok(clip) => clip,
         Err(error) => {
             planner.degrade(id);
@@ -2358,14 +2510,16 @@ fn poll_incremental_transcription(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recover_runtime_after_resume(
-    runtime: &mut AppRuntime<TargetSnapshot, ActiveRecording>,
+    runtime: &mut AppRuntime<TargetSnapshot, ExtendedRecording>,
     overlay: &StatusOverlay,
     tray: &SystemTray,
     worker: &TranscriptionWorker,
     incremental: &mut IncrementalPlanner,
     microphone: Option<&str>,
     context: &DictationContext,
+    capture: &ExtendedCaptureFactory,
 ) -> Result<()> {
     let runtime_id = runtime.active_id();
     let planner_id = incremental.cancel();
@@ -2381,6 +2535,7 @@ fn recover_runtime_after_resume(
         worker,
         microphone,
         context,
+        capture,
         released_at: None,
     };
     let notices = runtime
@@ -2390,14 +2545,16 @@ fn recover_runtime_after_resume(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_test_dictation(
-    runtime: &mut AppRuntime<TargetSnapshot, ActiveRecording>,
+    runtime: &mut AppRuntime<TargetSnapshot, ExtendedRecording>,
     overlay: &StatusOverlay,
     tray: &SystemTray,
     worker: &TranscriptionWorker,
     microphone: Option<&str>,
     context: &mut DictationContext,
     settings: &Settings,
+    capture: &ExtendedCaptureFactory,
 ) -> Result<()> {
     if runtime.state() == RuntimeState::Idle {
         *context = DictationContext::global(settings, context.verified_variant)?;
@@ -2413,6 +2570,7 @@ fn handle_test_dictation(
         worker,
         microphone,
         context,
+        capture,
         released_at: None,
     };
     let notices = match runtime.state() {
@@ -2650,10 +2808,11 @@ struct TranscriptionWorker {
 #[derive(Default)]
 struct InstantPump {
     active_id: Option<DictationId>,
+    degraded: bool,
 }
 
 fn poll_instant_transcription(
-    runtime: &mut AppRuntime<TargetSnapshot, ActiveRecording>,
+    runtime: &mut AppRuntime<TargetSnapshot, ExtendedRecording>,
     pump: &mut InstantPump,
     worker: &TranscriptionWorker,
 ) {
@@ -2682,10 +2841,24 @@ fn poll_instant_transcription(
         if let Some(stale) = pump.active_id.replace(id) {
             let _ = worker.cancel_incremental(stale);
         }
+        pump.degraded = false;
         worker.instant_begin(id, recording.sample_rate());
     }
-    let batch = recording.drain_streaming(16_384);
-    worker.instant_audio(id, batch.samples, batch.sample_rate, batch.dropped_samples);
+    match recording.drain_streaming(16_384) {
+        Ok(batch) => {
+            worker.instant_audio(id, batch.samples, batch.sample_rate, batch.dropped_samples)
+        }
+        Err(error) => {
+            if !pump.degraded {
+                pump.degraded = true;
+                worker.degrade_instant(id);
+                eprintln!(
+                    "dictation_id={} state=Listening event=instant_stream_degraded error={error}",
+                    id.0
+                );
+            }
+        }
+    }
 }
 
 enum RecognizerConfig {
@@ -2712,6 +2885,7 @@ struct InstantSession {
     inference_time: Duration,
     degraded: bool,
     continuity_prefix: Vec<f32>,
+    checkpoint_count: u64,
 }
 
 enum InstantAudioCommand {
@@ -2898,7 +3072,7 @@ impl TranscriptionWorker {
                         WorkerCommand::Transcribe {
                             id,
                             released_at,
-                            clip,
+                            audio,
                             language,
                             audio_context,
                             formatting: dictation_formatting,
@@ -2925,23 +3099,43 @@ impl TranscriptionWorker {
                                 &instant_audio_rx,
                                 &mut instant_sessions,
                             );
-                            let recognition = match &recognizer {
-                                LoadedRecognizer::Accurate(recognizer) => transcribe_final(
-                                    recognizer,
-                                    incremental_sessions.remove(&id),
-                                    &clip,
-                                    &language,
-                                    audio_context,
-                                    id,
-                                ),
-                                LoadedRecognizer::Instant(model) => transcribe_instant_final(
-                                    model,
-                                    instant_sessions.remove(&id),
-                                    &clip,
-                                    id,
-                                )
-                                .map_err(|error| error.to_string()),
+                            let stats = audio.stats();
+                            let incremental = incremental_sessions.remove(&id);
+                            let instant = instant_sessions.remove(&id);
+                            let checkpoint_count = match &recognizer {
+                                LoadedRecognizer::Accurate(_) => incremental
+                                    .as_ref()
+                                    .map_or(0, |session| u64::from(session.next_sequence)),
+                                LoadedRecognizer::Instant(_) => instant
+                                    .as_ref()
+                                    .map_or(0, |session| session.checkpoint_count),
                             };
+                            let repair_count = match (&recognizer, &instant) {
+                                (LoadedRecognizer::Instant(_), Some(session)) if session.degraded => 1,
+                                (LoadedRecognizer::Accurate(_), _)
+                                    if incremental
+                                        .as_ref()
+                                        .is_none_or(|session| session.degraded.is_some()) =>
+                                {
+                                    1
+                                }
+                                _ => 0,
+                            };
+                            let recognition = (*audio).resolve().and_then(|mut audio| match (&recognizer, &mut audio) {
+                                (LoadedRecognizer::Accurate(recognizer), FinalAudioSource::Short { clip, .. }) => transcribe_final(
+                                    recognizer, incremental, clip, &language, audio_context, id,
+                                ),
+                                (LoadedRecognizer::Accurate(recognizer), FinalAudioSource::Extended { audio, stats }) => transcribe_extended_accurate(
+                                    recognizer, incremental, audio, *stats, &language, id,
+                                ),
+                                (LoadedRecognizer::Instant(model), FinalAudioSource::Short { clip, .. }) => transcribe_instant_final(
+                                    model, instant, clip, id,
+                                ).map_err(|error| error.to_string()),
+                                (LoadedRecognizer::Instant(model), FinalAudioSource::Extended { audio, stats }) => transcribe_extended_instant(
+                                    model, instant, audio, *stats, id,
+                                ).map_err(|error| error.to_string()),
+                                (_, FinalAudioSource::Pending { .. }) => Err("final audio did not resolve".to_owned()),
+                            });
                             let result = match recognition {
                                 Ok(transcript) => {
                                     if has_pathological_repetition(&transcript.text) {
@@ -2999,6 +3193,12 @@ impl TranscriptionWorker {
                                         app_executable.as_deref(),
                                         &formatting_cancel,
                                     );
+                                    processed.terminal.checkpoint_count = Some(checkpoint_count);
+                                    processed.terminal.checkpoint_repair_count = Some(repair_count);
+                                    processed.terminal.peak_retained_audio_ms = Some(
+                                        stats.peak_retained_samples.saturating_mul(1_000) / 16_000,
+                                    );
+                                    processed.terminal.auto_stopped = Some(false);
                                     processed.pre_stt_time = pre_stt_time;
                                     eprintln!(
                                         "dictation_id={} state=Cleaning event=release_pipeline_stages pre_stt_ms={} stt_compute_ms={} formatting_ms={}",
@@ -3056,6 +3256,7 @@ impl TranscriptionWorker {
                                         inference_time: Duration::ZERO,
                                         degraded: true,
                                         continuity_prefix: Vec::new(),
+                                        checkpoint_count: 0,
                                     },
                                 );
                             }
@@ -3091,7 +3292,7 @@ impl TranscriptionWorker {
         let TranscriptionRequest {
             id,
             released_at,
-            clip,
+            audio,
             language,
             audio_context,
             formatting,
@@ -3104,7 +3305,7 @@ impl TranscriptionWorker {
         if let Err(error) = self.commands.send(WorkerCommand::Transcribe {
             id,
             released_at,
-            clip,
+            audio: Box::new(audio),
             language,
             audio_context,
             formatting,
@@ -3170,6 +3371,10 @@ impl TranscriptionWorker {
         }
     }
 
+    fn degrade_instant(&self, id: DictationId) {
+        let _ = self.commands.send(WorkerCommand::DegradeInstant { id });
+    }
+
     fn cancel_incremental(&self, id: DictationId) -> Result<()> {
         // Cancellation is visible before this FIFO command reaches the worker,
         // so queued stale audio is dropped without another Whisper invocation.
@@ -3220,7 +3425,7 @@ fn load_and_probe_resident<T, E>(
 struct TranscriptionRequest {
     id: DictationId,
     released_at: Instant,
-    clip: AudioClip,
+    audio: FinalAudioSource,
     language: String,
     audio_context: u32,
     formatting: WorkerFormatting,
@@ -3383,7 +3588,7 @@ enum WorkerCommand {
     Transcribe {
         id: DictationId,
         released_at: Instant,
-        clip: AudioClip,
+        audio: Box<FinalAudioSource>,
         language: String,
         audio_context: u32,
         formatting: WorkerFormatting,
@@ -3461,6 +3666,7 @@ fn drain_instant_audio(
                                 inference_time: Duration::ZERO,
                                 degraded: false,
                                 continuity_prefix: Vec::new(),
+                                checkpoint_count: 0,
                             },
                         );
                     }
@@ -3498,6 +3704,7 @@ fn drain_instant_audio(
                             .continuity_prefix
                             .extend_from_slice(&samples[..samples.len().min(remaining)]);
                         session.accepted_samples += samples.len() as u64;
+                        session.checkpoint_count = session.checkpoint_count.saturating_add(1);
                     }
                     Err(_) => session.degraded = true,
                 }
@@ -3645,6 +3852,133 @@ fn tail_start_at_clip_rate(
 ) -> usize {
     let accepted_seconds = accepted_samples as f64 / f64::from(accepted_sample_rate);
     (accepted_seconds * f64::from(clip_sample_rate)).floor() as usize
+}
+
+fn transcribe_extended_instant(
+    model: &VoskModel,
+    session: Option<InstantSession>,
+    audio: &mut ExtendedCapturedAudio,
+    stats: FinalAudioStats,
+    id: DictationId,
+) -> Result<Transcript, String> {
+    let continuous = session.as_ref().is_some_and(|session| {
+        !session.degraded
+            && session.sample_rate == 16_000
+            && session.accepted_samples <= stats.total_samples
+            && extended_stream_prefix_matches(session, audio).unwrap_or(false)
+    });
+    if !continuous {
+        eprintln!(
+            "dictation_id={} state=Transcribing event=instant_recovery path=bounded_spool",
+            id.0
+        );
+        return transcribe_instant_sequential(model, audio, stats);
+    }
+
+    let mut session = session.expect("continuous extended session exists");
+    if session.accepted_samples < stats.total_samples {
+        let range = SampleRange::new(session.accepted_samples, stats.total_samples)
+            .map_err(|error| error.to_string())?;
+        let tail = audio.snapshot(range).map_err(|error| error.to_string())?;
+        let started = Instant::now();
+        session
+            .recognizer
+            .accept_f32(tail.samples())
+            .map_err(|error| error.to_string())?;
+        session.inference_time = session.inference_time.saturating_add(started.elapsed());
+    }
+    let started = Instant::now();
+    let text = session
+        .recognizer
+        .finish()
+        .map_err(|error| error.to_string())?;
+    session.inference_time = session.inference_time.saturating_add(started.elapsed());
+    if text.trim().is_empty() && stats.rms >= 0.01 {
+        eprintln!(
+            "dictation_id={} state=Transcribing event=instant_recovery path=bounded_spool reason=empty_high_energy",
+            id.0
+        );
+        return transcribe_instant_sequential(model, audio, stats);
+    }
+    Ok(Transcript {
+        text,
+        backend: "vosk",
+        model_load_time: model.load_time(),
+        inference_time: session.inference_time,
+        audio_duration: Duration::from_secs_f64(stats.total_samples as f64 / 16_000.0),
+    })
+}
+
+fn extended_stream_prefix_matches(
+    session: &InstantSession,
+    audio: &mut ExtendedCapturedAudio,
+) -> Result<bool, String> {
+    if session.accepted_samples == 0 {
+        return Ok(session.continuity_prefix.is_empty());
+    }
+    let length = session.continuity_prefix.len().min(2_048);
+    if length < 64 {
+        return Ok(false);
+    }
+    let span = audio
+        .snapshot(SampleRange::new(0, length as u64).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let observed = &session.continuity_prefix[..length];
+    let expected = span.samples();
+    let observed_energy = observed.iter().map(|sample| sample * sample).sum::<f32>();
+    let expected_energy = expected.iter().map(|sample| sample * sample).sum::<f32>();
+    if observed_energy < 1e-6 || expected_energy < 1e-6 {
+        return Ok(observed_energy < 1e-6 && expected_energy < 1e-6);
+    }
+    let correlation = observed
+        .iter()
+        .zip(expected)
+        .map(|(left, right)| left * right)
+        .sum::<f32>()
+        / (observed_energy * expected_energy).sqrt();
+    Ok(correlation >= 0.70)
+}
+
+fn transcribe_instant_sequential(
+    model: &VoskModel,
+    audio: &mut ExtendedCapturedAudio,
+    stats: FinalAudioStats,
+) -> Result<Transcript, String> {
+    const RECOVERY_CHUNK_SAMPLES: u64 = 16_000 * 30;
+    let mut recognizer = model.session(16_000).map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    for_each_bounded_range(stats.total_samples, RECOVERY_CHUNK_SAMPLES, |range| {
+        let span = audio.snapshot(range).map_err(|error| error.to_string())?;
+        recognizer
+            .accept_f32(span.samples())
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })?;
+    let text = recognizer.finish().map_err(|error| error.to_string())?;
+    Ok(Transcript {
+        text,
+        backend: "vosk",
+        model_load_time: model.load_time(),
+        inference_time: started.elapsed(),
+        audio_duration: Duration::from_secs_f64(stats.total_samples as f64 / 16_000.0),
+    })
+}
+
+fn for_each_bounded_range(
+    total_samples: u64,
+    maximum_samples: u64,
+    mut visit: impl FnMut(SampleRange) -> Result<(), String>,
+) -> Result<(), String> {
+    if maximum_samples == 0 {
+        return Err("bounded audio traversal requires a non-zero chunk size".to_owned());
+    }
+    let mut cursor = 0;
+    while cursor < total_samples {
+        let end = total_samples.min(cursor.saturating_add(maximum_samples));
+        visit(SampleRange::new(cursor, end).map_err(|error| error.to_string())?)?;
+        cursor = end;
+    }
+    Ok(())
 }
 
 impl Default for PartialAccumulator {
@@ -3835,6 +4169,165 @@ fn has_pathological_repetition(text: &str) -> bool {
         }
     }
     false
+}
+
+fn transcribe_extended_accurate<R>(
+    recognizer: &R,
+    incremental: Option<PartialAccumulator>,
+    audio: &mut ExtendedCapturedAudio,
+    stats: FinalAudioStats,
+    language: &str,
+    id: DictationId,
+) -> Result<Transcript, String>
+where
+    R: SpeechRecognizer,
+{
+    transcribe_extended_accurate_with_source(
+        recognizer,
+        incremental,
+        stats,
+        language,
+        id,
+        |range| {
+            let span = audio.snapshot(range).map_err(|error| error.to_string())?;
+            audio_span_to_clip(span).map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn transcribe_extended_accurate_with_source<R>(
+    recognizer: &R,
+    incremental: Option<PartialAccumulator>,
+    stats: FinalAudioStats,
+    language: &str,
+    id: DictationId,
+    mut snapshot: impl FnMut(SampleRange) -> Result<AudioClip, String>,
+) -> Result<Transcript, String>
+where
+    R: SpeechRecognizer,
+{
+    let full_duration = Duration::from_secs_f64(stats.total_samples as f64 / 16_000.0);
+    if let Some(accumulator) = incremental {
+        let tail_attempt = (|| {
+            let plan = final_tail_plan(&accumulator, full_duration).map_err(str::to_owned)?;
+            let start_sample = (plan.start.as_secs_f64() * 16_000.0).floor() as u64;
+            if start_sample >= stats.total_samples {
+                return Err("extended Accurate capture has an empty final tail".to_owned());
+            }
+            let tail = snapshot(
+                SampleRange::new(start_sample, stats.total_samples)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| format!("extended Accurate final tail is not recoverable: {error}"))?;
+            let options = TranscriptionOptions {
+                language: Some(language),
+                thread_count: None,
+                audio_context: None,
+            };
+            let (recognition, tail_compute_time) =
+                WallComputeClock.measure(|| recognizer.transcribe(&tail, &options));
+            let mut tail_transcript = recognition.map_err(|error| error.to_string())?;
+            tail_transcript.inference_time = tail_compute_time;
+            suppress_non_speech_annotation(&mut tail_transcript);
+            let transcript = assemble_incremental_transcript(
+                &accumulator,
+                tail_transcript,
+                tail.rms(),
+                full_duration,
+            )
+            .map_err(|reason| format!("extended Accurate seam could not be proven: {reason}"))?;
+            if has_pathological_repetition(&transcript.text) {
+                return Err("Whisper produced a repeated output loop".to_owned());
+            }
+            eprintln!(
+                "dictation_id={} state=Transcribing event=extended_final_tail tail_audio_ms={}",
+                id.0,
+                tail.duration().as_millis()
+            );
+            Ok(transcript)
+        })();
+        if let Ok(transcript) = tail_attempt {
+            return Ok(transcript);
+        }
+    }
+
+    eprintln!(
+        "dictation_id={} state=Transcribing event=accurate_recovery path=bounded_spool",
+        id.0
+    );
+    transcribe_accurate_sequential(recognizer, stats, language, full_duration, &mut snapshot)
+}
+
+fn transcribe_accurate_sequential<R>(
+    recognizer: &R,
+    stats: FinalAudioStats,
+    language: &str,
+    full_duration: Duration,
+    snapshot: &mut impl FnMut(SampleRange) -> Result<AudioClip, String>,
+) -> Result<Transcript, String>
+where
+    R: SpeechRecognizer,
+{
+    const WINDOW: u64 = 16_000 * 30;
+    const OVERLAP: u64 = 16_000 * 2;
+    let options = TranscriptionOptions {
+        language: Some(language),
+        thread_count: None,
+        audio_context: None,
+    };
+    let mut output = String::new();
+    let mut cursor = 0_u64;
+    let mut inference_time = Duration::ZERO;
+    let mut model_load_time = Duration::ZERO;
+    let mut backend = None;
+    let mut previous_was_silence = true;
+    while cursor < stats.total_samples {
+        let end = stats.total_samples.min(cursor.saturating_add(WINDOW));
+        let clip = snapshot(SampleRange::new(cursor, end).map_err(|error| error.to_string())?)?;
+        let (recognized, compute) =
+            WallComputeClock.measure(|| recognizer.transcribe(&clip, &options));
+        let mut recognized = recognized.map_err(|error| error.to_string())?;
+        inference_time = inference_time.saturating_add(compute);
+        model_load_time = model_load_time.max(recognized.model_load_time);
+        backend.get_or_insert(recognized.backend);
+        suppress_non_speech_annotation(&mut recognized);
+        let text = recognized.text.trim();
+        if text.is_empty() {
+            if clip.rms() > 0.001 {
+                return Err("extended Accurate recovery found uncertain empty speech".to_owned());
+            }
+            previous_was_silence = true;
+        } else if output.is_empty() {
+            output.push_str(text);
+            previous_was_silence = false;
+        } else {
+            output = merge_overlapping(
+                &output,
+                text,
+                if previous_was_silence {
+                    MergeExpectation::Silence
+                } else {
+                    MergeExpectation::LexicalOverlap
+                },
+            )
+            .map_err(|_| "extended Accurate recovery could not prove a window seam".to_owned())?;
+            previous_was_silence = false;
+        }
+        if end == stats.total_samples {
+            break;
+        }
+        cursor = end.saturating_sub(OVERLAP);
+    }
+    if has_pathological_repetition(&output) {
+        return Err("Whisper produced a repeated output loop".to_owned());
+    }
+    Ok(Transcript {
+        text: output,
+        backend: backend.unwrap_or("whisper.cpp"),
+        model_load_time,
+        inference_time,
+        audio_duration: full_duration,
+    })
 }
 
 fn transcribe_final<R>(
@@ -4299,6 +4792,7 @@ struct ProcessedTranscript {
     language: String,
     app_executable: Option<String>,
     lifecycle: Option<LifecycleTiming>,
+    terminal: TerminalMetadata,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4326,23 +4820,51 @@ fn process_transcript(
     );
     let formatting_started = Instant::now();
     let mut warnings = Vec::new();
+    let mut terminal = TerminalMetadata::default();
     let (selected, cleaned_text) = match &formatting.profile {
         FormatProfile::Raw => (raw_text.clone(), None),
         FormatProfile::Light => (normalized_text.clone(), None),
         FormatProfile::Balanced | FormatProfile::Strong | FormatProfile::Custom(_) => {
             match (ollama, formatting.model.as_ref()) {
                 (Some(client), Some(model)) => {
-                    match client.format(
-                        model,
-                        &normalized_text,
-                        &formatting.profile,
-                        formatting.keep_alive.clone(),
-                        cancel,
-                    ) {
-                        FormatResult::Formatted { text, .. } => (text.clone(), Some(text)),
-                        FormatResult::Fallback { reason, .. } => {
-                            warnings.push(format!("ollama_fallback:{}", fallback_reason(&reason)));
-                            (normalized_text.clone(), None)
+                    if normalized_text.len() > 64 * 1024 {
+                        match client.format_document(
+                            model,
+                            &normalized_text,
+                            &formatting.profile,
+                            formatting.keep_alive.clone(),
+                            cancel,
+                        ) {
+                            Ok(result) => {
+                                terminal.formatting_chunk_count = Some(result.chunks.len() as u64);
+                                if result.disposition != DocumentFormatDisposition::Completed {
+                                    warnings.push(format!(
+                                        "ollama_document:{}",
+                                        document_disposition(result.disposition)
+                                    ));
+                                }
+                                let cleaned = result.model.as_ref().map(|_| result.text.clone());
+                                (result.text, cleaned)
+                            }
+                            Err(_) => {
+                                warnings.push("ollama_fallback:document_rejected".to_owned());
+                                (normalized_text.clone(), None)
+                            }
+                        }
+                    } else {
+                        match client.format(
+                            model,
+                            &normalized_text,
+                            &formatting.profile,
+                            formatting.keep_alive.clone(),
+                            cancel,
+                        ) {
+                            FormatResult::Formatted { text, .. } => (text.clone(), Some(text)),
+                            FormatResult::Fallback { reason, .. } => {
+                                warnings
+                                    .push(format!("ollama_fallback:{}", fallback_reason(&reason)));
+                                (normalized_text.clone(), None)
+                            }
                         }
                     }
                 }
@@ -4366,6 +4888,18 @@ fn process_transcript(
         language: language.to_owned(),
         app_executable: app_executable.map(str::to_owned),
         lifecycle: None,
+        terminal,
+    }
+}
+
+fn document_disposition(disposition: DocumentFormatDisposition) -> &'static str {
+    match disposition {
+        DocumentFormatDisposition::Completed => "completed",
+        DocumentFormatDisposition::PartiallyFormatted => "partially_formatted",
+        DocumentFormatDisposition::RawBypass => "raw_bypass",
+        DocumentFormatDisposition::Cancelled => "cancelled",
+        DocumentFormatDisposition::ServiceLost => "service_lost",
+        DocumentFormatDisposition::SourceFallbackOutputLimit => "output_limit",
     }
 }
 
@@ -4506,7 +5040,10 @@ fn persist_transcript(
         },
         warnings: processed.warnings.clone(),
     };
-    persistence.history().insert(&draft).map(|_| ())
+    persistence
+        .history()
+        .insert_with_terminal_metadata(&draft, &processed.terminal)
+        .map(|_| ())
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -5421,6 +5958,131 @@ mod composition_tests {
     }
 
     #[test]
+    fn extended_accurate_without_checkpoints_fails_closed_when_spool_read_fails() {
+        let recognizer = CountingRecognizer::returning("unused");
+        let reads = Cell::new(0_u32);
+        let result = transcribe_extended_accurate_with_source(
+            &recognizer,
+            None,
+            FinalAudioStats {
+                total_samples: 16_000 * 130,
+                peak_retained_samples: 16_000 * 120,
+                rms: 0.2,
+            },
+            "en",
+            DictationId(90),
+            |_| {
+                reads.set(reads.get() + 1);
+                Err("must not read".to_owned())
+            },
+        );
+        assert!(result.unwrap_err().contains("must not read"));
+        assert_eq!(reads.get(), 1);
+        assert!(recognizer.clip_lengths.borrow().is_empty());
+    }
+
+    #[test]
+    fn extended_accurate_without_checkpoints_recovers_in_bounded_overlapping_windows() {
+        let recognizer = SequencedRecognizer::new([
+            SequencedOutcome::Text("zero one shared two"),
+            SequencedOutcome::Text("shared two three four"),
+            SequencedOutcome::Text("three four five six"),
+            SequencedOutcome::Text("five six seven eight"),
+            SequencedOutcome::Text("seven eight nine"),
+        ]);
+        let requested = RefCell::new(Vec::new());
+        let transcript = transcribe_extended_accurate_with_source(
+            &recognizer,
+            None,
+            FinalAudioStats {
+                total_samples: 16_000 * 130,
+                peak_retained_samples: 16_000 * 120,
+                rms: 0.2,
+            },
+            "en",
+            DictationId(92),
+            |range| {
+                requested.borrow_mut().push(range);
+                AudioClip::new(vec![0.2; range.len() as usize], 16_000)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+        let ranges = requested.borrow();
+        assert_eq!(ranges.len(), 5);
+        assert!(ranges.iter().all(|range| range.len() <= 16_000 * 30));
+        assert!(
+            ranges
+                .windows(2)
+                .all(|pair| pair[0].end() - pair[1].start() == 16_000 * 2)
+        );
+        assert_eq!(
+            transcript.text,
+            "zero one shared two three four five six seven eight nine"
+        );
+        assert_eq!(transcript.backend, "fake");
+        assert_eq!(transcript.audio_duration, Duration::from_secs(130));
+    }
+
+    #[test]
+    fn extended_accurate_reads_only_the_unresolved_tail_after_120_seconds() {
+        let recognizer = CountingRecognizer::returning("tail text");
+        let accumulator = PartialAccumulator {
+            text: "stable text".to_owned(),
+            stable_end: Duration::from_secs(120),
+            accepted_through: Duration::from_secs(120),
+            timestamp_stable: true,
+            last_boundary: Some(BoundaryKind::Silence),
+            next_sequence: 6,
+            ..PartialAccumulator::default()
+        };
+        let requested = RefCell::new(Vec::new());
+        let transcript = transcribe_extended_accurate_with_source(
+            &recognizer,
+            Some(accumulator),
+            FinalAudioStats {
+                total_samples: 16_000 * 130,
+                peak_retained_samples: 16_000 * 120,
+                rms: 0.2,
+            },
+            "en",
+            DictationId(91),
+            |range| {
+                requested.borrow_mut().push(range);
+                AudioClip::new(vec![0.2; range.len() as usize], 16_000)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            requested.borrow().as_slice(),
+            &[SampleRange::new(16_000 * 120, 16_000 * 130).unwrap()]
+        );
+        assert_eq!(recognizer.clip_lengths.borrow().as_slice(), &[16_000 * 10]);
+        assert_eq!(transcript.audio_duration, Duration::from_secs(130));
+    }
+
+    #[test]
+    fn degraded_instant_recovery_visits_long_audio_sequentially_with_bounded_reads() {
+        let total = 16_000 * 185 + 7;
+        let maximum = 16_000 * 30;
+        let mut ranges = Vec::new();
+        for_each_bounded_range(total, maximum, |range| {
+            ranges.push(range);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ranges.first().unwrap().start(), 0);
+        assert_eq!(ranges.last().unwrap().end(), total);
+        assert!(ranges.iter().all(|range| range.len() <= maximum));
+        assert!(
+            ranges
+                .windows(2)
+                .all(|pair| pair[0].end() == pair[1].start())
+        );
+    }
+
+    #[test]
     fn persisted_release_lifecycle_includes_audio_finalization_and_terminal_insert() {
         let path = std::env::temp_dir().join(format!(
             "phorminx-release-timing-{}-{}.db",
@@ -5447,6 +6109,13 @@ mod composition_tests {
             None,
             &CancellationToken::new(),
         );
+        processed.terminal = TerminalMetadata {
+            checkpoint_count: Some(7),
+            checkpoint_repair_count: Some(1),
+            peak_retained_audio_ms: Some(120_000),
+            formatting_chunk_count: Some(3),
+            auto_stopped: Some(false),
+        };
         processed.lifecycle = Some(LifecycleTiming {
             release: ReleaseTiming {
                 released_at,
@@ -5472,6 +6141,10 @@ mod composition_tests {
         assert_eq!(
             record.dictation.timings.release_to_insert_duration_ms,
             Some(91)
+        );
+        assert_eq!(
+            persistence.history().terminal_metadata(record.id).unwrap(),
+            Some(processed.terminal)
         );
         drop(persistence);
         let _ = std::fs::remove_file(path);
