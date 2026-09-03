@@ -25,14 +25,29 @@ impl Default for LedgerLimits {
 /// A transcript block. Silence is explicit so checkpoint coverage cannot hide holes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TranscriptBlock {
-    Speech { range: SampleRange, text: String },
-    Silence { range: SampleRange },
+    Speech {
+        range: SampleRange,
+        separator_before: String,
+        text: String,
+    },
+    Silence {
+        range: SampleRange,
+    },
 }
 
 impl TranscriptBlock {
     pub fn speech(range: SampleRange, text: impl Into<String>) -> Self {
+        Self::speech_with_separator(range, "", text)
+    }
+
+    pub fn speech_with_separator(
+        range: SampleRange,
+        separator_before: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
         Self::Speech {
             range,
+            separator_before: separator_before.into(),
             text: text.into(),
         }
     }
@@ -51,6 +66,26 @@ impl TranscriptBlock {
         match self {
             Self::Speech { text, .. } => Some(text),
             Self::Silence { .. } => None,
+        }
+    }
+
+    pub fn separator_before(&self) -> Option<&str> {
+        match self {
+            Self::Speech {
+                separator_before, ..
+            } => Some(separator_before),
+            Self::Silence { .. } => None,
+        }
+    }
+
+    fn output_bytes(&self) -> usize {
+        match self {
+            Self::Speech {
+                separator_before,
+                text,
+                ..
+            } => separator_before.len().saturating_add(text.len()),
+            Self::Silence { .. } => 0,
         }
     }
 }
@@ -105,6 +140,7 @@ pub struct TranscriptLedger {
     text_bytes: usize,
     block_count: usize,
     event_count: usize,
+    expected_final_end: Option<u64>,
     assembled: bool,
     limits: LedgerLimits,
 }
@@ -133,6 +169,7 @@ impl TranscriptLedger {
             text_bytes: 0,
             block_count: 0,
             event_count: 0,
+            expected_final_end: None,
             assembled: false,
             limits,
         })
@@ -158,8 +195,41 @@ impl TranscriptLedger {
         self.unresolved
     }
 
+    pub const fn expected_final_end(&self) -> Option<u64> {
+        self.expected_final_end
+    }
+
     pub fn checkpoints(&self) -> &[TranscriptCheckpoint] {
         &self.checkpoints
+    }
+
+    /// Seals the ledger with the capture subsystem's authoritative final sample frontier.
+    /// Recognition recovery may continue up to this boundary, but assembly cannot occur before it.
+    pub fn seal(&mut self, expected_final_end: u64) -> Result<(), LedgerError> {
+        self.ensure_open()?;
+        let captured_samples = expected_final_end
+            .checked_sub(self.origin_sample)
+            .ok_or(LedgerError::CoverageBeforeOrigin)?;
+        if captured_samples > self.limits.max_samples {
+            return Err(LedgerError::SampleLimitExceeded);
+        }
+        if expected_final_end < self.committed_through {
+            return Err(LedgerError::FinalFrontierBehindCommitted {
+                committed_through: self.committed_through,
+                expected_final_end,
+            });
+        }
+        match self.expected_final_end {
+            Some(existing) if existing == expected_final_end => Ok(()),
+            Some(existing) => Err(LedgerError::ConflictingFinalFrontier {
+                existing,
+                actual: expected_final_end,
+            }),
+            None => {
+                self.expected_final_end = Some(expected_final_end);
+                Ok(())
+            }
+        }
     }
 
     /// Advances to exactly the next worker generation and invalidates older in-flight results.
@@ -237,8 +307,7 @@ impl TranscriptLedger {
         let new_text_bytes = checkpoint
             .blocks
             .iter()
-            .filter_map(TranscriptBlock::text)
-            .map(str::len)
+            .map(TranscriptBlock::output_bytes)
             .sum::<usize>();
         let index = self.checkpoints.len();
         self.committed_through = checkpoint.coverage.end();
@@ -262,14 +331,27 @@ impl TranscriptLedger {
         if let Some(frontier) = self.unresolved {
             return Err(LedgerError::Unresolved(frontier));
         }
+        let expected_final_end = self.expected_final_end.ok_or(LedgerError::Unsealed)?;
+        if self.committed_through != expected_final_end {
+            return Err(LedgerError::IncompleteFinalCoverage {
+                committed_through: self.committed_through,
+                expected_final_end,
+            });
+        }
         let mut output = String::new();
         output
             .try_reserve(self.text_bytes)
             .map_err(|_| LedgerError::AllocationFailed)?;
         for checkpoint in &self.checkpoints {
             for block in &checkpoint.blocks {
-                if let TranscriptBlock::Speech { text, .. } = block {
-                    append_with_boundary(&mut output, text);
+                if let TranscriptBlock::Speech {
+                    separator_before,
+                    text,
+                    ..
+                } = block
+                {
+                    output.push_str(separator_before);
+                    output.push_str(text);
                 }
             }
         }
@@ -438,6 +520,15 @@ impl TranscriptLedger {
 
     fn preflight_checkpoint(&self, checkpoint: &TranscriptCheckpoint) -> Result<(), LedgerError> {
         self.preflight_event()?;
+        if self
+            .expected_final_end
+            .is_some_and(|expected| checkpoint.coverage.end() > expected)
+        {
+            return Err(LedgerError::CheckpointBeyondFinalFrontier {
+                expected_final_end: self.expected_final_end.expect("checked as present"),
+                checkpoint_end: checkpoint.coverage.end(),
+            });
+        }
         let session_samples = checkpoint
             .coverage
             .end()
@@ -456,8 +547,7 @@ impl TranscriptLedger {
         let new_text = checkpoint
             .blocks
             .iter()
-            .filter_map(TranscriptBlock::text)
-            .try_fold(0usize, |sum, text| sum.checked_add(text.len()))
+            .try_fold(0usize, |sum, block| sum.checked_add(block.output_bytes()))
             .ok_or(LedgerError::TextLimitExceeded)?;
         let text_bytes = self
             .text_bytes
@@ -470,22 +560,37 @@ impl TranscriptLedger {
     }
 }
 
-fn append_with_boundary(output: &mut String, text: &str) {
-    let needs_space = !output.is_empty()
-        && !output.chars().next_back().is_some_and(char::is_whitespace)
-        && !text.chars().next().is_some_and(char::is_whitespace);
-    if needs_space {
-        output.push(' ');
-    }
-    output.push_str(text);
-}
-
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LedgerError {
     #[error("ledger limits must all be non-zero")]
     InvalidLimits,
     #[error("transcript has already been assembled")]
     AlreadyAssembled,
+    #[error("capture frontier must be sealed before transcript assembly")]
+    Unsealed,
+    #[error(
+        "transcript coverage ends at {committed_through}, but capture ended at {expected_final_end}"
+    )]
+    IncompleteFinalCoverage {
+        committed_through: u64,
+        expected_final_end: u64,
+    },
+    #[error(
+        "capture frontier {expected_final_end} is behind committed transcript {committed_through}"
+    )]
+    FinalFrontierBehindCommitted {
+        committed_through: u64,
+        expected_final_end: u64,
+    },
+    #[error("capture frontier was already sealed at {existing}, not {actual}")]
+    ConflictingFinalFrontier { existing: u64, actual: u64 },
+    #[error(
+        "checkpoint ends at {checkpoint_end}, beyond sealed capture frontier {expected_final_end}"
+    )]
+    CheckpointBeyondFinalFrontier {
+        expected_final_end: u64,
+        checkpoint_end: u64,
+    },
     #[error("worker generation overflow")]
     GenerationOverflow,
     #[error("stale generation {actual}; current generation is {expected}")]
@@ -566,7 +671,32 @@ mod tests {
             sequence,
             coverage: range(start, end),
             kind: CheckpointKind::Regular,
-            blocks: vec![TranscriptBlock::speech(range(start, end), text)],
+            blocks: vec![TranscriptBlock::speech_with_separator(
+                range(start, end),
+                if sequence == 0 { "" } else { " " },
+                text,
+            )],
+        }
+    }
+
+    fn checkpoint_with_separator(
+        generation: u64,
+        sequence: u64,
+        start: u64,
+        end: u64,
+        separator: &str,
+        text: &str,
+    ) -> TranscriptCheckpoint {
+        TranscriptCheckpoint {
+            generation,
+            sequence,
+            coverage: range(start, end),
+            kind: CheckpointKind::Regular,
+            blocks: vec![TranscriptBlock::speech_with_separator(
+                range(start, end),
+                separator,
+                text,
+            )],
         }
     }
 
@@ -586,6 +716,7 @@ mod tests {
             ApplyOutcome::Applied
         );
         assert_eq!(ledger.committed_through(), 20);
+        ledger.seal(20).unwrap();
         assert_eq!(ledger.assemble_once().unwrap(), "hello world.");
         assert_eq!(
             ledger.assemble_once().unwrap_err(),
@@ -661,7 +792,52 @@ mod tests {
             ],
         };
         ledger.apply(cp).unwrap();
+        ledger.seal(30).unwrap();
         assert_eq!(ledger.assemble_once().unwrap(), "spoken");
+    }
+
+    #[test]
+    fn assembly_uses_only_explicit_boundaries_for_punctuation_and_unicode() {
+        let mut punctuation = ledger();
+        punctuation
+            .apply(checkpoint_with_separator(7, 0, 0, 10, "", "hello"))
+            .unwrap();
+        punctuation
+            .apply(checkpoint_with_separator(7, 1, 10, 20, "", ","))
+            .unwrap();
+        punctuation.seal(20).unwrap();
+        assert_eq!(punctuation.assemble_once().unwrap(), "hello,");
+
+        let mut chinese = ledger();
+        chinese
+            .apply(checkpoint_with_separator(7, 0, 0, 10, "", "你"))
+            .unwrap();
+        chinese
+            .apply(checkpoint_with_separator(7, 1, 10, 20, "", "好"))
+            .unwrap();
+        chinese.seal(20).unwrap();
+        assert_eq!(chinese.assemble_once().unwrap(), "你好");
+    }
+
+    #[test]
+    fn explicit_separator_bytes_count_toward_text_limit() {
+        let limits = LedgerLimits {
+            max_samples: 20,
+            max_events: 2,
+            max_blocks: 2,
+            max_text_bytes: 3,
+        };
+        let mut ledger = TranscriptLedger::new(0, 7, limits).unwrap();
+        ledger
+            .apply(checkpoint_with_separator(7, 0, 0, 10, "", "a"))
+            .unwrap();
+        assert_eq!(
+            ledger
+                .apply(checkpoint_with_separator(7, 1, 10, 20, "  ", "b"))
+                .unwrap_err(),
+            LedgerError::TextLimitExceeded
+        );
+        assert_eq!(ledger.committed_through(), 10);
     }
 
     #[test]
@@ -684,7 +860,73 @@ mod tests {
         };
         ledger.apply(recovery).unwrap();
         assert_eq!(ledger.unresolved_frontier(), None);
+        ledger.seal(20).unwrap();
         assert_eq!(ledger.assemble_once().unwrap(), "before recovered");
+    }
+
+    #[test]
+    fn assembly_requires_authoritative_complete_capture_frontier() {
+        let mut empty = ledger();
+        assert_eq!(empty.assemble_once().unwrap_err(), LedgerError::Unsealed);
+        empty.seal(200).unwrap();
+        assert_eq!(
+            empty.assemble_once().unwrap_err(),
+            LedgerError::IncompleteFinalCoverage {
+                committed_through: 0,
+                expected_final_end: 200,
+            }
+        );
+
+        let mut prefix = ledger();
+        prefix.apply(checkpoint(7, 0, 0, 100, "prefix")).unwrap();
+        prefix.seal(200).unwrap();
+        assert_eq!(
+            prefix.assemble_once().unwrap_err(),
+            LedgerError::IncompleteFinalCoverage {
+                committed_through: 100,
+                expected_final_end: 200,
+            }
+        );
+        assert_eq!(
+            prefix
+                .apply(checkpoint(7, 1, 100, 201, "too far"))
+                .unwrap_err(),
+            LedgerError::CheckpointBeyondFinalFrontier {
+                expected_final_end: 200,
+                checkpoint_end: 201,
+            }
+        );
+    }
+
+    #[test]
+    fn zero_length_capture_may_seal_and_assemble_empty_once() {
+        let mut ledger = ledger();
+        ledger.seal(0).unwrap();
+        assert_eq!(ledger.assemble_once().unwrap(), "");
+        assert_eq!(
+            ledger.assemble_once().unwrap_err(),
+            LedgerError::AlreadyAssembled
+        );
+    }
+
+    #[test]
+    fn sealing_rejects_frontiers_outside_session_bounds() {
+        let limits = LedgerLimits {
+            max_samples: 100,
+            ..LedgerLimits::default()
+        };
+        let mut ledger = TranscriptLedger::new(50, 0, limits).unwrap();
+        assert_eq!(
+            ledger.seal(49).unwrap_err(),
+            LedgerError::CoverageBeforeOrigin
+        );
+        assert_eq!(
+            ledger.seal(151).unwrap_err(),
+            LedgerError::SampleLimitExceeded
+        );
+        assert_eq!(ledger.expected_final_end(), None);
+        ledger.seal(150).unwrap();
+        assert_eq!(ledger.expected_final_end(), Some(150));
     }
 
     #[test]

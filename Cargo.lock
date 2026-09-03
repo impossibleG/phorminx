@@ -2565,9 +2565,11 @@ dependencies = [
  "cpal",
  "hound",
  "phorminx-core",
+ "phorminx-session",
  "ringbuf",
  "rubato",
  "thiserror 2.0.20",
+ "zeroize",
 ]
 
 [[package]]
@@ -2615,6 +2617,7 @@ version = "0.1.0"
 dependencies = [
  "ring",
  "thiserror 2.0.20",
+ "zeroize",
 ]
 
 [[package]]

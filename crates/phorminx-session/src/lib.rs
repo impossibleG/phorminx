@@ -14,6 +14,6 @@ pub use ledger::{
     TranscriptLedger, UnresolvedFrontier,
 };
 pub use spool::{
-    EncryptedAudioSpool, FileStorage, ScavengeReport, SpoolError, SpoolQuota, SpoolStorage,
-    scavenge_orphans,
+    EncryptedAudioSpool, FileStorage, ScavengeReport, SpoolError, SpoolQuota, SpoolRoot,
+    SpoolStorage, scavenge_orphans,
 };

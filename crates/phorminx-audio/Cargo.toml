@@ -10,6 +10,8 @@ rust-version.workspace = true
 cpal.workspace = true
 hound.workspace = true
 phorminx-core = { path = "../phorminx-core" }
+phorminx-session = { path = "../phorminx-session" }
 ringbuf.workspace = true
 rubato.workspace = true
 thiserror.workspace = true
+zeroize = "=1.9.0"

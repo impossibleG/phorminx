@@ -1,6 +1,7 @@
 use std::ops::Range;
 
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// The only sample rate accepted by the session layer.
 pub const CANONICAL_SAMPLE_RATE: u32 = 16_000;
@@ -55,12 +56,13 @@ impl From<SampleRange> for Range<u64> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioSpan {
     range: SampleRange,
-    samples: Vec<f32>,
+    samples: Zeroizing<Vec<f32>>,
 }
 
 impl AudioSpan {
     /// Constructs a canonical 16 kHz span. The sample rate is intentionally not configurable.
     pub fn new(start_sample: u64, samples: Vec<f32>) -> Result<Self, AudioSpanError> {
+        let mut samples = Zeroizing::new(samples);
         if samples.is_empty() {
             return Err(AudioSpanError::Empty);
         }
@@ -74,7 +76,7 @@ impl AudioSpan {
             .ok_or(AudioSpanError::LengthOverflow)?;
         Ok(Self {
             range: SampleRange::new(start_sample, end)?,
-            samples,
+            samples: Zeroizing::new(std::mem::take(&mut *samples)),
         })
     }
 
@@ -84,10 +86,11 @@ impl AudioSpan {
         start_sample: u64,
         samples: Vec<f32>,
     ) -> Result<Self, AudioSpanError> {
+        let mut samples = Zeroizing::new(samples);
         if sample_rate != CANONICAL_SAMPLE_RATE {
             return Err(AudioSpanError::NonCanonicalSampleRate(sample_rate));
         }
-        Self::new(start_sample, samples)
+        Self::new(start_sample, std::mem::take(&mut *samples))
     }
 
     pub const fn range(&self) -> SampleRange {
@@ -98,8 +101,9 @@ impl AudioSpan {
         &self.samples
     }
 
-    pub fn into_samples(self) -> Vec<f32> {
-        self.samples
+    /// Transfers ownership while retaining wipe-on-drop semantics for the recipient.
+    pub fn into_samples(mut self) -> Zeroizing<Vec<f32>> {
+        std::mem::replace(&mut self.samples, Zeroizing::new(Vec::new()))
     }
 }
 
@@ -125,6 +129,8 @@ mod tests {
     fn span_uses_absolute_canonical_coverage() {
         let span = AudioSpan::from_sample_rate(CANONICAL_SAMPLE_RATE, 41, vec![0.0; 3]).unwrap();
         assert_eq!(span.range(), SampleRange::new(41, 44).unwrap());
+        let guarded_samples: Zeroizing<Vec<f32>> = span.into_samples();
+        assert_eq!(&*guarded_samples, &[0.0; 3]);
     }
 
     #[test]

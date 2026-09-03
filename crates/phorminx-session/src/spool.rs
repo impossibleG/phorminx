@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::{AudioSpan, AudioSpanError, CANONICAL_SAMPLE_RATE, SampleRange};
 
@@ -23,6 +24,8 @@ const FILE_AAD_DOMAIN: &[u8] = b"phorminx/audio-spool/file/v1";
 const RECORD_AAD_DOMAIN: &[u8] = b"phorminx/audio-spool/record/v1";
 const FILE_NAME_PREFIX: &str = "phorminx-audio-";
 const FILE_NAME_SUFFIX: &str = ".pxs";
+const OWNER_MARKER_NAME: &str = ".phorminx-spool-root";
+const OWNER_MARKER_CONTENT: &[u8] = b"PHORMINX_PRIVATE_AUDIO_SPOOL_ROOT_V1\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpoolQuota {
@@ -55,6 +58,72 @@ pub trait SpoolStorage: Read + Write + Seek + Send {
     fn set_len(&mut self, len: u64) -> io::Result<()>;
     fn sync_all(&mut self) -> io::Result<()>;
     fn cleanup(&mut self) -> io::Result<()>;
+}
+
+/// Validated application-owned directory in which encrypted spool files may exist.
+#[derive(Clone, Debug)]
+pub struct SpoolRoot {
+    path: PathBuf,
+}
+
+impl SpoolRoot {
+    /// Opens an existing marked root, or claims a newly-created/empty directory atomically.
+    /// A non-empty unmarked directory is never accepted as a scavenging target.
+    pub fn open_or_create(directory: impl AsRef<Path>) -> Result<Self, SpoolError> {
+        let directory = directory.as_ref();
+        if directory.exists() {
+            let metadata = fs::symlink_metadata(directory)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(SpoolError::UnownedRoot);
+            }
+        } else {
+            fs::create_dir_all(directory)?;
+        }
+
+        let marker = directory.join(OWNER_MARKER_NAME);
+        match fs::symlink_metadata(&marker) {
+            Ok(metadata) => {
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return Err(SpoolError::InvalidOwnerMarker);
+                }
+                if fs::read(&marker)? != OWNER_MARKER_CONTENT {
+                    return Err(SpoolError::InvalidOwnerMarker);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if fs::read_dir(directory)?.next().transpose()?.is_some() {
+                    return Err(SpoolError::UnownedRoot);
+                }
+                let mut marker_file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&marker)?;
+                marker_file.write_all(OWNER_MARKER_CONTENT)?;
+                marker_file.sync_all()?;
+            }
+            Err(error) => return Err(SpoolError::Io(error)),
+        }
+
+        Ok(Self {
+            path: fs::canonicalize(directory)?,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn validate_owner_marker(&self) -> Result<(), SpoolError> {
+        let marker = self.path.join(OWNER_MARKER_NAME);
+        let metadata = fs::symlink_metadata(&marker)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || fs::read(marker)? != OWNER_MARKER_CONTENT
+        {
+            return Err(SpoolError::InvalidOwnerMarker);
+        }
+        Ok(())
+    }
 }
 
 pub struct FileStorage {
@@ -140,7 +209,7 @@ struct RecordIndex {
 /// remaining bytes are cryptographically unreadable. `scavenge_orphans` only deletes such files.
 pub struct EncryptedAudioSpool<S: SpoolStorage = FileStorage> {
     storage: S,
-    key: LessSafeKey,
+    key_bytes: Zeroizing<[u8; KEY_LEN]>,
     nonce_prefix: [u8; NONCE_PREFIX_LEN],
     file_header: [u8; FILE_HEADER_LEN],
     quota: SpoolQuota,
@@ -155,16 +224,16 @@ pub struct EncryptedAudioSpool<S: SpoolStorage = FileStorage> {
 }
 
 impl EncryptedAudioSpool<FileStorage> {
-    pub fn create(directory: impl AsRef<Path>, quota: SpoolQuota) -> Result<Self, SpoolError> {
+    pub fn create(root: &SpoolRoot, quota: SpoolQuota) -> Result<Self, SpoolError> {
         validate_quota(quota)?;
-        fs::create_dir_all(directory.as_ref())?;
+        root.validate_owner_marker()?;
         let random = SystemRandom::new();
         let mut file_id = [0_u8; FILE_ID_LEN];
         for _ in 0..32 {
             random
                 .fill(&mut file_id)
                 .map_err(|_| SpoolError::RandomnessUnavailable)?;
-            let path = directory.as_ref().join(spool_file_name(file_id));
+            let path = root.path.join(spool_file_name(file_id));
             match OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -172,6 +241,10 @@ impl EncryptedAudioSpool<FileStorage> {
                 .open(&path)
             {
                 Ok(file) => {
+                    file.try_lock().map_err(|error| match error {
+                        fs::TryLockError::WouldBlock => SpoolError::ActiveSpool,
+                        fs::TryLockError::Error(error) => SpoolError::Io(error),
+                    })?;
                     let storage = FileStorage {
                         file: Some(file),
                         path,
@@ -212,24 +285,21 @@ impl<S: SpoolStorage> EncryptedAudioSpool<S> {
         }
 
         let random = SystemRandom::new();
-        let mut key_bytes = [0_u8; KEY_LEN];
+        let mut key_bytes = Zeroizing::new([0_u8; KEY_LEN]);
         let mut nonce_prefix = [0_u8; NONCE_PREFIX_LEN];
         random
-            .fill(&mut key_bytes)
+            .fill(key_bytes.as_mut())
             .map_err(|_| SpoolError::RandomnessUnavailable)?;
         random
             .fill(&mut nonce_prefix)
             .map_err(|_| SpoolError::RandomnessUnavailable)?;
-        let unbound = UnboundKey::new(&aead::AES_256_GCM, &key_bytes)
-            .map_err(|_| SpoolError::CryptoInitialization)?;
-        key_bytes.fill(0);
-        let key = LessSafeKey::new(unbound);
+        let key = less_safe_key(&key_bytes)?;
         let file_header = encode_file_header(file_id, nonce_prefix);
-        let mut header_tag = Vec::new();
+        let mut header_tag = Zeroizing::new(Vec::new());
         key.seal_in_place_append_tag(
             nonce_for(nonce_prefix, 0),
             Aad::from(file_aad(&file_header)),
-            &mut header_tag,
+            &mut *header_tag,
         )
         .map_err(|_| SpoolError::CryptoInitialization)?;
         debug_assert_eq!(header_tag.len(), TAG_LEN);
@@ -247,7 +317,7 @@ impl<S: SpoolStorage> EncryptedAudioSpool<S> {
 
         Ok(Self {
             storage,
-            key,
+            key_bytes,
             nonce_prefix,
             file_header,
             quota,
@@ -326,19 +396,22 @@ impl<S: SpoolStorage> EncryptedAudioSpool<S> {
         if counter == u64::MAX {
             return Err(SpoolError::NonceExhausted);
         }
+        // A nonce is burned as soon as it is selected. Storage rollback may make the sample range
+        // retryable, but it must never make an AES-GCM nonce retryable under the same key.
+        self.next_counter += 1;
         let record_header = encode_record_header(counter, span.range(), plaintext_len, sealed_len);
-        let mut encrypted = Vec::new();
+        let mut encrypted = Zeroizing::new(Vec::new());
         encrypted
             .try_reserve_exact(usize::try_from(sealed_len).map_err(|_| SpoolError::RecordTooLarge)?)
             .map_err(|_| SpoolError::AllocationFailed)?;
         for sample in span.samples() {
             encrypted.extend_from_slice(&sample.to_bits().to_le_bytes());
         }
-        self.key
+        less_safe_key(&self.key_bytes)?
             .seal_in_place_append_tag(
                 nonce_for(self.nonce_prefix, counter),
                 Aad::from(record_aad(&self.file_header, &record_header)),
-                &mut encrypted,
+                &mut *encrypted,
             )
             .map_err(|_| SpoolError::EncryptionFailed)?;
 
@@ -371,7 +444,6 @@ impl<S: SpoolStorage> EncryptedAudioSpool<S> {
         });
         self.origin_sample.get_or_insert(range.start());
         self.next_sample = Some(range.end());
-        self.next_counter += 1;
         self.file_len = future_file_len;
         self.sample_count = future_samples;
         Ok(())
@@ -399,7 +471,7 @@ impl<S: SpoolStorage> EncryptedAudioSpool<S> {
         self.authenticate_file_header()?;
 
         let output_len = usize::try_from(requested.len()).map_err(|_| SpoolError::ReadTooLarge)?;
-        let mut samples = Vec::new();
+        let mut samples = Zeroizing::new(Vec::new());
         samples
             .try_reserve_exact(output_len)
             .map_err(|_| SpoolError::AllocationFailed)?;
@@ -422,14 +494,13 @@ impl<S: SpoolStorage> EncryptedAudioSpool<S> {
                 return Err(SpoolError::CorruptHeader);
             }
 
-            let mut encrypted = vec![
+            let mut encrypted = Zeroizing::new(vec![
                 0_u8;
                 usize::try_from(record.sealed_len)
                     .map_err(|_| SpoolError::CorruptHeader)?
-            ];
+            ]);
             read_exact_classified(&mut self.storage, &mut encrypted)?;
-            let plaintext = self
-                .key
+            let plaintext = less_safe_key(&self.key_bytes)?
                 .open_in_place(
                     nonce_for(self.nonce_prefix, record.counter),
                     Aad::from(record_aad(&self.file_header, &actual_header)),
@@ -465,6 +536,7 @@ impl<S: SpoolStorage> EncryptedAudioSpool<S> {
         if samples.len() != output_len {
             return Err(SpoolError::IndexCoverageMismatch);
         }
+        let samples = std::mem::take(&mut *samples);
         AudioSpan::new(requested.start(), samples).map_err(SpoolError::InvalidAudio)
     }
 
@@ -490,9 +562,8 @@ impl<S: SpoolStorage> EncryptedAudioSpool<S> {
         if prefix[..FILE_HEADER_LEN] != self.file_header {
             return Err(SpoolError::CorruptHeader);
         }
-        let mut tag = prefix[FILE_HEADER_LEN..].to_vec();
-        let plaintext = self
-            .key
+        let mut tag = Zeroizing::new(prefix[FILE_HEADER_LEN..].to_vec());
+        let plaintext = less_safe_key(&self.key_bytes)?
             .open_in_place(
                 nonce_for(self.nonce_prefix, 0),
                 Aad::from(file_aad(&self.file_header)),
@@ -529,16 +600,14 @@ impl<S: SpoolStorage> Drop for EncryptedAudioSpool<S> {
 pub struct ScavengeReport {
     pub removed_files: u64,
     pub removed_bytes: u64,
+    pub skipped_live_files: u64,
 }
 
 /// Deletes prior-process spool files. No decryption is attempted because keys are never persisted.
-pub fn scavenge_orphans(directory: impl AsRef<Path>) -> Result<ScavengeReport, SpoolError> {
-    let directory = directory.as_ref();
-    if !directory.exists() {
-        return Ok(ScavengeReport::default());
-    }
+pub fn scavenge_orphans(root: &SpoolRoot) -> Result<ScavengeReport, SpoolError> {
+    root.validate_owner_marker()?;
     let mut report = ScavengeReport::default();
-    for entry in fs::read_dir(directory)? {
+    for entry in fs::read_dir(root.path())? {
         let entry = entry?;
         let file_type = entry.file_type()?;
         if !file_type.is_file() || file_type.is_symlink() {
@@ -550,8 +619,32 @@ pub fn scavenge_orphans(directory: impl AsRef<Path>) -> Result<ScavengeReport, S
         if !is_spool_file_name(&name) {
             continue;
         }
-        let bytes = entry.metadata()?.len();
+        let file = match OpenOptions::new().read(true).write(true).open(entry.path()) {
+            Ok(file) => file,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                report.skipped_live_files += 1;
+                continue;
+            }
+            Err(error) => return Err(SpoolError::Io(error)),
+        };
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                report.skipped_live_files += 1;
+                continue;
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(SpoolError::Io(error)),
+        }
+        let bytes = file.metadata()?.len();
+        // Keep the exclusive lock held through removal so another process cannot make the
+        // candidate live in the gap between the lock probe and deletion.
         fs::remove_file(entry.path())?;
+        drop(file);
         report.removed_files = report
             .removed_files
             .checked_add(1)
@@ -570,6 +663,7 @@ fn validate_quota(quota: SpoolQuota) -> Result<(), SpoolError> {
         || quota.max_records == 0
         || quota.max_record_samples == 0
         || quota.max_read_samples == 0
+        || quota.max_record_samples > quota.max_read_samples
     {
         Err(SpoolError::InvalidQuota)
     } else {
@@ -622,6 +716,12 @@ fn put<const N: usize>(output: &mut [u8; N], cursor: &mut usize, bytes: &[u8]) {
     let end = *cursor + bytes.len();
     output[*cursor..end].copy_from_slice(bytes);
     *cursor = end;
+}
+
+fn less_safe_key(key_bytes: &[u8; KEY_LEN]) -> Result<LessSafeKey, SpoolError> {
+    let unbound = UnboundKey::new(&aead::AES_256_GCM, key_bytes)
+        .map_err(|_| SpoolError::CryptoInitialization)?;
+    Ok(LessSafeKey::new(unbound))
 }
 
 fn nonce_for(prefix: [u8; NONCE_PREFIX_LEN], counter: u64) -> Nonce {
@@ -686,6 +786,12 @@ fn is_spool_file_name(name: &str) -> bool {
 
 #[derive(Debug, Error)]
 pub enum SpoolError {
+    #[error("spool root is not an empty or application-owned directory")]
+    UnownedRoot,
+    #[error("spool root owner marker is missing or invalid")]
+    InvalidOwnerMarker,
+    #[error("spool file is already active")]
+    ActiveSpool,
     #[error("spool quota is invalid")]
     InvalidQuota,
     #[error("spool quota exceeded")]
@@ -944,12 +1050,14 @@ mod tests {
     #[test]
     fn one_read_is_bounded_independently_from_total_spool_size() {
         let quota = SpoolQuota {
+            max_record_samples: 2,
             max_read_samples: 2,
             ..SpoolQuota::default()
         };
         let (storage, _) = MemoryStorage::new();
         let mut spool = EncryptedAudioSpool::from_empty_storage(storage, quota).unwrap();
-        spool.append(&span(0, &[0.1, 0.2, 0.3])).unwrap();
+        spool.append(&span(0, &[0.1, 0.2])).unwrap();
+        spool.append(&span(2, &[0.3])).unwrap();
         assert!(matches!(
             spool.read_range(SampleRange::new(0, 3).unwrap()),
             Err(SpoolError::ReadTooLarge)
@@ -1046,9 +1154,19 @@ mod tests {
         ));
         assert_eq!(handle.0.lock().unwrap().bytes.len(), committed_len);
         assert_eq!(spool.next_sample(), None);
+        assert_eq!(spool.next_counter, 2, "failed write must burn nonce 1");
         handle.0.lock().unwrap().fail_write_at = None;
-        spool.append(&span(0, &[0.1, 0.2])).unwrap();
+        spool.append(&span(0, &[0.7, 0.8])).unwrap();
         assert_eq!(spool.next_sample(), Some(2));
+        assert_eq!(spool.index[0].counter, 2);
+        assert_eq!(spool.next_counter, 3);
+        assert_eq!(
+            spool
+                .read_range(SampleRange::new(0, 2).unwrap())
+                .unwrap()
+                .samples(),
+            &[0.7, 0.8]
+        );
     }
 
     #[test]
@@ -1131,19 +1249,21 @@ mod tests {
     #[test]
     fn file_spool_cleanup_removes_the_file() {
         let directory = unique_test_directory();
-        let mut spool = EncryptedAudioSpool::create(&directory, SpoolQuota::default()).unwrap();
+        let root = SpoolRoot::open_or_create(&directory).unwrap();
+        let mut spool = EncryptedAudioSpool::create(&root, SpoolQuota::default()).unwrap();
         let path = spool.path().to_owned();
         spool.append(&span(0, &[0.1])).unwrap();
         assert!(path.exists());
         spool.cleanup().unwrap();
         assert!(!path.exists());
+        fs::remove_file(directory.join(OWNER_MARKER_NAME)).unwrap();
         fs::remove_dir(&directory).unwrap();
     }
 
     #[test]
     fn startup_scavenger_only_removes_exact_spool_names() {
         let directory = unique_test_directory();
-        fs::create_dir(&directory).unwrap();
+        let root = SpoolRoot::open_or_create(&directory).unwrap();
         let orphan = directory.join(format!(
             "{FILE_NAME_PREFIX}{}{FILE_NAME_SUFFIX}",
             "a".repeat(32)
@@ -1151,17 +1271,64 @@ mod tests {
         let unrelated = directory.join("keep-me.pxs");
         fs::write(&orphan, [1_u8, 2, 3]).unwrap();
         fs::write(&unrelated, [4_u8]).unwrap();
-        let report = scavenge_orphans(&directory).unwrap();
+        let report = scavenge_orphans(&root).unwrap();
         assert_eq!(
             report,
             ScavengeReport {
                 removed_files: 1,
-                removed_bytes: 3
+                removed_bytes: 3,
+                skipped_live_files: 0,
             }
         );
         assert!(!orphan.exists());
         assert!(unrelated.exists());
         fs::remove_file(unrelated).unwrap();
+        fs::remove_file(directory.join(OWNER_MARKER_NAME)).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn unmarked_nonempty_directory_is_never_a_spool_root() {
+        let directory = unique_test_directory();
+        fs::create_dir(&directory).unwrap();
+        let user_file = directory.join("user-data.txt");
+        fs::write(&user_file, b"keep").unwrap();
+        assert!(matches!(
+            SpoolRoot::open_or_create(&directory),
+            Err(SpoolError::UnownedRoot)
+        ));
+        assert_eq!(fs::read(&user_file).unwrap(), b"keep");
+        fs::remove_file(user_file).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn scavenger_refuses_a_live_locked_spool() {
+        let directory = unique_test_directory();
+        let root = SpoolRoot::open_or_create(&directory).unwrap();
+        let spool = EncryptedAudioSpool::create(&root, SpoolQuota::default()).unwrap();
+        let path = spool.path().to_owned();
+        let report = scavenge_orphans(&root).unwrap();
+        assert_eq!(report.removed_files, 0);
+        assert_eq!(report.skipped_live_files, 1);
+        assert!(path.exists());
+        drop(spool);
+        assert!(!path.exists());
+        fs::remove_file(directory.join(OWNER_MARKER_NAME)).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn record_decrypt_allocation_cannot_exceed_read_bound() {
+        let invalid = SpoolQuota {
+            max_record_samples: 10,
+            max_read_samples: 9,
+            ..SpoolQuota::default()
+        };
+        let (storage, _) = MemoryStorage::new();
+        assert!(matches!(
+            EncryptedAudioSpool::from_empty_storage(storage, invalid),
+            Err(SpoolError::InvalidQuota)
+        ));
     }
 }

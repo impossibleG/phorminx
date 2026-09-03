@@ -1,5 +1,12 @@
 //! Microphone capture and WAV utilities for Phorminx.
 
+mod extended;
+
+pub use extended::{
+    ExtendedCaptureConfig, ExtendedCaptureFault, ExtendedCaptureProgress, ExtendedCapturedAudio,
+    ExtendedRecording, ExtendedStorageKind, start_extended_default, start_extended_input,
+};
+
 use std::collections::TryReserveError;
 use std::path::Path;
 use std::sync::Arc;
@@ -558,6 +565,8 @@ pub enum CaptureError {
     BuildStream(cpal::Error),
     #[error("failed to start microphone stream: {0}")]
     PlayStream(cpal::Error),
+    #[error("failed to start the extended capture pump: {0}")]
+    PumpSpawn(std::io::Error),
     #[error(
         "microphone stream failed before producing audio ({warning_count} backend notifications)"
     )]
@@ -573,6 +582,10 @@ pub enum CaptureError {
         max_seconds: u64,
         dropped_samples: u64,
     },
+    #[error(transparent)]
+    Extended(#[from] ExtendedCaptureFault),
+    #[error("extended captures must be consumed through bounded snapshots")]
+    ExtendedCaptureRequiresSnapshots,
     #[error(
         "incremental snapshot range {start_sample}..{end_sample} exceeds the {observed_samples} observed samples"
     )]
