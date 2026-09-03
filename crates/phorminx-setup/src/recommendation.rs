@@ -16,14 +16,61 @@ pub enum RecommendationPreference {
     Fastest,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Exact candidate identity from the host's compiled/pinned catalog. This type
+/// is intentionally not deserializable; benchmark evidence may be persisted,
+/// but it cannot create recommendation authority.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TrustedCandidateIdentity {
+    candidate_id: ContentFreeId,
+    engine: EngineKind,
+    backend: BackendKind,
+    model_class: ModelClass,
+    model_digest: crate::Sha256Digest,
+    supported_languages: BTreeSet<Language>,
+    pt_brazil_instant_certified: bool,
+}
+
+impl TrustedCandidateIdentity {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        candidate_id: ContentFreeId,
+        engine: EngineKind,
+        backend: BackendKind,
+        model_class: ModelClass,
+        model_digest: crate::Sha256Digest,
+        supported_languages: impl IntoIterator<Item = Language>,
+        pt_brazil_instant_certified: bool,
+    ) -> Self {
+        Self {
+            candidate_id,
+            engine,
+            backend,
+            model_class,
+            model_digest,
+            supported_languages: supported_languages.into_iter().collect(),
+            pt_brazil_instant_certified,
+        }
+    }
+
+    fn matches(&self, evidence: &BenchmarkEvidence) -> bool {
+        self.candidate_id == evidence.candidate_id
+            && self.engine == evidence.engine
+            && self.backend == evidence.backend
+            && self.model_class == evidence.model_class
+            && self.model_digest == evidence.model_digest
+            && self.supported_languages == evidence.supported_languages
+            && self.pt_brazil_instant_certified == evidence.pt_brazil_instant_certified
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecommendationPolicy {
     pub protocol: BenchmarkProtocol,
     pub expected_build_id: ContentFreeId,
     pub expected_device_id: ContentFreeId,
     pub expected_driver_id: ContentFreeId,
-    pub allowed_artifact_digests: BTreeSet<crate::Sha256Digest>,
-    pub allowed_engine_backends: BTreeSet<(EngineKind, BackendKind)>,
+    trusted_candidates: BTreeMap<ContentFreeId, TrustedCandidateIdentity>,
     pub minimum_protected_token_exact_per_mille: u16,
     pub maximum_word_error_per_mille: u16,
     pub maximum_hallucination_per_mille: u16,
@@ -38,16 +85,27 @@ pub struct RecommendationPolicy {
 }
 
 impl RecommendationPolicy {
-    #[must_use]
     pub fn interactive(
         protocol_id: ContentFreeId,
         expected_build_id: ContentFreeId,
         expected_device_id: ContentFreeId,
         expected_driver_id: ContentFreeId,
-        allowed_artifact_digests: impl IntoIterator<Item = crate::Sha256Digest>,
-        allowed_engine_backends: impl IntoIterator<Item = (EngineKind, BackendKind)>,
-    ) -> Self {
-        Self {
+        trusted_candidates: impl IntoIterator<Item = TrustedCandidateIdentity>,
+    ) -> Result<Self, RecommendationPolicyError> {
+        let mut identities = BTreeMap::new();
+        for identity in trusted_candidates {
+            match identities.entry(identity.candidate_id.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(identity);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &identity => {
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(RecommendationPolicyError::ConflictingCandidateIdentity);
+                }
+            }
+        }
+        Ok(Self {
             protocol: BenchmarkProtocol {
                 protocol_id,
                 minimum_speech_samples: 3,
@@ -56,8 +114,7 @@ impl RecommendationPolicy {
             expected_build_id,
             expected_device_id,
             expected_driver_id,
-            allowed_artifact_digests: allowed_artifact_digests.into_iter().collect(),
-            allowed_engine_backends: allowed_engine_backends.into_iter().collect(),
+            trusted_candidates: identities,
             minimum_protected_token_exact_per_mille: 1_000,
             maximum_word_error_per_mille: 250,
             maximum_hallucination_per_mille: 0,
@@ -69,8 +126,14 @@ impl RecommendationPolicy {
             maximum_cold_load_ms: 10_000,
             maximum_warm_load_ms: 2_000,
             maximum_release_dispersion_ms: 300,
-        }
+        })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum RecommendationPolicyError {
+    #[error("trusted recommendation policy contains conflicting candidate identities")]
+    ConflictingCandidateIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -101,6 +164,8 @@ pub enum ExclusionReason {
     EvidenceContextMismatch,
     ArtifactNotAllowed,
     BackendNotAllowed,
+    CandidateNotAllowed,
+    CandidateIdentityMismatch,
     ConflictingEvidence,
 }
 
@@ -240,17 +305,21 @@ fn exclusion_reasons(
     {
         reasons.insert(ExclusionReason::EvidenceContextMismatch);
     }
-    if !policy
-        .allowed_artifact_digests
-        .contains(&evidence.model_digest)
-    {
-        reasons.insert(ExclusionReason::ArtifactNotAllowed);
-    }
-    if !policy
-        .allowed_engine_backends
-        .contains(&(evidence.engine, evidence.backend))
-    {
-        reasons.insert(ExclusionReason::BackendNotAllowed);
+    match policy.trusted_candidates.get(&evidence.candidate_id) {
+        None => {
+            reasons.insert(ExclusionReason::CandidateNotAllowed);
+        }
+        Some(identity) => {
+            if identity.model_digest != evidence.model_digest {
+                reasons.insert(ExclusionReason::ArtifactNotAllowed);
+            }
+            if identity.engine != evidence.engine || identity.backend != evidence.backend {
+                reasons.insert(ExclusionReason::BackendNotAllowed);
+            }
+            if !identity.matches(evidence) {
+                reasons.insert(ExclusionReason::CandidateIdentityMismatch);
+            }
+        }
     }
     if !evidence.supported_languages.contains(&language) {
         reasons.insert(ExclusionReason::LanguageIncompatible);
@@ -366,18 +435,26 @@ mod tests {
     use super::*;
     use crate::{BenchmarkSampleSummary, Sha256Digest};
 
-    fn policy() -> RecommendationPolicy {
+    fn policy(candidates: &[&CandidateEvidence]) -> RecommendationPolicy {
         RecommendationPolicy::interactive(
             ContentFreeId::new("setup-v1").unwrap(),
             ContentFreeId::new("build-1").unwrap(),
             ContentFreeId::new("device-class-1").unwrap(),
             ContentFreeId::new("driver-1").unwrap(),
-            [Sha256Digest::new("a".repeat(64)).unwrap()],
-            [
-                (EngineKind::Accurate, BackendKind::Vulkan),
-                (EngineKind::Instant, BackendKind::VoskNative),
-            ],
+            candidates.iter().map(|candidate| {
+                let evidence = &candidate.evidence;
+                TrustedCandidateIdentity::new(
+                    evidence.candidate_id.clone(),
+                    evidence.engine,
+                    evidence.backend,
+                    evidence.model_class,
+                    evidence.model_digest.clone(),
+                    evidence.supported_languages.iter().copied(),
+                    evidence.pt_brazil_instant_certified,
+                )
+            }),
         )
+        .unwrap()
     }
 
     fn candidate(
@@ -450,16 +527,17 @@ mod tests {
             100,
             300,
         );
+        let policy = policy(&[&base, &tiny]);
         let first = RecommendationEngine::recommend(
             Language::English,
             RecommendationPreference::Balanced,
-            &policy(),
+            &policy,
             [tiny.clone(), base.clone()],
         );
         let second = RecommendationEngine::recommend(
             Language::English,
             RecommendationPreference::Balanced,
-            &policy(),
+            &policy,
             [base, tiny],
         );
         assert_eq!(first, second);
@@ -467,28 +545,28 @@ mod tests {
 
     #[test]
     fn balanced_prefers_base_quality_over_tiny_speed() {
+        let tiny = candidate(
+            "tiny-fast",
+            EngineKind::Accurate,
+            ModelClass::Tiny,
+            Language::English,
+            120,
+            250,
+        );
+        let base = candidate(
+            "base-faithful",
+            EngineKind::Accurate,
+            ModelClass::Base,
+            Language::English,
+            40,
+            800,
+        );
+        let policy = policy(&[&tiny, &base]);
         let recommendation = RecommendationEngine::recommend(
             Language::English,
             RecommendationPreference::Balanced,
-            &policy(),
-            [
-                candidate(
-                    "tiny-fast",
-                    EngineKind::Accurate,
-                    ModelClass::Tiny,
-                    Language::English,
-                    120,
-                    250,
-                ),
-                candidate(
-                    "base-faithful",
-                    EngineKind::Accurate,
-                    ModelClass::Base,
-                    Language::English,
-                    40,
-                    800,
-                ),
-            ],
+            &policy,
+            [tiny, base],
         );
         assert!(matches!(
             recommendation.outcome,
@@ -519,10 +597,11 @@ mod tests {
             100,
             800,
         );
+        let policy = policy(&[&unsafe_tiny, &safe]);
         let recommendation = RecommendationEngine::recommend(
             Language::English,
             RecommendationPreference::Fastest,
-            &policy(),
+            &policy,
             [unsafe_tiny, safe],
         );
         assert!(matches!(
@@ -555,10 +634,11 @@ mod tests {
             80,
             800,
         );
+        let policy = policy(&[&instant, &accurate]);
         let recommendation = RecommendationEngine::recommend(
             Language::PortugueseBrazil,
             RecommendationPreference::Fastest,
-            &policy(),
+            &policy,
             [instant, accurate],
         );
         assert!(matches!(
@@ -584,10 +664,11 @@ mod tests {
             100,
         );
         insufficient.evidence.measurements.speech_samples = 1;
+        let policy = policy(&[&insufficient]);
         let recommendation = RecommendationEngine::recommend(
             Language::PortugueseBrazil,
             RecommendationPreference::Balanced,
-            &policy(),
+            &policy,
             [insufficient],
         );
         assert_eq!(
@@ -613,10 +694,11 @@ mod tests {
         );
         unsafe_candidate.evidence.measurements.available_memory_mib = 900;
         unsafe_candidate.evidence.measurements.peak_working_set_mib = 500;
+        let policy = policy(&[&unsafe_candidate]);
         let recommendation = RecommendationEngine::recommend(
             Language::English,
             RecommendationPreference::Balanced,
-            &policy(),
+            &policy,
             [unsafe_candidate],
         );
         assert_eq!(recommendation.outcome, RecommendationOutcome::Unavailable);
@@ -641,11 +723,12 @@ mod tests {
             0,
             100,
         );
+        let policy = policy(&[&fallback, &impossible]);
         impossible.evidence.backend = BackendKind::VoskNative;
         let recommendation = RecommendationEngine::recommend(
             Language::English,
             RecommendationPreference::Balanced,
-            &policy(),
+            &policy,
             [fallback, impossible],
         );
         assert_eq!(recommendation.outcome, RecommendationOutcome::Unavailable);
@@ -675,10 +758,11 @@ mod tests {
         candidate.evidence.measurements.release_p95_ms = 100;
         candidate.evidence.measurements.thermal_condition = ThermalCondition::Elevated;
         candidate.evidence.measurements.contention_condition = ContentionCondition::Contended;
+        let policy = policy(&[&candidate]);
         let recommendation = RecommendationEngine::recommend(
             Language::English,
             RecommendationPreference::Balanced,
-            &policy(),
+            &policy,
             [candidate],
         );
         assert_eq!(recommendation.outcome, RecommendationOutcome::Unavailable);
@@ -698,11 +782,12 @@ mod tests {
             0,
             100,
         );
+        let policy = policy(&[&stale]);
         stale.evidence.driver_id = ContentFreeId::new("old-driver").unwrap();
         let recommendation = RecommendationEngine::recommend(
             Language::English,
             RecommendationPreference::Balanced,
-            &policy(),
+            &policy,
             [stale],
         );
         assert_eq!(recommendation.outcome, RecommendationOutcome::Unavailable);
@@ -723,9 +808,10 @@ mod tests {
             0,
             100,
         );
+        let trusted_artifact = wrong_artifact.clone();
         wrong_artifact.evidence.model_digest = Sha256Digest::new("b".repeat(64)).unwrap();
 
-        let valid_artifact_wrong_policy_backend = candidate(
+        let mut wrong_backend = candidate(
             "wrong-backend-policy",
             EngineKind::Accurate,
             ModelClass::Base,
@@ -733,16 +819,15 @@ mod tests {
             0,
             100,
         );
-        let mut restricted = policy();
-        restricted.allowed_engine_backends = [(EngineKind::Instant, BackendKind::VoskNative)]
-            .into_iter()
-            .collect();
+        let trusted_backend = wrong_backend.clone();
+        wrong_backend.evidence.backend = BackendKind::Cpu;
+        let restricted = policy(&[&trusted_artifact, &trusted_backend]);
 
         let recommendation = RecommendationEngine::recommend(
             Language::English,
             RecommendationPreference::Balanced,
             &restricted,
-            [wrong_artifact, valid_artifact_wrong_policy_backend],
+            [wrong_artifact, wrong_backend],
         );
         assert_eq!(recommendation.outcome, RecommendationOutcome::Unavailable);
         assert!(recommendation.rejected_candidates.iter().any(|candidate| {
@@ -771,10 +856,11 @@ mod tests {
         );
         let mut conflicting = first.clone();
         conflicting.evidence.measurements.release_p95_ms = 200;
+        let policy = policy(&[&first]);
         let recommendation = RecommendationEngine::recommend(
             Language::English,
             RecommendationPreference::Balanced,
-            &policy(),
+            &policy,
             [first, conflicting],
         );
         assert_eq!(recommendation.outcome, RecommendationOutcome::Unavailable);
@@ -783,6 +869,87 @@ mod tests {
             recommendation.rejected_candidates[0]
                 .reasons
                 .contains(&ExclusionReason::ConflictingEvidence)
+        );
+    }
+
+    #[test]
+    fn allowed_identity_fields_cannot_be_recombined_as_a_cross_product() {
+        let instant = candidate(
+            "instant-en",
+            EngineKind::Instant,
+            ModelClass::Other,
+            Language::English,
+            40,
+            100,
+        );
+        let accurate = candidate(
+            "accurate-pt",
+            EngineKind::Accurate,
+            ModelClass::Base,
+            Language::PortugueseBrazil,
+            40,
+            100,
+        );
+        let policy = policy(&[&instant, &accurate]);
+        let mut forged = instant;
+        forged.evidence.engine = accurate.evidence.engine;
+        forged.evidence.backend = accurate.evidence.backend;
+        forged.evidence.model_class = accurate.evidence.model_class;
+        forged.evidence.supported_languages = accurate.evidence.supported_languages;
+
+        let recommendation = RecommendationEngine::recommend(
+            Language::PortugueseBrazil,
+            RecommendationPreference::Fastest,
+            &policy,
+            [forged],
+        );
+        assert_eq!(recommendation.outcome, RecommendationOutcome::Unavailable);
+        assert!(
+            recommendation.rejected_candidates[0]
+                .reasons
+                .contains(&ExclusionReason::CandidateIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn trusted_policy_rejects_conflicting_duplicate_candidate_identities() {
+        let first = candidate(
+            "same-id",
+            EngineKind::Accurate,
+            ModelClass::Base,
+            Language::English,
+            40,
+            100,
+        );
+        let second = candidate(
+            "same-id",
+            EngineKind::Instant,
+            ModelClass::Other,
+            Language::English,
+            40,
+            100,
+        );
+        let identities = [&first, &second].map(|candidate| {
+            let evidence = &candidate.evidence;
+            TrustedCandidateIdentity::new(
+                evidence.candidate_id.clone(),
+                evidence.engine,
+                evidence.backend,
+                evidence.model_class,
+                evidence.model_digest.clone(),
+                evidence.supported_languages.iter().copied(),
+                evidence.pt_brazil_instant_certified,
+            )
+        });
+        assert_eq!(
+            RecommendationPolicy::interactive(
+                ContentFreeId::new("setup-v1").unwrap(),
+                ContentFreeId::new("build-1").unwrap(),
+                ContentFreeId::new("device-class-1").unwrap(),
+                ContentFreeId::new("driver-1").unwrap(),
+                identities,
+            ),
+            Err(RecommendationPolicyError::ConflictingCandidateIdentity)
         );
     }
 }

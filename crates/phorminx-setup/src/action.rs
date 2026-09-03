@@ -779,14 +779,25 @@ pub struct ProbeTicket {
     pub generation: Generation,
 }
 
+/// Process-local authority for one exact execution attempt. It is deliberately
+/// not serializable, so delayed callbacks cannot reconstruct authority after a
+/// retry or process restart.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionTicket {
+    action_id: ActionId,
+    operation_generation: Generation,
+    attempt: u32,
+}
+
 #[derive(Default)]
 pub struct Coordinator {
     active: Option<ActionRuntime>,
+    action_generation: Generation,
     generations: BTreeMap<CapabilityId, Generation>,
 }
 
 impl Coordinator {
-    pub fn start(&mut self, action: SetupAction) -> Result<&ActionRuntime, CoordinatorError> {
+    pub fn start(&mut self, action: SetupAction) -> Result<ActionTicket, CoordinatorError> {
         if self
             .active
             .as_ref()
@@ -794,21 +805,26 @@ impl Coordinator {
         {
             return Err(CoordinatorError::Busy);
         }
+        self.action_generation = self.action_generation.next();
         self.active = Some(ActionRuntime::new(action));
-        Ok(self.active.as_ref().expect("just inserted"))
+        Ok(self.active_ticket().expect("just inserted"))
     }
 
     pub fn command(
         &mut self,
-        id: &ActionId,
+        ticket: &ActionTicket,
         command: ActionCommand,
     ) -> Result<&ActionRuntime, CoordinatorError> {
         let active = self
             .active
             .as_mut()
             .ok_or(CoordinatorError::NoActiveAction)?;
-        if active.action.id != *id {
+        if active.action.id != ticket.action_id {
             return Err(CoordinatorError::WrongAction);
+        }
+        if self.action_generation != ticket.operation_generation || active.attempt != ticket.attempt
+        {
+            return Err(CoordinatorError::StaleAttempt);
         }
         active.apply(command).map_err(CoordinatorError::Action)?;
         Ok(active)
@@ -817,6 +833,16 @@ impl Coordinator {
     #[must_use]
     pub fn active(&self) -> Option<&ActionRuntime> {
         self.active.as_ref()
+    }
+
+    /// Issues a ticket for the currently active execution attempt.
+    #[must_use]
+    pub fn active_ticket(&self) -> Option<ActionTicket> {
+        self.active.as_ref().map(|runtime| ActionTicket {
+            action_id: runtime.action.id.clone(),
+            operation_generation: self.action_generation,
+            attempt: runtime.attempt,
+        })
     }
 
     #[must_use]
@@ -870,6 +896,8 @@ pub enum CoordinatorError {
     NoActiveAction,
     #[error("command does not target the active setup operation")]
     WrongAction,
+    #[error("command belongs to an earlier execution attempt")]
+    StaleAttempt,
     #[error(transparent)]
     Action(#[from] ActionError),
 }
@@ -1293,15 +1321,14 @@ mod tests {
     fn rollback_blocked_releases_the_single_operation_coordinator() {
         let mut coordinator = Coordinator::default();
         let action = download();
-        let id = action.id().clone();
-        coordinator.start(action).unwrap();
+        let ticket = coordinator.start(action).unwrap();
         coordinator
-            .command(&id, ActionCommand::GrantConsent)
+            .command(&ticket, ActionCommand::GrantConsent)
             .unwrap();
-        coordinator.command(&id, ActionCommand::Start).unwrap();
+        coordinator.command(&ticket, ActionCommand::Start).unwrap();
         coordinator
             .command(
-                &id,
+                &ticket,
                 ActionCommand::Fail {
                     failure: ActionFailure::VerificationFailed,
                     retryable: false,
@@ -1309,11 +1336,11 @@ mod tests {
             )
             .unwrap();
         coordinator
-            .command(&id, ActionCommand::RequestRollback)
+            .command(&ticket, ActionCommand::RequestRollback)
             .unwrap();
         coordinator
             .command(
-                &id,
+                &ticket,
                 ActionCommand::Fail {
                     failure: ActionFailure::PermissionDenied,
                     retryable: false,
@@ -1331,7 +1358,7 @@ mod tests {
     fn coordinator_is_single_operation_and_generation_guarded() {
         let mut coordinator = Coordinator::default();
         let first = probe();
-        coordinator.start(first.clone()).unwrap();
+        let ticket = coordinator.start(first).unwrap();
         assert_eq!(coordinator.start(probe()), Err(CoordinatorError::Busy));
 
         let stale = coordinator.begin_probe(CapabilityId::Microphone);
@@ -1339,20 +1366,81 @@ mod tests {
         assert!(!coordinator.accepts_probe(&stale));
         assert!(coordinator.accepts_probe(&current));
 
-        coordinator
-            .command(first.id(), ActionCommand::Start)
-            .unwrap();
+        coordinator.command(&ticket, ActionCommand::Start).unwrap();
         coordinator
             .command(
-                first.id(),
+                &ticket,
                 ActionCommand::Progress(
                     ActionProgress::new(ActionPhase::Finalizing, 1, Some(1)).unwrap(),
                 ),
             )
             .unwrap();
         coordinator
-            .command(first.id(), ActionCommand::Succeed)
+            .command(&ticket, ActionCommand::Succeed)
             .unwrap();
         coordinator.start(probe()).unwrap();
+    }
+
+    #[test]
+    fn stale_action_attempt_cannot_mutate_a_retry() {
+        let mut coordinator = Coordinator::default();
+        let stale = coordinator.start(probe()).unwrap();
+        coordinator.command(&stale, ActionCommand::Start).unwrap();
+        coordinator
+            .command(
+                &stale,
+                ActionCommand::Fail {
+                    failure: ActionFailure::PlatformOperationFailed,
+                    retryable: true,
+                },
+            )
+            .unwrap();
+        coordinator.command(&stale, ActionCommand::Retry).unwrap();
+        let current = coordinator.active_ticket().unwrap();
+        coordinator.command(&current, ActionCommand::Start).unwrap();
+
+        assert_eq!(
+            coordinator.command(
+                &stale,
+                ActionCommand::Fail {
+                    failure: ActionFailure::ConsistencyFailure,
+                    retryable: false,
+                },
+            ),
+            Err(CoordinatorError::StaleAttempt)
+        );
+        assert!(matches!(
+            coordinator.active().map(|runtime| &runtime.state),
+            Some(ActionState::Running { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_ticket_cannot_mutate_a_later_operation_with_the_same_action_id() {
+        let mut coordinator = Coordinator::default();
+        let stale = coordinator.start(probe()).unwrap();
+        coordinator.command(&stale, ActionCommand::Start).unwrap();
+        coordinator
+            .command(
+                &stale,
+                ActionCommand::Progress(
+                    ActionProgress::new(ActionPhase::Finalizing, 1, Some(1)).unwrap(),
+                ),
+            )
+            .unwrap();
+        coordinator.command(&stale, ActionCommand::Succeed).unwrap();
+
+        let current = coordinator.start(probe()).unwrap();
+        coordinator.command(&current, ActionCommand::Start).unwrap();
+        assert_eq!(
+            coordinator.command(
+                &stale,
+                ActionCommand::Fail {
+                    failure: ActionFailure::ConsistencyFailure,
+                    retryable: false,
+                },
+            ),
+            Err(CoordinatorError::StaleAttempt)
+        );
     }
 }

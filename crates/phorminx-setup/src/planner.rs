@@ -3,10 +3,76 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionError, ActionId, ActionKey, CapabilityId, CapabilityRecord, CapabilityRecordError,
-    CapabilityValue, ContentFreeId, EngineKind, Language, Remedy, SetupAction, Sha256Digest,
-    Usability,
+    ActionError, ActionId, ActionKey, ArtifactDescriptor, CapabilityId, CapabilityRecord,
+    CapabilityRecordError, CapabilityValue, ContentFreeId, EngineKind, Language, Remedy,
+    SetupAction, Sha256Digest, Usability,
 };
+
+/// Process-local planning authority supplied by the host's compiled/pinned
+/// catalog. This type deliberately cannot be deserialized: persisted inventory
+/// may describe a problem, but it cannot mint a download or executable target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanningPolicy {
+    trusted_artifacts: BTreeSet<ArtifactDescriptor>,
+    ollama_tool: ContentFreeId,
+}
+
+impl PlanningPolicy {
+    pub const OLLAMA_TOOL_ID: &'static str = "ollama";
+
+    pub fn new(
+        trusted_artifacts: impl IntoIterator<Item = ArtifactDescriptor>,
+        ollama_tool: ContentFreeId,
+    ) -> Result<Self, PlanError> {
+        if ollama_tool.as_str() != Self::OLLAMA_TOOL_ID {
+            return Err(PlanError::UntrustedExternalTool);
+        }
+        Ok(Self {
+            trusted_artifacts: trusted_artifacts.into_iter().collect(),
+            ollama_tool,
+        })
+    }
+
+    #[must_use]
+    pub fn phorminx(trusted_artifacts: impl IntoIterator<Item = ArtifactDescriptor>) -> Self {
+        Self::new(
+            trusted_artifacts,
+            ContentFreeId::new(Self::OLLAMA_TOOL_ID).expect("static Ollama tool identity is valid"),
+        )
+        .expect("static Phorminx planning policy is valid")
+    }
+
+    fn authorize_record(&self, record: &CapabilityRecord) -> Result<(), PlanError> {
+        for remedy in record.remedies() {
+            match remedy {
+                Remedy::AcquireManagedAssets { artifacts }
+                | Remedy::ImportVerifiedAssets { artifacts } => {
+                    if !artifacts
+                        .iter()
+                        .all(|artifact| self.trusted_artifacts.contains(artifact))
+                    {
+                        return Err(PlanError::UntrustedArtifact);
+                    }
+                }
+                Remedy::GuidedExternalInstall { tool } | Remedy::StartExternalTool { tool } => {
+                    if tool != &self.ollama_tool {
+                        return Err(PlanError::UntrustedExternalTool);
+                    }
+                }
+                Remedy::Probe
+                | Remedy::ValidateInstalled
+                | Remedy::ActivateRecognition
+                | Remedy::GrantMicrophoneAccess
+                | Remedy::SelectMicrophone
+                | Remedy::PullOllamaModel { .. }
+                | Remedy::ApplyLaunchAtLogin { .. }
+                | Remedy::ChooseAlternative { .. }
+                | Remedy::UseDeterministicFormatting => {}
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -113,6 +179,7 @@ impl PersistedSetupPlan {
         self,
         desired: &DesiredConfiguration,
         capabilities: impl IntoIterator<Item = CapabilityRecord>,
+        policy: &PlanningPolicy,
     ) -> Result<SetupPlan, PlanError> {
         let candidate = SetupPlan {
             schema_version: self.schema_version,
@@ -120,7 +187,7 @@ impl PersistedSetupPlan {
             actions: self.actions,
         };
         candidate.validate()?;
-        let recomputed = Planner::plan(desired, capabilities)?;
+        let recomputed = Planner::plan(desired, capabilities, policy)?;
         if candidate != recomputed {
             return Err(PlanError::PersistedPlanMismatch);
         }
@@ -167,10 +234,12 @@ impl Planner {
     pub fn plan(
         desired: &DesiredConfiguration,
         capabilities: impl IntoIterator<Item = CapabilityRecord>,
+        policy: &PlanningPolicy,
     ) -> Result<SetupPlan, PlanError> {
         let mut inventory = BTreeMap::new();
         for capability in capabilities {
             capability.validate()?;
+            policy.authorize_record(&capability)?;
             match inventory.entry(capability.id().clone()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(capability);
@@ -194,11 +263,15 @@ impl Planner {
         };
 
         let mut graph = ActionGraph::default();
-        Self::plan_capability(&mut graph, inventory.get(&microphone), microphone.clone())?;
+        let microphone_tail =
+            Self::plan_capability(&mut graph, inventory.get(&microphone), microphone.clone())?;
         let recognition_tail =
             Self::plan_capability(&mut graph, inventory.get(&recognition), recognition.clone())?;
 
         let mut benchmark_dependencies = BTreeSet::new();
+        if let Some(tail) = microphone_tail {
+            benchmark_dependencies.insert(tail);
+        }
         if let Some(tail) = recognition_tail {
             benchmark_dependencies.insert(tail);
         }
@@ -562,6 +635,10 @@ pub enum PlanError {
     NotTopologicallySorted,
     #[error("managed asset acquisition requires at least one artifact")]
     EmptyAssetSet,
+    #[error("setup inventory references an artifact outside the trusted host catalog")]
+    UntrustedArtifact,
+    #[error("setup inventory references an external tool outside the trusted host policy")]
+    UntrustedExternalTool,
 }
 
 #[cfg(test)]
@@ -668,9 +745,14 @@ mod tests {
         }
     }
 
+    fn policy(artifacts: impl IntoIterator<Item = ArtifactDescriptor>) -> PlanningPolicy {
+        PlanningPolicy::phorminx(artifacts)
+    }
+
     #[test]
     fn plan_is_invariant_to_inventory_enumeration_order() {
         let model = artifact("whisper-base-en-f16", 'a');
+        let policy = policy([model.clone()]);
         let records = vec![
             ready(CapabilityId::Microphone),
             missing(
@@ -685,8 +767,8 @@ mod tests {
         let mut reversed = records.clone();
         reversed.reverse();
         assert_eq!(
-            Planner::plan(&desired(), records).unwrap(),
-            Planner::plan(&desired(), reversed).unwrap()
+            Planner::plan(&desired(), records, &policy).unwrap(),
+            Planner::plan(&desired(), reversed, &policy).unwrap()
         );
     }
 
@@ -695,17 +777,19 @@ mod tests {
         let capability = CapabilityId::AccurateRecognition {
             language: Language::English,
         };
+        let model = artifact("base-en", 'a');
+        let policy = policy([model.clone()]);
         let records = vec![
             ready(CapabilityId::Microphone),
             missing(
                 capability,
                 Remedy::AcquireManagedAssets {
-                    artifacts: [artifact("base-en", 'a')].into_iter().collect(),
+                    artifacts: [model].into_iter().collect(),
                 },
             ),
         ];
-        let first = Planner::plan(&desired(), records.clone()).unwrap();
-        let second = Planner::plan(&desired(), records).unwrap();
+        let first = Planner::plan(&desired(), records.clone(), &policy).unwrap();
+        let second = Planner::plan(&desired(), records, &policy).unwrap();
         assert_eq!(first, second);
         first.validate().unwrap();
         assert!(matches!(
@@ -732,7 +816,7 @@ mod tests {
                 },
             ),
         ];
-        let plan = Planner::plan(&desired(), records).unwrap();
+        let plan = Planner::plan(&desired(), records, &policy([])).unwrap();
         assert!(plan.actions().iter().all(|planned| !matches!(
             planned.action().key(),
             ActionKey::GuidedExternalInstall { .. }
@@ -766,7 +850,7 @@ mod tests {
                 Remedy::PullOllamaModel { digest },
             ),
         ];
-        let plan = Planner::plan(&configuration, records).unwrap();
+        let plan = Planner::plan(&configuration, records, &policy([])).unwrap();
         plan.validate().unwrap();
         let start_index = plan
             .actions
@@ -786,7 +870,7 @@ mod tests {
         let first = ready(CapabilityId::Microphone);
         let second = missing(CapabilityId::Microphone, Remedy::SelectMicrophone);
         assert_eq!(
-            Planner::plan(&desired(), [first, second]),
+            Planner::plan(&desired(), [first, second], &policy([])),
             Err(PlanError::ConflictingCapability)
         );
     }
@@ -805,13 +889,15 @@ mod tests {
             artifact_for("vosk-en-model", 'b', EngineKind::Instant, Language::English),
         ]
         .into_iter()
-        .collect();
+        .collect::<BTreeSet<_>>();
+        let policy = policy(artifacts.iter().cloned());
         let plan = Planner::plan(
             &desired,
             [
                 ready(CapabilityId::Microphone),
                 missing(instant, Remedy::AcquireManagedAssets { artifacts }),
             ],
+            &policy,
         )
         .unwrap();
         let native_actions = plan
@@ -837,10 +923,16 @@ mod tests {
                 }),
             ]
         };
-        let plan = Planner::plan(&desired(), inventory()).unwrap();
+        let policy = policy([]);
+        let plan = Planner::plan(&desired(), inventory(), &policy).unwrap();
         let persisted: PersistedSetupPlan =
             serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
-        assert_eq!(persisted.authorize(&desired(), inventory()).unwrap(), plan);
+        assert_eq!(
+            persisted
+                .authorize(&desired(), inventory(), &policy)
+                .unwrap(),
+            plan
+        );
         let mut relabelled = serde_json::to_value(&plan).unwrap();
         relabelled["actions"][0]["action"]["id"] = serde_json::json!(ActionId::for_key(
             &ActionKey::Probe(CapabilityId::Microphone)
@@ -863,6 +955,7 @@ mod tests {
                         language: Language::English,
                     }),
                 ],
+                &policy,
             ),
             Err(PlanError::PersistedPlanMismatch)
         );
@@ -915,6 +1008,7 @@ mod tests {
                 )
                 .unwrap(),
             ],
+            &policy([]),
         )
         .unwrap();
         assert!(plan.actions().iter().any(|planned| matches!(
@@ -935,6 +1029,7 @@ mod tests {
                     language: Language::English,
                 }),
             ],
+            &policy([]),
         )
         .unwrap();
         assert!(plan.actions().iter().any(|planned| matches!(
@@ -949,6 +1044,7 @@ mod tests {
             language: Language::English,
         };
         let model = artifact("base-en", 'a');
+        let policy = policy([model.clone()]);
         let record = CapabilityRecord::new(
             capability.clone(),
             None,
@@ -966,7 +1062,12 @@ mod tests {
             },
         ])
         .unwrap();
-        let plan = Planner::plan(&desired(), [ready(CapabilityId::Microphone), record]).unwrap();
+        let plan = Planner::plan(
+            &desired(),
+            [ready(CapabilityId::Microphone), record],
+            &policy,
+        )
+        .unwrap();
         assert!(matches!(
             plan.actions()[0].action().key(),
             ActionKey::ImportVerifiedAssets { .. }
@@ -981,6 +1082,8 @@ mod tests {
         configuration.formatting = FormattingChoice::Ollama {
             model_digest: digest.clone(),
         };
+        let model = artifact("base-en", 'a');
+        let policy = policy([model.clone()]);
         let plan = Planner::plan(
             &configuration,
             [
@@ -990,7 +1093,7 @@ mod tests {
                         language: Language::English,
                     },
                     Remedy::AcquireManagedAssets {
-                        artifacts: [artifact("base-en", 'a')].into_iter().collect(),
+                        artifacts: [model].into_iter().collect(),
                     },
                 ),
                 missing(
@@ -1006,6 +1109,7 @@ mod tests {
                     Remedy::PullOllamaModel { digest },
                 ),
             ],
+            &policy,
         )
         .unwrap();
         let benchmark = plan
@@ -1033,6 +1137,123 @@ mod tests {
             dependency_keys
                 .iter()
                 .any(|key| matches!(key, ActionKey::PullOllamaModel { .. }))
+        );
+    }
+
+    #[test]
+    fn benchmark_waits_for_microphone_remediation() {
+        let mut configuration = desired();
+        configuration.benchmark_protocol = Some(ContentFreeId::new("setup-v1").unwrap());
+        let plan = Planner::plan(
+            &configuration,
+            [
+                missing(CapabilityId::Microphone, Remedy::GrantMicrophoneAccess),
+                ready(CapabilityId::AccurateRecognition {
+                    language: Language::English,
+                }),
+            ],
+            &policy([]),
+        )
+        .unwrap();
+        let microphone = plan
+            .actions()
+            .iter()
+            .find(|planned| matches!(planned.action().key(), ActionKey::GrantMicrophoneAccess))
+            .unwrap();
+        let benchmark = plan
+            .actions()
+            .iter()
+            .find(|planned| matches!(planned.action().key(), ActionKey::RunBenchmark { .. }))
+            .unwrap();
+        assert!(benchmark.dependencies().contains(microphone.action().id()));
+        let microphone_index = plan
+            .actions()
+            .iter()
+            .position(|planned| planned.action().id() == microphone.action().id())
+            .unwrap();
+        let benchmark_index = plan
+            .actions()
+            .iter()
+            .position(|planned| planned.action().id() == benchmark.action().id())
+            .unwrap();
+        assert!(microphone_index < benchmark_index);
+    }
+
+    #[test]
+    fn inventory_cannot_mint_artifacts_outside_the_host_policy() {
+        let trusted = artifact("base-en", 'a');
+        let injected = ArtifactDescriptor::new(
+            trusted.asset_id().clone(),
+            trusted.digest().clone(),
+            trusted.size_bytes(),
+            trusted.vendor().clone(),
+            trusted.version().clone(),
+            trusted.license().clone(),
+            "https://attacker.invalid/base-en.bin",
+            trusted.kind(),
+            trusted.signer().cloned(),
+            trusted.engine(),
+            trusted.supported_languages().iter().copied(),
+        )
+        .unwrap();
+        let record = missing(
+            CapabilityId::AccurateRecognition {
+                language: Language::English,
+            },
+            Remedy::AcquireManagedAssets {
+                artifacts: [injected].into_iter().collect(),
+            },
+        );
+        assert_eq!(
+            Planner::plan(
+                &desired(),
+                [ready(CapabilityId::Microphone), record],
+                &policy([trusted]),
+            ),
+            Err(PlanError::UntrustedArtifact)
+        );
+    }
+
+    #[test]
+    fn inventory_cannot_mint_an_external_tool_identity() {
+        let record = missing(
+            CapabilityId::OllamaDaemon,
+            Remedy::GuidedExternalInstall {
+                tool: ContentFreeId::new("lookalike-installer").unwrap(),
+            },
+        );
+        assert_eq!(
+            Planner::plan(&desired(), [record], &policy([])),
+            Err(PlanError::UntrustedExternalTool)
+        );
+        assert_eq!(
+            PlanningPolicy::new([], ContentFreeId::new("lookalike-installer").unwrap(),),
+            Err(PlanError::UntrustedExternalTool)
+        );
+    }
+
+    #[test]
+    fn persisted_plan_reauthorization_uses_current_host_catalog() {
+        let model = artifact("base-en", 'a');
+        let inventory = || {
+            [
+                ready(CapabilityId::Microphone),
+                missing(
+                    CapabilityId::AccurateRecognition {
+                        language: Language::English,
+                    },
+                    Remedy::AcquireManagedAssets {
+                        artifacts: [model.clone()].into_iter().collect(),
+                    },
+                ),
+            ]
+        };
+        let plan = Planner::plan(&desired(), inventory(), &policy([model.clone()])).unwrap();
+        let persisted: PersistedSetupPlan =
+            serde_json::from_value(serde_json::to_value(plan).unwrap()).unwrap();
+        assert_eq!(
+            persisted.authorize(&desired(), inventory(), &policy([])),
+            Err(PlanError::UntrustedArtifact)
         );
     }
 }

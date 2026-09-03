@@ -15,7 +15,7 @@ mod recommendation;
 
 pub use action::{
     ActionCommand, ActionError, ActionFailure, ActionId, ActionKey, ActionPhase, ActionProgress,
-    ActionRuntime, ActionState, CancellationOutcome, ConsentCategory, Coordinator,
+    ActionRuntime, ActionState, ActionTicket, CancellationOutcome, ConsentCategory, Coordinator,
     CoordinatorError, ProbeTicket, RollbackCause, RollbackPolicy, RollbackResidue, SetupAction,
 };
 pub use asset::{
@@ -34,11 +34,12 @@ pub use capability::{
 };
 pub use planner::{
     DesiredConfiguration, FormattingChoice, PersistedSetupPlan, PlanError, PlannedAction, Planner,
-    RecognitionChoice, SetupPlan,
+    PlanningPolicy, RecognitionChoice, SetupPlan,
 };
 pub use recommendation::{
     CandidateEvidence, ExclusionReason, Recommendation, RecommendationEngine,
-    RecommendationOutcome, RecommendationPolicy, RecommendationPreference, RejectedCandidate,
+    RecommendationOutcome, RecommendationPolicy, RecommendationPolicyError,
+    RecommendationPreference, RejectedCandidate, TrustedCandidateIdentity,
 };
 
 /// Adapter implemented by a host that can observe a capability.
