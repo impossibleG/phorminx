@@ -23,6 +23,8 @@ mod profile_window;
 #[cfg(windows)]
 mod settings_window;
 #[cfg(windows)]
+mod setup_lock;
+#[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]
 mod startup;
@@ -63,6 +65,8 @@ pub use settings_window::{
     SettingsHistoryRetention, SettingsOllamaLifecycle, SettingsRecognitionMode,
     SettingsRecordingMode, SettingsWindow, SettingsWindowError, SettingsWindowEvent,
 };
+#[cfg(windows)]
+pub use setup_lock::{SetupOperationLock, SetupOperationLockError};
 #[cfg(windows)]
 pub use single_instance::{SingleInstance, SingleInstanceError, activate_existing_window};
 #[cfg(windows)]
