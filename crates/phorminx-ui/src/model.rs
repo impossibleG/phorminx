@@ -7,6 +7,7 @@ use std::fmt;
 pub enum Route {
     #[default]
     Home,
+    Setup,
     History,
     Lexicon,
     Profiles,
@@ -15,8 +16,9 @@ pub enum Route {
 }
 
 impl Route {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Home,
+        Self::Setup,
         Self::History,
         Self::Lexicon,
         Self::Profiles,
@@ -28,6 +30,7 @@ impl Route {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Home => "Home",
+            Self::Setup => "Setup",
             Self::History => "History",
             Self::Lexicon => "Lexicon",
             Self::Profiles => "Profiles",
@@ -40,6 +43,7 @@ impl Route {
     pub const fn title(self) -> &'static str {
         match self {
             Self::Home => "The instrument at rest",
+            Self::Setup => "Commissioning",
             Self::History => "Recovered thought",
             Self::Lexicon => "A deliberate vocabulary",
             Self::Profiles => "Policy by application",
@@ -52,6 +56,7 @@ impl Route {
     pub const fn context(self) -> &'static str {
         match self {
             Self::Home => "Voice, disciplined.",
+            Self::Setup => "Every local system, proven.",
             Self::History => "Compare what was spoken with what was kept.",
             Self::Lexicon => "Exact names. Exact replacements.",
             Self::Profiles => "Let context govern the instrument.",
@@ -108,6 +113,83 @@ pub struct SystemReadiness {
     pub name: String,
     pub detail: String,
     pub state: Readiness,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SetupStage {
+    #[default]
+    Discovering,
+    PlanReady,
+    AwaitingConsent,
+    Working,
+    Benchmarking,
+    Ready,
+    Blocked,
+}
+
+impl SetupStage {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Discovering => "Inspecting this machine",
+            Self::PlanReady => "Plan ready",
+            Self::AwaitingConsent => "Awaiting consent",
+            Self::Working => "Applying the plan",
+            Self::Benchmarking => "Measuring locally",
+            Self::Ready => "Commissioned",
+            Self::Blocked => "Needs attention",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupCapability {
+    pub id: String,
+    pub name: String,
+    pub detail: String,
+    pub state: Readiness,
+    pub remedy: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupAction {
+    pub id: String,
+    pub title: String,
+    pub detail: String,
+    pub progress_percent: Option<u8>,
+    pub consent: Vec<String>,
+    pub running: bool,
+    pub can_retry: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupRecommendation {
+    pub id: String,
+    pub title: String,
+    pub rationale: String,
+    pub evidence: Vec<String>,
+    pub can_apply: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupSnapshot {
+    pub stage: SetupStage,
+    pub summary: String,
+    pub capabilities: Vec<SetupCapability>,
+    pub actions: Vec<SetupAction>,
+    pub recommendation: Option<SetupRecommendation>,
+}
+
+impl Default for SetupSnapshot {
+    fn default() -> Self {
+        Self {
+            stage: SetupStage::Discovering,
+            summary: "Reading local capabilities. No changes are being made.".into(),
+            capabilities: Vec::new(),
+            actions: Vec::new(),
+            recommendation: None,
+        }
+    }
 }
 
 impl SystemReadiness {
@@ -443,6 +525,7 @@ pub struct ShellSnapshot {
     pub vosk: ModelSystem,
     pub ollama: ModelSystem,
     pub settings: SettingsSnapshot,
+    pub setup: SetupSnapshot,
     pub notice: Option<InlineNotice>,
 }
 
@@ -640,6 +723,73 @@ impl ShellSnapshot {
                 launch_at_login: true,
                 ..SettingsSnapshot::default()
             },
+            setup: SetupSnapshot {
+                stage: if error {
+                    SetupStage::Blocked
+                } else {
+                    SetupStage::PlanReady
+                },
+                summary: if error {
+                    "Core dictation is available; local refinement needs repair.".into()
+                } else {
+                    "The local stack is healthy. A measured recommendation is available.".into()
+                },
+                capabilities: vec![
+                    SetupCapability {
+                        id: "microphone".into(),
+                        name: "Microphone".into(),
+                        detail: "Studio USB · selected and available".into(),
+                        state: Readiness::Ready,
+                        remedy: None,
+                    },
+                    SetupCapability {
+                        id: "accurate-en".into(),
+                        name: "Accurate recognition".into(),
+                        detail: "Base English · Vulkan · resident".into(),
+                        state: Readiness::Ready,
+                        remedy: None,
+                    },
+                    SetupCapability {
+                        id: "ollama".into(),
+                        name: "Local refinement".into(),
+                        detail: if error {
+                            "Ollama is not running. Light output remains available.".into()
+                        } else {
+                            "Ollama · loopback verified".into()
+                        },
+                        state: if error {
+                            Readiness::Optional
+                        } else {
+                            Readiness::Ready
+                        },
+                        remedy: error.then(|| "Inspect".into()),
+                    },
+                ],
+                actions: error
+                    .then(|| SetupAction {
+                        id: "repair-ollama".into(),
+                        title: "Inspect local refinement".into(),
+                        detail: "Determine whether Ollama is absent, stopped, or incompatible."
+                            .into(),
+                        progress_percent: None,
+                        consent: Vec::new(),
+                        running: false,
+                        can_retry: false,
+                    })
+                    .into_iter()
+                    .collect(),
+                recommendation: (!error).then(|| SetupRecommendation {
+                    id: "balanced-base-vulkan".into(),
+                    title: "Base English on Vulkan".into(),
+                    rationale: "The measured quality advantage is worth the small latency cost."
+                        .into(),
+                    evidence: vec![
+                        "Warm release p95 · 1.18 s".into(),
+                        "Backend · Vulkan-capable GPU".into(),
+                    ],
+                    can_apply: true,
+                }),
+            },
             notice: error.then(|| InlineNotice {
                 kind: NoticeKind::Error,
                 title: "Local refinement unavailable".into(),
@@ -676,6 +826,11 @@ pub enum ShellEvent {
     CancelProfileEdit,
     RemoveProfile(String),
     VerifyModels,
+    RefreshSetup,
+    StartSetupAction(String),
+    CancelSetupAction(String),
+    RetrySetupAction(String),
+    ApplySetupRecommendation(String),
     ChangeWhisperModel(AccurateModel),
     InstallVerifiedVoskAssets,
     SelectOllamaModel(String),

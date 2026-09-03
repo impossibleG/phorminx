@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn sidebar_arrow_navigation_clamps_at_both_ends() {
         assert_eq!(adjacent_route(0, -1), Route::Home);
-        assert_eq!(adjacent_route(0, 1), Route::History);
+        assert_eq!(adjacent_route(0, 1), Route::Setup);
         let last = Route::ALL.len() - 1;
         assert_eq!(adjacent_route(last, 1), Route::Settings);
         assert_eq!(adjacent_route(last, -1), Route::Models);

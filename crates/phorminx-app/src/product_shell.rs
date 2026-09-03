@@ -15,8 +15,8 @@ use phorminx_ui::{
     FormattingStrength as ShellFormatting, HistoryItem, InlineNotice, LexiconCasePolicy,
     LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle as ShellLifecycle, PhorminxUi,
     ProfileInsertion, Readiness, RecognitionMode as ShellRecognitionMode,
-    RecordingMode as ShellRecording, Route, RuntimeStatus, SettingsSnapshot, ShellEvent,
-    ShellSnapshot, SystemReadiness,
+    RecordingMode as ShellRecording, Route, RuntimeStatus, SettingsSnapshot, SetupCapability,
+    SetupSnapshot, SetupStage, ShellEvent, ShellSnapshot, SystemReadiness,
 };
 use phorminx_whisper::WhisperReadiness;
 use phorminx_windows::{SystemAppearance, system_appearance};
@@ -444,6 +444,19 @@ impl ProductShellApp {
                 );
                 self.refresh();
             }
+            ShellEvent::RefreshSetup => {
+                self.readiness = UiReadinessSnapshot::checking(self.bridge.settings(), &self.store);
+                let (sender, receiver) = mpsc::channel();
+                self.readiness_rx = receiver;
+                probe_readiness(
+                    self.bridge.settings().clone(),
+                    self.store.clone(),
+                    self.loaded_whisper.clone(),
+                    UiVoskProbe::FullValidation,
+                    sender,
+                );
+                self.refresh();
+            }
             ShellEvent::NoticeAction if self.download_active => {
                 let _ = self
                     .events
@@ -492,7 +505,11 @@ impl ProductShellApp {
             | ShellEvent::NewLexiconEntry
             | ShellEvent::EditLexicon(_)
             | ShellEvent::NewProfile
-            | ShellEvent::EditProfile(_) => {}
+            | ShellEvent::EditProfile(_)
+            | ShellEvent::StartSetupAction(_)
+            | ShellEvent::CancelSetupAction(_)
+            | ShellEvent::RetrySetupAction(_)
+            | ShellEvent::ApplySetupRecommendation(_) => {}
             ShellEvent::CancelLexiconEdit => self.shell.close_lexicon_editor(),
             ShellEvent::CancelProfileEdit => self.shell.close_profile_editor(),
         }
@@ -727,7 +744,77 @@ fn map_snapshot(
                 .collect(),
         },
         settings: map_settings(settings, microphone),
+        setup: setup_snapshot(microphone, whisper, vosk, ollama),
         notice,
+    }
+}
+
+fn setup_snapshot(
+    microphone: &crate::ui_bridge::UiMicrophoneReadiness,
+    whisper: &crate::ui_bridge::UiWhisperReadiness,
+    vosk: &crate::ui_bridge::UiVoskReadiness,
+    ollama: &crate::ui_bridge::UiOllamaReadiness,
+) -> SetupSnapshot {
+    let core_ready = microphone.state == UiReadinessState::Ready
+        && (whisper.state == UiReadinessState::Ready || vosk.state == UiReadinessState::Ready);
+    SetupSnapshot {
+        stage: if [microphone.state, whisper.state, vosk.state, ollama.state]
+            .contains(&UiReadinessState::Checking)
+        {
+            SetupStage::Discovering
+        } else if core_ready {
+            SetupStage::Ready
+        } else {
+            SetupStage::Blocked
+        },
+        summary: if core_ready {
+            "Core local dictation is operational. Optional systems are reported separately."
+                .to_owned()
+        } else {
+            "One or more required local capabilities need attention.".to_owned()
+        },
+        capabilities: vec![
+            SetupCapability {
+                id: "microphone".to_owned(),
+                name: "Microphone".to_owned(),
+                detail: microphone.message.clone(),
+                state: map_readiness(microphone.state),
+                remedy: (microphone.state == UiReadinessState::NeedsAttention).then(|| {
+                    "Choose an available microphone or inspect Windows privacy access.".to_owned()
+                }),
+            },
+            SetupCapability {
+                id: "accurate-recognition".to_owned(),
+                name: "Accurate recognition".to_owned(),
+                detail: whisper.message.clone(),
+                state: map_readiness(whisper.state),
+                remedy: (whisper.state == UiReadinessState::NeedsAttention)
+                    .then(|| "Verify or acquire a compatible Whisper model.".to_owned()),
+            },
+            SetupCapability {
+                id: "instant-recognition".to_owned(),
+                name: "Instant recognition".to_owned(),
+                detail: vosk.message.clone(),
+                state: map_readiness(vosk.state),
+                remedy: (vosk.state == UiReadinessState::NeedsAttention).then(|| {
+                    "Verify or acquire matching Vosk runtime and model assets.".to_owned()
+                }),
+            },
+            SetupCapability {
+                id: "ollama".to_owned(),
+                name: "Local refinement".to_owned(),
+                detail: ollama.message.clone(),
+                state: if ollama.state == UiReadinessState::NeedsAttention {
+                    Readiness::Optional
+                } else {
+                    map_readiness(ollama.state)
+                },
+                remedy: (ollama.state == UiReadinessState::NeedsAttention)
+                    .then(|| "Optional. Light formatting remains ready without Ollama.".to_owned()),
+            },
+        ],
+        actions: Vec::new(),
+        recommendation: None,
     }
 }
 
@@ -875,6 +962,7 @@ fn optional(value: String) -> Option<String> {
 fn map_route(route: UiRoute) -> Route {
     match route {
         UiRoute::Home => Route::Home,
+        UiRoute::Setup => Route::Setup,
         UiRoute::History => Route::History,
         UiRoute::Lexicon => Route::Lexicon,
         UiRoute::Profiles => Route::Profiles,
@@ -885,6 +973,7 @@ fn map_route(route: UiRoute) -> Route {
 fn unmap_route(route: Route) -> UiRoute {
     match route {
         Route::Home => UiRoute::Home,
+        Route::Setup => UiRoute::Setup,
         Route::History => UiRoute::History,
         Route::Lexicon => UiRoute::Lexicon,
         Route::Profiles => UiRoute::Profiles,
@@ -1046,6 +1135,7 @@ mod tests {
     fn route_mapping_is_bidirectional() {
         for route in [
             UiRoute::Home,
+            UiRoute::Setup,
             UiRoute::History,
             UiRoute::Lexicon,
             UiRoute::Profiles,

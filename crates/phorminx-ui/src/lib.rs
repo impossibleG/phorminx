@@ -17,6 +17,7 @@ pub use model::{
     AccurateBackend, AccurateModel, AppearancePreference, ApplicationProfile, FormattingStrength,
     GalleryScenario, HistoryItem, HistoryVariant, InlineNotice, LexiconCasePolicy, LexiconDraft,
     LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle, ProfileDraft, ProfileInsertion,
-    Readiness, RecognitionMode, RecordingMode, Route, RuntimeStatus, SettingsSnapshot, ShellEvent,
-    ShellSnapshot, SystemReadiness,
+    Readiness, RecognitionMode, RecordingMode, Route, RuntimeStatus, SettingsSnapshot, SetupAction,
+    SetupCapability, SetupRecommendation, SetupSnapshot, SetupStage, ShellEvent, ShellSnapshot,
+    SystemReadiness,
 };

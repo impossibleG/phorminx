@@ -92,11 +92,121 @@ pub(crate) fn show(
 ) {
     match route {
         Route::Home => home(ui, snapshot, outbox),
+        Route::Setup => setup(ui, snapshot, outbox),
         Route::History => history(ui, snapshot, state, outbox),
         Route::Lexicon => lexicon(ui, snapshot, state, outbox),
         Route::Profiles => profiles(ui, snapshot, state, outbox),
         Route::Models => models(ui, snapshot, state, outbox),
         Route::Settings => settings(ui, snapshot, state, outbox),
+    }
+}
+
+fn setup(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
+    let tokens = ui.tokens();
+    page_header(ui, Route::Setup.title(), Route::Setup.context(), None);
+    ui.add_space(Space::LG);
+    metadata(ui, "Commissioning state");
+    ui.add_space(Space::XS);
+    ui.label(
+        RichText::new(snapshot.setup.stage.label())
+            .size(32.0)
+            .color(tokens.text),
+    );
+    ui.label(RichText::new(&snapshot.setup.summary).color(tokens.secondary_text));
+    ui.add_space(Space::MD);
+    if action(ui, "Inspect again", ActionTone::Secondary).clicked() {
+        outbox.push(ShellEvent::RefreshSetup);
+    }
+
+    ui.add_space(Space::XL);
+    section_title(
+        ui,
+        "01",
+        "Local capabilities",
+        "Observed evidence, not assumed readiness.",
+    );
+    for capability in &snapshot.setup.capabilities {
+        readiness_row(ui, &capability.name, &capability.detail, capability.state);
+        if let Some(remedy) = &capability.remedy {
+            ui.horizontal(|ui| {
+                ui.add_space(Space::MD);
+                ui.label(
+                    RichText::new(remedy)
+                        .size(12.0)
+                        .color(tokens.secondary_text),
+                );
+            });
+        }
+        hairline(ui);
+    }
+
+    if !snapshot.setup.actions.is_empty() {
+        ui.add_space(Space::XL);
+        section_title(
+            ui,
+            "02",
+            "Plan",
+            "Every side effect is disclosed before it begins.",
+        );
+        for planned in &snapshot.setup.actions {
+            ui.label(RichText::new(&planned.title).strong().color(tokens.text));
+            ui.label(RichText::new(&planned.detail).color(tokens.secondary_text));
+            for consent in &planned.consent {
+                ui.label(
+                    RichText::new(format!("Consent · {consent}"))
+                        .size(12.0)
+                        .color(tokens.accent),
+                );
+            }
+            if let Some(progress) = planned.progress_percent {
+                ui.add(egui::ProgressBar::new(f32::from(progress) / 100.0).show_percentage());
+            }
+            ui.horizontal(|ui| {
+                if planned.running {
+                    if action(ui, "Cancel", ActionTone::Secondary).clicked() {
+                        outbox.push(ShellEvent::CancelSetupAction(planned.id.clone()));
+                    }
+                } else if planned.can_retry {
+                    if action(ui, "Retry", ActionTone::Primary).clicked() {
+                        outbox.push(ShellEvent::RetrySetupAction(planned.id.clone()));
+                    }
+                } else if action(ui, "Review and continue", ActionTone::Primary).clicked() {
+                    outbox.push(ShellEvent::StartSetupAction(planned.id.clone()));
+                }
+            });
+            hairline(ui);
+        }
+    }
+
+    if let Some(recommendation) = &snapshot.setup.recommendation {
+        ui.add_space(Space::XL);
+        section_title(
+            ui,
+            "03",
+            "Measured recommendation",
+            "Evidence remains on this machine.",
+        );
+        ui.label(
+            RichText::new(&recommendation.title)
+                .size(22.0)
+                .color(tokens.text),
+        );
+        ui.label(RichText::new(&recommendation.rationale).color(tokens.secondary_text));
+        for evidence in &recommendation.evidence {
+            ui.label(
+                RichText::new(evidence)
+                    .monospace()
+                    .color(tokens.secondary_text),
+            );
+        }
+        if recommendation.can_apply {
+            ui.add_space(Space::SM);
+            if action(ui, "Apply recommendation", ActionTone::Primary).clicked() {
+                outbox.push(ShellEvent::ApplySetupRecommendation(
+                    recommendation.id.clone(),
+                ));
+            }
+        }
     }
 }
 

@@ -31,6 +31,7 @@ pub const MAX_HISTORY_LIMIT: usize = 500;
 pub enum UiRoute {
     #[default]
     Home,
+    Setup,
     History,
     Lexicon,
     Profiles,
