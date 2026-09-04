@@ -21,8 +21,16 @@ function Assert-True {
 $installer = Get-Content -LiteralPath $installerPath -Raw
 $releaseBuild = Get-Content -LiteralPath $buildScript -Raw
 Assert-True ($releaseBuild -match 'PhorminxBuild') "Release build must use the short native target path."
+Assert-True ($releaseBuild -match 'short-v2') "Release build must isolate caches created before short-path and native CRT alignment."
+Assert-True ($releaseBuild -match 'subst\.exe') "Release build must map per-user storage to a short drive root."
+Assert-True ($releaseBuild -match 'Dismount-ShortBuildDrive') "Release build must remove its temporary drive mapping."
+Assert-True ($releaseBuild -match '(?s)finally\s*\{\s*Dismount-ShortBuildDrive') "Temporary drive cleanup must be protected by a finally boundary."
+Assert-True ($releaseBuild -match 'CARGO_TARGET_DIR = "\$shortBuildDrive\\"') "Cargo must see the temporary drive root rather than the backing path."
 Assert-True ($releaseBuild -match 'desktop,vulkan') "Default Windows release must compile the Vulkan backend."
 Assert-True ($releaseBuild -match 'target-feature=\+crt-static') "Release build must statically link the MSVC CRT."
+Assert-True ($releaseBuild -match 'CMAKE_MSVC_RUNTIME_LIBRARY\s*=\s*"MultiThreaded"') "Native CMake targets must select the static MSVC CRT."
+Assert-True ($releaseBuild -match 'CMAKE_C_FLAGS_RELEASE\s*=\s*"/MT') "Native C release objects must compile with /MT."
+Assert-True ($releaseBuild -match 'CMAKE_CXX_FLAGS_RELEASE\s*=\s*"/MT') "Native C++ release objects must compile with /MT."
 Assert-True ($releaseBuild -match '/dependents') "Release packaging must inspect the executable dependency table."
 Assert-True ($releaseBuild -match 'api-ms-win-crt-.*msvcp.*vcruntime.*ucrtbase') "Release packaging must reject unbundled Microsoft C/C++ runtime dependencies."
 Assert-True ($installer -match '(?m)^PrivilegesRequired=lowest\r?$') "Installer must be per-user."

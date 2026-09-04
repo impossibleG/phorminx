@@ -15,7 +15,8 @@ Code signing is a release gate, but no signing identity or trusted timestamping 
 - Use an Inno Setup 6 script for an x64-compatible, per-user installation under `{localappdata}\Programs\Phorminx`.
 - Set `PrivilegesRequired=lowest` and provide no elevation override.
 - Install only the application executable. Speech and cleanup models remain separate, explicitly consented downloads.
-- Statically link the Microsoft C/C++ runtime in packaged builds. The release script inspects the PE dependency table and refuses to package an executable that still imports the unbundled MSVC/UCRT redistributable.
+- Statically link the Microsoft C/C++ runtime in packaged builds. Rust and the older whisper.cpp CMake project are both pinned to the static runtime; the release script inspects the final PE dependency table and refuses to package an executable that still imports the unbundled MSVC/UCRT redistributable.
+- Build native dependencies through a temporary drive-root mapping backed by versioned per-user LocalAppData storage. This keeps Vulkan shader-generator paths below legacy MSVC limits; the mapping is removed in a `finally` boundary and is never the installer source path.
 - Add Start Menu and uninstall entries.
 - Offer launch-at-login as an unchecked installer task that writes only the `Phorminx` value under the current user's Run key.
 - Treat an unsigned installer as a development artifact. `Build-PhorminxInstaller.ps1 -RequireSignedBinary` fails closed unless both the input binary and produced installer have valid Authenticode signatures. Signing configuration remains external to the repository and no signing success is claimed by this ADR.

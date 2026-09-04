@@ -15,9 +15,11 @@ Set-StrictMode -Version Latest
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $installerScript = Join-Path $repositoryRoot "packaging\phorminx.iss"
 # whisper.cpp's nested Vulkan shader project exceeds MSVC's reliable path
-# depth when Cargo uses a deep worktree target. Keep the native target short
-# and deterministic for both build and installer input.
-$releaseTargetDirectory = Join-Path $env:LOCALAPPDATA "PhorminxBuild"
+# depth even under LocalAppData. Keep the files in per-user storage, but expose
+# that storage through a temporary drive root while native code is compiling.
+# The versioned directory also prevents reuse of old CMake caches that recorded
+# the former long path.
+$releaseTargetDirectory = Join-Path $env:LOCALAPPDATA "PhorminxBuild\short-v2"
 $sourceExecutable = Join-Path $releaseTargetDirectory "release\phorminx-app.exe"
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $repositoryRoot "artifacts\installer"
@@ -29,22 +31,74 @@ if ($Version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
 $numericVersion = ([regex]::Match($Version, '^(\d+)\.(\d+)\.(\d+)')).Groups[1..3].Value -join '.'
 $numericVersion += '.0'
 
+function Mount-ShortBuildDrive {
+    param([Parameter(Mandatory)][string] $BackingDirectory)
+
+    New-Item -ItemType Directory -Force -Path $BackingDirectory | Out-Null
+    $resolvedBackingDirectory = (Resolve-Path -LiteralPath $BackingDirectory).Path
+    $substPath = Join-Path $env:SystemRoot "System32\subst.exe"
+    if (-not (Test-Path -LiteralPath $substPath -PathType Leaf)) {
+        throw "Windows subst.exe was not found; a short native build path cannot be created."
+    }
+
+    $occupied = @([System.IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name.Substring(0, 2) })
+    foreach ($codePoint in 90..80) {
+        $drive = "$([char]$codePoint):"
+        if ($occupied -contains $drive) {
+            continue
+        }
+        & $substPath $drive $resolvedBackingDirectory
+        if ($LASTEXITCODE -eq 0) {
+            if (Test-Path -LiteralPath "$drive\" -PathType Container) {
+                return $drive
+            }
+            # Do not leak a mapping if Windows accepted it but the mapped
+            # storage could not be resolved for Cargo.
+            & $substPath $drive /D | Out-Null
+        }
+    }
+
+    throw "No free drive letter was available for the short native build path."
+}
+
+function Dismount-ShortBuildDrive {
+    param([Parameter(Mandatory)][string] $Drive)
+
+    $substPath = Join-Path $env:SystemRoot "System32\subst.exe"
+    & $substPath $Drive /D
+    if ($LASTEXITCODE -ne 0) {
+        throw "The temporary native build drive $Drive could not be removed."
+    }
+}
+
 if (-not $SkipBuild) {
     & (Join-Path $PSScriptRoot "Enter-PhorminxDevShell.ps1") -Vulkan:(-not $Cpu)
     if ($LASTEXITCODE -ne 0) {
         throw "The Phorminx development shell could not be initialized."
     }
 
-    $env:CARGO_TARGET_DIR = $releaseTargetDirectory
     # The per-user installer deliberately ships one executable and cannot
     # elevate to install the Microsoft Visual C++ Redistributable. Pin the
     # release build to the static MSVC CRT so it also works on a clean host.
     Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue
     $env:RUSTFLAGS = "-C target-feature=+crt-static"
+    # whisper.cpp's CMake project predates CMP0091 and otherwise emits /MD
+    # objects even when Rust is using crt-static. Supply /MT explicitly for
+    # native release objects; the runtime-library variable also covers nested
+    # targets that opt into the modern policy.
+    $env:CMAKE_MSVC_RUNTIME_LIBRARY = "MultiThreaded"
+    $env:CMAKE_C_FLAGS_RELEASE = "/MT /O2 /Ob2 /DNDEBUG"
+    $env:CMAKE_CXX_FLAGS_RELEASE = "/MT /O2 /Ob2 /DNDEBUG"
     $features = if ($Cpu) { "desktop" } else { "desktop,vulkan" }
-    & cargo build --locked --release --package phorminx-app --features $features
-    if ($LASTEXITCODE -ne 0) {
-        throw "The desktop release build failed with exit code $LASTEXITCODE."
+    $shortBuildDrive = Mount-ShortBuildDrive -BackingDirectory $releaseTargetDirectory
+    try {
+        $env:CARGO_TARGET_DIR = "$shortBuildDrive\"
+        & cargo build --locked --release --package phorminx-app --features $features
+        if ($LASTEXITCODE -ne 0) {
+            throw "The desktop release build failed with exit code $LASTEXITCODE."
+        }
+    } finally {
+        Dismount-ShortBuildDrive -Drive $shortBuildDrive
     }
 }
 
