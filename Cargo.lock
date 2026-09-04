@@ -2696,6 +2696,7 @@ name = "phorminx-windows"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "tempfile",
  "thiserror 2.0.20",
  "windows",
 ]

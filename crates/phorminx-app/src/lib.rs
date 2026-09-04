@@ -3,6 +3,7 @@
 mod history_loader;
 pub mod incremental;
 pub mod model;
+pub mod ollama_onboarding;
 pub mod performance;
 pub mod product_shell;
 pub mod runtime;

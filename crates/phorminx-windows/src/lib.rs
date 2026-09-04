@@ -17,6 +17,8 @@ mod insertion;
 #[cfg(windows)]
 mod lexicon_window;
 #[cfg(windows)]
+mod ollama;
+#[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 mod profile_window;
@@ -51,6 +53,14 @@ pub use insertion::{ClipboardOnlyReason, InsertionOutcome, copy_and_maybe_paste}
 pub use lexicon_window::{
     LexiconCasePolicy, LexiconDraft, LexiconItem, LexiconWindow, LexiconWindowError,
     LexiconWindowEvent,
+};
+#[cfg(windows)]
+pub use ollama::{
+    AutomaticOllamaInstallAvailability, AutomaticOllamaInstallUnavailable,
+    OLLAMA_OFFICIAL_WINDOWS_DOWNLOAD, OllamaInstallConsentError, OllamaInstallReview,
+    OllamaInstallation, OllamaInstallationError, OllamaManualInstallAction,
+    OllamaUninstallGuidance, OpenOllamaDownloadError, inspect_ollama_installation,
+    ollama_automatic_install_availability, open_official_ollama_download,
 };
 #[cfg(windows)]
 pub use overlay::{OverlayError, OverlayStatus, StatusOverlay};

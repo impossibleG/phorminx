@@ -7,6 +7,7 @@
 mod client;
 mod document;
 mod model;
+mod onboarding;
 mod prompt;
 mod validation;
 
@@ -21,6 +22,12 @@ pub use document::{
 };
 pub use model::{
     ModelCatalog, ModelDetails, ModelName, ModelSelectionError, OllamaModel, SelectionPolicy,
+};
+pub use onboarding::{
+    AuthorizedModelPull, CuratedLanguage, CuratedModel, CuratedModelCatalog, CuratedModelId,
+    CuratedModelState, DaemonState, InstalledModelIdentity, ModelPullOutcome, ModelPullProgress,
+    ModelPullReview, OllamaOnboarding, OllamaOnboardingTransport, OllamaVersion, PullFailure,
+    PullResidue, TransportError, UreqOnboardingTransport,
 };
 pub use prompt::{FormatProfile, FormatPrompt, PromptError, PromptPlan, build_prompt};
 pub use validation::{
