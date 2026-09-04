@@ -173,6 +173,216 @@ pub struct SetupRecommendation {
     pub can_apply: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OllamaSetupState {
+    #[default]
+    Inspecting,
+    Missing,
+    Unsafe,
+    Stopped,
+    Incompatible,
+    Unhealthy,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OllamaOperationState {
+    #[default]
+    Idle,
+    OpeningOfficialPage,
+    Pulling,
+    Cancelling,
+    Activating,
+    Complete,
+    Failed,
+    ReconcileRequired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OllamaModelChoice {
+    pub id: String,
+    pub display_name: String,
+    pub exact_name: String,
+    pub summary: String,
+    pub languages: String,
+    pub model_bytes: u64,
+    pub minimum_free_disk_bytes: u64,
+    pub recommended_ram_bytes: u64,
+    pub installed: bool,
+    pub identity_matches: bool,
+    pub selected: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OllamaSetupSnapshot {
+    pub state: OllamaSetupState,
+    pub detail: String,
+    pub version: Option<String>,
+    pub operation: OllamaOperationState,
+    pub operation_detail: Option<String>,
+    pub progress_percent: Option<u8>,
+    pub can_inspect: bool,
+    pub controls_enabled: bool,
+    pub models: Vec<OllamaModelChoice>,
+}
+
+impl Default for OllamaSetupSnapshot {
+    fn default() -> Self {
+        Self {
+            state: OllamaSetupState::Inspecting,
+            detail: "Inspecting the documented per-user installation and loopback service.".into(),
+            version: None,
+            operation: OllamaOperationState::Idle,
+            operation_detail: None,
+            progress_percent: None,
+            can_inspect: false,
+            controls_enabled: false,
+            models: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PerformancePreference {
+    Fastest,
+    #[default]
+    Balanced,
+    Quality,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CalibrationCaptureState {
+    #[default]
+    Empty,
+    Starting,
+    Recording,
+    Processing,
+    Ready,
+    Failed,
+    Consumed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CalibrationPromptView {
+    pub id: String,
+    pub ordinal: usize,
+    pub kind: String,
+    pub text: String,
+    pub capture: CalibrationCaptureState,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BenchmarkCandidateView {
+    pub id: String,
+    pub title: String,
+    pub detail: String,
+    pub selected: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BenchmarkUnavailableView {
+    pub title: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BenchmarkEvidenceView {
+    pub candidate_id: String,
+    pub title: String,
+    pub release_p50_ms: u64,
+    pub release_p95_ms: u64,
+    pub realtime_factor_milli: u32,
+    pub word_error_per_mille: u16,
+    pub hallucination_per_mille: u16,
+    pub protected_token_exact_per_mille: u16,
+    pub peak_working_set_mib: u32,
+    pub available_memory_mib: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PerformanceRunState {
+    #[default]
+    Discovering,
+    NeedsCalibration,
+    Ready,
+    Running,
+    Cancelling,
+    Complete,
+    Failed,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PerformanceRollbackState {
+    #[default]
+    Inspecting,
+    None,
+    Ready,
+    StaleOrCorrupt,
+    Unavailable,
+    Working,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PerformanceRecommendationView {
+    pub id: String,
+    pub title: String,
+    pub rationale: String,
+    pub excluded: Vec<String>,
+    pub can_apply: bool,
+    pub can_revert: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PerformanceSetupSnapshot {
+    pub language: String,
+    pub preference: PerformancePreference,
+    pub state: PerformanceRunState,
+    pub detail: String,
+    pub progress_completed: u32,
+    pub progress_total: u32,
+    pub controls_enabled: bool,
+    pub can_start_benchmark: bool,
+    pub can_cancel_benchmark: bool,
+    pub can_reset_calibration: bool,
+    pub rollback_state: PerformanceRollbackState,
+    pub rollback_detail: Option<String>,
+    pub can_revert_after_restart: bool,
+    pub can_discard_rollback: bool,
+    pub candidates: Vec<BenchmarkCandidateView>,
+    pub unavailable: Vec<BenchmarkUnavailableView>,
+    pub prompts: Vec<CalibrationPromptView>,
+    pub evidence: Vec<BenchmarkEvidenceView>,
+    pub recommendation: Option<PerformanceRecommendationView>,
+}
+
+impl Default for PerformanceSetupSnapshot {
+    fn default() -> Self {
+        Self {
+            language: "English".into(),
+            preference: PerformancePreference::Balanced,
+            state: PerformanceRunState::Discovering,
+            detail: "Discovering exact, verified recognition candidates.".into(),
+            progress_completed: 0,
+            progress_total: 0,
+            controls_enabled: false,
+            can_start_benchmark: false,
+            can_cancel_benchmark: false,
+            can_reset_calibration: false,
+            rollback_state: PerformanceRollbackState::Inspecting,
+            rollback_detail: None,
+            can_revert_after_restart: false,
+            can_discard_rollback: false,
+            candidates: Vec::new(),
+            unavailable: Vec::new(),
+            prompts: Vec::new(),
+            evidence: Vec::new(),
+            recommendation: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupSnapshot {
     pub stage: SetupStage,
@@ -180,6 +390,8 @@ pub struct SetupSnapshot {
     pub capabilities: Vec<SetupCapability>,
     pub actions: Vec<SetupAction>,
     pub recommendation: Option<SetupRecommendation>,
+    pub ollama: OllamaSetupSnapshot,
+    pub performance: PerformanceSetupSnapshot,
 }
 
 impl Default for SetupSnapshot {
@@ -190,6 +402,8 @@ impl Default for SetupSnapshot {
             capabilities: Vec::new(),
             actions: Vec::new(),
             recommendation: None,
+            ollama: OllamaSetupSnapshot::default(),
+            performance: PerformanceSetupSnapshot::default(),
         }
     }
 }
@@ -889,6 +1103,7 @@ impl ShellSnapshot {
                     ],
                     can_apply: true,
                 }),
+                ..SetupSnapshot::default()
             },
             notice: error.then(|| InlineNotice {
                 kind: NoticeKind::Error,
@@ -931,6 +1146,22 @@ pub enum ShellEvent {
     CancelSetupAction(String),
     RetrySetupAction(String),
     ApplySetupRecommendation(String),
+    InspectOllama,
+    OpenOfficialOllamaDownload,
+    PullCuratedOllamaModel(String),
+    CancelOllamaPull,
+    ActivateCuratedOllamaModel(String),
+    SelectBenchmarkCandidate(String),
+    SetPerformancePreference(PerformancePreference),
+    StartCalibrationCapture(String),
+    StopCalibrationCapture(String),
+    DiscardCalibrationCapture(String),
+    ResetPerformanceCalibration,
+    StartPerformanceBenchmark,
+    CancelPerformanceBenchmark,
+    ApplyPerformanceRecommendation(String),
+    RevertPerformanceRecommendation,
+    DiscardPerformanceRollback,
     ChangeWhisperModel(AccurateModel),
     InstallVerifiedVoskAssets,
     SelectOllamaModel(String),

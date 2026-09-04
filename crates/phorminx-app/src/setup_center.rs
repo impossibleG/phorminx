@@ -503,6 +503,7 @@ impl SetupCenter {
             capabilities: capabilities(readiness),
             actions,
             recommendation: None,
+            ..SetupSnapshot::default()
         }
     }
 }

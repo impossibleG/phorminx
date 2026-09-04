@@ -963,6 +963,60 @@ impl TransientCalibrationAudio {
         Ok(())
     }
 
+    /// Replaces a captured calibration sample before the benchmark consumes it.
+    /// This is the only re-recording boundary: the previous in-memory clip is
+    /// dropped immediately and neither clip can be serialized or exported.
+    pub fn replace(
+        &self,
+        case_id: &ContentFreeId,
+        clip: AudioClip,
+    ) -> Result<(), PerformanceRuntimeError> {
+        if clip.sample_rate != CALIBRATION_SAMPLE_RATE
+            || !(MIN_CALIBRATION_DURATION..=MAX_CALIBRATION_DURATION).contains(&clip.duration())
+            || clip.samples.iter().any(|sample| !sample.is_finite())
+        {
+            return Err(PerformanceRuntimeError::Calibration);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PerformanceRuntimeError::Calibration)?;
+        if state
+            .consumed
+            .iter()
+            .any(|(_, consumed_case)| consumed_case == case_id)
+        {
+            return Err(PerformanceRuntimeError::Calibration);
+        }
+        let slot = state
+            .expected
+            .get_mut(case_id)
+            .ok_or(PerformanceRuntimeError::Calibration)?;
+        *slot = CalibrationSlot::Ready(clip);
+        Ok(())
+    }
+
+    /// Forgets one unconsumed capture. No audio or text is returned.
+    pub fn discard(&self, case_id: &ContentFreeId) -> Result<(), PerformanceRuntimeError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PerformanceRuntimeError::Calibration)?;
+        if state
+            .consumed
+            .iter()
+            .any(|(_, consumed_case)| consumed_case == case_id)
+        {
+            return Err(PerformanceRuntimeError::Calibration);
+        }
+        let slot = state
+            .expected
+            .get_mut(case_id)
+            .ok_or(PerformanceRuntimeError::Calibration)?;
+        *slot = CalibrationSlot::Empty;
+        Ok(())
+    }
+
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.state.lock().is_ok_and(|state| {
@@ -2215,6 +2269,30 @@ mod tests {
             MeasurementFailure::CaptureFailed
         );
         assert!(audio.take_for(&id("candidate-two"), case).is_ok());
+    }
+
+    #[test]
+    fn discarding_a_re_record_target_removes_the_prior_unconsumed_clip() {
+        let audio = TransientCalibrationAudio::pinned_v1(Language::English);
+        for prompt in audio.prompts() {
+            audio
+                .submit(
+                    &prompt.case_id,
+                    AudioClip::new(vec![0.1; 3_200], CALIBRATION_SAMPLE_RATE).unwrap(),
+                )
+                .unwrap();
+        }
+        assert!(audio.is_ready());
+        let replaced = audio.prompts()[0].case_id.clone();
+        audio.discard(&replaced).unwrap();
+        assert!(!audio.is_ready());
+        audio
+            .replace(
+                &replaced,
+                AudioClip::new(vec![0.2; 3_200], CALIBRATION_SAMPLE_RATE).unwrap(),
+            )
+            .unwrap();
+        assert!(audio.is_ready());
     }
 
     #[test]

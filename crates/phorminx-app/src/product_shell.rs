@@ -29,6 +29,7 @@ use crate::settings::{
     Settings, SettingsStore,
 };
 use crate::setup_center::{BenchmarkUnavailable, SetupCenter};
+use crate::setup_features::SetupFeatures;
 use crate::ui_bridge::{
     DEFAULT_HISTORY_LIMIT, UiBridge, UiCommand, UiEffect, UiLexiconDraft, UiMutation,
     UiProfileDraft, UiReadinessSnapshot, UiReadinessState, UiRoute, UiRuntimeStatus, UiSnapshot,
@@ -180,6 +181,11 @@ fn run_shell(
     // make dictation or the unified shell fail to start.
     let setup_center =
         SetupCenter::open(store.clone(), std::sync::Arc::new(BenchmarkUnavailable)).ok();
+    let setup_features = SetupFeatures::open(
+        store.clone(),
+        bridge.settings(),
+        initial_route == UiRoute::Setup && initially_visible,
+    );
     let readiness = UiReadinessSnapshot::checking(bridge.settings(), &store);
     let snapshot = bridge
         .snapshot(initial_status, readiness.clone(), DEFAULT_HISTORY_LIMIT)
@@ -228,6 +234,7 @@ fn run_shell(
         loaded_whisper,
         history_loader,
         setup_center,
+        setup_features,
         readiness_started,
         initially_visible,
     );
@@ -300,6 +307,7 @@ struct ProductShellApp {
     quitting: bool,
     history_loader: HistoryLoader,
     setup_center: Option<SetupCenter>,
+    setup_features: SetupFeatures,
     window_visible: bool,
 }
 
@@ -318,18 +326,17 @@ impl ProductShellApp {
         loaded_whisper: Option<WhisperReadiness>,
         history_loader: HistoryLoader,
         setup_center: Option<SetupCenter>,
+        setup_features: SetupFeatures,
         readiness_started: bool,
         initially_visible: bool,
     ) -> Self {
+        let mut setup = setup_center
+            .as_ref()
+            .map(|center| center.snapshot(&readiness))
+            .unwrap_or_else(unavailable_setup_snapshot);
+        setup_features.enrich(&mut setup);
         let mut app = Self {
-            shell: PhorminxUi::new(map_snapshot_with_setup(
-                snapshot,
-                route,
-                None,
-                setup_center
-                    .as_ref()
-                    .map(|center| center.snapshot(&readiness)),
-            )),
+            shell: PhorminxUi::new(map_snapshot_with_setup(snapshot, route, None, Some(setup))),
             bridge,
             readiness,
             route,
@@ -346,6 +353,7 @@ impl ProductShellApp {
             quitting: false,
             history_loader,
             setup_center,
+            setup_features,
             window_visible: initially_visible,
         };
         if !readiness_started {
@@ -365,15 +373,17 @@ impl ProductShellApp {
             DEFAULT_HISTORY_LIMIT,
         ) {
             Ok(snapshot) => {
-                let setup = self
+                let mut setup = self
                     .setup_center
                     .as_ref()
-                    .map(|center| center.snapshot(&self.readiness));
+                    .map(|center| center.snapshot(&self.readiness))
+                    .unwrap_or_else(unavailable_setup_snapshot);
+                self.setup_features.enrich(&mut setup);
                 self.shell.apply_snapshot(map_snapshot_with_setup(
                     snapshot,
                     self.route,
                     self.notice.clone(),
-                    setup,
+                    Some(setup),
                 ))
             }
             Err(error) => self.set_error(error.to_string()),
@@ -387,6 +397,15 @@ impl ProductShellApp {
             detail: message,
             action: None,
         });
+    }
+
+    fn setup_mutation_active(&self) -> bool {
+        self.setup_center.as_ref().is_some_and(|center| {
+            matches!(
+                center.snapshot(&self.readiness).stage,
+                SetupStage::AwaitingConsent | SetupStage::Working | SetupStage::Benchmarking
+            )
+        })
     }
 
     fn ensure_history_detail(&mut self) {
@@ -533,7 +552,13 @@ impl ProductShellApp {
     fn handle_shell_event(&mut self, event: ShellEvent) {
         match event {
             ShellEvent::Navigate(route) => {
-                self.route = unmap_route(route);
+                let destination = unmap_route(route);
+                if self.route == UiRoute::Setup && destination != UiRoute::Setup {
+                    self.setup_features.deactivate();
+                } else if self.route != UiRoute::Setup && destination == UiRoute::Setup {
+                    self.setup_features.activate(self.bridge.settings());
+                }
+                self.route = destination;
                 if self.route != UiRoute::History {
                     self.history_loader.invalidate();
                     self.shell.clear_history_detail();
@@ -604,9 +629,15 @@ impl ProductShellApp {
                 }
                 self.readiness = UiReadinessSnapshot::checking(self.bridge.settings(), &self.store);
                 self.request_readiness(UiVoskProbe::FullValidation);
+                self.setup_features.refresh_local_features();
                 self.refresh();
             }
             ShellEvent::StartSetupAction(id) | ShellEvent::RetrySetupAction(id) => {
+                if self.setup_features.mutation_conflict() {
+                    self.set_error("Finish or cancel calibration, measurement, or model acquisition before changing setup assets.".to_owned());
+                    self.refresh();
+                    return;
+                }
                 let result = self
                     .setup_center
                     .as_mut()
@@ -655,6 +686,126 @@ impl ProductShellApp {
                 settings.formatting.ollama_model = Some(model);
                 settings.formatting.ollama_model_identity = None;
                 self.execute(UiCommand::SaveSettings(settings));
+            }
+            ShellEvent::InspectOllama => {
+                self.setup_features.inspect_ollama();
+                self.refresh();
+            }
+            ShellEvent::OpenOfficialOllamaDownload => {
+                self.setup_features.open_official_ollama_page();
+                self.refresh();
+            }
+            ShellEvent::PullCuratedOllamaModel(id) => {
+                if self.setup_mutation_active() {
+                    self.set_error(
+                        "Finish the active setup repair before acquiring an Ollama model."
+                            .to_owned(),
+                    );
+                    self.refresh();
+                    return;
+                }
+                self.setup_features.pull_ollama_model(&id);
+                self.refresh();
+            }
+            ShellEvent::CancelOllamaPull => {
+                self.setup_features.cancel_ollama_pull();
+                self.refresh();
+            }
+            ShellEvent::ActivateCuratedOllamaModel(id) => {
+                if self.setup_mutation_active() {
+                    self.set_error(
+                        "Finish the active setup repair before changing the runtime model."
+                            .to_owned(),
+                    );
+                    self.refresh();
+                    return;
+                }
+                self.setup_features.activate_ollama_model(&id);
+                self.refresh();
+            }
+            ShellEvent::SelectBenchmarkCandidate(id) => {
+                self.setup_features.select_benchmark_candidate(&id);
+                self.refresh();
+            }
+            ShellEvent::SetPerformancePreference(preference) => {
+                self.setup_features.set_preference(preference);
+                self.refresh();
+            }
+            ShellEvent::StartCalibrationCapture(id) => {
+                if self.setup_mutation_active() {
+                    self.set_error(
+                        "Finish the active setup repair before opening the calibration microphone."
+                            .to_owned(),
+                    );
+                    self.refresh();
+                    return;
+                }
+                self.setup_features
+                    .start_capture(&id, self.bridge.settings().recognition.microphone.clone());
+                self.refresh();
+            }
+            ShellEvent::StopCalibrationCapture(id) => {
+                self.setup_features.stop_capture(&id);
+                self.refresh();
+            }
+            ShellEvent::DiscardCalibrationCapture(id) => {
+                self.setup_features.discard_capture(&id);
+                self.refresh();
+            }
+            ShellEvent::ResetPerformanceCalibration => {
+                self.setup_features.reset_performance_calibration();
+                self.refresh();
+            }
+            ShellEvent::StartPerformanceBenchmark => {
+                if self.setup_mutation_active() {
+                    self.set_error(
+                        "Finish the active setup repair before measuring performance.".to_owned(),
+                    );
+                    self.refresh();
+                    return;
+                }
+                self.setup_features.start_benchmark();
+                self.refresh();
+            }
+            ShellEvent::CancelPerformanceBenchmark => {
+                self.setup_features.cancel_benchmark();
+                self.refresh();
+            }
+            ShellEvent::ApplyPerformanceRecommendation(id) => {
+                if self.setup_mutation_active() {
+                    self.set_error(
+                        "Finish the active setup repair before applying a recommendation."
+                            .to_owned(),
+                    );
+                    self.refresh();
+                    return;
+                }
+                self.setup_features.apply_recommendation(&id);
+                self.refresh();
+            }
+            ShellEvent::RevertPerformanceRecommendation => {
+                if self.setup_mutation_active() {
+                    self.set_error(
+                        "Finish the active setup repair before reverting a recommendation."
+                            .to_owned(),
+                    );
+                    self.refresh();
+                    return;
+                }
+                self.setup_features.revert_recommendation();
+                self.refresh();
+            }
+            ShellEvent::DiscardPerformanceRollback => {
+                if self.setup_mutation_active() {
+                    self.set_error(
+                        "Finish the active setup repair before discarding rollback state."
+                            .to_owned(),
+                    );
+                    self.refresh();
+                    return;
+                }
+                self.setup_features.discard_persisted_rollback();
+                self.refresh();
             }
             ShellEvent::SaveSettings(form) => {
                 let settings = apply_settings_snapshot(self.bridge.settings(), &form);
@@ -725,6 +876,11 @@ impl eframe::App for ProductShellApp {
         while let Ok(control) = self.controls.try_recv() {
             match control {
                 ProductShellControl::Focus(route) => {
+                    if self.route == UiRoute::Setup && route != UiRoute::Setup {
+                        self.setup_features.deactivate();
+                    } else if self.route != UiRoute::Setup && route == UiRoute::Setup {
+                        self.setup_features.activate(self.bridge.settings());
+                    }
                     self.window_visible = true;
                     self.route = route;
                     if self.route != UiRoute::History {
@@ -782,6 +938,7 @@ impl eframe::App for ProductShellApp {
                     self.refresh();
                 }
                 ProductShellControl::Quit => {
+                    self.setup_features.deactivate();
                     self.window_visible = false;
                     self.history_loader.invalidate();
                     self.quitting = true;
@@ -798,6 +955,7 @@ impl eframe::App for ProductShellApp {
                     return;
                 }
                 self.readiness = readiness;
+                self.setup_features.reconfigure(self.bridge.settings());
                 if let Some(center) = self.setup_center.as_mut()
                     && center
                         .replan(self.bridge.settings(), &self.readiness)
@@ -828,6 +986,7 @@ impl eframe::App for ProductShellApp {
                         self.readiness =
                             UiReadinessSnapshot::checking(self.bridge.settings(), &self.store);
                         self.request_readiness(UiVoskProbe::FullValidation);
+                        self.setup_features.refresh_local_features();
                     }
                 }
                 Ok(false) => {}
@@ -838,7 +997,27 @@ impl eframe::App for ProductShellApp {
                 }
             }
         }
+        let feature_poll = self.setup_features.poll();
+        if feature_poll.settings_refresh && self.bridge.reload_settings().is_err() {
+            self.set_error(
+                "Updated setup settings could not be reloaded in the control panel.".to_owned(),
+            );
+        }
+        if feature_poll.runtime_reload {
+            if self.bridge.reload_settings().is_err() {
+                self.set_error("Updated setup settings could not be reloaded.".to_owned());
+            } else {
+                let _ = self.events.send(ProductShellEvent::RuntimeReloadRequested(
+                    UiMutation::SettingsSaved,
+                ));
+                self.setup_features.reconfigure(self.bridge.settings());
+            }
+        }
+        if feature_poll.changed {
+            self.refresh();
+        }
         if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
+            self.setup_features.deactivate();
             self.window_visible = false;
             self.history_loader.invalidate();
             self.shell.clear_history_detail();
@@ -1015,13 +1194,17 @@ fn map_snapshot_with_setup(
     if let Some(setup) = setup {
         mapped.setup = setup;
     } else {
-        mapped.setup = SetupSnapshot {
-            stage: SetupStage::Blocked,
-            summary: "Setup and repair are unavailable in this session. Dictation settings were not changed.".to_owned(),
-            ..SetupSnapshot::default()
-        };
+        mapped.setup = unavailable_setup_snapshot();
     }
     mapped
+}
+
+fn unavailable_setup_snapshot() -> SetupSnapshot {
+    SetupSnapshot {
+        stage: SetupStage::Blocked,
+        summary: "Transactional asset repair is unavailable in this session. Local refinement and measurement remain independently inspectable.".to_owned(),
+        ..SetupSnapshot::default()
+    }
 }
 
 fn setup_snapshot(
@@ -1090,6 +1273,7 @@ fn setup_snapshot(
         ],
         actions: Vec::new(),
         recommendation: None,
+        ..SetupSnapshot::default()
     }
 }
 

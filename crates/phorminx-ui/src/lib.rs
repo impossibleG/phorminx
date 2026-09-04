@@ -14,10 +14,15 @@ pub mod theme;
 pub use app::PhorminxUi;
 pub use gallery::ComponentGallery;
 pub use model::{
-    AccurateBackend, AccurateModel, AppearancePreference, ApplicationProfile, FormattingStrength,
-    GalleryScenario, HistoryItem, HistoryLoadedText, HistoryVariant, HistoryVariantAvailability,
-    InlineNotice, LexiconCasePolicy, LexiconDraft, LexiconEntry, ModelSystem, NoticeKind,
-    OllamaLifecycle, ProfileDraft, ProfileInsertion, Readiness, RecognitionMode, RecordingMode,
-    Route, RuntimeStatus, SettingsSnapshot, SetupAction, SetupCapability, SetupRecommendation,
-    SetupSnapshot, SetupStage, ShellEvent, ShellSnapshot, SystemReadiness,
+    AccurateBackend, AccurateModel, AppearancePreference, ApplicationProfile,
+    BenchmarkCandidateView, BenchmarkEvidenceView, BenchmarkUnavailableView,
+    CalibrationCaptureState, CalibrationPromptView, FormattingStrength, GalleryScenario,
+    HistoryItem, HistoryLoadedText, HistoryVariant, HistoryVariantAvailability, InlineNotice,
+    LexiconCasePolicy, LexiconDraft, LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle,
+    OllamaModelChoice, OllamaOperationState, OllamaSetupSnapshot, OllamaSetupState,
+    PerformancePreference, PerformanceRecommendationView, PerformanceRollbackState,
+    PerformanceRunState, PerformanceSetupSnapshot, ProfileDraft, ProfileInsertion, Readiness,
+    RecognitionMode, RecordingMode, Route, RuntimeStatus, SettingsSnapshot, SetupAction,
+    SetupCapability, SetupRecommendation, SetupSnapshot, SetupStage, ShellEvent, ShellSnapshot,
+    SystemReadiness,
 };

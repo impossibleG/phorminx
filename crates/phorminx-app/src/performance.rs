@@ -780,6 +780,16 @@ pub struct AppliedRecommendation {
     rollback_nonce: u64,
 }
 
+/// Content-free status of the narrow persisted recognition rollback receipt.
+/// The receipt itself and its filesystem location never cross this boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistedRollbackState {
+    None,
+    Ready,
+    StaleOrCorrupt,
+    Unavailable,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecognitionRollbackFields {
@@ -1155,6 +1165,36 @@ impl PerformanceRecommender {
             .lock()
             .map_err(|_| ApplyError::Settings)?;
         rollback_persisted_locked(store, None)
+    }
+
+    /// Inspects rollback eligibility without changing settings or deleting a
+    /// stale receipt. Expensive filesystem work belongs on a background worker.
+    #[must_use]
+    pub fn persisted_rollback_state(store: &SettingsStore) -> PersistedRollbackState {
+        let Ok(_rollback_guard) = ROLLBACK_SAVE_LOCK.lock() else {
+            return PersistedRollbackState::Unavailable;
+        };
+        let Ok(path) = rollback_receipt_path(store) else {
+            return PersistedRollbackState::Unavailable;
+        };
+        match path.try_exists() {
+            Ok(false) => return PersistedRollbackState::None,
+            Err(_) => return PersistedRollbackState::Unavailable,
+            Ok(true) => {}
+        }
+        let Ok(receipt) = load_rollback_receipt(store) else {
+            return PersistedRollbackState::StaleOrCorrupt;
+        };
+        let Ok(current) = store.load() else {
+            return PersistedRollbackState::Unavailable;
+        };
+        let digest_matches =
+            settings_digest(&current).is_ok_and(|digest| digest == receipt.applied_settings_sha256);
+        if digest_matches && RecognitionRollbackFields::from_settings(&current) == receipt.applied {
+            PersistedRollbackState::Ready
+        } else {
+            PersistedRollbackState::StaleOrCorrupt
+        }
     }
 
     /// Permanently discards the pending rollback without changing settings.
@@ -2066,6 +2106,51 @@ mod tests {
             PerformanceRecommender::rollback_after_restart(&store),
             Err(ApplyError::StaleRollback)
         ));
+    }
+
+    #[test]
+    fn persisted_rollback_probe_distinguishes_none_ready_stale_corrupt_and_oversize() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(directory.path().join("settings.toml")).unwrap();
+        let original = Settings::default();
+        store.save(&original).unwrap();
+        assert_eq!(
+            PerformanceRecommender::persisted_rollback_state(&store),
+            PersistedRollbackState::None
+        );
+
+        let mut recommender = recommender();
+        let (_, consent) = recommender.evaluate(
+            Language::English,
+            RecommendationPreference::Balanced,
+            [evidence()],
+        );
+        let _receipt = recommender.apply(consent.unwrap(), &store).unwrap();
+        assert_eq!(
+            PerformanceRecommender::persisted_rollback_state(&store),
+            PersistedRollbackState::Ready
+        );
+
+        let mut changed = store.load().unwrap();
+        changed.recognition.minimum_rms = 0.01;
+        store.save(&changed).unwrap();
+        assert_eq!(
+            PerformanceRecommender::persisted_rollback_state(&store),
+            PersistedRollbackState::StaleOrCorrupt
+        );
+
+        let receipt_path = rollback_receipt_path(&store).unwrap();
+        fs::write(&receipt_path, b"not a receipt").unwrap();
+        assert_eq!(
+            PerformanceRecommender::persisted_rollback_state(&store),
+            PersistedRollbackState::StaleOrCorrupt
+        );
+
+        fs::write(&receipt_path, vec![b'x'; (MAX_ROLLBACK_BYTES + 1) as usize]).unwrap();
+        assert_eq!(
+            PerformanceRecommender::persisted_rollback_state(&store),
+            PersistedRollbackState::StaleOrCorrupt
+        );
     }
 
     #[test]

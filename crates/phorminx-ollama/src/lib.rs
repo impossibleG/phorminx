@@ -27,7 +27,7 @@ pub use onboarding::{
     AuthorizedModelPull, CuratedLanguage, CuratedModel, CuratedModelCatalog, CuratedModelId,
     CuratedModelState, DaemonState, InstalledModelIdentity, ModelPullOutcome, ModelPullProgress,
     ModelPullReview, OllamaOnboarding, OllamaOnboardingTransport, OllamaVersion, PullFailure,
-    PullFailureKind, PullResidue, TransportError, UreqOnboardingTransport,
+    PullFailureKind, PullPhase, PullResidue, TransportError, UreqOnboardingTransport,
 };
 pub use prompt::{FormatProfile, FormatPrompt, PromptError, PromptPlan, build_prompt};
 pub use validation::{

@@ -7,9 +7,11 @@ use crate::components::{
     section_title, segmented,
 };
 use crate::model::{
-    AccurateBackend, AccurateModel, AppearancePreference, FormattingStrength, HistoryVariant,
-    LexiconCasePolicy, LexiconDraft, OllamaLifecycle, ProfileDraft, ProfileInsertion,
-    RecognitionMode, RecordingMode, Route, SettingsSnapshot, ShellEvent, ShellSnapshot,
+    AccurateBackend, AccurateModel, AppearancePreference, CalibrationCaptureState,
+    FormattingStrength, HistoryVariant, LexiconCasePolicy, LexiconDraft, OllamaLifecycle,
+    OllamaOperationState, OllamaSetupState, PerformancePreference, PerformanceRollbackState,
+    PerformanceRunState, ProfileDraft, ProfileInsertion, RecognitionMode, RecordingMode, Route,
+    SettingsSnapshot, ShellEvent, ShellSnapshot,
 };
 use crate::theme::{Space, UiThemeExt};
 
@@ -29,6 +31,13 @@ pub(crate) struct PageState {
     pub settings_dirty: bool,
     pub confirm_model_download: Option<AccurateModel>,
     pub confirm_setup_action: Option<String>,
+    pub ollama_search: String,
+    pub confirm_ollama_page: bool,
+    pub confirm_ollama_pull: Option<String>,
+    pub confirm_ollama_activation: Option<String>,
+    pub confirm_performance_apply: Option<String>,
+    pub confirm_performance_revert: bool,
+    pub confirm_performance_discard: bool,
 }
 
 impl PageState {
@@ -54,6 +63,13 @@ impl PageState {
             settings_dirty: false,
             confirm_model_download: None,
             confirm_setup_action: None,
+            ollama_search: String::new(),
+            confirm_ollama_page: false,
+            confirm_ollama_pull: None,
+            confirm_ollama_activation: None,
+            confirm_performance_apply: None,
+            confirm_performance_revert: false,
+            confirm_performance_discard: false,
         }
     }
 
@@ -64,6 +80,26 @@ impl PageState {
             .is_some_and(|id| !snapshot.setup.actions.iter().any(|action| &action.id == id))
         {
             self.confirm_setup_action = None;
+        }
+        if self.confirm_ollama_pull.as_ref().is_some_and(|id| {
+            !snapshot
+                .setup
+                .ollama
+                .models
+                .iter()
+                .any(|model| &model.id == id)
+        }) {
+            self.confirm_ollama_pull = None;
+        }
+        if self.confirm_performance_apply.as_ref().is_some_and(|id| {
+            snapshot
+                .setup
+                .performance
+                .recommendation
+                .as_ref()
+                .is_none_or(|item| &item.id != id || !item.can_apply)
+        }) {
+            self.confirm_performance_apply = None;
         }
         if self
             .history_id
@@ -281,6 +317,531 @@ fn setup(
                 ));
             }
         }
+    }
+
+    ui.add_space(Space::XL);
+    ollama_commissioning(ui, snapshot, state, outbox);
+    ui.add_space(Space::XL);
+    performance_commissioning(ui, snapshot, state, outbox);
+}
+
+fn ollama_commissioning(
+    ui: &mut Ui,
+    snapshot: &ShellSnapshot,
+    state: &mut PageState,
+    outbox: &mut Vec<ShellEvent>,
+) {
+    let tokens = ui.tokens();
+    let ollama = &snapshot.setup.ollama;
+    if !ollama.controls_enabled {
+        state.confirm_ollama_pull = None;
+        state.confirm_ollama_activation = None;
+    }
+    if !ollama.can_inspect {
+        state.confirm_ollama_page = false;
+    }
+    section_title(
+        ui,
+        "03",
+        "Local refinement",
+        "A fixed loopback service and a small, reviewed model catalog.",
+    );
+    ui.add_space(Space::SM);
+    ui.horizontal(|ui| {
+        metadata(ui, ollama_state_label(ollama.state));
+        if let Some(version) = &ollama.version {
+            ui.label(
+                RichText::new(format!("Version {version}"))
+                    .monospace()
+                    .color(tokens.secondary_text),
+            );
+        }
+    });
+    ui.label(RichText::new(&ollama.detail).color(tokens.secondary_text));
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(ollama.can_inspect, |ui| {
+            if action(ui, "Inspect Ollama", ActionTone::Secondary).clicked() {
+                outbox.push(ShellEvent::InspectOllama);
+            }
+        });
+        if matches!(
+            ollama.state,
+            OllamaSetupState::Missing | OllamaSetupState::Incompatible
+        ) {
+            ui.add_enabled_ui(ollama.can_inspect, |ui| {
+                if state.confirm_ollama_page {
+                    if action(ui, "Open ollama.com", ActionTone::Primary).clicked() {
+                        state.confirm_ollama_page = false;
+                        outbox.push(ShellEvent::OpenOfficialOllamaDownload);
+                    }
+                    if action(ui, "Not now", ActionTone::Quiet).clicked() {
+                        state.confirm_ollama_page = false;
+                    }
+                } else if action(ui, "Review manual install", ActionTone::Secondary).clicked() {
+                    state.confirm_ollama_page = true;
+                }
+            });
+        }
+    });
+    if state.confirm_ollama_page {
+        ui.label(
+            RichText::new("Consent · Open only https://ollama.com/download/windows. Phorminx will not download, execute, elevate, or enable autostart.")
+                .size(12.0)
+                .color(tokens.accent),
+        );
+    }
+    if let Some(detail) = &ollama.operation_detail {
+        ui.add_space(Space::SM);
+        ui.label(RichText::new(detail).color(tokens.secondary_text));
+    }
+    if let Some(percent) = ollama.progress_percent {
+        ui.add(egui::ProgressBar::new(f32::from(percent) / 100.0).show_percentage());
+    }
+    if matches!(
+        ollama.operation,
+        OllamaOperationState::Pulling | OllamaOperationState::Cancelling
+    ) {
+        ui.add_enabled_ui(ollama.operation == OllamaOperationState::Pulling, |ui| {
+            if action(
+                ui,
+                if ollama.operation == OllamaOperationState::Cancelling {
+                    "Cancelling…"
+                } else {
+                    "Cancel model acquisition"
+                },
+                ActionTone::Secondary,
+            )
+            .clicked()
+            {
+                outbox.push(ShellEvent::CancelOllamaPull);
+            }
+        });
+    }
+
+    if ollama.state != OllamaSetupState::Ready {
+        return;
+    }
+    ui.add_space(Space::MD);
+    ui.add(
+        TextEdit::singleline(&mut state.ollama_search)
+            .hint_text("Search the reviewed local catalog")
+            .desired_width(360.0),
+    );
+    let terms = state.ollama_search.to_ascii_lowercase();
+    for model in ollama.models.iter().filter(|model| {
+        terms.split_whitespace().all(|term| {
+            format!(
+                "{} {} {}",
+                model.display_name, model.exact_name, model.summary
+            )
+            .to_ascii_lowercase()
+            .contains(term)
+        })
+    }) {
+        ui.add_space(Space::SM);
+        ui.label(
+            RichText::new(&model.display_name)
+                .size(17.0)
+                .strong()
+                .color(tokens.text),
+        );
+        ui.label(
+            RichText::new(format!("{} · {}", model.exact_name, model.languages))
+                .monospace()
+                .color(tokens.secondary_text),
+        );
+        ui.label(RichText::new(&model.summary).color(tokens.secondary_text));
+        ui.label(
+            RichText::new(format!(
+                "Model {} · free disk required {} · recommended RAM {}",
+                format_bytes(model.model_bytes),
+                format_bytes(model.minimum_free_disk_bytes),
+                format_bytes(model.recommended_ram_bytes),
+            ))
+            .size(12.0)
+            .color(tokens.secondary_text),
+        );
+        if !model.identity_matches {
+            ui.label(RichText::new("A mutable tag with this name exists, but its exact digest or size is different. It cannot be selected.").color(tokens.destructive));
+        } else if model.installed {
+            if model.selected {
+                metadata(ui, "Selected · exact identity verified");
+            } else if state.confirm_ollama_activation.as_deref() == Some(&model.id) {
+                ui.add_enabled_ui(ollama.controls_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        if action(ui, "Use this exact model", ActionTone::Primary).clicked() {
+                            state.confirm_ollama_activation = None;
+                            outbox.push(ShellEvent::ActivateCuratedOllamaModel(model.id.clone()));
+                        }
+                        if action(ui, "Not now", ActionTone::Quiet).clicked() {
+                            state.confirm_ollama_activation = None;
+                        }
+                    })
+                });
+                ui.label(RichText::new("Consent · Re-verify the compiled digest and size, then atomically change only the local model selection.").size(12.0).color(tokens.accent));
+            } else {
+                ui.add_enabled_ui(ollama.controls_enabled, |ui| {
+                    if action(ui, "Review selection", ActionTone::Secondary).clicked() {
+                        state.confirm_ollama_activation = Some(model.id.clone());
+                    }
+                });
+            }
+        } else if state.confirm_ollama_pull.as_deref() == Some(&model.id) {
+            ui.add_enabled_ui(ollama.controls_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    if action(ui, "I consent — download", ActionTone::Primary).clicked() {
+                        state.confirm_ollama_pull = None;
+                        outbox.push(ShellEvent::PullCuratedOllamaModel(model.id.clone()));
+                    }
+                    if action(ui, "Not now", ActionTone::Quiet).clicked() {
+                        state.confirm_ollama_pull = None;
+                    }
+                })
+            });
+            ui.label(RichText::new(format!("Consent · Ask the fixed loopback Ollama service to acquire exactly {}. Network transfer may leave a resumable cache if cancelled.", model.exact_name)).size(12.0).color(tokens.accent));
+        } else {
+            ui.add_enabled_ui(ollama.controls_enabled, |ui| {
+                if action(ui, "Review acquisition", ActionTone::Secondary).clicked() {
+                    state.confirm_ollama_pull = Some(model.id.clone());
+                }
+            });
+        }
+        hairline(ui);
+    }
+}
+
+fn performance_commissioning(
+    ui: &mut Ui,
+    snapshot: &ShellSnapshot,
+    state: &mut PageState,
+    outbox: &mut Vec<ShellEvent>,
+) {
+    let tokens = ui.tokens();
+    let performance = &snapshot.setup.performance;
+    if !performance.controls_enabled {
+        state.confirm_performance_apply = None;
+    }
+    if !performance.can_revert_after_restart {
+        state.confirm_performance_revert = false;
+    }
+    if !performance.can_discard_rollback {
+        state.confirm_performance_discard = false;
+    }
+    section_title(
+        ui,
+        "04",
+        "Measured performance",
+        "Four one-use captures. No insertion, clipboard, history, transcript, or audio persistence.",
+    );
+    ui.add_space(Space::SM);
+    ui.label(
+        RichText::new(format!("Pinned calibration · {}", performance.language))
+            .monospace()
+            .color(tokens.secondary_text),
+    );
+    ui.label(RichText::new(&performance.detail).color(tokens.secondary_text));
+
+    ui.add_space(Space::MD);
+    metadata(ui, "Optimize for");
+    let mut preference = performance.preference;
+    ui.add_enabled_ui(performance.controls_enabled, |ui| {
+        if let Some(selected) = segmented(
+            ui,
+            [
+                PerformancePreference::Fastest,
+                PerformancePreference::Balanced,
+                PerformancePreference::Quality,
+            ],
+            &mut preference,
+            preference_label,
+        ) {
+            outbox.push(ShellEvent::SetPerformancePreference(selected));
+        }
+    });
+
+    if !performance.candidates.is_empty() {
+        ui.add_space(Space::MD);
+        metadata(ui, "Verified candidates");
+        for candidate in &performance.candidates {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(&candidate.title).strong().color(tokens.text));
+                    ui.label(
+                        RichText::new(&candidate.detail)
+                            .size(12.0)
+                            .color(tokens.secondary_text),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if candidate.selected {
+                        metadata(ui, "Selected");
+                    } else {
+                        ui.add_enabled_ui(performance.controls_enabled, |ui| {
+                            if action(ui, "Measure", ActionTone::Secondary).clicked() {
+                                outbox.push(ShellEvent::SelectBenchmarkCandidate(
+                                    candidate.id.clone(),
+                                ));
+                            }
+                        });
+                    }
+                });
+            });
+            hairline(ui);
+        }
+    }
+    for unavailable in &performance.unavailable {
+        ui.label(
+            RichText::new(format!(
+                "Unavailable · {} · {}",
+                unavailable.title, unavailable.reason
+            ))
+            .size(12.0)
+            .color(tokens.secondary_text),
+        );
+    }
+
+    if !performance.prompts.is_empty() {
+        ui.add_space(Space::MD);
+        metadata(ui, "Transient calibration set");
+        for prompt in &performance.prompts {
+            ui.add_space(Space::SM);
+            ui.label(
+                RichText::new(format!("{:02} · {}", prompt.ordinal, prompt.kind))
+                    .monospace()
+                    .color(tokens.accent_focus),
+            );
+            if prompt.kind == "Silence" {
+                ui.label(RichText::new("Remain silent for about two seconds.").color(tokens.text));
+            } else {
+                ui.label(RichText::new(&prompt.text).color(tokens.text));
+            }
+            ui.horizontal(|ui| match prompt.capture {
+                CalibrationCaptureState::Empty | CalibrationCaptureState::Failed => {
+                    ui.add_enabled_ui(performance.controls_enabled, |ui| {
+                        if action(ui, "Record", ActionTone::Primary).clicked() {
+                            outbox.push(ShellEvent::StartCalibrationCapture(prompt.id.clone()));
+                        }
+                    });
+                }
+                CalibrationCaptureState::Starting => metadata(ui, "Opening microphone…"),
+                CalibrationCaptureState::Recording => {
+                    metadata(ui, "Recording in memory");
+                    if action(ui, "Stop", ActionTone::Primary).clicked() {
+                        outbox.push(ShellEvent::StopCalibrationCapture(prompt.id.clone()));
+                    }
+                }
+                CalibrationCaptureState::Processing => metadata(ui, "Finalizing in memory…"),
+                CalibrationCaptureState::Ready => {
+                    metadata(ui, "Ready · memory only");
+                    ui.add_enabled_ui(performance.controls_enabled, |ui| {
+                        if action(ui, "Re-record", ActionTone::Secondary).clicked() {
+                            outbox.push(ShellEvent::StartCalibrationCapture(prompt.id.clone()));
+                        }
+                        if action(ui, "Discard", ActionTone::Quiet).clicked() {
+                            outbox.push(ShellEvent::DiscardCalibrationCapture(prompt.id.clone()));
+                        }
+                    });
+                }
+                CalibrationCaptureState::Consumed => metadata(ui, "Consumed and destroyed"),
+            });
+            if let Some(detail) = &prompt.detail {
+                ui.label(RichText::new(detail).size(12.0).color(tokens.destructive));
+            }
+            hairline(ui);
+        }
+    }
+
+    ui.add_space(Space::MD);
+    match performance.state {
+        PerformanceRunState::Ready => {
+            ui.add_enabled_ui(performance.can_start_benchmark, |ui| {
+                if action(ui, "Run local benchmark", ActionTone::Primary).clicked() {
+                    outbox.push(ShellEvent::StartPerformanceBenchmark);
+                }
+            });
+        }
+        PerformanceRunState::Running | PerformanceRunState::Cancelling => {
+            if performance.progress_total != 0 {
+                ui.add(
+                    egui::ProgressBar::new(
+                        performance.progress_completed as f32 / performance.progress_total as f32,
+                    )
+                    .text(format!(
+                        "{} / {} samples",
+                        performance.progress_completed, performance.progress_total
+                    )),
+                );
+            }
+            if performance.can_cancel_benchmark
+                && action(ui, "Cancel benchmark", ActionTone::Secondary).clicked()
+            {
+                outbox.push(ShellEvent::CancelPerformanceBenchmark);
+            }
+        }
+        _ => {}
+    }
+    if performance
+        .prompts
+        .iter()
+        .any(|prompt| prompt.capture == CalibrationCaptureState::Consumed)
+        && ui
+            .add_enabled_ui(performance.can_reset_calibration, |ui| {
+                action(ui, "Prepare another measurement", ActionTone::Secondary).clicked()
+            })
+            .inner
+    {
+        outbox.push(ShellEvent::ResetPerformanceCalibration);
+    }
+
+    if !performance.evidence.is_empty() {
+        ui.add_space(Space::MD);
+        metadata(ui, "Measured evidence");
+        for evidence in &performance.evidence {
+            ui.label(RichText::new(&evidence.title).strong().color(tokens.text));
+            ui.label(
+                RichText::new(format!(
+                    "release p50 / p95 · {} / {} ms   RTF · {:.3}",
+                    evidence.release_p50_ms,
+                    evidence.release_p95_ms,
+                    evidence.realtime_factor_milli as f32 / 1000.0
+                ))
+                .monospace()
+                .color(tokens.secondary_text),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "word error · {:.1}%   hallucination · {:.1}%   protected exact · {:.1}%",
+                    evidence.word_error_per_mille as f32 / 10.0,
+                    evidence.hallucination_per_mille as f32 / 10.0,
+                    evidence.protected_token_exact_per_mille as f32 / 10.0
+                ))
+                .monospace()
+                .color(tokens.secondary_text),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "working-set peak · {} MiB   available memory · {} MiB",
+                    evidence.peak_working_set_mib, evidence.available_memory_mib
+                ))
+                .monospace()
+                .color(tokens.secondary_text),
+            );
+            hairline(ui);
+        }
+    }
+
+    if let Some(recommendation) = &performance.recommendation {
+        ui.add_space(Space::MD);
+        ui.label(
+            RichText::new(&recommendation.title)
+                .size(20.0)
+                .color(tokens.text),
+        );
+        ui.label(RichText::new(&recommendation.rationale).color(tokens.secondary_text));
+        for excluded in &recommendation.excluded {
+            ui.label(
+                RichText::new(format!("Excluded · {excluded}"))
+                    .size(12.0)
+                    .color(tokens.secondary_text),
+            );
+        }
+        if recommendation.can_apply {
+            if state.confirm_performance_apply.as_deref() == Some(&recommendation.id) {
+                ui.horizontal(|ui| {
+                    if action(ui, "Apply exact recommendation", ActionTone::Primary).clicked() {
+                        state.confirm_performance_apply = None;
+                        outbox.push(ShellEvent::ApplyPerformanceRecommendation(
+                            recommendation.id.clone(),
+                        ));
+                    }
+                    if action(ui, "Not now", ActionTone::Quiet).clicked() {
+                        state.confirm_performance_apply = None;
+                    }
+                });
+                ui.label(RichText::new("Consent · Re-verify the exact measured assets, compare-and-save settings once, then restart recognition. The narrow rollback remains available after restart.").size(12.0).color(tokens.accent));
+            } else if action(ui, "Review apply", ActionTone::Primary).clicked() {
+                state.confirm_performance_apply = Some(recommendation.id.clone());
+            }
+        }
+    }
+
+    if performance.rollback_state != PerformanceRollbackState::None {
+        ui.add_space(Space::MD);
+        metadata(ui, "Recognition rollback");
+        if let Some(detail) = &performance.rollback_detail {
+            ui.label(RichText::new(detail).color(tokens.secondary_text));
+        }
+        match performance.rollback_state {
+            PerformanceRollbackState::Ready => {
+                if state.confirm_performance_revert {
+                    ui.horizontal(|ui| {
+                        if action(ui, "Restore and restart", ActionTone::Primary).clicked() {
+                            state.confirm_performance_revert = false;
+                            outbox.push(ShellEvent::RevertPerformanceRecommendation);
+                        }
+                        if action(ui, "Not now", ActionTone::Quiet).clicked() {
+                            state.confirm_performance_revert = false;
+                        }
+                    });
+                    ui.label(RichText::new("Consent · Restore only the recognition fields changed by the recommendation, but only if current settings still match exactly. Phorminx restarts recognition after a verified save.").size(12.0).color(tokens.accent));
+                } else if performance.can_revert_after_restart
+                    && action(ui, "Review revert", ActionTone::Secondary).clicked()
+                {
+                    state.confirm_performance_revert = true;
+                }
+            }
+            PerformanceRollbackState::Inspecting => metadata(ui, "Inspecting…"),
+            PerformanceRollbackState::Working => metadata(ui, "Working…"),
+            PerformanceRollbackState::StaleOrCorrupt => {
+                ui.label(RichText::new("The receipt cannot safely restore settings. Discarding it never changes current settings.").size(12.0).color(tokens.destructive));
+            }
+            PerformanceRollbackState::Unavailable => metadata(ui, "Inspection unavailable"),
+            PerformanceRollbackState::None => {}
+        }
+        if performance.can_discard_rollback {
+            if state.confirm_performance_discard {
+                ui.horizontal(|ui| {
+                    if action(ui, "Discard rollback only", ActionTone::Secondary).clicked() {
+                        state.confirm_performance_discard = false;
+                        outbox.push(ShellEvent::DiscardPerformanceRollback);
+                    }
+                    if action(ui, "Keep rollback", ActionTone::Quiet).clicked() {
+                        state.confirm_performance_discard = false;
+                    }
+                });
+                ui.label(RichText::new("Consent · Permanently remove only the content-free rollback receipt. Current settings remain unchanged.").size(12.0).color(tokens.accent));
+            } else if action(ui, "Review discard rollback", ActionTone::Quiet).clicked() {
+                state.confirm_performance_discard = true;
+            }
+        }
+    }
+}
+
+const fn ollama_state_label(state: OllamaSetupState) -> &'static str {
+    match state {
+        OllamaSetupState::Inspecting => "Inspecting",
+        OllamaSetupState::Missing => "Not installed",
+        OllamaSetupState::Unsafe => "Unsafe installation",
+        OllamaSetupState::Stopped => "Installed · stopped",
+        OllamaSetupState::Incompatible => "Update required",
+        OllamaSetupState::Unhealthy => "Unhealthy response",
+        OllamaSetupState::Ready => "Ready · loopback verified",
+    }
+}
+
+const fn preference_label(value: PerformancePreference) -> &'static str {
+    match value {
+        PerformancePreference::Fastest => "Fastest",
+        PerformancePreference::Balanced => "Balanced",
+        PerformancePreference::Quality => "Quality",
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else {
+        format!("{:.0} MiB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -1449,7 +2010,11 @@ const fn lifecycle_label(value: OllamaLifecycle) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::GalleryScenario;
+    use crate::model::{
+        BenchmarkCandidateView, BenchmarkEvidenceView, CalibrationPromptView, GalleryScenario,
+        OllamaModelChoice, PerformanceRecommendationView,
+    };
+    use crate::theme::{self, ThemeMode};
 
     #[test]
     fn every_route_renders_all_gallery_scenarios() {
@@ -1507,6 +2072,111 @@ mod tests {
             state.profile_draft = Some(ProfileDraft::default());
             profiles(ui, &snapshot, &mut state, &mut events);
             assert!(state.profile_draft.is_some());
+        });
+    }
+
+    #[test]
+    fn setup_feature_states_paint_without_overflow_or_missing_controls() {
+        let mut snapshot = ShellSnapshot::gallery(GalleryScenario::Empty);
+        snapshot.route = Route::Setup;
+        snapshot.setup.ollama.state = OllamaSetupState::Ready;
+        snapshot.setup.ollama.detail = "Fixed loopback API verified.".into();
+        snapshot.setup.ollama.can_inspect = true;
+        snapshot.setup.ollama.controls_enabled = true;
+        snapshot.setup.ollama.models = vec![OllamaModelChoice {
+            id: "gemma3-1b".into(),
+            display_name: "Gemma 3 1B".into(),
+            exact_name: "gemma3:1b".into(),
+            summary: "Reviewed multilingual cleanup model.".into(),
+            languages: "EN · PT-BR".into(),
+            model_bytes: 800_000_000,
+            minimum_free_disk_bytes: 1_400_000_000,
+            recommended_ram_bytes: 4_000_000_000,
+            installed: false,
+            identity_matches: true,
+            selected: false,
+        }];
+        snapshot.setup.performance.state = PerformanceRunState::Complete;
+        snapshot.setup.performance.controls_enabled = true;
+        snapshot.setup.performance.can_reset_calibration = true;
+        snapshot.setup.performance.rollback_state = PerformanceRollbackState::Ready;
+        snapshot.setup.performance.rollback_detail =
+            Some("Previous recognition settings can be restored after restart.".into());
+        snapshot.setup.performance.can_revert_after_restart = true;
+        snapshot.setup.performance.can_discard_rollback = true;
+        snapshot.setup.performance.candidates = vec![BenchmarkCandidateView {
+            id: "candidate-one".into(),
+            title: "Base Accurate on Vulkan".into(),
+            detail: "Accurate · Vulkan · exact pinned identity".into(),
+            selected: true,
+        }];
+        snapshot.setup.performance.prompts = vec![CalibrationPromptView {
+            id: "en-speech-01".into(),
+            ordinal: 1,
+            kind: "Speech".into(),
+            text: "Pinned calibration prompt.".into(),
+            capture: CalibrationCaptureState::Consumed,
+            detail: None,
+        }];
+        snapshot.setup.performance.evidence = vec![BenchmarkEvidenceView {
+            candidate_id: "candidate-one".into(),
+            title: "Base Accurate on Vulkan".into(),
+            release_p50_ms: 220,
+            release_p95_ms: 390,
+            realtime_factor_milli: 90,
+            word_error_per_mille: 50,
+            hallucination_per_mille: 0,
+            protected_token_exact_per_mille: 1_000,
+            peak_working_set_mib: 640,
+            available_memory_mib: 8_192,
+        }];
+        snapshot.setup.performance.recommendation = Some(PerformanceRecommendationView {
+            id: "candidate-one".into(),
+            title: "Base Accurate on Vulkan".into(),
+            rationale: "All pinned gates passed.".into(),
+            excluded: vec!["candidate-two · ReleaseLatencyTooHigh".into()],
+            can_apply: true,
+            can_revert: false,
+        });
+        for mode in [
+            ThemeMode::AuthoredDark,
+            ThemeMode::AuthoredLight,
+            ThemeMode::HighContrast,
+            ThemeMode::HighContrastLight,
+        ] {
+            egui::__run_test_ui(|ui| {
+                theme::apply(ui.ctx(), mode);
+                let mut state = PageState::from_snapshot(&snapshot);
+                let mut events = Vec::new();
+                setup(ui, &snapshot, &mut state, &mut events);
+            });
+        }
+    }
+
+    #[test]
+    fn busy_feature_snapshots_clear_stale_one_shot_confirmations() {
+        let mut snapshot = ShellSnapshot::gallery(GalleryScenario::Empty);
+        snapshot.route = Route::Setup;
+        snapshot.setup.ollama.can_inspect = false;
+        snapshot.setup.ollama.controls_enabled = false;
+        snapshot.setup.performance.controls_enabled = false;
+        egui::__run_test_ui(|ui| {
+            let mut state = PageState::from_snapshot(&snapshot);
+            state.confirm_ollama_page = true;
+            state.confirm_ollama_pull = Some("gemma3-1b".into());
+            state.confirm_ollama_activation = Some("gemma3-1b".into());
+            state.confirm_performance_apply = Some("candidate".into());
+            state.confirm_performance_revert = true;
+            state.confirm_performance_discard = true;
+            let mut events = Vec::new();
+            setup(ui, &snapshot, &mut state, &mut events);
+            assert!(!state.confirm_ollama_page);
+            assert!(state.confirm_ollama_pull.is_none());
+            assert!(state.confirm_ollama_activation.is_none());
+            assert!(state.confirm_performance_apply.is_none());
+            assert!(!state.confirm_performance_revert);
+            assert!(!state.confirm_performance_discard);
+            assert!(events.is_empty());
         });
     }
 }
