@@ -1305,7 +1305,8 @@ fn rollback_persisted_locked(
     {
         // A prepared receipt whose settings commit never happened, a replay,
         // or a newer recognition edit must never overwrite the current state.
-        remove_rollback_receipt(store)?;
+        // Preserve the receipt as stale until the user explicitly discards it;
+        // a failed restore attempt is not authority to destroy rollback state.
         return Err(ApplyError::StaleRollback);
     }
     let mut restored = current.clone();
@@ -2269,6 +2270,16 @@ mod tests {
             Err(ApplyError::StaleRollback)
         ));
         assert_eq!(store.load().unwrap(), changed);
+        assert_eq!(
+            PerformanceRecommender::persisted_rollback_state(&store),
+            PersistedRollbackState::StaleOrCorrupt
+        );
+        assert!(rollback_receipt_path(&store).unwrap().is_file());
+        PerformanceRecommender::discard_persisted_rollback(&store).unwrap();
+        assert_eq!(
+            PerformanceRecommender::persisted_rollback_state(&store),
+            PersistedRollbackState::None
+        );
     }
 
     #[test]

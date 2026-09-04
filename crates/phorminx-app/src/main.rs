@@ -3253,7 +3253,9 @@ impl TranscriptionWorker {
 
                 // Keep the app-owned Ollama workload lease for the worker's
                 // lifetime. Setup pulls cannot replace the selected tag while
-                // this verified resident formatting session is active.
+                // this verified resident formatting session is active. An
+                // external Ollama client can still mutate the tag; a restart
+                // re-runs the identity probe before formatting is enabled.
                 let _ollama_activity = ollama_activity;
                 let mut aliases = aliases;
                 let mut incremental_sessions = HashMap::new();

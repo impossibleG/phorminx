@@ -257,8 +257,9 @@ pub struct FormattingSettings {
     /// Explicitly selected installed Ollama model. Never chosen implicitly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ollama_model: Option<String>,
-    /// Immutable manifest identity observed when the user explicitly selected
-    /// `ollama_model`. Runtime use fails closed if the mutable tag is replaced.
+    /// Manifest identity observed when the user explicitly selected
+    /// `ollama_model`. It is revalidated when the resident worker starts;
+    /// external Ollama clients can still mutate a tag after that boundary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ollama_model_identity: Option<OllamaModelIdentity>,
     pub ollama_lifecycle: OllamaLifecycle,

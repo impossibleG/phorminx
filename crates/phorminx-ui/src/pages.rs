@@ -465,7 +465,12 @@ fn ollama_commissioning(
             ui.label(RichText::new("A mutable tag with this name exists, but its exact digest or size is different. It cannot be selected.").color(tokens.destructive));
         } else if model.installed {
             if model.selected {
-                metadata(ui, "Selected · exact identity verified");
+                metadata(ui, "Selected · identity matched at latest inspection");
+                ui.label(
+                    RichText::new("Phorminx verifies again when its recognition worker starts and blocks its own model pulls for that session. If another Ollama client replaces the tag, restart Phorminx to re-probe before further use.")
+                        .size(12.0)
+                        .color(tokens.secondary_text),
+                );
             } else if state.confirm_ollama_activation.as_deref() == Some(&model.id) {
                 ui.add_enabled_ui(ollama.controls_enabled, |ui| {
                     ui.horizontal(|ui| {
