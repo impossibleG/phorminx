@@ -1107,16 +1107,20 @@ impl PerformanceRecommender {
         let _rollback_guard = ROLLBACK_SAVE_LOCK
             .lock()
             .map_err(|_| ApplyError::Settings)?;
-        if let Ok(existing) = load_rollback_receipt(store) {
-            let current = store.load().map_err(|_| ApplyError::Settings)?;
-            if settings_digest(&current)? == existing.applied_settings_sha256 {
-                return Err(ApplyError::RollbackPending);
-            }
-            remove_rollback_receipt(store)?;
-        } else if rollback_receipt_path(store)?.exists() {
-            // Corrupt or future receipts require explicit discard. Silently
-            // overwriting them would destroy the user's only possible undo.
-            return Err(ApplyError::Settings);
+        let rollback_path = rollback_receipt_path(store)?;
+        if rollback_path
+            .try_exists()
+            .map_err(|_| ApplyError::Settings)?
+        {
+            // No apply attempt is authority to destroy an earlier undo. A
+            // valid receipt remains explicitly discardable even if later
+            // settings edits made it stale; corrupt/future receipts likewise
+            // require the dedicated discard path.
+            return if load_rollback_receipt(store).is_ok() {
+                Err(ApplyError::RollbackPending)
+            } else {
+                Err(ApplyError::Settings)
+            };
         }
         write_rollback_receipt(store, &persisted)?;
         let committed = store.compare_and_save(&previous, &applied);
@@ -2283,7 +2287,7 @@ mod tests {
     }
 
     #[test]
-    fn old_or_replayed_rollback_receipts_cannot_match_a_later_identical_apply() {
+    fn stale_receipt_blocks_a_later_apply_until_explicit_discard_and_replay_stays_rejected() {
         let directory = tempfile::tempdir().unwrap();
         let store = SettingsStore::new(directory.path().join("settings.toml")).unwrap();
         let original = Settings::default();
@@ -2297,6 +2301,18 @@ mod tests {
         );
         let first_receipt = recommender.apply(first_consent.unwrap(), &store).unwrap();
         store.save(&original).unwrap();
+
+        let (_, blocked_consent) = recommender.evaluate(
+            Language::English,
+            RecommendationPreference::Balanced,
+            [evidence()],
+        );
+        assert!(matches!(
+            recommender.apply(blocked_consent.unwrap(), &store),
+            Err(ApplyError::RollbackPending)
+        ));
+        assert!(rollback_receipt_path(&store).unwrap().is_file());
+        PerformanceRecommender::discard_persisted_rollback(&store).unwrap();
 
         let (_, second_consent) = recommender.evaluate(
             Language::English,

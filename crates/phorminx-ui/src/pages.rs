@@ -152,6 +152,19 @@ impl PageState {
             self.settings = snapshot.settings.clone();
         }
     }
+
+    /// Consent review is deliberately route-scoped. Leaving Setup must require
+    /// the user to review the exact operation again instead of returning to a
+    /// stale one-click confirmation after unrelated navigation or tray use.
+    pub fn clear_setup_confirmations(&mut self) {
+        self.confirm_setup_action = None;
+        self.confirm_ollama_page = false;
+        self.confirm_ollama_pull = None;
+        self.confirm_ollama_activation = None;
+        self.confirm_performance_apply = None;
+        self.confirm_performance_revert = false;
+        self.confirm_performance_discard = false;
+    }
 }
 
 pub(crate) fn show(
@@ -560,6 +573,9 @@ fn performance_commissioning(
             &mut preference,
             preference_label,
         ) {
+            // The visible rationale and one-shot authority are preference-bound.
+            // Even if the same candidate wins again, require a fresh review.
+            state.confirm_performance_apply = None;
             outbox.push(ShellEvent::SetPerformancePreference(selected));
         }
     });
@@ -647,7 +663,7 @@ fn performance_commissioning(
                         }
                     });
                 }
-                CalibrationCaptureState::Consumed => metadata(ui, "Consumed and destroyed"),
+                CalibrationCaptureState::Consumed => metadata(ui, "Consumed; buffer released"),
             });
             if let Some(detail) = &prompt.detail {
                 ui.label(RichText::new(detail).size(12.0).color(tokens.destructive));

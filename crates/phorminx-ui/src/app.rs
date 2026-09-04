@@ -56,6 +56,9 @@ impl PhorminxUi {
     }
 
     pub fn apply_snapshot(&mut self, snapshot: ShellSnapshot) {
+        if self.route == Route::Setup && snapshot.route != Route::Setup {
+            self.pages.clear_setup_confirmations();
+        }
         let retained = self
             .snapshot
             .history
@@ -79,6 +82,9 @@ impl PhorminxUi {
 
     pub fn navigate(&mut self, route: Route) {
         if self.route != route {
+            if self.route == Route::Setup {
+                self.pages.clear_setup_confirmations();
+            }
             self.route = route;
             if route != Route::History {
                 self.clear_history_detail();
@@ -348,6 +354,52 @@ mod tests {
         assert!(app.take_events().is_empty());
         app.navigate(Route::Models);
         assert_eq!(app.take_events(), vec![ShellEvent::Navigate(Route::Models)]);
+    }
+
+    fn arm_all_setup_confirmations(app: &mut PhorminxUi) {
+        app.pages.confirm_setup_action = Some("action:test".into());
+        app.pages.confirm_ollama_page = true;
+        app.pages.confirm_ollama_pull = Some("model:test".into());
+        app.pages.confirm_ollama_activation = Some("model:test".into());
+        app.pages.confirm_performance_apply = Some("candidate:test".into());
+        app.pages.confirm_performance_revert = true;
+        app.pages.confirm_performance_discard = true;
+    }
+
+    fn assert_setup_confirmations_cleared(app: &PhorminxUi) {
+        assert!(app.pages.confirm_setup_action.is_none());
+        assert!(!app.pages.confirm_ollama_page);
+        assert!(app.pages.confirm_ollama_pull.is_none());
+        assert!(app.pages.confirm_ollama_activation.is_none());
+        assert!(app.pages.confirm_performance_apply.is_none());
+        assert!(!app.pages.confirm_performance_revert);
+        assert!(!app.pages.confirm_performance_discard);
+    }
+
+    #[test]
+    fn leaving_setup_clears_every_pending_consent_review() {
+        let mut snapshot = ShellSnapshot::gallery(GalleryScenario::Populated);
+        snapshot.route = Route::Setup;
+        let mut app = PhorminxUi::new(snapshot);
+        arm_all_setup_confirmations(&mut app);
+
+        app.navigate(Route::Home);
+
+        assert_setup_confirmations_cleared(&app);
+    }
+
+    #[test]
+    fn host_driven_route_change_clears_every_pending_consent_review() {
+        let mut initial = ShellSnapshot::gallery(GalleryScenario::Populated);
+        initial.route = Route::Setup;
+        let mut app = PhorminxUi::new(initial);
+        arm_all_setup_confirmations(&mut app);
+        let mut replacement = ShellSnapshot::gallery(GalleryScenario::Populated);
+        replacement.route = Route::History;
+
+        app.apply_snapshot(replacement);
+
+        assert_setup_confirmations_cleared(&app);
     }
 
     #[test]

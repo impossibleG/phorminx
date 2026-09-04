@@ -878,7 +878,8 @@ impl eframe::App for ProductShellApp {
                 ProductShellControl::Focus(route) => {
                     if self.route == UiRoute::Setup && route != UiRoute::Setup {
                         self.setup_features.deactivate();
-                    } else if self.route != UiRoute::Setup && route == UiRoute::Setup {
+                    } else if should_activate_setup_features(self.route, route, self.window_visible)
+                    {
                         self.setup_features.activate(self.bridge.settings());
                     }
                     self.window_visible = true;
@@ -1182,6 +1183,14 @@ fn map_snapshot(
         setup: setup_snapshot(microphone, whisper, vosk, ollama),
         notice,
     }
+}
+
+fn should_activate_setup_features(
+    current: UiRoute,
+    destination: UiRoute,
+    window_visible: bool,
+) -> bool {
+    destination == UiRoute::Setup && (current != UiRoute::Setup || !window_visible)
 }
 
 fn map_snapshot_with_setup(
@@ -1604,6 +1613,30 @@ mod tests {
         ] {
             assert_eq!(unmap_route(map_route(route)), route);
         }
+    }
+
+    #[test]
+    fn reopening_a_hidden_setup_route_reactivates_its_feature_controllers() {
+        assert!(should_activate_setup_features(
+            UiRoute::Setup,
+            UiRoute::Setup,
+            false
+        ));
+        assert!(should_activate_setup_features(
+            UiRoute::Home,
+            UiRoute::Setup,
+            true
+        ));
+        assert!(!should_activate_setup_features(
+            UiRoute::Setup,
+            UiRoute::Setup,
+            true
+        ));
+        assert!(!should_activate_setup_features(
+            UiRoute::Setup,
+            UiRoute::Home,
+            false
+        ));
     }
 
     #[test]

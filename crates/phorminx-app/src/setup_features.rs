@@ -425,15 +425,15 @@ impl SetupFeatures {
             self.performance.capture_details.clear();
             if self.performance.applied.is_some() {
                 self.performance.run_state = PerformanceRunState::Complete;
-                self.performance.run_detail = "Recommendation remains staged for the next launch. Revert remains available in this session; transient audio was destroyed.".into();
+                self.performance.run_detail = "Recommendation remains staged for the next launch. Revert remains available in this session; Phorminx released its transient audio buffers.".into();
             } else {
                 self.performance.run_state = PerformanceRunState::NeedsCalibration;
                 self.performance.run_detail =
-                    "Calibration stopped and all transient audio was destroyed.".into();
+                    "Calibration stopped and Phorminx released its transient audio buffers.".into();
             }
         } else {
             self.performance.run_state = PerformanceRunState::Cancelling;
-            self.performance.run_detail = "Stopping the native benchmark. Calibration audio remains only in the worker and will be destroyed when it returns or Phorminx exits.".into();
+            self.performance.run_detail = "Stopping the native benchmark. Calibration audio remains only in the worker; Phorminx releases those buffers when it returns or the process exits.".into();
         }
     }
 
@@ -1276,7 +1276,15 @@ impl SetupFeatures {
                                 .into();
                     }
                     Err(message) => {
-                        self.performance.run_state = PerformanceRunState::Failed;
+                        // `start` failed before it returned a benchmark ticket,
+                        // so no one-use clip was consumed. Keep the prepared
+                        // set runnable; the detail tells the user what must be
+                        // corrected before retrying.
+                        self.performance.run_state = if self.performance.calibration.is_ready() {
+                            PerformanceRunState::Ready
+                        } else {
+                            PerformanceRunState::Failed
+                        };
                         self.performance.run_detail = preflight_detail(&message).to_owned();
                     }
                 }
@@ -1289,7 +1297,7 @@ impl SetupFeatures {
                     Ok(evidence) => {
                         self.performance.evidence = evidence;
                         self.performance.run_state = PerformanceRunState::Complete;
-                        self.performance.run_detail = "Content-free measurements were committed locally. Calibration audio has been destroyed.".into();
+                        self.performance.run_detail = "Content-free measurements were committed locally. Phorminx released its calibration audio buffers.".into();
                         self.evaluate_recommendation();
                     }
                     Err(()) => {
@@ -2349,6 +2357,34 @@ mod tests {
         features.discover_performance();
         assert!(features.performance.discovery_pending);
         assert_eq!(features.performance.discovery_generation, 7);
+    }
+
+    #[test]
+    fn failed_benchmark_start_keeps_unconsumed_calibration_runnable() {
+        let (_directory, mut features) = inactive_features();
+        for prompt in features.performance.calibration.prompts() {
+            features
+                .performance
+                .calibration
+                .submit(
+                    &prompt.case_id,
+                    phorminx_core::AudioClip::new(vec![0.1; 3_200], 16_000).unwrap(),
+                )
+                .unwrap();
+        }
+        features.performance.benchmark_generation = 12;
+        features.performance.benchmark_starting = true;
+        features.performance.run_state = PerformanceRunState::Running;
+
+        features.handle_event(FeatureEvent::BenchmarkStarted {
+            generation: 12,
+            result: Err("dictation owns the workload lane".into()),
+        });
+
+        assert!(!features.performance.benchmark_starting);
+        assert!(features.performance.calibration.is_ready());
+        assert_eq!(features.performance.run_state, PerformanceRunState::Ready);
+        assert!(features.performance.run_detail.contains("retry"));
     }
 
     #[test]
