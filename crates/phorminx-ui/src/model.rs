@@ -160,6 +160,8 @@ pub struct SetupAction {
     pub consent: Vec<String>,
     pub running: bool,
     pub can_retry: bool,
+    pub complete: bool,
+    pub available: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -871,6 +873,8 @@ impl ShellSnapshot {
                         consent: Vec::new(),
                         running: false,
                         can_retry: false,
+                        complete: false,
+                        available: true,
                     })
                     .into_iter()
                     .collect(),

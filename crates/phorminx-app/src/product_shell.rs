@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use eframe::egui::{self, Vec2, ViewportCommand};
-use phorminx_ollama::OllamaClient;
+use phorminx_ollama::{ClientTimeouts, OllamaClient, OllamaEndpoint};
 use phorminx_persistence::{CasePolicy, FormattingStyle, InsertionPreference};
 use phorminx_ui::theme::ThemeMode;
 use phorminx_ui::{
@@ -28,6 +28,7 @@ use crate::settings::{
     FormattingStrength, HistoryRetention, OllamaLifecycle, RecognitionMode, RecordingMode,
     Settings, SettingsStore,
 };
+use crate::setup_center::{BenchmarkUnavailable, SetupCenter};
 use crate::ui_bridge::{
     DEFAULT_HISTORY_LIMIT, UiBridge, UiCommand, UiEffect, UiLexiconDraft, UiMutation,
     UiProfileDraft, UiReadinessSnapshot, UiReadinessState, UiRoute, UiRuntimeStatus, UiSnapshot,
@@ -175,12 +176,16 @@ fn run_shell(
     let bridge =
         UiBridge::open(store.clone(), database_path.clone()).map_err(|error| error.to_string())?;
     let history_loader = HistoryLoader::new(database_path.clone());
+    // Setup is an optional child subsystem. Failure to recover it must never
+    // make dictation or the unified shell fail to start.
+    let setup_center =
+        SetupCenter::open(store.clone(), std::sync::Arc::new(BenchmarkUnavailable)).ok();
     let readiness = UiReadinessSnapshot::checking(bridge.settings(), &store);
     let snapshot = bridge
         .snapshot(initial_status, readiness.clone(), DEFAULT_HISTORY_LIMIT)
         .map_err(|error| error.to_string())?;
-    let (readiness_tx, readiness_rx) = mpsc::channel();
-    probe_readiness(
+    let (readiness_tx, readiness_rx) = mpsc::sync_channel(1);
+    let readiness_started = probe_readiness(
         bridge.settings().clone(),
         store.clone(),
         loaded_whisper.clone(),
@@ -222,6 +227,8 @@ fn run_shell(
         store,
         loaded_whisper,
         history_loader,
+        setup_center,
+        readiness_started,
         initially_visible,
     );
     eframe::run_native(
@@ -246,20 +253,31 @@ fn probe_readiness(
     store: SettingsStore,
     loaded_whisper: Option<WhisperReadiness>,
     vosk_probe: UiVoskProbe,
-    sender: Sender<UiReadinessSnapshot>,
-) {
-    let _ = thread::Builder::new()
+    sender: mpsc::SyncSender<UiReadinessSnapshot>,
+) -> bool {
+    thread::Builder::new()
         .name("phorminx-readiness".to_owned())
         .spawn(move || {
+            let ollama = OllamaClient::new(
+                OllamaEndpoint::default(),
+                ClientTimeouts {
+                    connect: Duration::from_millis(500),
+                    response_headers: Duration::from_secs(2),
+                    response_body: Duration::from_secs(2),
+                    overall: Duration::from_secs(3),
+                },
+            )
+            .expect("the fixed readiness timeout policy is valid");
             let readiness = UiReadinessSnapshot::probe(
                 &settings,
                 &store,
-                &OllamaClient::default(),
+                &ollama,
                 loaded_whisper.as_ref(),
                 vosk_probe,
             );
             let _ = sender.send(readiness);
-        });
+        })
+        .is_ok()
 }
 
 const AUTOMATIC_REFRESH_VOSK_PROBE: UiVoskProbe = UiVoskProbe::LayoutOnly;
@@ -273,12 +291,15 @@ struct ProductShellApp {
     controls: Receiver<ProductShellControl>,
     events: Sender<ProductShellEvent>,
     readiness_rx: Receiver<UiReadinessSnapshot>,
+    readiness_in_flight: bool,
+    readiness_refresh_pending: bool,
     store: SettingsStore,
     loaded_whisper: Option<WhisperReadiness>,
     notice: Option<InlineNotice>,
     download_active: bool,
     quitting: bool,
     history_loader: HistoryLoader,
+    setup_center: Option<SetupCenter>,
     window_visible: bool,
 }
 
@@ -296,10 +317,19 @@ impl ProductShellApp {
         store: SettingsStore,
         loaded_whisper: Option<WhisperReadiness>,
         history_loader: HistoryLoader,
+        setup_center: Option<SetupCenter>,
+        readiness_started: bool,
         initially_visible: bool,
     ) -> Self {
         let mut app = Self {
-            shell: PhorminxUi::new(map_snapshot(snapshot, route, None)),
+            shell: PhorminxUi::new(map_snapshot_with_setup(
+                snapshot,
+                route,
+                None,
+                setup_center
+                    .as_ref()
+                    .map(|center| center.snapshot(&readiness)),
+            )),
             bridge,
             readiness,
             route,
@@ -307,14 +337,21 @@ impl ProductShellApp {
             controls,
             events,
             readiness_rx,
+            readiness_in_flight: readiness_started,
+            readiness_refresh_pending: false,
             store,
             loaded_whisper,
             notice: None,
             download_active: false,
             quitting: false,
             history_loader,
+            setup_center,
             window_visible: initially_visible,
         };
+        if !readiness_started {
+            app.set_error("Local readiness inspection could not start.".to_owned());
+            app.refresh();
+        }
         if route == UiRoute::History && initially_visible {
             app.ensure_history_detail();
         }
@@ -328,8 +365,16 @@ impl ProductShellApp {
             DEFAULT_HISTORY_LIMIT,
         ) {
             Ok(snapshot) => {
-                self.shell
-                    .apply_snapshot(map_snapshot(snapshot, self.route, self.notice.clone()))
+                let setup = self
+                    .setup_center
+                    .as_ref()
+                    .map(|center| center.snapshot(&self.readiness));
+                self.shell.apply_snapshot(map_snapshot_with_setup(
+                    snapshot,
+                    self.route,
+                    self.notice.clone(),
+                    setup,
+                ))
             }
             Err(error) => self.set_error(error.to_string()),
         }
@@ -450,15 +495,7 @@ impl ProductShellApp {
                     self.loaded_whisper = None;
                     self.readiness =
                         UiReadinessSnapshot::checking(self.bridge.settings(), &self.store);
-                    let (sender, receiver) = mpsc::channel();
-                    self.readiness_rx = receiver;
-                    probe_readiness(
-                        self.bridge.settings().clone(),
-                        self.store.clone(),
-                        self.loaded_whisper.clone(),
-                        AUTOMATIC_REFRESH_VOSK_PROBE,
-                        sender,
-                    );
+                    self.request_readiness(AUTOMATIC_REFRESH_VOSK_PROBE);
                 }
                 self.refresh();
                 if self.route == UiRoute::History {
@@ -470,6 +507,26 @@ impl ProductShellApp {
                 self.set_error(error.to_string());
                 false
             }
+        }
+    }
+
+    fn request_readiness(&mut self, vosk_probe: UiVoskProbe) {
+        if self.readiness_in_flight {
+            self.readiness_refresh_pending = true;
+            return;
+        }
+        self.readiness_in_flight = true;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.readiness_rx = receiver;
+        if !probe_readiness(
+            self.bridge.settings().clone(),
+            self.store.clone(),
+            self.loaded_whisper.clone(),
+            vosk_probe,
+            sender,
+        ) {
+            self.readiness_in_flight = false;
+            self.set_error("Local readiness inspection could not start.".to_owned());
         }
     }
 
@@ -532,28 +589,37 @@ impl ProductShellApp {
             }
             ShellEvent::VerifyModels => {
                 self.readiness = UiReadinessSnapshot::checking(self.bridge.settings(), &self.store);
-                let (sender, receiver) = mpsc::channel();
-                self.readiness_rx = receiver;
-                probe_readiness(
-                    self.bridge.settings().clone(),
-                    self.store.clone(),
-                    self.loaded_whisper.clone(),
-                    UiVoskProbe::FullValidation,
-                    sender,
-                );
+                self.request_readiness(UiVoskProbe::FullValidation);
                 self.refresh();
             }
             ShellEvent::RefreshSetup => {
+                if let Some(center) = self.setup_center.as_mut() {
+                    let _ = center.retry_recovery();
+                }
                 self.readiness = UiReadinessSnapshot::checking(self.bridge.settings(), &self.store);
-                let (sender, receiver) = mpsc::channel();
-                self.readiness_rx = receiver;
-                probe_readiness(
-                    self.bridge.settings().clone(),
-                    self.store.clone(),
-                    self.loaded_whisper.clone(),
-                    UiVoskProbe::FullValidation,
-                    sender,
-                );
+                self.request_readiness(UiVoskProbe::FullValidation);
+                self.refresh();
+            }
+            ShellEvent::StartSetupAction(id) | ShellEvent::RetrySetupAction(id) => {
+                let result = self
+                    .setup_center
+                    .as_mut()
+                    .ok_or("Setup and repair are unavailable in this session.")
+                    .and_then(|center| center.start(&id));
+                if let Err(message) = result {
+                    self.set_error(message.to_owned());
+                }
+                self.refresh();
+            }
+            ShellEvent::CancelSetupAction(id) => {
+                let result = self
+                    .setup_center
+                    .as_ref()
+                    .ok_or("Setup and repair are unavailable in this session.")
+                    .and_then(|center| center.cancel(&id));
+                if let Err(message) = result {
+                    self.set_error(message.to_owned());
+                }
                 self.refresh();
             }
             ShellEvent::NoticeAction if self.download_active => {
@@ -563,15 +629,7 @@ impl ProductShellApp {
             }
             ShellEvent::NoticeAction => {
                 self.readiness = UiReadinessSnapshot::checking(self.bridge.settings(), &self.store);
-                let (sender, receiver) = mpsc::channel();
-                self.readiness_rx = receiver;
-                probe_readiness(
-                    self.bridge.settings().clone(),
-                    self.store.clone(),
-                    self.loaded_whisper.clone(),
-                    UiVoskProbe::FullValidation,
-                    sender,
-                );
+                self.request_readiness(UiVoskProbe::FullValidation);
                 self.refresh();
             }
             ShellEvent::ChangeWhisperModel(variant) => {
@@ -612,9 +670,6 @@ impl ProductShellApp {
             | ShellEvent::EditLexicon(_)
             | ShellEvent::NewProfile
             | ShellEvent::EditProfile(_)
-            | ShellEvent::StartSetupAction(_)
-            | ShellEvent::CancelSetupAction(_)
-            | ShellEvent::RetrySetupAction(_)
             | ShellEvent::ApplySetupRecommendation(_) => {}
             ShellEvent::CancelLexiconEdit => self.shell.close_lexicon_editor(),
             ShellEvent::CancelProfileEdit => self.shell.close_profile_editor(),
@@ -729,10 +784,52 @@ impl eframe::App for ProductShellApp {
         }
         match self.readiness_rx.try_recv() {
             Ok(readiness) => {
+                self.readiness_in_flight = false;
+                if self.readiness_refresh_pending {
+                    self.readiness_refresh_pending = false;
+                    self.request_readiness(UiVoskProbe::FullValidation);
+                    return;
+                }
                 self.readiness = readiness;
+                if let Some(center) = self.setup_center.as_mut()
+                    && center
+                        .replan(self.bridge.settings(), &self.readiness)
+                        .is_err()
+                {
+                    self.set_error("A safe setup plan could not be created.".to_owned());
+                }
                 self.refresh();
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+        }
+        if let Some(center) = self.setup_center.as_mut() {
+            match center.poll() {
+                Ok(true) => {
+                    let terminal = center.terminal();
+                    self.refresh();
+                    if terminal {
+                        let previous_recognition = self.bridge.settings().recognition.clone();
+                        if self.bridge.reload_settings().is_err() {
+                            self.set_error(
+                                "Updated setup settings could not be reloaded.".to_owned(),
+                            );
+                        } else if self.bridge.settings().recognition != previous_recognition {
+                            let _ = self.events.send(ProductShellEvent::RuntimeReloadRequested(
+                                UiMutation::SettingsSaved,
+                            ));
+                        }
+                        self.readiness =
+                            UiReadinessSnapshot::checking(self.bridge.settings(), &self.store);
+                        self.request_readiness(UiVoskProbe::FullValidation);
+                    }
+                }
+                Ok(false) => {}
+                Err(message) => {
+                    self.set_error(message.to_owned());
+                    self.setup_center = None;
+                    self.refresh();
+                }
+            }
         }
         if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
             self.window_visible = false;
@@ -899,6 +996,25 @@ fn map_snapshot(
         setup: setup_snapshot(microphone, whisper, vosk, ollama),
         notice,
     }
+}
+
+fn map_snapshot_with_setup(
+    snapshot: UiSnapshot,
+    route: UiRoute,
+    notice: Option<InlineNotice>,
+    setup: Option<SetupSnapshot>,
+) -> ShellSnapshot {
+    let mut mapped = map_snapshot(snapshot, route, notice);
+    if let Some(setup) = setup {
+        mapped.setup = setup;
+    } else {
+        mapped.setup = SetupSnapshot {
+            stage: SetupStage::Blocked,
+            summary: "Setup and repair are unavailable in this session. Dictation settings were not changed.".to_owned(),
+            ..SetupSnapshot::default()
+        };
+    }
+    mapped
 }
 
 fn setup_snapshot(

@@ -28,6 +28,7 @@ pub(crate) struct PageState {
     pub settings: SettingsSnapshot,
     pub settings_dirty: bool,
     pub confirm_model_download: Option<AccurateModel>,
+    pub confirm_setup_action: Option<String>,
 }
 
 impl PageState {
@@ -52,10 +53,18 @@ impl PageState {
             settings: snapshot.settings.clone(),
             settings_dirty: false,
             confirm_model_download: None,
+            confirm_setup_action: None,
         }
     }
 
     pub fn reconcile(&mut self, snapshot: &ShellSnapshot) {
+        if self
+            .confirm_setup_action
+            .as_ref()
+            .is_some_and(|id| !snapshot.setup.actions.iter().any(|action| &action.id == id))
+        {
+            self.confirm_setup_action = None;
+        }
         if self
             .history_id
             .is_none_or(|id| !snapshot.history.iter().any(|item| item.id == id))
@@ -118,7 +127,7 @@ pub(crate) fn show(
 ) {
     match route {
         Route::Home => home(ui, snapshot, outbox),
-        Route::Setup => setup(ui, snapshot, outbox),
+        Route::Setup => setup(ui, snapshot, state, outbox),
         Route::History => history(ui, snapshot, state, outbox),
         Route::Lexicon => lexicon(ui, snapshot, state, outbox),
         Route::Profiles => profiles(ui, snapshot, state, outbox),
@@ -127,7 +136,12 @@ pub(crate) fn show(
     }
 }
 
-fn setup(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
+fn setup(
+    ui: &mut Ui,
+    snapshot: &ShellSnapshot,
+    state: &mut PageState,
+    outbox: &mut Vec<ShellEvent>,
+) {
     let tokens = ui.tokens();
     page_header(ui, Route::Setup.title(), Route::Setup.context(), None);
     ui.add_space(Space::LG);
@@ -188,18 +202,49 @@ fn setup(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
                 ui.add(egui::ProgressBar::new(f32::from(progress) / 100.0).show_percentage());
             }
             ui.horizontal(|ui| {
-                if planned.running {
+                if planned.complete {
+                    metadata(ui, "Complete");
+                } else if !planned.available {
+                    metadata(ui, "Waiting for the active operation");
+                } else if planned.running {
                     if action(ui, "Cancel", ActionTone::Secondary).clicked() {
                         outbox.push(ShellEvent::CancelSetupAction(planned.id.clone()));
                     }
-                } else if planned.can_retry {
-                    if action(ui, "Retry", ActionTone::Primary).clicked() {
-                        outbox.push(ShellEvent::RetrySetupAction(planned.id.clone()));
+                } else if state.confirm_setup_action.as_deref() == Some(&planned.id) {
+                    if action(ui, "I consent — begin", ActionTone::Primary).clicked() {
+                        state.confirm_setup_action = None;
+                        outbox.push(if planned.can_retry {
+                            ShellEvent::RetrySetupAction(planned.id.clone())
+                        } else {
+                            ShellEvent::StartSetupAction(planned.id.clone())
+                        });
                     }
-                } else if action(ui, "Review and continue", ActionTone::Primary).clicked() {
-                    outbox.push(ShellEvent::StartSetupAction(planned.id.clone()));
+                    if action(ui, "Not now", ActionTone::Secondary).clicked() {
+                        state.confirm_setup_action = None;
+                    }
+                } else if planned.can_retry {
+                    if planned.consent.is_empty() {
+                        if action(ui, "Retry", ActionTone::Primary).clicked() {
+                            outbox.push(ShellEvent::RetrySetupAction(planned.id.clone()));
+                        }
+                    } else if action(ui, "Review retry consent", ActionTone::Primary).clicked() {
+                        state.confirm_setup_action = Some(planned.id.clone());
+                    }
+                } else if planned.consent.is_empty() {
+                    if action(ui, "Continue", ActionTone::Primary).clicked() {
+                        outbox.push(ShellEvent::StartSetupAction(planned.id.clone()));
+                    }
+                } else if action(ui, "Review consent", ActionTone::Primary).clicked() {
+                    state.confirm_setup_action = Some(planned.id.clone());
                 }
             });
+            if state.confirm_setup_action.as_deref() == Some(&planned.id) {
+                ui.label(
+                    RichText::new("Only the disclosed operations above will be authorized. Confirm once to begin this action.")
+                        .size(12.0)
+                        .color(tokens.secondary_text),
+                );
+            }
             hairline(ui);
         }
     }
@@ -1426,6 +1471,15 @@ mod tests {
         assert_eq!(state.history_id, None);
         assert_eq!(state.lexicon_id, None);
         assert_eq!(state.profile_name, None);
+    }
+
+    #[test]
+    fn stale_setup_confirmation_is_cleared_by_host_snapshot() {
+        let populated = ShellSnapshot::gallery(GalleryScenario::Error);
+        let mut state = PageState::from_snapshot(&populated);
+        state.confirm_setup_action = Some("stale-action".to_owned());
+        state.reconcile(&populated);
+        assert!(state.confirm_setup_action.is_none());
     }
 
     #[test]

@@ -121,6 +121,9 @@ pub struct UiOllamaModel {
     pub name: String,
     pub size_bytes: Option<u64>,
     pub family: Option<String>,
+    /// Exact identity reported by the loopback Ollama API. This is retained so
+    /// setup never substitutes a mutable model name for digest authority.
+    pub digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,6 +132,8 @@ pub struct UiOllamaReadiness {
     pub models: Vec<UiOllamaModel>,
     pub selected: Option<String>,
     pub message: String,
+    pub daemon_reachable: bool,
+    pub installed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,6 +187,7 @@ impl UiReadinessSnapshot {
                         name: model.name.to_string(),
                         size_bytes: model.size,
                         family: model.details.family.clone(),
+                        digest: model.digest.clone(),
                     })
                     .collect::<Vec<_>>();
                 let selected = settings.formatting.ollama_model.clone();
@@ -209,6 +215,8 @@ impl UiReadinessSnapshot {
                     models,
                     selected,
                     message: message.to_owned(),
+                    daemon_reachable: true,
+                    installed: true,
                 }
             }
             Err(_) => UiOllamaReadiness {
@@ -216,6 +224,8 @@ impl UiReadinessSnapshot {
                 models: Vec::new(),
                 selected: settings.formatting.ollama_model.clone(),
                 message: "Ollama is not running. Dictation will use Light output.".to_owned(),
+                daemon_reachable: false,
+                installed: ollama_is_installed(),
             },
         };
 
@@ -256,6 +266,8 @@ impl UiReadinessSnapshot {
                 models: Vec::new(),
                 selected: settings.formatting.ollama_model.clone(),
                 message: "Checking Ollama.".to_owned(),
+                daemon_reachable: false,
+                installed: false,
             },
         }
     }
@@ -264,6 +276,14 @@ impl UiReadinessSnapshot {
         self.ollama.state == UiReadinessState::Ready
             && self.ollama.models.iter().any(|model| model.name == name)
     }
+}
+
+fn ollama_is_installed() -> bool {
+    std::env::var_os("LOCALAPPDATA").is_some_and(|root| {
+        let executable = PathBuf::from(root).join("Programs/Ollama/ollama.exe");
+        std::fs::symlink_metadata(executable)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    })
 }
 
 fn whisper_readiness(
@@ -665,6 +685,13 @@ impl UiBridge {
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Refreshes the in-memory settings after a trusted background host action
+    /// commits them. The durable store remains authoritative.
+    pub fn reload_settings(&mut self) -> Result<(), UiBridgeError> {
+        self.settings = self.store.load().map_err(UiBridgeError::settings)?;
+        Ok(())
     }
 
     pub fn snapshot(
@@ -1392,9 +1419,12 @@ mod tests {
                     name: "qwen2.5:3b".to_owned(),
                     size_bytes: Some(1_000),
                     family: Some("qwen".to_owned()),
+                    digest: Some("a".repeat(64)),
                 }],
                 selected: None,
                 message: "Ollama available; warm-up is independent.".to_owned(),
+                daemon_reachable: true,
+                installed: true,
             },
         }
     }

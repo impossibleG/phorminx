@@ -493,8 +493,9 @@ impl SettingsStore {
         self.save_locked(settings)
     }
 
-    /// Atomically verifies the caller's read snapshot and commits a validated
-    /// replacement under the same process-wide settings lock.
+    /// Atomically commits `replacement` only while the durable settings still
+    /// equal the snapshot that was validated. Long-running work cannot
+    /// overwrite a newer edit made in the unified UI.
     pub fn compare_and_save(
         &self,
         expected: &Settings,
@@ -858,6 +859,23 @@ mod tests {
         let store = SettingsStore::new(path.clone()).unwrap();
         assert_eq!(store.load().unwrap(), Settings::default());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn compare_and_save_never_overwrites_a_newer_snapshot() {
+        let directory = TestDirectory::new("compare-and-save");
+        let store = SettingsStore::new(directory.0.join("settings.toml")).unwrap();
+        let original = Settings::default();
+        store.save(&original).unwrap();
+
+        let mut concurrent = original.clone();
+        concurrent.recognition.minimum_rms = 0.02;
+        store.save(&concurrent).unwrap();
+
+        let mut stale_candidate = original.clone();
+        stale_candidate.startup.launch_at_login = true;
+        assert!(!store.compare_and_save(&original, &stale_candidate).unwrap());
+        assert_eq!(store.load().unwrap(), concurrent);
     }
 
     #[test]
