@@ -10,6 +10,9 @@ use crate::{
     TrustedCandidateIdentity,
 };
 
+const MAX_SCORED_WORDS: usize = 4_096;
+const MAX_SCORED_CHARACTERS: usize = 32_768;
+
 /// Exact, host-trusted identity of a benchmarkable recognition configuration.
 /// It deliberately has no deserializer: persisted evidence cannot mint runtime authority.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -360,17 +363,27 @@ pub enum AggregationError {
 #[must_use]
 pub fn score_transcript(calibration: &EphemeralCalibration<'_>, transcript: &str) -> QualityCounts {
     let reference_words = tokenize_words(calibration.reference()).collect::<Vec<_>>();
-    let transcript_words = tokenize_words(transcript).collect::<Vec<_>>();
-    let reference_characters = normalize_characters(calibration.reference());
-    let transcript_characters = normalize_characters(transcript);
+    let transcript_words = tokenize_words(transcript)
+        .take(MAX_SCORED_WORDS + 1)
+        .collect::<Vec<_>>();
+    let reference_characters = normalize_characters(calibration.reference()).collect::<Vec<_>>();
+    let transcript_characters = normalize_characters(transcript)
+        .take(MAX_SCORED_CHARACTERS + 1)
+        .collect::<Vec<_>>();
     let protected_tokens = calibration.protected_tokens();
-    let protected_tokens_exact = protected_tokens
-        .iter()
-        .filter(|token| {
-            let expected = bounded_occurrences(calibration.reference(), token);
-            expected > 0 && bounded_occurrences(transcript, token) == expected
-        })
-        .count();
+    let transcript_was_bounded = transcript_words.len() > MAX_SCORED_WORDS
+        || transcript_characters.len() > MAX_SCORED_CHARACTERS;
+    let protected_tokens_exact = if transcript_was_bounded {
+        0
+    } else {
+        protected_tokens
+            .iter()
+            .filter(|token| {
+                let expected = bounded_occurrences(calibration.reference(), token);
+                expected > 0 && bounded_occurrences(transcript, token) == expected
+            })
+            .count()
+    };
     let word_edits = edit_counts(&reference_words, &transcript_words);
     let character_edits = edit_counts(&reference_characters, &transcript_characters);
     let silence = calibration.reference().is_empty();
@@ -493,7 +506,21 @@ pub fn aggregate_evidence(
             .push(u64::try_from(rtf).map_err(|_| AggregationError::InvalidMeasurement)?);
         peak_working_set_mib = peak_working_set_mib.max(observation.peak_working_set_mib);
         available_memory_mib = available_memory_mib.min(observation.available_memory_mib);
-        fallback_count = fallback_count.saturating_add(observation.fallback_count);
+        fallback_count = fallback_count
+            .checked_add(observation.fallback_count)
+            .ok_or(AggregationError::InvalidMeasurement)?;
+        let case = corpus
+            .cases
+            .iter()
+            .find(|case| case.case_id == observation.case_id)
+            .ok_or(AggregationError::InvalidCaseSet)?;
+        let baseline = score_transcript(&case.ephemeral_content(), case.reference);
+        if observation.quality.reference_words != baseline.reference_words
+            || observation.quality.reference_characters != baseline.reference_characters
+            || observation.quality.protected_tokens != baseline.protected_tokens
+        {
+            return Err(AggregationError::InvalidMeasurement);
+        }
         quality.reference_words = quality
             .reference_words
             .checked_add(observation.quality.reference_words)
@@ -609,7 +636,7 @@ fn percentile(values: &[u64], percent: usize) -> Option<u64> {
     if values.is_empty() || percent == 0 || percent > 100 {
         return None;
     }
-    let rank = values.len().saturating_mul(percent).div_ceil(100);
+    let rank = values.len().checked_mul(percent)?.div_ceil(100);
     values.get(rank.saturating_sub(1)).copied()
 }
 
@@ -641,12 +668,11 @@ fn tokenize_words(value: &str) -> impl Iterator<Item = String> + '_ {
     })
 }
 
-fn normalize_characters(value: &str) -> Vec<char> {
+fn normalize_characters(value: &str) -> impl Iterator<Item = char> + '_ {
     value
         .chars()
         .filter(|character| character.is_alphanumeric())
         .flat_map(char::to_lowercase)
-        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -908,6 +934,111 @@ mod tests {
             ),
             Err(AggregationError::InvalidMeasurement)
         );
+
+        let mut observations = perfect_observations(&corpus, Language::English);
+        observations[0].quality.reference_words = 1;
+        assert_eq!(
+            aggregate_evidence(
+                &candidate(Language::English),
+                &context(),
+                &corpus,
+                Language::English,
+                &observations,
+            ),
+            Err(AggregationError::InvalidMeasurement)
+        );
+
+        let mut observations = perfect_observations(&corpus, Language::English);
+        observations[0].fallback_count = u32::MAX;
+        observations[1].fallback_count = 1;
+        assert_eq!(
+            aggregate_evidence(
+                &candidate(Language::English),
+                &context(),
+                &corpus,
+                Language::English,
+                &observations,
+            ),
+            Err(AggregationError::InvalidMeasurement)
+        );
+    }
+
+    #[test]
+    fn hostile_transcript_scoring_is_bounded_and_fails_quality_gates() {
+        let corpus = CalibrationCorpus::pinned_v1();
+        let case = corpus.cases_for(Language::English).next().unwrap();
+        let transcript = "invented ".repeat(200_000);
+        let score = score_transcript(&case.ephemeral_content(), &transcript);
+        assert_eq!(score.protected_tokens_exact, 0);
+        assert!(score.word_errors > score.reference_words);
+        assert!(score.character_errors > score.reference_characters);
+        assert!(score.hallucinated_tokens > 0);
+        assert!(score.word_errors <= u32::try_from(MAX_SCORED_WORDS + 1).unwrap());
+        assert!(score.character_errors <= u32::try_from(MAX_SCORED_CHARACTERS + 1).unwrap());
+    }
+
+    #[test]
+    fn randomized_edit_classification_matches_full_reference_dp() {
+        fn reference(left: &[u8], right: &[u8]) -> EditCounts {
+            let mut table = vec![vec![EditCounts::default(); right.len() + 1]; left.len() + 1];
+            for (index, cell) in table[0].iter_mut().enumerate() {
+                *cell = EditCounts {
+                    distance: index,
+                    insertions: index,
+                };
+            }
+            for (index, row) in table.iter_mut().enumerate().skip(1) {
+                row[0] = EditCounts {
+                    distance: index,
+                    insertions: 0,
+                };
+            }
+            for row in 1..=left.len() {
+                for column in 1..=right.len() {
+                    let mut candidates = [
+                        table[row - 1][column - 1],
+                        table[row][column - 1],
+                        table[row - 1][column],
+                    ];
+                    candidates[0].distance += usize::from(left[row - 1] != right[column - 1]);
+                    candidates[1].distance += 1;
+                    candidates[1].insertions += 1;
+                    candidates[2].distance += 1;
+                    table[row][column] = candidates
+                        .into_iter()
+                        .min_by_key(|score| (score.distance, std::cmp::Reverse(score.insertions)))
+                        .unwrap();
+                }
+            }
+            table[left.len()][right.len()]
+        }
+
+        let mut state = 0x5eed_u64;
+        for _ in 0..2_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let left_len = usize::try_from(state % 7).unwrap();
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let right_len = usize::try_from(state % 7).unwrap();
+            let mut left = Vec::with_capacity(left_len);
+            let mut right = Vec::with_capacity(right_len);
+            for _ in 0..left_len {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                left.push(u8::try_from(state % 4).unwrap());
+            }
+            for _ in 0..right_len {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                right.push(u8::try_from(state % 4).unwrap());
+            }
+            assert_eq!(edit_counts(&left, &right), reference(&left, &right));
+        }
     }
 
     #[test]

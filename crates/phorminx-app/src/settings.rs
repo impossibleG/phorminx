@@ -503,14 +503,36 @@ impl SettingsStore {
         let _save_guard = SAVE_LOCK
             .lock()
             .map_err(|_| SettingsError::SaveLockPoisoned)?;
-        if self.load()? != *expected {
+        let temporary_path = self.prepare_locked(replacement)?;
+        self.commit_temporary_if_unchanged(temporary_path, expected)
+    }
+
+    fn commit_temporary_if_unchanged(
+        &self,
+        temporary_path: PathBuf,
+        expected: &Settings,
+    ) -> Result<bool, SettingsError> {
+        let current = match self.load() {
+            Ok(current) => current,
+            Err(error) => {
+                let _ = fs::remove_file(temporary_path);
+                return Err(error);
+            }
+        };
+        if current != *expected {
+            let _ = fs::remove_file(temporary_path);
             return Ok(false);
         }
-        self.save_locked(replacement)?;
+        self.commit_temporary(temporary_path)?;
         Ok(true)
     }
 
     fn save_locked(&self, settings: &Settings) -> Result<(), SettingsError> {
+        let temporary_path = self.prepare_locked(settings)?;
+        self.commit_temporary(temporary_path)
+    }
+
+    fn prepare_locked(&self, settings: &Settings) -> Result<PathBuf, SettingsError> {
         let mut canonical = settings.clone();
         canonical.validate_and_normalize()?;
         let serialized = toml::to_string_pretty(&canonical).map_err(SettingsError::Serialize)?;
@@ -544,12 +566,21 @@ impl SettingsStore {
                     source,
                 })?;
             drop(temporary_file);
-            atomic_replace_file(&temporary_path, &self.path).map_err(SettingsError::AtomicReplace)
+            Ok(temporary_path.clone())
         })();
         if write_result.is_err() {
             let _ = fs::remove_file(&temporary_path);
         }
         write_result
+    }
+
+    fn commit_temporary(&self, temporary_path: PathBuf) -> Result<(), SettingsError> {
+        let result =
+            atomic_replace_file(&temporary_path, &self.path).map_err(SettingsError::AtomicReplace);
+        if result.is_err() {
+            let _ = fs::remove_file(temporary_path);
+        }
+        result
     }
 
     pub fn resolve_model_path(&self, model_path: &Path) -> PathBuf {
@@ -1073,6 +1104,31 @@ language = "pt-BR"
         replacement.formatting.strength = FormattingStrength::Raw;
         store.save(&replacement).unwrap();
         assert_eq!(store.load().unwrap(), replacement);
+    }
+
+    #[test]
+    fn prepared_compare_and_save_rechecks_external_changes_at_commit_boundary() {
+        let directory = TestDirectory::new("compare-external");
+        let store = SettingsStore::new(directory.0.join("settings.toml")).unwrap();
+        let original = Settings::default();
+        store.save(&original).unwrap();
+
+        let mut replacement = original.clone();
+        replacement.recognition.minimum_rms = 0.1;
+        let temporary = store.prepare_locked(&replacement).unwrap();
+
+        let mut external = original.clone();
+        external.recognition.minimum_rms = 0.2;
+        let serialized = toml::to_string_pretty(&external).unwrap();
+        fs::write(store.path(), serialized).unwrap();
+
+        assert!(
+            !store
+                .commit_temporary_if_unchanged(temporary.clone(), &original)
+                .unwrap()
+        );
+        assert_eq!(store.load().unwrap(), external);
+        assert!(!temporary.exists());
     }
 
     #[test]

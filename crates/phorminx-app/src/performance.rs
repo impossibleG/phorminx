@@ -17,8 +17,7 @@ use phorminx_windows::atomic_replace_file;
 use serde::{Deserialize, Serialize};
 
 use crate::settings::{
-    AccurateBackendPreference, AccurateModelVariant, RecognitionMode, Settings, SettingsError,
-    SettingsStore,
+    AccurateBackendPreference, AccurateModelVariant, RecognitionMode, Settings, SettingsStore,
 };
 
 const MAX_EVIDENCE_BYTES: u64 = 512 * 1024;
@@ -26,6 +25,7 @@ const MAX_EVIDENCE_RECORDS: usize = 64;
 const MIN_BENCHMARK_DURATION: Duration = Duration::from_secs(5);
 const MAX_BENCHMARK_DURATION: Duration = Duration::from_secs(15 * 60);
 static EVIDENCE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static EVIDENCE_SAVE_LOCK: Mutex<()> = Mutex::new(());
 static GLOBAL_BENCHMARK_PERMIT: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 static RECOMMENDER_AUTHORITY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -307,16 +307,7 @@ impl PerformanceBenchmarkService {
                     )
                 }))
                 .unwrap_or(Err(BenchmarkFailure::WorkerFailed));
-                if shared.generation.load(Ordering::Acquire) == generation {
-                    set_state(
-                        &shared,
-                        match terminal {
-                            Ok(evidence) => BenchmarkRunState::Complete(Box::new(evidence)),
-                            Err(error) => BenchmarkRunState::Failed(error),
-                        },
-                    );
-                }
-                shared.running.store(false, Ordering::Release);
+                finalize_run(&shared, generation, deadline, terminal);
                 process_permit.store(false, Ordering::Release);
             })
             .map_err(|_| {
@@ -334,18 +325,22 @@ impl PerformanceBenchmarkService {
 
     #[must_use]
     pub fn cancel(&self, ticket: BenchmarkTicket) -> bool {
+        if self.shared.generation.load(Ordering::Acquire) != ticket.generation {
+            return false;
+        }
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.shared.generation.load(Ordering::Acquire) != ticket.generation
             || !self.shared.running.load(Ordering::Acquire)
         {
             return false;
         }
         self.shared.cancelled.store(true, Ordering::Release);
-        let current = self.snapshot();
-        if let BenchmarkRunState::Running { completed, total } = current {
-            set_state(
-                &self.shared,
-                BenchmarkRunState::Cancelling { completed, total },
-            );
+        if let &BenchmarkRunState::Running { completed, total } = &*state {
+            *state = BenchmarkRunState::Cancelling { completed, total };
         }
         true
     }
@@ -404,15 +399,12 @@ fn run_benchmark(
             contention_condition: sample.contention_condition,
             quality: sample.quality,
         });
-        if shared.generation.load(Ordering::Acquire) == generation {
-            set_state(
-                shared,
-                BenchmarkRunState::Running {
-                    completed: u32::try_from(index + 1).unwrap_or(u32::MAX),
-                    total,
-                },
-            );
-        }
+        set_progress(
+            shared,
+            generation,
+            u32::try_from(index + 1).unwrap_or(u32::MAX),
+            total,
+        );
     }
     aggregate_evidence(&candidate, &context, corpus, language, &observations)
         .map_err(|_| BenchmarkFailure::InvalidEvidence)
@@ -426,6 +418,33 @@ fn ensure_live(control: &BenchmarkControl) -> Result<(), BenchmarkFailure> {
     } else {
         Ok(())
     }
+}
+
+fn finalize_run(
+    shared: &SharedRun,
+    generation: u64,
+    deadline: Instant,
+    terminal: Result<BenchmarkEvidence, BenchmarkFailure>,
+) {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    shared.running.store(false, Ordering::Release);
+    if shared.generation.load(Ordering::Acquire) != generation {
+        return;
+    }
+    let terminal = if shared.cancelled.load(Ordering::Acquire) {
+        Err(BenchmarkFailure::Cancelled)
+    } else if Instant::now() >= deadline {
+        Err(BenchmarkFailure::DeadlineExceeded)
+    } else {
+        terminal
+    };
+    *state = match terminal {
+        Ok(evidence) => BenchmarkRunState::Complete(Box::new(evidence)),
+        Err(error) => BenchmarkRunState::Failed(error),
+    };
 }
 
 const fn map_measurement_failure(error: MeasurementFailure) -> BenchmarkFailure {
@@ -446,6 +465,19 @@ fn set_state(shared: &SharedRun, state: BenchmarkRunState) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
 }
 
+fn set_progress(shared: &SharedRun, generation: u64, completed: u32, total: u32) {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if shared.generation.load(Ordering::Acquire) == generation
+        && !shared.cancelled.load(Ordering::Acquire)
+        && matches!(&*state, BenchmarkRunState::Running { .. })
+    {
+        *state = BenchmarkRunState::Running { completed, total };
+    }
+}
+
 #[derive(Clone)]
 pub struct EvidenceStore {
     path: PathBuf,
@@ -457,12 +489,12 @@ impl std::fmt::Debug for EvidenceStore {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum EvidenceStoreError {
     #[error("the evidence path is invalid")]
     InvalidPath,
     #[error("could not access benchmark evidence")]
-    Access(#[source] std::io::Error),
+    Access(std::io::ErrorKind),
     #[error("benchmark evidence exceeds its size limit")]
     TooLarge,
     #[error("benchmark evidence is corrupt or has an unsupported schema")]
@@ -470,9 +502,23 @@ pub enum EvidenceStoreError {
     #[error("benchmark evidence contains invalid records")]
     InvalidEvidence,
     #[error("could not encode benchmark evidence")]
-    Encode(#[source] serde_json::Error),
+    Encode,
     #[error("could not atomically commit benchmark evidence")]
-    Commit(#[source] phorminx_windows::AtomicReplaceError),
+    Commit,
+}
+
+impl std::fmt::Debug for EvidenceStoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidPath => "EvidenceStoreError::InvalidPath",
+            Self::Access(_) => "EvidenceStoreError::Access([REDACTED])",
+            Self::TooLarge => "EvidenceStoreError::TooLarge",
+            Self::InvalidFormat => "EvidenceStoreError::InvalidFormat",
+            Self::InvalidEvidence => "EvidenceStoreError::InvalidEvidence",
+            Self::Encode => "EvidenceStoreError::Encode",
+            Self::Commit => "EvidenceStoreError::Commit",
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -501,16 +547,21 @@ impl EvidenceStore {
         let mut file = match File::open(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(EvidenceStoreError::Access(error)),
+            Err(error) => return Err(EvidenceStoreError::Access(error.kind())),
         };
-        if file.metadata().map_err(EvidenceStoreError::Access)?.len() > MAX_EVIDENCE_BYTES {
+        if file
+            .metadata()
+            .map_err(|error| EvidenceStoreError::Access(error.kind()))?
+            .len()
+            > MAX_EVIDENCE_BYTES
+        {
             return Err(EvidenceStoreError::TooLarge);
         }
         let mut bytes = Vec::new();
         Read::by_ref(&mut file)
             .take(MAX_EVIDENCE_BYTES + 1)
             .read_to_end(&mut bytes)
-            .map_err(EvidenceStoreError::Access)?;
+            .map_err(|error| EvidenceStoreError::Access(error.kind()))?;
         if bytes.len() as u64 > MAX_EVIDENCE_BYTES {
             return Err(EvidenceStoreError::TooLarge);
         }
@@ -521,6 +572,9 @@ impl EvidenceStore {
     }
 
     pub fn save(&self, evidence: &[BenchmarkEvidence]) -> Result<(), EvidenceStoreError> {
+        let _save_guard = EVIDENCE_SAVE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut evidence = evidence.to_vec();
         evidence.sort();
         evidence.dedup();
@@ -529,12 +583,12 @@ impl EvidenceStore {
             evidence,
         };
         validate_envelope(&envelope)?;
-        let bytes = serde_json::to_vec(&envelope).map_err(EvidenceStoreError::Encode)?;
+        let bytes = serde_json::to_vec(&envelope).map_err(|_| EvidenceStoreError::Encode)?;
         if bytes.len() as u64 > MAX_EVIDENCE_BYTES {
             return Err(EvidenceStoreError::TooLarge);
         }
         let directory = self.path.parent().ok_or(EvidenceStoreError::InvalidPath)?;
-        fs::create_dir_all(directory).map_err(EvidenceStoreError::Access)?;
+        fs::create_dir_all(directory).map_err(|error| EvidenceStoreError::Access(error.kind()))?;
         let temporary = directory.join(format!(
             ".performance-evidence.{}.{}.tmp",
             std::process::id(),
@@ -545,13 +599,13 @@ impl EvidenceStore {
                 .write(true)
                 .create_new(true)
                 .open(&temporary)
-                .map_err(EvidenceStoreError::Access)?;
+                .map_err(|error| EvidenceStoreError::Access(error.kind()))?;
             file.write_all(&bytes)
                 .and_then(|()| file.flush())
                 .and_then(|()| file.sync_all())
-                .map_err(EvidenceStoreError::Access)?;
+                .map_err(|error| EvidenceStoreError::Access(error.kind()))?;
             drop(file);
-            atomic_replace_file(&temporary, &self.path).map_err(EvidenceStoreError::Commit)
+            atomic_replace_file(&temporary, &self.path).map_err(|_| EvidenceStoreError::Commit)
         })();
         if write_result.is_err() {
             let _ = fs::remove_file(&temporary);
@@ -689,12 +743,14 @@ impl std::fmt::Debug for AppliedRecommendation {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum ApplyError {
     #[error("application profile does not match its exact benchmark identity")]
     ProfileMismatch,
     #[error("recommendation is not eligible for application")]
     NotApplicable,
+    #[error("the recommended local recognition assets are unavailable or no longer match")]
+    AssetUnavailable,
     #[error("application consent is stale or has already been consumed")]
     StaleConsent,
     #[error("settings changed after the recommendation was applied")]
@@ -702,7 +758,21 @@ pub enum ApplyError {
     #[error("settings changed before the recommendation could be committed")]
     ConcurrentSettingsChange,
     #[error("settings validation or atomic commit failed")]
-    Settings(#[from] SettingsError),
+    Settings,
+}
+
+impl std::fmt::Debug for ApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ProfileMismatch => "ApplyError::ProfileMismatch",
+            Self::NotApplicable => "ApplyError::NotApplicable",
+            Self::AssetUnavailable => "ApplyError::AssetUnavailable",
+            Self::StaleConsent => "ApplyError::StaleConsent",
+            Self::StaleRollback => "ApplyError::StaleRollback",
+            Self::ConcurrentSettingsChange => "ApplyError::ConcurrentSettingsChange",
+            Self::Settings => "ApplyError::Settings",
+        })
+    }
 }
 
 pub struct PerformanceRecommender {
@@ -711,12 +781,83 @@ pub struct PerformanceRecommender {
     authority_id: u64,
     next_generation: u64,
     pending_generation: Option<u64>,
+    latest_applied_generation: Option<u64>,
+    asset_verifier: Arc<dyn ApplicationAssetVerifier>,
+}
+
+trait ApplicationAssetVerifier: Send + Sync {
+    fn matches(&self, profile: &ApplicationProfile, store: &SettingsStore) -> bool;
+}
+
+struct LocalApplicationAssetVerifier;
+
+impl ApplicationAssetVerifier for LocalApplicationAssetVerifier {
+    fn matches(&self, profile: &ApplicationProfile, store: &SettingsStore) -> bool {
+        match &profile.recognition {
+            RecognitionApplication::Accurate {
+                model, model_path, ..
+            } => crate::model::identify_pinned_model(&store.resolve_model_path(model_path))
+                .is_ok_and(|identified| identified == Some(*model)),
+            RecognitionApplication::Instant {
+                model_path,
+                runtime_path,
+            } => {
+                let resolved_runtime = store.resolve_asset_path(runtime_path);
+                let resolved_model = store.resolve_asset_path(model_path);
+                let Ok(catalog) = crate::setup_host::PinnedCatalog::phorminx() else {
+                    return false;
+                };
+                let expected =
+                    catalog.preferred_recognition_artifacts(EngineKind::Instant, profile.language);
+                if expected.len() != 2 {
+                    return false;
+                }
+                let Ok(root) = crate::setup_host::ManagedRoot::from_local_app_data() else {
+                    return false;
+                };
+                let Ok(installed) = root.installed() else {
+                    return false;
+                };
+                let receipts_match = expected.iter().all(|descriptor| {
+                    let expected_target = if descriptor.supported_languages().is_empty() {
+                        &resolved_runtime
+                    } else {
+                        if descriptor.digest() != profile.candidate.model_digest() {
+                            return false;
+                        }
+                        &resolved_model
+                    };
+                    installed.iter().any(|install| {
+                        &install.target == expected_target
+                            && install.receipt.asset().descriptor() == descriptor
+                    })
+                });
+                receipts_match
+                    && matches!(
+                        phorminx_vosk::inspect(
+                            &resolved_runtime,
+                            &resolved_model,
+                            profile.language.code(),
+                        ),
+                        phorminx_vosk::Readiness::Ready { .. }
+                    )
+            }
+        }
+    }
 }
 
 impl PerformanceRecommender {
     pub fn new(
         policy: RecommendationPolicy,
         profiles: impl IntoIterator<Item = ApplicationProfile>,
+    ) -> Result<Self, ApplyError> {
+        Self::new_with_verifier(policy, profiles, Arc::new(LocalApplicationAssetVerifier))
+    }
+
+    fn new_with_verifier(
+        policy: RecommendationPolicy,
+        profiles: impl IntoIterator<Item = ApplicationProfile>,
+        asset_verifier: Arc<dyn ApplicationAssetVerifier>,
     ) -> Result<Self, ApplyError> {
         let mut exact = BTreeMap::new();
         for profile in profiles {
@@ -735,6 +876,8 @@ impl PerformanceRecommender {
             authority_id: RECOMMENDER_AUTHORITY_SEQUENCE.fetch_add(1, Ordering::Relaxed),
             next_generation: 0,
             pending_generation: None,
+            latest_applied_generation: None,
+            asset_verifier,
         })
     }
 
@@ -807,13 +950,22 @@ impl PerformanceRecommender {
             .profiles
             .get(&consent.candidate_id)
             .ok_or(ApplyError::NotApplicable)?;
-        let previous = store.load()?;
+        if !self.asset_verifier.matches(profile, store) {
+            return Err(ApplyError::AssetUnavailable);
+        }
+        let previous = store.load().map_err(|_| ApplyError::Settings)?;
         let mut applied = previous.clone();
         apply_profile(&mut applied, profile);
-        applied.validate_and_normalize()?;
-        if !store.compare_and_save(&previous, &applied)? {
+        applied
+            .validate_and_normalize()
+            .map_err(|_| ApplyError::Settings)?;
+        if !store
+            .compare_and_save(&previous, &applied)
+            .map_err(|_| ApplyError::Settings)?
+        {
             return Err(ApplyError::ConcurrentSettingsChange);
         }
+        self.latest_applied_generation = Some(consent.generation);
         Ok(AppliedRecommendation {
             authority_id: self.authority_id,
             generation: consent.generation,
@@ -828,14 +980,22 @@ impl PerformanceRecommender {
         store: &SettingsStore,
     ) -> Result<(), ApplyError> {
         if receipt.authority_id != self.authority_id
-            || receipt.generation > self.next_generation
-            || store.load()? != receipt.applied
+            || self.latest_applied_generation != Some(receipt.generation)
         {
             return Err(ApplyError::StaleRollback);
         }
+        self.latest_applied_generation = None;
+        if store.load().map_err(|_| ApplyError::Settings)? != receipt.applied {
+            return Err(ApplyError::StaleRollback);
+        }
         let mut previous = receipt.previous;
-        previous.validate_and_normalize()?;
-        if !store.compare_and_save(&receipt.applied, &previous)? {
+        previous
+            .validate_and_normalize()
+            .map_err(|_| ApplyError::Settings)?;
+        if !store
+            .compare_and_save(&receipt.applied, &previous)
+            .map_err(|_| ApplyError::Settings)?
+        {
             return Err(ApplyError::StaleRollback);
         }
         Ok(())
@@ -916,7 +1076,7 @@ fn apply_profile(settings: &mut Settings, profile: &ApplicationProfile) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Condvar;
+    use std::sync::{Barrier, Condvar};
 
     use phorminx_setup::{
         BenchmarkSampleSummary, ModelClass, Sha256Digest, TrustedCandidateIdentity,
@@ -924,6 +1084,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::settings::SettingsError;
 
     fn id(value: &str) -> ContentFreeId {
         ContentFreeId::new(value).unwrap()
@@ -1054,6 +1215,28 @@ mod tests {
             _candidate: &BenchmarkCandidate,
         ) -> Result<Box<dyn BenchmarkActivityLease>, BenchmarkPreflightFailure> {
             panic!("synthetic content-free preflight failure")
+        }
+    }
+
+    struct PanicAdapter;
+
+    impl PerformanceMeasurementAdapter for PanicAdapter {
+        fn measure(
+            &self,
+            _candidate: &BenchmarkCandidate,
+            _case: &CalibrationCase,
+            _cold_load: bool,
+            _control: &BenchmarkControl,
+        ) -> Result<MeasuredSample, MeasurementFailure> {
+            panic!("synthetic content-free adapter failure")
+        }
+    }
+
+    struct AllowAssetVerifier;
+
+    impl ApplicationAssetVerifier for AllowAssetVerifier {
+        fn matches(&self, _profile: &ApplicationProfile, _store: &SettingsStore) -> bool {
+            true
         }
     }
 
@@ -1245,6 +1428,99 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn panicking_worker_fails_closed_and_releases_the_process_permit() {
+        let permit = Arc::new(AtomicBool::new(false));
+        let broken = PerformanceBenchmarkService::with_permit(
+            Arc::new(PanicAdapter),
+            Arc::new(AllowPreflight),
+            Arc::clone(&permit),
+        );
+        broken
+            .start(
+                candidate(),
+                context(),
+                Language::English,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(
+            wait_terminal(&broken),
+            BenchmarkRunState::Failed(BenchmarkFailure::WorkerFailed)
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while permit.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+
+        let healthy = PerformanceBenchmarkService::with_permit(
+            Arc::new(PerfectAdapter),
+            Arc::new(AllowPreflight),
+            permit,
+        );
+        healthy
+            .start(
+                candidate(),
+                context(),
+                Language::English,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert!(matches!(
+            wait_terminal(&healthy),
+            BenchmarkRunState::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn acknowledged_cancel_always_wins_the_terminal_publication_race() {
+        for _ in 0..100 {
+            let service = service(Arc::new(PerfectAdapter));
+            let ticket = service
+                .start(
+                    candidate(),
+                    context(),
+                    Language::English,
+                    Duration::from_secs(5),
+                )
+                .unwrap();
+            let acknowledged = service.cancel(ticket);
+            let terminal = wait_terminal(&service);
+            if acknowledged {
+                assert_eq!(
+                    terminal,
+                    BenchmarkRunState::Failed(BenchmarkFailure::Cancelled)
+                );
+            } else {
+                assert!(matches!(terminal, BenchmarkRunState::Complete(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn deadline_at_terminal_publication_overrides_a_late_success() {
+        let shared = SharedRun {
+            generation: AtomicU64::new(7),
+            running: AtomicBool::new(true),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            state: Mutex::new(BenchmarkRunState::Running {
+                completed: 4,
+                total: 4,
+            }),
+        };
+        finalize_run(
+            &shared,
+            7,
+            Instant::now() - Duration::from_millis(1),
+            Ok(evidence()),
+        );
+        assert_eq!(
+            shared.state.into_inner().unwrap(),
+            BenchmarkRunState::Failed(BenchmarkFailure::DeadlineExceeded)
+        );
+    }
+
     fn temporary_store() -> (TempDir, EvidenceStore) {
         let directory = tempfile::tempdir().unwrap();
         let store = EvidenceStore::new(directory.path().join("evidence.json")).unwrap();
@@ -1303,6 +1579,45 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_evidence_writers_leave_one_complete_valid_envelope() {
+        let (_directory, store) = temporary_store();
+        let store = Arc::new(store);
+        let barrier = Arc::new(Barrier::new(8));
+        let workers = (0..8)
+            .map(|index| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut record = evidence();
+                    record.candidate_id = id(&format!("candidate-{index}"));
+                    barrier.wait();
+                    store.save(&[record.clone()]).unwrap();
+                    record
+                })
+            })
+            .collect::<Vec<_>>();
+        let expected = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(expected.contains(&loaded[0]));
+    }
+
+    #[test]
+    fn evidence_store_errors_never_disclose_the_storage_path_in_debug() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("private-evidence-destination");
+        fs::create_dir(&destination).unwrap();
+        let store = EvidenceStore::new(destination).unwrap();
+        let error = store.save(&[evidence()]).unwrap_err();
+        let rendered = format!("{error:?}");
+        assert!(!rendered.contains(&directory.path().display().to_string()));
+        assert_eq!(rendered, "EvidenceStoreError::Commit");
+    }
+
+    #[test]
     fn evidence_store_keeps_distinct_measured_languages_for_one_artifact() {
         let (_directory, store) = temporary_store();
         let english = evidence();
@@ -1354,7 +1669,7 @@ mod tests {
 
     fn recommender() -> PerformanceRecommender {
         let candidate = candidate();
-        PerformanceRecommender::new(
+        PerformanceRecommender::new_with_verifier(
             policy(&candidate),
             [ApplicationProfile::new(
                 candidate,
@@ -1366,8 +1681,42 @@ mod tests {
                 },
             )
             .unwrap()],
+            Arc::new(AllowAssetVerifier),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn apply_revalidates_the_exact_local_asset_before_committing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(directory.path().join("settings.toml")).unwrap();
+        let original = Settings::default();
+        store.save(&original).unwrap();
+        let candidate = candidate();
+        let mut recommender = PerformanceRecommender::new(
+            policy(&candidate),
+            [ApplicationProfile::new(
+                candidate,
+                Language::English,
+                RecognitionApplication::Accurate {
+                    model: AccurateModelVariant::BaseEnglish,
+                    backend: AccurateBackendPreference::Vulkan,
+                    model_path: PathBuf::from("models/missing-or-drifted.bin"),
+                },
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let (_, consent) = recommender.evaluate(
+            Language::English,
+            RecommendationPreference::Balanced,
+            [evidence()],
+        );
+        assert!(matches!(
+            recommender.apply(consent.unwrap(), &store),
+            Err(ApplyError::AssetUnavailable)
+        ));
+        assert_eq!(store.load().unwrap(), original);
     }
 
     #[test]
@@ -1482,6 +1831,56 @@ mod tests {
     }
 
     #[test]
+    fn old_or_replayed_rollback_receipts_cannot_match_a_later_identical_apply() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(directory.path().join("settings.toml")).unwrap();
+        let original = Settings::default();
+        store.save(&original).unwrap();
+        let mut recommender = recommender();
+
+        let (_, first_consent) = recommender.evaluate(
+            Language::English,
+            RecommendationPreference::Balanced,
+            [evidence()],
+        );
+        let first_receipt = recommender.apply(first_consent.unwrap(), &store).unwrap();
+        store.save(&original).unwrap();
+
+        let (_, second_consent) = recommender.evaluate(
+            Language::English,
+            RecommendationPreference::Balanced,
+            [evidence()],
+        );
+        let second_receipt = recommender.apply(second_consent.unwrap(), &store).unwrap();
+        let expected_applied = store.load().unwrap();
+        assert!(matches!(
+            recommender.rollback(first_receipt, &store),
+            Err(ApplyError::StaleRollback)
+        ));
+        assert_eq!(store.load().unwrap(), expected_applied);
+
+        let replay = second_receipt.clone();
+        recommender.rollback(second_receipt, &store).unwrap();
+        store.save(&expected_applied).unwrap();
+        assert!(matches!(
+            recommender.rollback(replay, &store),
+            Err(ApplyError::StaleRollback)
+        ));
+        assert_eq!(store.load().unwrap(), expected_applied);
+    }
+
+    #[test]
+    fn apply_errors_redact_settings_paths_in_debug() {
+        let private = PathBuf::from(r"C:\Users\Private\settings.toml");
+        let underlying = SettingsError::InvalidSettingsPath(private.clone());
+        let error = ApplyError::Settings;
+        let rendered = format!("{error:?}");
+        assert!(!rendered.contains(&private.display().to_string()));
+        assert!(!rendered.contains(&underlying.to_string()));
+        assert_eq!(rendered, "ApplyError::Settings");
+    }
+
+    #[test]
     fn uncertified_portuguese_instant_profile_is_impossible() {
         let instant = BenchmarkCandidate::new(
             id("instant-pt"),
@@ -1503,6 +1902,31 @@ mod tests {
             ),
             Err(ApplyError::ProfileMismatch)
         ));
+    }
+
+    #[test]
+    fn certification_flag_cannot_invent_a_missing_pinned_portuguese_asset() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(directory.path().join("settings.toml")).unwrap();
+        let instant = BenchmarkCandidate::new(
+            id("instant-pt-forged-certification"),
+            EngineKind::Instant,
+            BackendKind::VoskNative,
+            ModelClass::Other,
+            Sha256Digest::new("c".repeat(64)).unwrap(),
+            [Language::PortugueseBrazil],
+            true,
+        );
+        let profile = ApplicationProfile::new(
+            instant,
+            Language::PortugueseBrazil,
+            RecognitionApplication::Instant {
+                model_path: PathBuf::from("models/pt"),
+                runtime_path: PathBuf::from("runtime/vosk"),
+            },
+        )
+        .unwrap();
+        assert!(!LocalApplicationAssetVerifier.matches(&profile, &store));
     }
 
     #[test]

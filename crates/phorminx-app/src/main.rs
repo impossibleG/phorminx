@@ -1646,7 +1646,7 @@ fn poll_shell_events(
                     Err(error) => {
                         if let Some(window) = settings_window.as_ref() {
                             window
-                                .show_error(format!("{error:#}"))
+                                .show_error(user_safe_settings_error(&error))
                                 .context("failed to display the settings error")?;
                         }
                         show_shell_status(overlay, tray, OverlayStatus::Error, TrayStatus::Error);
@@ -2142,8 +2142,7 @@ fn apply_settings_form(
     let resolved_model = store.resolve_model_path(&candidate.recognition.model_path);
     if !resolved_model.is_file() {
         return Err(anyhow!(
-            "The selected Whisper model does not exist or is not a file: {}",
-            resolved_model.display()
+            "The selected Whisper model does not exist or is not a file."
         ));
     }
     store.save(&candidate).context("Could not write settings")?;
@@ -2159,6 +2158,10 @@ fn apply_settings_form(
     }
     *settings = candidate;
     Ok(())
+}
+
+fn user_safe_settings_error(error: &anyhow::Error) -> String {
+    error.to_string()
 }
 
 fn restart_with_settings(settings_path: &Path) -> Result<()> {
@@ -6731,5 +6734,17 @@ mod composition_tests {
             UiVoskProbe::LayoutOnly
         );
         assert_eq!(setup_shell_vosk_probe(), UiVoskProbe::FullValidation);
+    }
+
+    #[test]
+    fn legacy_settings_errors_do_not_render_source_paths() {
+        let private = PathBuf::from(r"C:\Users\Private\settings.toml");
+        let error = anyhow::Error::new(phorminx_app::settings::SettingsError::InvalidSettingsPath(
+            private.clone(),
+        ))
+        .context("Settings could not be saved.");
+        let rendered = user_safe_settings_error(&error);
+        assert_eq!(rendered, "Settings could not be saved.");
+        assert!(!rendered.contains(&private.display().to_string()));
     }
 }
