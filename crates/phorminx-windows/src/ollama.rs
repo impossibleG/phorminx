@@ -1,12 +1,14 @@
+use std::ffi::OsStr;
 use std::fmt;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
-    FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellExecuteW,
+    FOLDERID_LocalAppData, FOLDERID_Profile, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::w;
@@ -60,6 +62,16 @@ pub enum OllamaInstallationError {
     InspectionFailed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum OllamaModelStorageError {
+    #[error("Windows could not resolve Ollama model storage")]
+    LocationUnavailable,
+    #[error("Ollama model storage is not on a local absolute drive")]
+    InvalidLocation,
+    #[error("Windows could not measure free space for Ollama models")]
+    CapacityUnavailable,
+}
+
 /// Resolve LocalAppData through the Windows Known Folder API. Environment
 /// variables, PATH, the process current directory, and the registry are not used.
 pub fn inspect_ollama_installation() -> Result<OllamaInstallation, OllamaInstallationError> {
@@ -78,6 +90,49 @@ fn known_local_app_data() -> Result<PathBuf, OllamaInstallationError> {
     let path = PathBuf::from(text?);
     if !absolute_drive_path(&path) {
         return Err(OllamaInstallationError::InvalidKnownFolder);
+    }
+    Ok(path)
+}
+
+/// Measures free space on the local volume Ollama is configured to use for
+/// models. Only an absolute drive path is accepted; no path is returned and
+/// the value grants no authority to open or execute anything there.
+pub fn ollama_model_disk_free_bytes() -> Result<u64, OllamaModelStorageError> {
+    let configured = match std::env::var_os("OLLAMA_MODELS") {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => known_profile()?.join(".ollama").join("models"),
+    };
+    if !absolute_drive_path(&configured) {
+        return Err(OllamaModelStorageError::InvalidLocation);
+    }
+    let volume = configured.components().take(2).collect::<PathBuf>();
+    let wide = wide_null(volume.as_os_str());
+    let mut available = 0_u64;
+    // SAFETY: `wide` is a NUL-terminated absolute drive root and `available`
+    // is writable for one u64. The other values are intentionally ignored.
+    unsafe {
+        GetDiskFreeSpaceExW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            Some(&mut available),
+            None,
+            None,
+        )
+    }
+    .map_err(|_| OllamaModelStorageError::CapacityUnavailable)?;
+    Ok(available)
+}
+
+fn known_profile() -> Result<PathBuf, OllamaModelStorageError> {
+    // SAFETY: The folder id is a valid static GUID and no impersonation token is used.
+    let raw = unsafe { SHGetKnownFolderPath(&FOLDERID_Profile, KF_FLAG_DEFAULT, None) }
+        .map_err(|_| OllamaModelStorageError::LocationUnavailable)?;
+    // SAFETY: SHGetKnownFolderPath returns a NUL-terminated allocation owned by CoTaskMem.
+    let text = unsafe { raw.to_string() }.map_err(|_| OllamaModelStorageError::LocationUnavailable);
+    // SAFETY: `raw` was allocated by SHGetKnownFolderPath and is released exactly once.
+    unsafe { CoTaskMemFree(Some(raw.0.cast())) };
+    let path = PathBuf::from(text?);
+    if !absolute_drive_path(&path) {
+        return Err(OllamaModelStorageError::InvalidLocation);
     }
     Ok(path)
 }
@@ -131,6 +186,11 @@ fn absolute_drive_path(path: &Path) -> bool {
 
 fn is_reparse(metadata: &std::fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+}
+
+fn wide_null(value: &OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    value.encode_wide().chain(std::iter::once(0)).collect()
 }
 
 /// An explicit review of the only installer flow Phorminx currently trusts.

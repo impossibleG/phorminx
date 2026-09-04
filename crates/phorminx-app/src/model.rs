@@ -11,6 +11,9 @@ use phorminx_windows::atomic_replace_file;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::performance_runtime::{
+    RuntimeActivityKind, RuntimeActivityLease, production_workload_coordinator,
+};
 use crate::settings::AccurateModelVariant;
 
 const EMBEDDED_MANIFEST: &str = include_str!("../../../config/model-manifest.json");
@@ -118,6 +121,7 @@ pub struct ModelDownload {
     events: Receiver<ModelDownloadEvent>,
     cancel: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    _activity: RuntimeActivityLease,
 }
 
 impl ModelDownload {
@@ -130,6 +134,9 @@ impl ModelDownload {
         variant: AccurateModelVariant,
     ) -> Result<Self, ModelError> {
         let spec = model_for_variant(variant)?;
+        let activity = production_workload_coordinator()
+            .try_begin(RuntimeActivityKind::Whisper)
+            .map_err(|_| ModelError::ComputeBusy)?;
         let destination = destination_directory.join(&spec.file_name);
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = Arc::clone(&cancel);
@@ -158,6 +165,7 @@ impl ModelDownload {
             events: event_rx,
             cancel,
             thread: Some(thread),
+            _activity: activity,
         })
     }
 
@@ -414,6 +422,8 @@ pub enum ModelError {
     AtomicReplace(phorminx_windows::AtomicReplaceError),
     #[error("model download was cancelled")]
     Cancelled,
+    #[error("a performance benchmark owns the recognition workload lane")]
+    ComputeBusy,
     #[error("failed to start the model download thread: {0}")]
     Spawn(std::io::Error),
     #[error("the model download thread panicked")]

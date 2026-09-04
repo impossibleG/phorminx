@@ -1,11 +1,18 @@
 //! UI-independent production composition for trusted Ollama onboarding.
 
 use phorminx_ollama::{
-    AuthorizedModelPull, CancellationToken, CuratedModelCatalog, CuratedModelId, DaemonState,
-    ModelPullOutcome, ModelPullProgress, ModelPullReview, OllamaOnboarding,
-    OllamaOnboardingTransport, PullFailure, UreqOnboardingTransport,
+    AuthorizedModelPull, CancellationToken, CuratedModelCatalog, CuratedModelId, CuratedModelState,
+    DaemonState, InstalledModelIdentity, ModelPullOutcome, ModelPullProgress, ModelPullReview,
+    OllamaOnboarding, OllamaOnboardingTransport, PullFailure, PullFailureKind, PullResidue,
+    UreqOnboardingTransport,
 };
-use phorminx_windows::{OllamaInstallation, inspect_ollama_installation};
+use phorminx_windows::{
+    OllamaInstallation, inspect_ollama_installation, ollama_model_disk_free_bytes,
+};
+
+use crate::performance_runtime::{
+    RuntimeActivityKind, WorkloadCoordinator, production_workload_coordinator,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstallPresence {
@@ -20,6 +27,8 @@ pub struct InstallProbeError;
 
 pub trait OllamaInstallProbe: Send + Sync {
     fn inspect(&self) -> Result<InstallPresence, InstallProbeError>;
+
+    fn available_model_disk_bytes(&self) -> Result<u64, InstallProbeError>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -33,6 +42,10 @@ impl OllamaInstallProbe for WindowsOllamaInstallProbe {
             OllamaInstallation::Unsafe => Ok(InstallPresence::Unsafe),
         }
     }
+
+    fn available_model_disk_bytes(&self) -> Result<u64, InstallProbeError> {
+        ollama_model_disk_free_bytes().map_err(|_| InstallProbeError)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,6 +58,7 @@ pub enum OllamaHostState {
 pub struct OllamaOnboardingHost<T, P> {
     onboarding: OllamaOnboarding<T>,
     install_probe: P,
+    workloads: std::sync::Arc<WorkloadCoordinator>,
 }
 
 impl OllamaOnboardingHost<UreqOnboardingTransport, WindowsOllamaInstallProbe> {
@@ -59,10 +73,19 @@ impl OllamaOnboardingHost<UreqOnboardingTransport, WindowsOllamaInstallProbe> {
 
 impl<T: OllamaOnboardingTransport, P: OllamaInstallProbe> OllamaOnboardingHost<T, P> {
     #[must_use]
-    pub const fn new(transport: T, install_probe: P) -> Self {
+    pub fn new(transport: T, install_probe: P) -> Self {
+        Self::with_workloads(transport, install_probe, production_workload_coordinator())
+    }
+
+    fn with_workloads(
+        transport: T,
+        install_probe: P,
+        workloads: std::sync::Arc<WorkloadCoordinator>,
+    ) -> Self {
         Self {
             onboarding: OllamaOnboarding::new(transport),
             install_probe,
+            workloads,
         }
     }
 
@@ -89,13 +112,49 @@ impl<T: OllamaOnboardingTransport, P: OllamaInstallProbe> OllamaOnboardingHost<T
         self.onboarding.review_pull(id)
     }
 
+    #[must_use]
+    pub fn model_state(
+        &self,
+        id: CuratedModelId,
+        installed: &[InstalledModelIdentity],
+    ) -> CuratedModelState {
+        self.onboarding.model_state(id, installed)
+    }
+
     pub fn pull(
         &self,
         authorization: AuthorizedModelPull,
         cancel: &CancellationToken,
         progress: impl FnMut(ModelPullProgress),
     ) -> Result<ModelPullOutcome, PullFailure> {
-        self.onboarding.pull(authorization, cancel, progress)
+        if cancel.is_cancelled() {
+            return Err(PullFailure {
+                kind: PullFailureKind::Cancelled,
+                residue: PullResidue::None,
+            });
+        }
+        if self.install_probe.inspect() != Ok(InstallPresence::Present) {
+            return Err(PullFailure {
+                kind: PullFailureKind::InstallationUntrusted,
+                residue: PullResidue::None,
+            });
+        }
+        let available = self
+            .install_probe
+            .available_model_disk_bytes()
+            .map_err(|_| PullFailure {
+                kind: PullFailureKind::CapacityUnavailable,
+                residue: PullResidue::None,
+            })?;
+        let _activity = self
+            .workloads
+            .try_begin(RuntimeActivityKind::Ollama)
+            .map_err(|_| PullFailure {
+                kind: PullFailureKind::Busy,
+                residue: PullResidue::None,
+            })?;
+        self.onboarding
+            .pull(authorization, available, cancel, progress)
     }
 }
 
@@ -137,6 +196,10 @@ mod tests {
         fn inspect(&self) -> Result<InstallPresence, InstallProbeError> {
             self.0
         }
+
+        fn available_model_disk_bytes(&self) -> Result<u64, InstallProbeError> {
+            Ok(u64::MAX)
+        }
     }
 
     #[test]
@@ -167,5 +230,22 @@ mod tests {
             InstallProbeError.to_string(),
             "the Ollama installation state could not be inspected"
         );
+    }
+
+    #[test]
+    fn pull_rechecks_installation_and_never_contacts_an_untrusted_daemon() {
+        let host = OllamaOnboardingHost::with_workloads(
+            NeverTransport,
+            FixedProbe(Ok(InstallPresence::Unsafe)),
+            std::sync::Arc::new(WorkloadCoordinator::default()),
+        );
+        let review = host.review_pull(CuratedModelId::Gemma3OneB);
+        let confirmation = review.confirmation().to_owned();
+        let action = review.authorize(&confirmation).unwrap();
+        let error = host
+            .pull(action, &CancellationToken::new(), |_| {})
+            .unwrap_err();
+        assert_eq!(error.kind, PullFailureKind::InstallationUntrusted);
+        assert_eq!(error.residue, PullResidue::None);
     }
 }

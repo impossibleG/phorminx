@@ -36,6 +36,9 @@ ureq.workspace = true
 winit.workspace = true
 zip.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
 [build-dependencies]
 winresource.workspace = true
 

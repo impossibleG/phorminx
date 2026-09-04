@@ -2588,6 +2588,7 @@ dependencies = [
  "thiserror 2.0.20",
  "toml",
  "ureq",
+ "windows",
  "winit",
  "winresource",
  "zip",

@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 
 use windows::Win32::{
@@ -12,7 +13,7 @@ use windows::Win32::{
         },
         SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
         Threading::{
-            GetCurrentProcess, GetProcessInformation, GetSystemTimes,
+            GetCurrentProcess, GetProcessInformation, GetProcessTimes, GetSystemTimes,
             PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
             PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling,
         },
@@ -50,6 +51,8 @@ pub enum HostResourceError {
     VulkanDriverIdentity,
     #[error("Windows system processor load is unavailable")]
     ProcessorLoad,
+    #[error("Windows system directory is unavailable")]
+    SystemDirectory,
 }
 
 /// Measures aggregate CPU busy time over a bounded interval. Kernel time on
@@ -83,6 +86,64 @@ pub fn host_cpu_busy_per_mille(interval: std::time::Duration) -> Result<u16, Hos
         .map_err(|_| HostResourceError::NumericBounds)
 }
 
+/// Measures CPU busy time not attributable to the current Phorminx process.
+/// This prevents the recognizer under test from classifying its own expected
+/// CPU work as hostile system contention.
+pub fn host_external_cpu_busy_per_mille(
+    interval: std::time::Duration,
+) -> Result<u16, HostResourceError> {
+    if interval.is_zero() || interval > std::time::Duration::from_secs(1) {
+        return Err(HostResourceError::ProcessorLoad);
+    }
+    let process = unsafe { GetCurrentProcess() };
+    let before_system = system_times()?;
+    let before_process = process_times(process)?;
+    std::thread::sleep(interval);
+    let after_system = system_times()?;
+    let after_process = process_times(process)?;
+    external_cpu_ratio(before_system, after_system, before_process, after_process)
+}
+
+fn external_cpu_ratio(
+    before_system: (u64, u64, u64),
+    after_system: (u64, u64, u64),
+    before_process: (u64, u64),
+    after_process: (u64, u64),
+) -> Result<u16, HostResourceError> {
+    let idle = after_system
+        .0
+        .checked_sub(before_system.0)
+        .ok_or(HostResourceError::ProcessorLoad)?;
+    let kernel = after_system
+        .1
+        .checked_sub(before_system.1)
+        .ok_or(HostResourceError::ProcessorLoad)?;
+    let user = after_system
+        .2
+        .checked_sub(before_system.2)
+        .ok_or(HostResourceError::ProcessorLoad)?;
+    let total = kernel
+        .checked_add(user)
+        .ok_or(HostResourceError::ProcessorLoad)?;
+    if total == 0 || idle > total {
+        return Err(HostResourceError::ProcessorLoad);
+    }
+    let process_kernel = after_process
+        .0
+        .checked_sub(before_process.0)
+        .ok_or(HostResourceError::ProcessorLoad)?;
+    let process_user = after_process
+        .1
+        .checked_sub(before_process.1)
+        .ok_or(HostResourceError::ProcessorLoad)?;
+    let process_busy = process_kernel
+        .checked_add(process_user)
+        .ok_or(HostResourceError::ProcessorLoad)?;
+    let external_busy = total.saturating_sub(idle).saturating_sub(process_busy);
+    u16::try_from(external_busy.saturating_mul(1_000) / total)
+        .map_err(|_| HostResourceError::NumericBounds)
+}
+
 fn system_times() -> Result<(u64, u64, u64), HostResourceError> {
     let mut idle = FILETIME::default();
     let mut kernel = FILETIME::default();
@@ -91,6 +152,46 @@ fn system_times() -> Result<(u64, u64, u64), HostResourceError> {
     unsafe { GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)) }
         .map_err(|_| HostResourceError::ProcessorLoad)?;
     Ok((filetime(idle), filetime(kernel), filetime(user)))
+}
+
+fn process_times(
+    process: windows::Win32::Foundation::HANDLE,
+) -> Result<(u64, u64), HostResourceError> {
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: the pseudo-handle is valid and every output points to initialized storage.
+    unsafe {
+        GetProcessTimes(
+            process,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    }
+    .map_err(|_| HostResourceError::ProcessorLoad)?;
+    Ok((filetime(kernel), filetime(user)))
+}
+
+/// Resolves the native Windows system directory without trusting process
+/// environment variables such as `SystemRoot`.
+pub fn windows_system_directory() -> Result<PathBuf, HostResourceError> {
+    let mut buffer = vec![0_u16; 32_768];
+    // SAFETY: the buffer is initialized and writable for its declared length.
+    let length = unsafe {
+        windows::Win32::System::SystemInformation::GetSystemDirectoryW(Some(&mut buffer))
+    } as usize;
+    if length == 0 || length >= buffer.len() {
+        return Err(HostResourceError::SystemDirectory);
+    }
+    buffer.truncate(length);
+    let path = PathBuf::from(std::ffi::OsString::from_wide(&buffer));
+    if !path.is_absolute() || !path.is_dir() {
+        return Err(HostResourceError::SystemDirectory);
+    }
+    Ok(path)
 }
 
 const fn filetime(value: FILETIME) -> u64 {
@@ -319,6 +420,26 @@ mod tests {
         assert!(busy <= 1_000);
         assert!(host_cpu_busy_per_mille(std::time::Duration::ZERO).is_err());
         assert!(host_cpu_busy_per_mille(std::time::Duration::from_secs(2)).is_err());
+        assert!(
+            host_external_cpu_busy_per_mille(std::time::Duration::from_millis(75)).unwrap()
+                <= 1_000
+        );
+    }
+
+    #[test]
+    fn candidate_process_cpu_is_subtracted_from_contention() {
+        // total=1,000; idle=100; Phorminx=800 => external busy=100.
+        assert_eq!(
+            external_cpu_ratio((0, 0, 0), (100, 600, 400), (0, 0), (500, 300)).unwrap(),
+            100
+        );
+    }
+
+    #[test]
+    fn system_directory_does_not_depend_on_environment() {
+        let directory = windows_system_directory().unwrap();
+        assert!(directory.is_absolute());
+        assert!(directory.join("ntoskrnl.exe").is_file());
     }
 
     #[test]

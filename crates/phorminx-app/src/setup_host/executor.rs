@@ -13,6 +13,10 @@ use phorminx_setup::{
 };
 use phorminx_windows::{SetupOperationLock, SetupOperationLockError};
 
+use crate::performance_runtime::{
+    RuntimeActivityKind, WorkloadCoordinator, production_workload_coordinator,
+};
+
 use super::managed::{ArtifactFetcher, FetchError};
 use super::{
     ManagedInstall, ManagedRoot, ManagedRootError, NormalizedProbeFact, PinnedCatalog,
@@ -238,6 +242,7 @@ pub struct SetupExecutor {
     worker: Option<ActiveWorker>,
     succeeded: Arc<Mutex<BTreeSet<ActionId>>>,
     installs: Arc<Mutex<BTreeMap<ActionId, ManagedInstall>>>,
+    workloads: Arc<WorkloadCoordinator>,
 }
 
 impl SetupExecutor {
@@ -261,6 +266,7 @@ impl SetupExecutor {
             worker: None,
             succeeded: Arc::new(Mutex::new(BTreeSet::new())),
             installs: Arc::new(Mutex::new(BTreeMap::new())),
+            workloads: production_workload_coordinator(),
         }
     }
 
@@ -285,6 +291,10 @@ impl SetupExecutor {
         if granted_consent != *authorized.action.consent() {
             return Err(SetupExecutorError::Consent(ConsentError::ExactSetRequired));
         }
+        let setup_activity = self
+            .workloads
+            .try_begin(RuntimeActivityKind::Whisper)
+            .map_err(|_| SetupExecutorError::ComputeBusy)?;
         // Acquire cross-process mutation authority before the coordinator is
         // moved into Running. If another process owns the lease, this action
         // has performed no work and must never enter a compensating rollback
@@ -316,6 +326,7 @@ impl SetupExecutor {
         let spawned = thread::Builder::new()
             .name("phorminx-setup-action".to_owned())
             .spawn(move || {
+                let _setup_activity = setup_activity;
                 let _operation_lock = operation_lock;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     execute_action(
@@ -399,6 +410,10 @@ impl SetupExecutor {
         if self.worker.is_some() {
             return Err(SetupExecutorError::Busy);
         }
+        let setup_activity = self
+            .workloads
+            .try_begin(RuntimeActivityKind::Whisper)
+            .map_err(|_| SetupExecutorError::ComputeBusy)?;
         let operation_lock = SetupOperationLock::try_acquire()?;
         let (ticket, action, mode) = {
             let mut coordinator = self.lock_coordinator()?;
@@ -436,6 +451,7 @@ impl SetupExecutor {
         let spawned = thread::Builder::new()
             .name("phorminx-setup-recovery".to_owned())
             .spawn(move || {
+                let _setup_activity = setup_activity;
                 let _operation_lock = operation_lock;
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match mode {
@@ -1007,6 +1023,8 @@ pub enum SetupExecutorError {
     OperationLock(#[from] SetupOperationLockError),
     #[error("another setup action is still executing")]
     Busy,
+    #[error("a performance benchmark owns the recognition workload lane")]
+    ComputeBusy,
     #[error("the setup action worker could not start: {0}")]
     Spawn(std::io::Error),
     #[error("the setup action worker panicked")]

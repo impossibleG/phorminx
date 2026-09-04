@@ -329,7 +329,7 @@ impl PerformanceBenchmarkService {
                     &self.shared,
                     BenchmarkRunState::Failed(BenchmarkFailure::WorkerFailed),
                 );
-                BenchmarkStartError::AlreadyRunning
+                BenchmarkStartError::WorkerUnavailable
             })?;
 
         Ok(BenchmarkTicket { generation })
@@ -587,12 +587,29 @@ impl EvidenceStore {
         let _save_guard = EVIDENCE_SAVE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut evidence = evidence.to_vec();
-        evidence.sort();
-        evidence.dedup();
+        let mut incoming = evidence.to_vec();
+        incoming.sort();
+        incoming.dedup();
+        let incoming_envelope = EvidenceEnvelope {
+            schema_version: 1,
+            evidence: incoming.clone(),
+        };
+        validate_envelope(&incoming_envelope)?;
+
+        // Saving benchmark output is an upsert, not a snapshot replacement:
+        // one completed candidate must not erase comparable evidence already
+        // collected for the same host. The process lock covers the read and
+        // atomic replace as one local transaction.
+        let mut merged = self.load()?;
+        for replacement in incoming {
+            let identity = evidence_identity(&replacement);
+            merged.retain(|existing| evidence_identity(existing) != identity);
+            merged.push(replacement);
+        }
+        merged.sort();
         let envelope = EvidenceEnvelope {
             schema_version: 1,
-            evidence,
+            evidence: merged,
         };
         validate_envelope(&envelope)?;
         let bytes = serde_json::to_vec(&envelope).map_err(|_| EvidenceStoreError::Encode)?;
@@ -653,19 +670,34 @@ fn validate_envelope(envelope: &EvidenceEnvelope) -> Result<(), EvidenceStoreErr
         return Err(EvidenceStoreError::InvalidEvidence);
     }
     let mut identities = BTreeSet::new();
-    if envelope.evidence.iter().any(|evidence| {
-        !identities.insert((
-            evidence.protocol_id.clone(),
-            evidence.build_id.clone(),
-            evidence.device_id.clone(),
-            evidence.driver_id.clone(),
-            evidence.candidate_id.clone(),
-            evidence.measured_language,
-        ))
-    }) {
+    if envelope
+        .evidence
+        .iter()
+        .any(|evidence| !identities.insert(evidence_identity(evidence)))
+    {
         return Err(EvidenceStoreError::InvalidEvidence);
     }
     Ok(())
+}
+
+fn evidence_identity(
+    evidence: &BenchmarkEvidence,
+) -> (
+    ContentFreeId,
+    ContentFreeId,
+    ContentFreeId,
+    ContentFreeId,
+    ContentFreeId,
+    Language,
+) {
+    (
+        evidence.protocol_id.clone(),
+        evidence.build_id.clone(),
+        evidence.device_id.clone(),
+        evidence.driver_id.clone(),
+        evidence.candidate_id.clone(),
+        evidence.measured_language,
+    )
 }
 
 #[derive(Clone)]
@@ -807,9 +839,25 @@ impl ApplicationAssetVerifier for LocalApplicationAssetVerifier {
     fn matches(&self, profile: &ApplicationProfile, store: &SettingsStore) -> bool {
         match &profile.recognition {
             RecognitionApplication::Accurate {
-                model, model_path, ..
-            } => crate::model::identify_pinned_model(&store.resolve_model_path(model_path))
-                .is_ok_and(|identified| identified == Some(*model)),
+                model,
+                backend,
+                model_path,
+            } => {
+                let model_matches =
+                    crate::model::identify_pinned_model(&store.resolve_model_path(model_path))
+                        .is_ok_and(|identified| identified == Some(*model));
+                let backend_matches = match backend {
+                    crate::settings::AccurateBackendPreference::Cpu => true,
+                    crate::settings::AccurateBackendPreference::Vulkan => {
+                        phorminx_whisper::probe_backend(
+                            phorminx_whisper::WhisperBackendPreference::Vulkan,
+                        )
+                        .is_ok()
+                    }
+                    crate::settings::AccurateBackendPreference::Auto => false,
+                };
+                model_matches && backend_matches
+            }
             RecognitionApplication::Instant {
                 model_path,
                 runtime_path,
@@ -834,9 +882,6 @@ impl ApplicationAssetVerifier for LocalApplicationAssetVerifier {
                     let expected_target = if descriptor.supported_languages().is_empty() {
                         &resolved_runtime
                     } else {
-                        if descriptor.digest() != profile.candidate.model_digest() {
-                            return false;
-                        }
                         &resolved_model
                     };
                     installed.iter().any(|install| {
@@ -844,7 +889,16 @@ impl ApplicationAssetVerifier for LocalApplicationAssetVerifier {
                             && install.receipt.asset().descriptor() == descriptor
                     })
                 });
+                let live_identity = crate::performance_runtime::vosk_live_identity(
+                    &resolved_runtime,
+                    &resolved_model,
+                    profile.language,
+                );
                 receipts_match
+                    && live_identity.is_ok_and(|(_, _, candidate_id, model_digest)| {
+                        &candidate_id == profile.candidate.candidate_id()
+                            && &model_digest == profile.candidate.model_digest()
+                    })
                     && matches!(
                         phorminx_vosk::inspect(
                             &resolved_runtime,
@@ -996,7 +1050,6 @@ impl PerformanceRecommender {
         {
             return Err(ApplyError::StaleRollback);
         }
-        self.latest_applied_generation = None;
         if store.load().map_err(|_| ApplyError::Settings)? != receipt.applied {
             return Err(ApplyError::StaleRollback);
         }
@@ -1010,6 +1063,7 @@ impl PerformanceRecommender {
         {
             return Err(ApplyError::StaleRollback);
         }
+        self.latest_applied_generation = None;
         Ok(())
     }
 }
@@ -1613,8 +1667,8 @@ mod tests {
             .map(|worker| worker.join().unwrap())
             .collect::<Vec<_>>();
         let loaded = store.load().unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert!(expected.contains(&loaded[0]));
+        assert_eq!(loaded.len(), expected.len());
+        assert!(expected.iter().all(|record| loaded.contains(record)));
     }
 
     #[test]
@@ -1626,7 +1680,10 @@ mod tests {
         let error = store.save(&[evidence()]).unwrap_err();
         let rendered = format!("{error:?}");
         assert!(!rendered.contains(&directory.path().display().to_string()));
-        assert_eq!(rendered, "EvidenceStoreError::Commit");
+        assert!(matches!(
+            error,
+            EvidenceStoreError::Access(_) | EvidenceStoreError::Commit
+        ));
     }
 
     #[test]

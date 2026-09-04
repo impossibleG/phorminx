@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::Read;
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -24,6 +25,7 @@ use phorminx_vosk::VoskModel;
 use phorminx_whisper::{WhisperBackend, WhisperBackendPreference, WhisperRecognizer};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
 use crate::model::{identify_pinned_model, model_for_variant};
 use crate::performance::{
@@ -45,6 +47,7 @@ const WORKER_POLL: Duration = Duration::from_millis(20);
 const NATIVE_WORKER_HANDOFF_TIMEOUT: Duration = Duration::from_millis(250);
 const NATIVE_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_AVAILABLE_MEMORY_MIB: u32 = 512;
+const MAX_CALIBRATION_CANDIDATES: usize = 16;
 static GLOBAL_NATIVE_BENCHMARK_WORKER: AtomicBool = AtomicBool::new(false);
 static GLOBAL_WORKLOAD: OnceLock<Arc<WorkloadCoordinator>> = OnceLock::new();
 
@@ -432,8 +435,8 @@ fn add_vosk_candidates(
         });
         return Ok(());
     }
-    let (Ok(runtime_digest), Ok(model_digest)) =
-        (hash_tree(&runtime.target), hash_tree(&model.target))
+    let Ok((runtime_digest, model_digest, candidate_id, model_identity)) =
+        vosk_live_identity(&runtime.target, &model.target, Language::English)
     else {
         inventory.unavailable.push(CandidateUnavailable {
             engine: EngineKind::Instant,
@@ -443,19 +446,12 @@ fn add_vosk_candidates(
         });
         return Ok(());
     };
-    let mut identity = Sha256::new();
-    identity.update(b"vosk-native\0");
-    identity.update(&runtime_digest);
-    identity.update(b"\0en\0");
-    identity.update(&model_digest);
-    let candidate_id = digest_id("vosk-en", &identity.finalize())?;
     let candidate = BenchmarkCandidate::new(
         candidate_id,
         EngineKind::Instant,
         BackendKind::VoskNative,
         ModelClass::Other,
-        Sha256Digest::new(digest_hex(&model_digest))
-            .map_err(|_| PerformanceRuntimeError::InvalidIdentity)?,
+        model_identity,
         [Language::English],
         false,
     );
@@ -579,12 +575,10 @@ fn production_context(include_vulkan: bool) -> Result<BenchmarkContext, Performa
         );
     }
 
-    let windows_root = env::var_os("SystemRoot")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or(PerformanceRuntimeError::HostIdentity)?;
+    let system_directory = phorminx_windows::windows_system_directory()
+        .map_err(|_| PerformanceRuntimeError::HostIdentity)?;
     let mut driver = Sha256::new();
-    driver.update(hash_file(&windows_root.join("System32/ntoskrnl.exe"))?);
+    driver.update(hash_file(&system_directory.join("ntoskrnl.exe"))?);
     if include_vulkan {
         let manifests = phorminx_windows::vulkan_driver_manifests()
             .map_err(|_| PerformanceRuntimeError::HostIdentity)?;
@@ -655,6 +649,11 @@ fn hash_vulkan_driver(path: &Path) -> Result<(Vec<u8>, Vec<u8>), PerformanceRunt
 }
 
 fn hash_file(path: &Path) -> Result<Vec<u8>, PerformanceRuntimeError> {
+    let path_metadata =
+        fs::symlink_metadata(path).map_err(|_| PerformanceRuntimeError::HostIdentity)?;
+    if !path_metadata.is_file() || is_link_or_reparse(&path_metadata) {
+        return Err(PerformanceRuntimeError::HostIdentity);
+    }
     let mut file = File::open(path).map_err(|_| PerformanceRuntimeError::HostIdentity)?;
     let length = file
         .metadata()
@@ -665,6 +664,7 @@ fn hash_file(path: &Path) -> Result<Vec<u8>, PerformanceRuntimeError> {
     }
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 128 * 1024];
+    let mut read_bytes = 0_u64;
     loop {
         let count = file
             .read(&mut buffer)
@@ -672,7 +672,20 @@ fn hash_file(path: &Path) -> Result<Vec<u8>, PerformanceRuntimeError> {
         if count == 0 {
             break;
         }
+        read_bytes = read_bytes
+            .checked_add(count as u64)
+            .filter(|total| *total <= length)
+            .ok_or(PerformanceRuntimeError::HostIdentity)?;
         hasher.update(&buffer[..count]);
+    }
+    if read_bytes != length
+        || file
+            .metadata()
+            .map_err(|_| PerformanceRuntimeError::HostIdentity)?
+            .len()
+            != length
+    {
+        return Err(PerformanceRuntimeError::HostIdentity);
     }
     Ok(hasher.finalize().to_vec())
 }
@@ -683,7 +696,7 @@ fn hash_file(path: &Path) -> Result<Vec<u8>, PerformanceRuntimeError> {
 fn hash_tree(root: &Path) -> Result<Vec<u8>, PerformanceRuntimeError> {
     let root_metadata =
         fs::symlink_metadata(root).map_err(|_| PerformanceRuntimeError::HostIdentity)?;
-    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+    if !root_metadata.is_dir() || is_link_or_reparse(&root_metadata) {
         return Err(PerformanceRuntimeError::HostIdentity);
     }
     let mut pending = vec![root.to_path_buf()];
@@ -694,7 +707,7 @@ fn hash_tree(root: &Path) -> Result<Vec<u8>, PerformanceRuntimeError> {
             let path = entry.path();
             let metadata =
                 fs::symlink_metadata(&path).map_err(|_| PerformanceRuntimeError::HostIdentity)?;
-            if metadata.file_type().is_symlink() {
+            if is_link_or_reparse(&metadata) {
                 return Err(PerformanceRuntimeError::HostIdentity);
             }
             let relative = path
@@ -763,6 +776,10 @@ fn hash_file_bounded(
     if expected_length > MAX_HASHED_TREE_BYTES {
         return Err(PerformanceRuntimeError::HostIdentity);
     }
+    let metadata = fs::symlink_metadata(path).map_err(|_| PerformanceRuntimeError::HostIdentity)?;
+    if !metadata.is_file() || is_link_or_reparse(&metadata) || metadata.len() != expected_length {
+        return Err(PerformanceRuntimeError::HostIdentity);
+    }
     let mut file = File::open(path).map_err(|_| PerformanceRuntimeError::HostIdentity)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 128 * 1024];
@@ -780,7 +797,13 @@ fn hash_file_bounded(
             .ok_or(PerformanceRuntimeError::HostIdentity)?;
         hasher.update(&buffer[..count]);
     }
-    if read_bytes != expected_length {
+    if read_bytes != expected_length
+        || file
+            .metadata()
+            .map_err(|_| PerformanceRuntimeError::HostIdentity)?
+            .len()
+            != expected_length
+    {
         return Err(PerformanceRuntimeError::HostIdentity);
     }
     Ok(hasher.finalize().to_vec())
@@ -825,11 +848,37 @@ impl std::fmt::Debug for CalibrationPrompt {
 enum CalibrationSlot {
     Empty,
     Ready(AudioClip),
-    Consumed,
+}
+
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+}
+
+pub(crate) fn vosk_live_identity(
+    runtime: &Path,
+    model: &Path,
+    language: Language,
+) -> Result<(Vec<u8>, Vec<u8>, ContentFreeId, Sha256Digest), PerformanceRuntimeError> {
+    let runtime_digest = hash_tree(runtime)?;
+    let model_digest = hash_tree(model)?;
+    let mut identity = Sha256::new();
+    identity.update(b"vosk-native\0");
+    identity.update(&runtime_digest);
+    identity.update(b"\0");
+    identity.update(language.code().as_bytes());
+    identity.update(b"\0");
+    identity.update(&model_digest);
+    let candidate_id = digest_id(&format!("vosk-{}", language.code()), &identity.finalize())?;
+    let model_identity = Sha256Digest::new(digest_hex(&model_digest))
+        .map_err(|_| PerformanceRuntimeError::InvalidIdentity)?;
+    Ok((runtime_digest, model_digest, candidate_id, model_identity))
 }
 
 struct CalibrationState {
     expected: BTreeMap<ContentFreeId, CalibrationSlot>,
+    candidates: BTreeSet<ContentFreeId>,
+    consumed: BTreeSet<(ContentFreeId, ContentFreeId)>,
 }
 
 /// Bounded, one-use calibration audio. Dropping this value drops every sample;
@@ -870,7 +919,11 @@ impl TransientCalibrationAudio {
         Self {
             language,
             prompts,
-            state: Mutex::new(CalibrationState { expected }),
+            state: Mutex::new(CalibrationState {
+                expected,
+                candidates: BTreeSet::new(),
+                consumed: BTreeSet::new(),
+            }),
         }
     }
 
@@ -920,7 +973,11 @@ impl TransientCalibrationAudio {
         })
     }
 
-    fn take(&self, case: &CalibrationCase) -> Result<AudioClip, MeasurementFailure> {
+    fn take_for(
+        &self,
+        candidate_id: &ContentFreeId,
+        case: &CalibrationCase,
+    ) -> Result<AudioClip, MeasurementFailure> {
         if case.language() != self.language {
             return Err(MeasurementFailure::CaptureFailed);
         }
@@ -928,14 +985,24 @@ impl TransientCalibrationAudio {
             .state
             .lock()
             .map_err(|_| MeasurementFailure::CaptureFailed)?;
+        if !state.candidates.contains(candidate_id)
+            && state.candidates.len() >= MAX_CALIBRATION_CANDIDATES
+        {
+            return Err(MeasurementFailure::CaptureFailed);
+        }
+        let consumption = (candidate_id.clone(), case.case_id().clone());
+        if !state.consumed.insert(consumption.clone()) {
+            return Err(MeasurementFailure::CaptureFailed);
+        }
+        state.candidates.insert(candidate_id.clone());
         let slot = state
             .expected
-            .get_mut(case.case_id())
+            .get(case.case_id())
             .ok_or(MeasurementFailure::CaptureFailed)?;
-        match std::mem::replace(slot, CalibrationSlot::Consumed) {
-            CalibrationSlot::Ready(clip) => Ok(clip),
-            previous => {
-                *slot = previous;
+        match slot {
+            CalibrationSlot::Ready(clip) => Ok(clip.clone()),
+            CalibrationSlot::Empty => {
+                state.consumed.remove(&consumption);
                 Err(MeasurementFailure::CaptureFailed)
             }
         }
@@ -945,6 +1012,7 @@ impl TransientCalibrationAudio {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeActivityKind {
     Dictation,
+    CalibrationCapture,
     Whisper,
     Ollama,
 }
@@ -952,6 +1020,7 @@ pub enum RuntimeActivityKind {
 #[derive(Default)]
 struct WorkloadState {
     benchmark: bool,
+    calibration: bool,
     dictation: u32,
     whisper: u32,
     ollama: u32,
@@ -980,8 +1049,26 @@ impl WorkloadCoordinator {
         if state.benchmark {
             return Err(BenchmarkPreflightFailure::ComputeContention);
         }
+        if state.calibration {
+            return Err(BenchmarkPreflightFailure::DictationActive);
+        }
+        if kind == RuntimeActivityKind::CalibrationCapture {
+            if state.dictation != 0 || state.whisper != 0 || state.ollama != 0 {
+                return Err(BenchmarkPreflightFailure::ComputeContention);
+            }
+            state.calibration = true;
+            return Ok(RuntimeActivityLease {
+                state: Arc::clone(&self.state),
+                kind,
+                active: true,
+            });
+        }
+        if kind == RuntimeActivityKind::Dictation && state.dictation != 0 {
+            return Err(BenchmarkPreflightFailure::DictationActive);
+        }
         let counter = match kind {
             RuntimeActivityKind::Dictation => &mut state.dictation,
+            RuntimeActivityKind::CalibrationCapture => unreachable!(),
             RuntimeActivityKind::Whisper => &mut state.whisper,
             RuntimeActivityKind::Ollama => &mut state.ollama,
         };
@@ -1003,7 +1090,7 @@ impl WorkloadCoordinator {
         if state.benchmark {
             return Err(BenchmarkPreflightFailure::ComputeContention);
         }
-        if state.dictation != 0 {
+        if state.dictation != 0 || state.calibration {
             return Err(BenchmarkPreflightFailure::DictationActive);
         }
         if state.whisper != 0 || state.ollama != 0 {
@@ -1036,6 +1123,11 @@ impl Drop for RuntimeActivityLease {
         if let Ok(mut state) = self.state.lock() {
             let counter = match self.kind {
                 RuntimeActivityKind::Dictation => &mut state.dictation,
+                RuntimeActivityKind::CalibrationCapture => {
+                    state.calibration = false;
+                    self.active = false;
+                    return;
+                }
                 RuntimeActivityKind::Whisper => &mut state.whisper,
                 RuntimeActivityKind::Ollama => &mut state.ollama,
             };
@@ -1104,7 +1196,7 @@ impl HostResourceProbe for WindowsHostResourceProbe {
     }
 
     fn contention_condition(&self) -> Result<ContentionCondition, MeasurementFailure> {
-        let busy = phorminx_windows::host_cpu_busy_per_mille(Duration::from_millis(75))
+        let busy = phorminx_windows::host_external_cpu_busy_per_mille(Duration::from_millis(75))
             .map_err(|_| MeasurementFailure::ResourceProbeFailed)?;
         Ok(if busy > 850 {
             ContentionCondition::Contended
@@ -1767,7 +1859,7 @@ impl PerformanceMeasurementAdapter for ProductionPerformanceAdapter {
         }
         // Do not consume one-use calibration audio until a bounded native
         // worker has actually been reserved for this run.
-        let clip = match self.calibration.take(case) {
+        let clip = match self.calibration.take_for(candidate.candidate_id(), case) {
             Ok(clip) => clip,
             Err(error) => {
                 Self::stop_worker(&mut worker);
@@ -2091,11 +2183,13 @@ mod tests {
             .cases_for(Language::English)
             .find(|case| case.case_id() == &first)
             .unwrap();
-        assert!(audio.take(case).is_ok());
+        let candidate = id("candidate-one");
+        assert!(audio.take_for(&candidate, case).is_ok());
         assert_eq!(
-            audio.take(case).unwrap_err(),
+            audio.take_for(&candidate, case).unwrap_err(),
             MeasurementFailure::CaptureFailed
         );
+        assert!(audio.take_for(&id("candidate-two"), case).is_ok());
     }
 
     #[test]
@@ -2176,6 +2270,33 @@ mod tests {
             start.wait();
             finish.wait();
             assert_ne!(left.join().unwrap(), right.join().unwrap());
+        }
+    }
+
+    #[test]
+    fn calibration_and_dictation_race_has_exactly_one_microphone_owner() {
+        for _ in 0..100 {
+            let coordinator = Arc::new(WorkloadCoordinator::default());
+            let start = Arc::new(Barrier::new(3));
+            let finish = Arc::new(Barrier::new(3));
+            let run = |kind| {
+                let coordinator = Arc::clone(&coordinator);
+                let start = Arc::clone(&start);
+                let finish = Arc::clone(&finish);
+                thread::spawn(move || {
+                    start.wait();
+                    let lease = coordinator.try_begin(kind);
+                    let won = lease.is_ok();
+                    finish.wait();
+                    drop(lease);
+                    won
+                })
+            };
+            let dictation = run(RuntimeActivityKind::Dictation);
+            let calibration = run(RuntimeActivityKind::CalibrationCapture);
+            start.wait();
+            finish.wait();
+            assert_ne!(dictation.join().unwrap(), calibration.join().unwrap());
         }
     }
 

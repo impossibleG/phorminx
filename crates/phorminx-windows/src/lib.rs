@@ -61,15 +61,17 @@ pub use ollama::{
     AutomaticOllamaInstallAvailability, AutomaticOllamaInstallUnavailable,
     OLLAMA_OFFICIAL_WINDOWS_DOWNLOAD, OllamaInstallConsentError, OllamaInstallReview,
     OllamaInstallation, OllamaInstallationError, OllamaManualInstallAction,
-    OllamaUninstallGuidance, OpenOllamaDownloadError, inspect_ollama_installation,
-    ollama_automatic_install_availability, open_official_ollama_download,
+    OllamaModelStorageError, OllamaUninstallGuidance, OpenOllamaDownloadError,
+    inspect_ollama_installation, ollama_automatic_install_availability,
+    ollama_model_disk_free_bytes, open_official_ollama_download,
 };
 #[cfg(windows)]
 pub use overlay::{OverlayError, OverlayStatus, StatusOverlay};
 #[cfg(windows)]
 pub use performance::{
-    HostResourceError, HostResourceSnapshot, host_cpu_busy_per_mille, host_resource_snapshot,
-    vulkan_driver_manifests,
+    HostResourceError, HostResourceSnapshot, host_cpu_busy_per_mille,
+    host_external_cpu_busy_per_mille, host_resource_snapshot, vulkan_driver_manifests,
+    windows_system_directory,
 };
 #[cfg(windows)]
 pub use profile_window::{

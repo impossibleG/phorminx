@@ -16,8 +16,10 @@ use crate::{CancellationToken, OllamaEndpoint};
 
 const MAX_JSON_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PROGRESS_LINE_BYTES: usize = 16 * 1024;
-const MAX_PROGRESS_EVENTS: usize = 100_000;
+const MAX_PROGRESS_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PROGRESS_EVENTS: usize = 10_000;
 const DISK_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
+static GLOBAL_PULL_LOCK: Mutex<()> = Mutex::new(());
 
 /// A stable key for one model Phorminx has reviewed for transcript cleanup.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -365,6 +367,9 @@ pub struct PullFailure {
 pub enum PullFailureKind {
     Busy,
     Cancelled,
+    InstallationUntrusted,
+    CapacityUnavailable,
+    InsufficientDisk,
     DaemonUnavailable,
     DaemonIncompatible,
     ExistingIdentityMismatch,
@@ -484,9 +489,13 @@ impl<T: OllamaOnboardingTransport> OllamaOnboarding<T> {
     pub fn pull(
         &self,
         authorization: AuthorizedModelPull,
+        available_disk_bytes: u64,
         cancel: &CancellationToken,
         mut progress: impl FnMut(ModelPullProgress),
     ) -> Result<ModelPullOutcome, PullFailure> {
+        let _global_guard = GLOBAL_PULL_LOCK
+            .try_lock()
+            .map_err(|_| failure(PullFailureKind::Busy, PullResidue::None))?;
         let _guard = self
             .pull_lock
             .try_lock()
@@ -518,6 +527,12 @@ impl<T: OllamaOnboardingTransport> OllamaOnboarding<T> {
             }
             return Err(failure(
                 PullFailureKind::ExistingIdentityMismatch,
+                PullResidue::None,
+            ));
+        }
+        if available_disk_bytes < model.minimum_free_disk_bytes {
+            return Err(failure(
+                PullFailureKind::InsufficientDisk,
                 PullResidue::None,
             ));
         }
@@ -798,6 +813,7 @@ fn read_pull_events(
 ) -> Result<(), TransportError> {
     let mut line = Vec::with_capacity(1024);
     let mut event_count = 0_usize;
+    let mut response_bytes = 0_usize;
     let mut succeeded = false;
     loop {
         check_cancel(cancel)?;
@@ -814,6 +830,10 @@ fn read_pull_events(
         if event_count > MAX_PROGRESS_EVENTS {
             return Err(TransportError::ResponseTooLarge);
         }
+        response_bytes = response_bytes
+            .checked_add(read)
+            .filter(|total| *total <= MAX_PROGRESS_BYTES)
+            .ok_or(TransportError::ResponseTooLarge)?;
         let event: PullEvent =
             serde_json::from_slice(&line).map_err(|_| TransportError::MalformedResponse)?;
         if event.status.is_empty()
@@ -1213,6 +1233,7 @@ mod tests {
         let error = service
             .pull(
                 authorize(&service, CuratedModelId::Gemma3OneB),
+                u64::MAX,
                 &CancellationToken::new(),
                 |_| {},
             )
@@ -1221,6 +1242,40 @@ mod tests {
         assert_eq!(error.residue, PullResidue::None);
         assert!(service.transport.pulled_names.lock().unwrap().is_empty());
         drop(guard);
+    }
+
+    #[test]
+    fn pull_is_serialized_across_service_instances() {
+        let global = GLOBAL_PULL_LOCK.lock().unwrap();
+        let service = OllamaOnboarding::new(FakeTransport::new(vec![]));
+        let error = service
+            .pull(
+                authorize(&service, CuratedModelId::Gemma3OneB),
+                u64::MAX,
+                &CancellationToken::new(),
+                |_| {},
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, PullFailureKind::Busy);
+        assert_eq!(error.residue, PullResidue::None);
+        drop(global);
+    }
+
+    #[test]
+    fn missing_capacity_stops_before_model_acquisition() {
+        let model = CuratedModelCatalog.get(CuratedModelId::Gemma3OneB);
+        let service = OllamaOnboarding::new(FakeTransport::new(vec![Vec::new()]));
+        let error = service
+            .pull(
+                authorize(&service, model.id),
+                model.minimum_free_disk_bytes - 1,
+                &CancellationToken::new(),
+                |_| {},
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, PullFailureKind::InsufficientDisk);
+        assert_eq!(error.residue, PullResidue::None);
+        assert!(service.transport.pulled_names.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1278,7 +1333,7 @@ mod tests {
         let action = authorize(&service, model.id);
         let mut events = Vec::new();
         let outcome = service
-            .pull(action, &CancellationToken::new(), |event| {
+            .pull(action, u64::MAX, &CancellationToken::new(), |event| {
                 events.push(event)
             })
             .unwrap();
@@ -1298,6 +1353,7 @@ mod tests {
         let service = OllamaOnboarding::new(FakeTransport::new(vec![vec![wrong]]));
         let result = service.pull(
             authorize(&service, model.id),
+            u64::MAX,
             &CancellationToken::new(),
             |_| {},
         );
@@ -1320,6 +1376,7 @@ mod tests {
         let service = OllamaOnboarding::new(fake);
         let result = service.pull(
             authorize(&service, model.id),
+            u64::MAX,
             &CancellationToken::new(),
             |_| {},
         );
@@ -1341,6 +1398,7 @@ mod tests {
         let error = service
             .pull(
                 authorize(&service, model.id),
+                u64::MAX,
                 &CancellationToken::new(),
                 |_| {},
             )
@@ -1366,6 +1424,7 @@ mod tests {
         let error = service
             .pull(
                 authorize(&service, model.id),
+                u64::MAX,
                 &CancellationToken::new(),
                 |_| {},
             )
@@ -1380,6 +1439,7 @@ mod tests {
         let service = OllamaOnboarding::new(FakeTransport::new(vec![Vec::new(), Vec::new()]));
         let result = service.pull(
             authorize(&service, model.id),
+            u64::MAX,
             &CancellationToken::new(),
             |_| panic!("adversarial progress callback"),
         );
@@ -1400,7 +1460,7 @@ mod tests {
         cancel.cancel();
         assert_eq!(
             service
-                .pull(authorize(&service, model.id), &cancel, |_| {})
+                .pull(authorize(&service, model.id), u64::MAX, &cancel, |_| {})
                 .unwrap_err()
                 .residue,
             PullResidue::None
@@ -1412,6 +1472,7 @@ mod tests {
         let error = service
             .pull(
                 authorize(&service, model.id),
+                u64::MAX,
                 &CancellationToken::new(),
                 |_| {},
             )
@@ -1515,6 +1576,7 @@ mod tests {
         let error = service
             .pull(
                 authorize(&service, model.id),
+                u64::MAX,
                 &CancellationToken::new(),
                 |_| {},
             )
