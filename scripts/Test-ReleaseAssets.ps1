@@ -22,6 +22,9 @@ $installer = Get-Content -LiteralPath $installerPath -Raw
 $releaseBuild = Get-Content -LiteralPath $buildScript -Raw
 Assert-True ($releaseBuild -match 'PhorminxBuild') "Release build must use the short native target path."
 Assert-True ($releaseBuild -match 'desktop,vulkan') "Default Windows release must compile the Vulkan backend."
+Assert-True ($releaseBuild -match 'target-feature=\+crt-static') "Release build must statically link the MSVC CRT."
+Assert-True ($releaseBuild -match '/dependents') "Release packaging must inspect the executable dependency table."
+Assert-True ($releaseBuild -match 'api-ms-win-crt-.*msvcp.*vcruntime.*ucrtbase') "Release packaging must reject unbundled Microsoft C/C++ runtime dependencies."
 Assert-True ($installer -match '(?m)^PrivilegesRequired=lowest\r?$') "Installer must be per-user."
 Assert-True ($installer -match '(?m)^DefaultDirName=\{localappdata\}\\Programs\\Phorminx\r?$') "Installer must target LocalAppData."
 Assert-True ($installer -match '(?m)^Root: HKCU;.*CurrentVersion\\Run') "Autostart must use HKCU."

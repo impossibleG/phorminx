@@ -36,6 +36,11 @@ if (-not $SkipBuild) {
     }
 
     $env:CARGO_TARGET_DIR = $releaseTargetDirectory
+    # The per-user installer deliberately ships one executable and cannot
+    # elevate to install the Microsoft Visual C++ Redistributable. Pin the
+    # release build to the static MSVC CRT so it also works on a clean host.
+    Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue
+    $env:RUSTFLAGS = "-C target-feature=+crt-static"
     $features = if ($Cpu) { "desktop" } else { "desktop,vulkan" }
     & cargo build --locked --release --package phorminx-app --features $features
     if ($LASTEXITCODE -ne 0) {
@@ -45,6 +50,32 @@ if (-not $SkipBuild) {
 
 if (-not (Test-Path -LiteralPath $sourceExecutable -PathType Leaf)) {
     throw "Release executable not found. Build it first: $sourceExecutable"
+}
+
+# Prove that the single-file installer input is not relying on a separately
+# installed MSVC/UCRT redistributable. This also protects -SkipBuild from
+# accidentally packaging an executable produced outside the release contract.
+$dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+if ($null -eq $dumpbin) {
+    throw "dumpbin.exe was not found. Run from the Phorminx development shell so release dependencies can be verified."
+}
+$dependencyOutput = & $dumpbin.Source /nologo /dependents $sourceExecutable
+if ($LASTEXITCODE -ne 0) {
+    throw "dumpbin could not inspect the release executable (exit code $LASTEXITCODE)."
+}
+$dependencyNames = @($dependencyOutput | ForEach-Object {
+    if ($_ -match '^\s*([A-Za-z0-9_.-]+\.dll)\s*$') {
+        $matches[1]
+    }
+})
+if ($dependencyNames.Count -eq 0) {
+    throw "The release executable dependency table could not be read."
+}
+$forbiddenRuntimeDependencies = @($dependencyNames | Where-Object {
+    $_ -match '^(?i:api-ms-win-crt-|msvcp|vcruntime|ucrtbase\.dll)'
+})
+if ($forbiddenRuntimeDependencies.Count -gt 0) {
+    throw "Release executable depends on an unbundled Microsoft C/C++ runtime: $($forbiddenRuntimeDependencies -join ', ')"
 }
 
 $signature = Get-AuthenticodeSignature -LiteralPath $sourceExecutable

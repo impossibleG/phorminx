@@ -15,6 +15,7 @@ Code signing is a release gate, but no signing identity or trusted timestamping 
 - Use an Inno Setup 6 script for an x64-compatible, per-user installation under `{localappdata}\Programs\Phorminx`.
 - Set `PrivilegesRequired=lowest` and provide no elevation override.
 - Install only the application executable. Speech and cleanup models remain separate, explicitly consented downloads.
+- Statically link the Microsoft C/C++ runtime in packaged builds. The release script inspects the PE dependency table and refuses to package an executable that still imports the unbundled MSVC/UCRT redistributable.
 - Add Start Menu and uninstall entries.
 - Offer launch-at-login as an unchecked installer task that writes only the `Phorminx` value under the current user's Run key.
 - Treat an unsigned installer as a development artifact. `Build-PhorminxInstaller.ps1 -RequireSignedBinary` fails closed unless both the input binary and produced installer have valid Authenticode signatures. Signing configuration remains external to the repository and no signing success is claimed by this ADR.
@@ -43,7 +44,7 @@ Code signing is a release gate, but no signing identity or trusted timestamping 
 
 ## Consequences
 
-- Developers can validate packaging privacy and policy invariants without installing Inno Setup.
+- Developers can validate packaging privacy, static-runtime, and policy invariants without installing Inno Setup.
 - Producing an installer still requires Inno Setup 6; producing a distributable installer additionally requires an externally managed code-signing process.
 - Launch-at-login is available as a tested platform primitive and installer option, but its final Settings checkbox depends on app composition work.
 - Compatibility completion requires deliberate manual execution on declared Windows hardware and target applications.

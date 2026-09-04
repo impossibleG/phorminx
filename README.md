@@ -41,6 +41,7 @@ $env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA 'PhorminxBuild'
 cargo run --release -p phorminx-app --features vulkan
 
 # Packaged-style build: no console; use the tray menu to exit.
+$env:RUSTFLAGS = '-C target-feature=+crt-static'
 cargo build --release -p phorminx-app --features desktop,vulkan
 ```
 
