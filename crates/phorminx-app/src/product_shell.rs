@@ -593,8 +593,14 @@ impl ProductShellApp {
                 self.refresh();
             }
             ShellEvent::RefreshSetup => {
-                if let Some(center) = self.setup_center.as_mut() {
-                    let _ = center.retry_recovery();
+                if let Some(message) = self
+                    .setup_center
+                    .as_mut()
+                    .and_then(|center| center.retry_recovery().err())
+                {
+                    self.set_error(message.to_owned());
+                    self.refresh();
+                    return;
                 }
                 self.readiness = UiReadinessSnapshot::checking(self.bridge.settings(), &self.store);
                 self.request_readiness(UiVoskProbe::FullValidation);
@@ -614,7 +620,7 @@ impl ProductShellApp {
             ShellEvent::CancelSetupAction(id) => {
                 let result = self
                     .setup_center
-                    .as_ref()
+                    .as_mut()
                     .ok_or("Setup and repair are unavailable in this session.")
                     .and_then(|center| center.cancel(&id));
                 if let Err(message) = result {

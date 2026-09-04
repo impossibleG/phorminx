@@ -27,6 +27,9 @@ pub enum NormalizedProbeFact {
     Microphone {
         selected_is_available: bool,
         permission_denied: bool,
+        /// A concrete enumerated input exists, so changing the selection can
+        /// actually repair this state. Absence must not masquerade as denial.
+        selection_possible: bool,
     },
     Recognition {
         engine: EngineKind,
@@ -55,6 +58,7 @@ impl NormalizedProbeFact {
             Self::Microphone {
                 selected_is_available,
                 permission_denied,
+                selection_possible,
             } => {
                 let usability = if selected_is_available {
                     Usability::Ready {
@@ -69,11 +73,6 @@ impl NormalizedProbeFact {
                         },
                     }
                 };
-                let remedy = if permission_denied {
-                    Remedy::GrantMicrophoneAccess
-                } else {
-                    Remedy::SelectMicrophone
-                };
                 let record = CapabilityRecord::new(
                     CapabilityId::Microphone,
                     Some(CapabilityValue::Microphone {
@@ -83,8 +82,12 @@ impl NormalizedProbeFact {
                 )?;
                 if selected_is_available {
                     Ok(record)
+                } else if permission_denied {
+                    Ok(record.with_remedies([Remedy::GrantMicrophoneAccess])?)
+                } else if selection_possible {
+                    Ok(record.with_remedies([Remedy::SelectMicrophone])?)
                 } else {
-                    Ok(record.with_remedies([remedy])?)
+                    Ok(record)
                 }
             }
             Self::Recognition {
@@ -267,6 +270,43 @@ pub enum ProbeFactError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_microphone_does_not_invent_a_selection_or_permission_repair() {
+        let catalog = PinnedCatalog::phorminx().unwrap();
+        let record = NormalizedProbeFact::Microphone {
+            selected_is_available: false,
+            permission_denied: false,
+            selection_possible: false,
+        }
+        .into_record(&catalog)
+        .unwrap();
+        assert!(record.remedies().is_empty());
+    }
+
+    #[test]
+    fn permission_denial_and_missing_selection_remain_distinct() {
+        let catalog = PinnedCatalog::phorminx().unwrap();
+        let denied = NormalizedProbeFact::Microphone {
+            selected_is_available: false,
+            permission_denied: true,
+            selection_possible: true,
+        }
+        .into_record(&catalog)
+        .unwrap();
+        assert_eq!(denied.remedies().len(), 1);
+        assert!(denied.remedies().contains(&Remedy::GrantMicrophoneAccess));
+
+        let selectable = NormalizedProbeFact::Microphone {
+            selected_is_available: false,
+            permission_denied: false,
+            selection_possible: true,
+        }
+        .into_record(&catalog)
+        .unwrap();
+        assert_eq!(selectable.remedies().len(), 1);
+        assert!(selectable.remedies().contains(&Remedy::SelectMicrophone));
+    }
 
     #[test]
     fn missing_english_instant_derives_only_compiled_catalog_remedies() {

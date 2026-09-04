@@ -185,6 +185,15 @@ impl HostActionError {
             rollback_blocked: false,
         }
     }
+
+    #[must_use]
+    pub const fn rollback_blocked(failure: ActionFailure, retryable: bool) -> Self {
+        Self {
+            failure,
+            retryable,
+            rollback_blocked: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,6 +205,12 @@ pub struct ActionEvent {
 struct ActiveWorker {
     cancel: Arc<AtomicBool>,
     thread: JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryMode {
+    Rollback,
+    External,
 }
 
 #[derive(Clone)]
@@ -358,6 +373,126 @@ impl SetupExecutor {
         };
         self.worker = Some(ActiveWorker { cancel, thread });
         Ok(())
+    }
+
+    /// Reports whether this freshly authorized action's prerequisites have
+    /// completed. This is only a UI hint; [`Self::start`] checks again.
+    pub fn dependencies_satisfied(
+        &self,
+        authorized: &AuthorizedAction,
+    ) -> Result<bool, SetupExecutorError> {
+        let succeeded = self
+            .succeeded
+            .lock()
+            .map_err(|_| SetupExecutorError::SucceededStatePoisoned)?;
+        Ok(authorized
+            .dependencies
+            .iter()
+            .all(|dependency| succeeded.contains(dependency)))
+    }
+
+    /// Retries unfinished rollback or external-state reconciliation without
+    /// re-executing the original action. The coordinator supplies the action;
+    /// a UI identifier can only select that exact retained action.
+    pub fn retry_recovery(&mut self, action_id: &str) -> Result<(), SetupExecutorError> {
+        self.reap_finished()?;
+        if self.worker.is_some() {
+            return Err(SetupExecutorError::Busy);
+        }
+        let operation_lock = SetupOperationLock::try_acquire()?;
+        let (ticket, action, mode) = {
+            let mut coordinator = self.lock_coordinator()?;
+            let runtime = coordinator
+                .active()
+                .ok_or(SetupExecutorError::RecoveryUnavailable)?;
+            if runtime.action.id().as_str() != action_id {
+                return Err(SetupExecutorError::RecoveryUnavailable);
+            }
+            let mode = match runtime.state {
+                ActionState::RollbackRetryPending { .. } => RecoveryMode::Rollback,
+                ActionState::FailedExternalSideEffectsMayRemain { .. }
+                | ActionState::Cancelled {
+                    outcome: phorminx_setup::CancellationOutcome::ExternalSideEffectsMayRemain,
+                } => RecoveryMode::External,
+                _ => return Err(SetupExecutorError::RecoveryUnavailable),
+            };
+            let ticket = coordinator
+                .active_ticket()
+                .ok_or(SetupExecutorError::RecoveryUnavailable)?;
+            let action = runtime.action.clone();
+            if mode == RecoveryMode::Rollback {
+                coordinator.command(&ticket, ActionCommand::RequestRollback)?;
+                emit_locked(&coordinator, &self.events);
+            }
+            (ticket, action, mode)
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let adapters = Arc::clone(&self.adapters);
+        let coordinator = Arc::clone(&self.coordinator);
+        let events = self.events.clone();
+        let worker_ticket = ticket.clone();
+        let spawned = thread::Builder::new()
+            .name("phorminx-setup-recovery".to_owned())
+            .spawn(move || {
+                let _operation_lock = operation_lock;
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match mode {
+                        RecoveryMode::Rollback => adapters.rollback(action.key(), &worker_cancel),
+                        RecoveryMode::External => {
+                            adapters.reconcile_external(action.key(), &worker_cancel)
+                        }
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(HostActionError::new(
+                            ActionFailure::PlatformOperationFailed,
+                            true,
+                        ))
+                    });
+                let Ok(mut coordinator) = coordinator.lock() else {
+                    return;
+                };
+                let command = match (mode, result) {
+                    (RecoveryMode::Rollback, Ok(())) => ActionCommand::RollbackCompleted,
+                    (RecoveryMode::Rollback, Err(error)) => ActionCommand::Fail {
+                        failure: error.failure,
+                        retryable: error.retryable,
+                    },
+                    (RecoveryMode::External, Ok(())) => ActionCommand::ExternalStateReconciled,
+                    (RecoveryMode::External, Err(_)) => {
+                        emit_locked(&coordinator, &events);
+                        return;
+                    }
+                };
+                let _ = coordinator.command(&worker_ticket, command);
+                emit_locked(&coordinator, &events);
+            });
+        match spawned {
+            Ok(thread) => {
+                self.worker = Some(ActiveWorker { cancel, thread });
+                Ok(())
+            }
+            Err(error) => {
+                if mode == RecoveryMode::Rollback {
+                    let mut coordinator = self.lock_coordinator()?;
+                    let _ = coordinator.command(
+                        &ticket,
+                        ActionCommand::Fail {
+                            failure: ActionFailure::PlatformOperationFailed,
+                            retryable: true,
+                        },
+                    );
+                    emit_locked(&coordinator, &self.events);
+                }
+                Err(SetupExecutorError::Spawn(error))
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn recovery_in_progress(&self) -> bool {
+        self.worker.is_some()
     }
 
     pub fn cancel(&self) -> Result<(), SetupExecutorError> {
@@ -882,6 +1017,10 @@ pub enum SetupExecutorError {
     EventStatePoisoned,
     #[error("the setup event channel closed")]
     EventChannelClosed,
+    #[error("setup action success state is unavailable")]
+    SucceededStatePoisoned,
+    #[error("the requested setup recovery is not current")]
+    RecoveryUnavailable,
 }
 
 #[cfg(test)]
@@ -899,6 +1038,10 @@ mod tests {
         rollbacks: AtomicUsize,
         delay_ms: AtomicU64,
         panic_select: AtomicBool,
+        launch_failures: AtomicUsize,
+        start_failures: AtomicUsize,
+        rollback_failures: AtomicUsize,
+        reconcile_failures: AtomicUsize,
     }
 
     impl ActionAdapters for FakeAdapters {
@@ -947,6 +1090,18 @@ mod tests {
             Ok(())
         }
         fn start_ollama(&self, _cancel: &AtomicBool) -> Result<(), HostActionError> {
+            if self
+                .start_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(HostActionError::new(
+                    ActionFailure::PlatformOperationFailed,
+                    true,
+                ));
+            }
             Ok(())
         }
         fn pull_ollama_model(
@@ -963,6 +1118,18 @@ mod tests {
         ) -> Result<(), HostActionError> {
             self.launch_applied.fetch_add(1, Ordering::AcqRel);
             thread::sleep(Duration::from_millis(self.delay_ms.load(Ordering::Acquire)));
+            if self
+                .launch_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(HostActionError::new(
+                    ActionFailure::PlatformOperationFailed,
+                    true,
+                ));
+            }
             Ok(())
         }
         fn run_benchmark(
@@ -978,6 +1145,18 @@ mod tests {
             _cancel: &AtomicBool,
         ) -> Result<(), HostActionError> {
             self.rollbacks.fetch_add(1, Ordering::AcqRel);
+            if self
+                .rollback_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(HostActionError::new(
+                    ActionFailure::PlatformOperationFailed,
+                    true,
+                ));
+            }
             Ok(())
         }
         fn reconcile_external(
@@ -985,6 +1164,18 @@ mod tests {
             _action: &ActionKey,
             _cancel: &AtomicBool,
         ) -> Result<(), HostActionError> {
+            if self
+                .reconcile_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(HostActionError::new(
+                    ActionFailure::PlatformOperationFailed,
+                    true,
+                ));
+            }
             Ok(())
         }
     }
@@ -1017,6 +1208,7 @@ mod tests {
             NormalizedProbeFact::Microphone {
                 selected_is_available: true,
                 permission_denied: false,
+                selection_possible: true,
             },
             NormalizedProbeFact::Recognition {
                 engine: EngineKind::Accurate,
@@ -1029,6 +1221,23 @@ mod tests {
                 exact_command: true,
             },
         ]
+    }
+
+    fn wait_for_state(
+        executor: &mut SetupExecutor,
+        predicate: impl Fn(&ActionState) -> bool,
+    ) -> ActionEvent {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            let _ = executor.try_event().unwrap();
+            if let Some(event) = executor.current_state().unwrap()
+                && predicate(&event.state)
+            {
+                return event;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
@@ -1103,6 +1312,7 @@ mod tests {
         facts[0] = NormalizedProbeFact::Microphone {
             selected_is_available: false,
             permission_denied: false,
+            selection_possible: true,
         };
         let plan = authority
             .plan(&desired(FormattingChoice::Deterministic), facts)
@@ -1180,6 +1390,8 @@ mod tests {
             Arc::new(EmptyFetcher),
         );
 
+        assert!(!executor.dependencies_satisfied(&start).unwrap());
+
         executor.start(install, install_consent).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -1193,6 +1405,8 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
+
+        assert!(executor.dependencies_satisfied(&start).unwrap());
 
         executor.start(start, start_consent).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1211,6 +1425,112 @@ mod tests {
     }
 
     #[test]
+    fn unfinished_external_reconciliation_can_be_retried_without_reexecution() {
+        let _serial = EXECUTOR_TEST_LOCK.lock().unwrap();
+        let authority = SetupAuthority::phorminx().unwrap();
+        let digest = Sha256Digest::new("b".repeat(64)).unwrap();
+        let mut facts = ready_baseline();
+        facts.extend([
+            NormalizedProbeFact::OllamaDaemon {
+                version: None,
+                reachable: false,
+                installed: true,
+            },
+            NormalizedProbeFact::OllamaModel {
+                expected_digest: digest.clone(),
+                present_digest: Some(digest.clone()),
+            },
+        ]);
+        let plan = authority
+            .plan(
+                &desired(FormattingChoice::Ollama {
+                    model_digest: digest,
+                }),
+                facts,
+            )
+            .unwrap();
+        let presented = plan
+            .actions()
+            .into_iter()
+            .find(|action| matches!(action.key, ActionKey::StartExternalTool { .. }))
+            .unwrap();
+        let id = presented.id.as_str().to_owned();
+        let consent = presented.required_consent.clone();
+        let action = plan.authorize(&presented.id).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::for_test(
+            &temporary.path().join("managed"),
+            super::super::AcquisitionLimits::default(),
+        )
+        .unwrap();
+        let adapters = Arc::new(FakeAdapters {
+            start_failures: AtomicUsize::new(1),
+            reconcile_failures: AtomicUsize::new(1),
+            ..FakeAdapters::default()
+        });
+        let mut executor = SetupExecutor::new(root, adapters.clone(), Arc::new(EmptyFetcher));
+
+        executor.start(action, consent).unwrap();
+        wait_for_state(&mut executor, |state| {
+            matches!(
+                state,
+                ActionState::FailedExternalSideEffectsMayRemain { .. }
+            )
+        });
+        executor.retry_recovery(&id).unwrap();
+        wait_for_state(&mut executor, |state| {
+            matches!(
+                state,
+                ActionState::Failed {
+                    retryable: true,
+                    ..
+                }
+            )
+        });
+        assert_eq!(adapters.start_failures.load(Ordering::Acquire), 0);
+        executor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn retryable_rollback_can_finish_without_reexecuting_the_original_action() {
+        let _serial = EXECUTOR_TEST_LOCK.lock().unwrap();
+        let authority = SetupAuthority::phorminx().unwrap();
+        let mut desired = desired(FormattingChoice::Deterministic);
+        desired.launch_at_login = true;
+        let plan = authority.plan(&desired, ready_baseline()).unwrap();
+        let presented = plan
+            .actions()
+            .into_iter()
+            .find(|action| matches!(action.key, ActionKey::ApplyLaunchAtLogin { .. }))
+            .unwrap();
+        let id = presented.id.as_str().to_owned();
+        let consent = presented.required_consent.clone();
+        let action = plan.authorize(&presented.id).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::for_test(
+            &temporary.path().join("managed"),
+            super::super::AcquisitionLimits::default(),
+        )
+        .unwrap();
+        let adapters = Arc::new(FakeAdapters {
+            launch_failures: AtomicUsize::new(1),
+            rollback_failures: AtomicUsize::new(1),
+            ..FakeAdapters::default()
+        });
+        let mut executor = SetupExecutor::new(root, adapters.clone(), Arc::new(EmptyFetcher));
+
+        executor.start(action, consent).unwrap();
+        wait_for_state(&mut executor, |state| {
+            matches!(state, ActionState::RollbackRetryPending { .. })
+        });
+        executor.retry_recovery(&id).unwrap();
+        wait_for_state(&mut executor, |state| *state == ActionState::RolledBack);
+        assert_eq!(adapters.launch_applied.load(Ordering::Acquire), 1);
+        assert_eq!(adapters.rollbacks.load(Ordering::Acquire), 2);
+        executor.shutdown().unwrap();
+    }
+
+    #[test]
     fn duplicate_operation_is_rejected_and_success_is_reported() {
         let _serial = EXECUTOR_TEST_LOCK.lock().unwrap();
         let authority = SetupAuthority::phorminx().unwrap();
@@ -1218,6 +1538,7 @@ mod tests {
         facts[0] = NormalizedProbeFact::Microphone {
             selected_is_available: false,
             permission_denied: false,
+            selection_possible: true,
         };
         let plan = authority
             .plan(&desired(FormattingChoice::Deterministic), facts)
@@ -1258,6 +1579,50 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_retry_can_replace_a_retryable_terminal_attempt() {
+        let _serial = EXECUTOR_TEST_LOCK.lock().unwrap();
+        let authority = SetupAuthority::phorminx().unwrap();
+        let mut facts = ready_baseline();
+        facts[0] = NormalizedProbeFact::Microphone {
+            selected_is_available: false,
+            permission_denied: false,
+            selection_possible: true,
+        };
+        let plan = authority
+            .plan(&desired(FormattingChoice::Deterministic), facts)
+            .unwrap();
+        let presented = plan.actions().into_iter().next().unwrap();
+        let first = plan.authorize(&presented.id).unwrap();
+        let retry = plan.authorize(&presented.id).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::for_test(
+            &temporary.path().join("managed"),
+            super::super::AcquisitionLimits::default(),
+        )
+        .unwrap();
+        let adapters = Arc::new(FakeAdapters {
+            panic_select: AtomicBool::new(true),
+            ..FakeAdapters::default()
+        });
+        let mut executor = SetupExecutor::new(root, adapters.clone(), Arc::new(EmptyFetcher));
+
+        executor.start(first, BTreeSet::new()).unwrap();
+        wait_for_state(&mut executor, |state| {
+            matches!(
+                state,
+                ActionState::Failed {
+                    retryable: true,
+                    ..
+                }
+            )
+        });
+        executor.start(retry, BTreeSet::new()).unwrap();
+        wait_for_state(&mut executor, |state| *state == ActionState::Succeeded);
+        assert_eq!(adapters.selected.load(Ordering::Acquire), 2);
+        executor.shutdown().unwrap();
+    }
+
+    #[test]
     fn adapter_panic_becomes_a_retryable_terminal_failure() {
         let _serial = EXECUTOR_TEST_LOCK.lock().unwrap();
         let authority = SetupAuthority::phorminx().unwrap();
@@ -1265,6 +1630,7 @@ mod tests {
         facts[0] = NormalizedProbeFact::Microphone {
             selected_is_available: false,
             permission_denied: false,
+            selection_possible: true,
         };
         let plan = authority
             .plan(&desired(FormattingChoice::Deterministic), facts)
@@ -1494,6 +1860,7 @@ mod tests {
         facts[0] = NormalizedProbeFact::Microphone {
             selected_is_available: false,
             permission_denied: false,
+            selection_possible: true,
         };
         let plan = authority
             .plan(&desired(FormattingChoice::Deterministic), facts)

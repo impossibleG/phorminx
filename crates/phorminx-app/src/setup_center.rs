@@ -5,13 +5,13 @@
 //! never cross this boundary as execution authority.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::thread;
+use std::time::Duration;
 
 use phorminx_ollama::{CancellationToken, ClientTimeouts, OllamaClient, OllamaEndpoint};
 use phorminx_setup::{
@@ -20,7 +20,9 @@ use phorminx_setup::{
     RecognitionChoice, Sha256Digest,
 };
 use phorminx_ui::{Readiness, SetupAction, SetupCapability, SetupSnapshot, SetupStage};
-use phorminx_windows::{LaunchAtLoginState, launch_at_login_state, set_launch_at_login};
+use phorminx_windows::{
+    LaunchAtLoginState, SetupOperationLock, launch_at_login_state, set_launch_at_login,
+};
 
 use crate::model::{identify_pinned_model, model_for_variant};
 use crate::settings::{FormattingStrength, RecognitionMode, Settings, SettingsStore};
@@ -55,6 +57,38 @@ pub struct SetupCenter {
     presentations: Vec<crate::setup_host::ActionPresentation>,
     active: Option<ActionEvent>,
     initialization_notice: Option<&'static str>,
+    planning_notice: Option<&'static str>,
+    plan_generation: u64,
+    plan_in_flight: bool,
+    plan_worker_active: bool,
+    pending_plan: Option<PlanRequest>,
+    plan_tx: SyncSender<PlanResult>,
+    plan_rx: Receiver<PlanResult>,
+    storage_recovery_in_flight: bool,
+    storage_recovery_tx: SyncSender<StorageRecoveryResult>,
+    storage_recovery_rx: Receiver<StorageRecoveryResult>,
+}
+
+struct PlanRequest {
+    generation: u64,
+    settings: Settings,
+    readiness: UiReadinessSnapshot,
+}
+
+struct PlanResult {
+    generation: u64,
+    result: Result<PreparedPlan, &'static str>,
+}
+
+struct PreparedPlan {
+    authorized: BTreeMap<String, AuthorizedAction>,
+    presentations: Vec<crate::setup_host::ActionPresentation>,
+}
+
+enum StorageRecoveryResult {
+    Recovered,
+    ManualReview,
+    Failed,
 }
 
 impl SetupCenter {
@@ -64,13 +98,18 @@ impl SetupCenter {
     ) -> Result<Self, &'static str> {
         let authority = SetupAuthority::phorminx().map_err(|_| "Setup catalog unavailable.")?;
         let root = ManagedRoot::from_local_app_data().map_err(|_| "Setup storage unavailable.")?;
-        let initialization_notice = match root.recover() {
-            Ok(report) if report.rejected_journals > 0 => {
-                Some("A previous setup operation needs manual review.")
-            }
-            Ok(_) => None,
+        let initialization_notice = match SetupOperationLock::try_acquire() {
+            Ok(_lock) => match root.recover() {
+                Ok(report) if report.rejected_journals > 0 => {
+                    Some("A previous setup operation needs manual review.")
+                }
+                Ok(_) => None,
+                Err(_) => Some(
+                    "Setup recovery could not finish; existing runtime settings were preserved.",
+                ),
+            },
             Err(_) => {
-                Some("Setup recovery could not finish; existing runtime settings were preserved.")
+                Some("Another Phorminx process is changing setup. Inspect again when it finishes.")
             }
         };
         let adapters = Arc::new(ProductionAdapters {
@@ -79,6 +118,8 @@ impl SetupCenter {
             benchmark,
             compensation: Mutex::new(BTreeMap::new()),
         });
+        let (plan_tx, plan_rx) = mpsc::sync_channel(1);
+        let (storage_recovery_tx, storage_recovery_rx) = mpsc::sync_channel(1);
         Ok(Self {
             authority,
             root: root.clone(),
@@ -87,29 +128,58 @@ impl SetupCenter {
             presentations: Vec::new(),
             active: None,
             initialization_notice,
+            planning_notice: None,
+            plan_generation: 0,
+            plan_in_flight: false,
+            plan_worker_active: false,
+            pending_plan: None,
+            plan_tx,
+            plan_rx,
+            storage_recovery_in_flight: false,
+            storage_recovery_tx,
+            storage_recovery_rx,
         })
     }
 
     /// Retries only marker-verified recovery. It never deletes or adopts an
     /// unowned path. A successful retry re-enables fresh planning.
     pub fn retry_recovery(&mut self) -> Result<(), &'static str> {
-        match self.root.recover() {
-            Ok(report) if report.rejected_journals == 0 => {
-                self.initialization_notice = None;
-                Ok(())
-            }
-            Ok(_) => {
-                self.initialization_notice =
-                    Some("A previous setup operation needs manual review.");
-                Err("Setup recovery still needs manual review.")
-            }
-            Err(_) => {
-                self.initialization_notice = Some(
-                    "Setup recovery could not finish; existing runtime settings were preserved.",
-                );
-                Err("Setup recovery could not finish.")
-            }
+        if self.initialization_notice.is_none() || self.storage_recovery_in_flight {
+            return Ok(());
         }
+        if self.plan_worker_active
+            || self.executor.recovery_in_progress()
+            || self
+                .active
+                .as_ref()
+                .is_some_and(|event| !event.state.is_terminal())
+        {
+            return Err("Wait for the active setup operation before retrying recovery.");
+        }
+        let root = self.root.clone();
+        let sender = self.storage_recovery_tx.clone();
+        self.storage_recovery_in_flight = true;
+        thread::Builder::new()
+            .name("phorminx-setup-storage-recovery".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _lock = SetupOperationLock::try_acquire().map_err(|_| ())?;
+                    root.recover().map_err(|_| ())
+                }));
+                let result = match result {
+                    Ok(Ok(report)) if report.rejected_journals == 0 => {
+                        StorageRecoveryResult::Recovered
+                    }
+                    Ok(Ok(_)) => StorageRecoveryResult::ManualReview,
+                    Ok(Err(_)) | Err(_) => StorageRecoveryResult::Failed,
+                };
+                let _ = sender.send(result);
+            })
+            .map_err(|_| {
+                self.storage_recovery_in_flight = false;
+                "Setup recovery could not start."
+            })?;
+        Ok(())
     }
 
     pub fn replan(
@@ -124,21 +194,51 @@ impl SetupCenter {
         {
             return Ok(());
         }
-        let desired = desired_configuration(settings, readiness);
-        let facts = normalized_facts(settings, readiness, &self.executor)
-            .map_err(|_| "Local setup inventory could not be verified.")?;
-        let plan = self
-            .authority
-            .plan(&desired, facts)
-            .map_err(|_| "A safe setup plan could not be created.")?;
-        self.presentations = plan.actions();
+        self.plan_generation = self.plan_generation.wrapping_add(1);
+        let generation = self.plan_generation;
+        self.plan_in_flight = true;
+        self.planning_notice = None;
+        // A plan is authority, so it becomes unusable before a newer probe is
+        // dispatched rather than when that probe eventually returns.
+        self.presentations.clear();
         self.authorized.clear();
-        for presentation in &self.presentations {
-            if let Ok(action) = plan.authorize(&presentation.id) {
-                self.authorized
-                    .insert(presentation.id.as_str().to_owned(), action);
-            }
+        let request = PlanRequest {
+            generation,
+            settings: settings.clone(),
+            readiness: readiness.clone(),
+        };
+        if self.plan_worker_active || self.storage_recovery_in_flight {
+            // Only the newest observation matters. Keep one bounded pending
+            // request instead of launching concurrent multi-gigabyte hashes.
+            self.pending_plan = Some(request);
+            return Ok(());
         }
+        self.spawn_plan(request)
+    }
+
+    fn spawn_plan(&mut self, request: PlanRequest) -> Result<(), &'static str> {
+        let authority = self.authority.clone();
+        let root = self.root.clone();
+        let sender = self.plan_tx.clone();
+        self.plan_worker_active = true;
+        thread::Builder::new()
+            .name("phorminx-setup-plan".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    prepare_plan(&authority, &root, &request.settings, &request.readiness)
+                }))
+                .unwrap_or(Err("Local setup inspection failed safely."));
+                let _ = sender.send(PlanResult {
+                    generation: request.generation,
+                    result,
+                });
+            })
+            .map_err(|_| {
+                self.plan_worker_active = false;
+                self.plan_in_flight = false;
+                self.planning_notice = Some("Local setup inspection could not start.");
+                "Local setup inspection could not start."
+            })?;
         Ok(())
     }
 
@@ -146,35 +246,143 @@ impl SetupCenter {
         if self.initialization_notice.is_some() {
             return Err("Setup mutations are blocked until local recovery is repaired.");
         }
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|event| event.action_id.as_str() == id && recovery_required(&event.state))
+        {
+            self.executor
+                .retry_recovery(id)
+                .map_err(|_| "The unfinished setup recovery could not restart.")?;
+            return Ok(());
+        }
         let action = self
             .authorized
-            .remove(id)
+            .get(id)
+            .cloned()
             .ok_or("That setup action is no longer current. Inspect again.")?;
+        if !self
+            .executor
+            .dependencies_satisfied(&action)
+            .map_err(|_| "Setup prerequisite state is unavailable.")?
+        {
+            return Err("Complete the earlier setup steps first.");
+        }
         let granted = action.required_consent().clone();
         self.executor
             .start(action, granted)
-            .map_err(|_| "The setup action could not start.")
+            .map_err(|_| "The setup action could not start.")?;
+        self.authorized.remove(id);
+        self.active = self
+            .executor
+            .current_state()
+            .map_err(|_| "Setup status became unavailable.")?;
+        Ok(())
     }
 
-    pub fn cancel(&self, id: &str) -> Result<(), &'static str> {
+    pub fn cancel(&mut self, id: &str) -> Result<(), &'static str> {
         if self.active.as_ref().map(|event| event.action_id.as_str()) != Some(id) {
             return Err("That setup action is no longer active.");
         }
         self.executor
             .cancel()
-            .map_err(|_| "The setup action could not be cancelled.")
+            .map_err(|_| "The setup action could not be cancelled.")?;
+        self.active = self
+            .executor
+            .current_state()
+            .map_err(|_| "Setup status became unavailable.")?;
+        Ok(())
     }
 
     pub fn poll(&mut self) -> Result<bool, &'static str> {
-        match self.executor.try_event() {
+        let mut changed = match self.executor.try_event() {
             Ok(Some(event)) => {
                 let changed = self.active.as_ref() != Some(&event);
                 self.active = Some(event);
-                Ok(changed)
+                changed
             }
-            Ok(None) => Ok(false),
-            Err(_) => Err("Setup status became unavailable."),
+            Ok(None) => false,
+            Err(_) => return Err("Setup status became unavailable."),
+        };
+        match self.storage_recovery_rx.try_recv() {
+            Ok(StorageRecoveryResult::Recovered) => {
+                self.storage_recovery_in_flight = false;
+                self.initialization_notice = None;
+                changed = true;
+            }
+            Ok(StorageRecoveryResult::ManualReview) => {
+                self.storage_recovery_in_flight = false;
+                self.initialization_notice =
+                    Some("A previous setup operation needs manual review.");
+                changed = true;
+            }
+            Ok(StorageRecoveryResult::Failed) => {
+                self.storage_recovery_in_flight = false;
+                self.initialization_notice = Some(
+                    "Setup recovery could not finish; existing runtime settings were preserved.",
+                );
+                changed = true;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.storage_recovery_in_flight = false;
+                self.initialization_notice = Some("Setup recovery became unavailable.");
+                changed = true;
+            }
         }
+        if !self.storage_recovery_in_flight
+            && !self.plan_worker_active
+            && let Some(request) = self.pending_plan.take()
+        {
+            let _ = self.spawn_plan(request);
+        }
+        loop {
+            match self.plan_rx.try_recv() {
+                Ok(result) => {
+                    self.plan_worker_active = false;
+                    changed = true;
+                    if let Some(request) = self.pending_plan.take() {
+                        let _ = self.spawn_plan(request);
+                        continue;
+                    }
+                    self.plan_in_flight = false;
+                    if result.generation != self.plan_generation {
+                        continue;
+                    }
+                    match result.result {
+                        Ok(plan) => {
+                            self.planning_notice = None;
+                            self.authorized = plan.authorized;
+                            self.presentations = plan.presentations;
+                            if self.active.as_ref().is_some_and(|event| {
+                                event.state.is_terminal()
+                                    && !self
+                                        .presentations
+                                        .iter()
+                                        .any(|item| item.id == event.action_id)
+                            }) {
+                                self.active = None;
+                            }
+                        }
+                        Err(message) => {
+                            self.authorized.clear();
+                            self.presentations.clear();
+                            self.planning_notice = Some(message);
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.plan_worker_active = false;
+                    self.pending_plan = None;
+                    self.plan_in_flight = false;
+                    self.planning_notice = Some("Local setup inspection became unavailable.");
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        Ok(changed)
     }
 
     #[must_use]
@@ -192,14 +400,20 @@ impl SetupCenter {
             readiness.vosk.state,
             readiness.ollama.state,
         ]
-        .contains(&UiReadinessState::Checking);
+        .contains(&UiReadinessState::Checking)
+            || self.plan_in_flight
+            || self.storage_recovery_in_flight;
         let core_ready = readiness.microphone.state == UiReadinessState::Ready
             && (readiness.whisper.state == UiReadinessState::Ready
                 || readiness.vosk.state == UiReadinessState::Ready);
-        let busy = self
+        let recovery_needed = self
             .active
             .as_ref()
-            .is_some_and(|event| !event.state.is_terminal());
+            .is_some_and(|event| recovery_required(&event.state));
+        let busy = self.executor.recovery_in_progress()
+            || self.active.as_ref().is_some_and(|event| {
+                !event.state.is_terminal() && !recovery_required(&event.state)
+            });
         let failed = self.active.as_ref().is_some_and(|event| {
             matches!(
                 event.state,
@@ -220,7 +434,11 @@ impl SetupCenter {
                 }
                 _ => SetupStage::Working,
             }
-        } else if failed || self.initialization_notice.is_some() {
+        } else if failed
+            || recovery_needed
+            || self.initialization_notice.is_some()
+            || self.planning_notice.is_some()
+        {
             SetupStage::Blocked
         } else if !self.presentations.is_empty() {
             SetupStage::PlanReady
@@ -229,8 +447,12 @@ impl SetupCenter {
         } else {
             SetupStage::Blocked
         };
-        let summary = self.initialization_notice.map_or_else(
-            || match stage {
+        let summary = self
+            .initialization_notice
+            .or(self.planning_notice)
+            .map_or_else(
+                || {
+                    match stage {
                 SetupStage::PlanReady => {
                     "A verified local repair plan is ready. Each side effect requires review."
                         .to_owned()
@@ -251,15 +473,28 @@ impl SetupCenter {
                 SetupStage::Discovering => {
                     "Reading local capabilities. No changes are being made.".to_owned()
                 }
-            },
-            str::to_owned,
-        );
+            }
+                },
+                str::to_owned,
+            );
         let actions = if self.initialization_notice.is_some() {
             Vec::new()
         } else {
             self.presentations
                 .iter()
-                .map(|presentation| present_action(presentation, self.active.as_ref()))
+                .map(|presentation| {
+                    let dependencies_ready = self
+                        .authorized
+                        .get(presentation.id.as_str())
+                        .and_then(|action| self.executor.dependencies_satisfied(action).ok())
+                        .unwrap_or(false);
+                    present_action(
+                        presentation,
+                        self.active.as_ref(),
+                        dependencies_ready,
+                        self.executor.recovery_in_progress(),
+                    )
+                })
                 .collect()
         };
         SetupSnapshot {
@@ -305,10 +540,36 @@ fn desired_configuration(
     }
 }
 
+fn prepare_plan(
+    authority: &SetupAuthority,
+    root: &ManagedRoot,
+    settings: &Settings,
+    readiness: &UiReadinessSnapshot,
+) -> Result<PreparedPlan, &'static str> {
+    let desired = desired_configuration(settings, readiness);
+    let facts = normalized_facts(settings, readiness, root)
+        .map_err(|_| "Local setup inventory could not be verified.")?;
+    let plan = authority
+        .plan(&desired, facts)
+        .map_err(|_| "A safe setup plan could not be created.")?;
+    let presentations = plan.actions();
+    let mut authorized = BTreeMap::new();
+    for presentation in &presentations {
+        let action = plan
+            .authorize(&presentation.id)
+            .map_err(|_| "A safe setup plan could not be authorized.")?;
+        authorized.insert(presentation.id.as_str().to_owned(), action);
+    }
+    Ok(PreparedPlan {
+        authorized,
+        presentations,
+    })
+}
+
 fn normalized_facts(
     settings: &Settings,
     readiness: &UiReadinessSnapshot,
-    executor: &SetupExecutor,
+    root: &ManagedRoot,
 ) -> Result<Vec<NormalizedProbeFact>, ()> {
     let language = if settings.recognition.language == "pt-br" {
         Language::PortugueseBrazil
@@ -318,39 +579,54 @@ fn normalized_facts(
     let mut facts = vec![NormalizedProbeFact::Microphone {
         selected_is_available: readiness.microphone.state == UiReadinessState::Ready,
         permission_denied: false,
+        selection_possible: !readiness.microphone.devices.is_empty(),
     }];
-    let installed = executor.durable_installed().map_err(|_| ())?;
+    let installed = root.installed().map_err(|_| ())?;
     let (engine, ui_ready, digest, all_managed) = match settings.recognition.mode {
         RecognitionMode::Accurate => {
+            let expected_variant = settings.recognition.accurate_model;
             let expected = model_for_variant(settings.recognition.accurate_model)
                 .ok()
                 .and_then(|model| Sha256Digest::new(model.sha256).ok());
             let expected_id = settings.recognition.accurate_model.manifest_id();
-            let managed = expected_id.is_some_and(|id| {
-                installed.iter().any(|item| {
+            let managed_item = expected_id.and_then(|id| {
+                installed.iter().find(|item| {
                     item.receipt.asset().asset_id().as_str() == id
                         && expected.as_ref() == Some(item.receipt.asset().digest())
                 })
             });
+            let managed = managed_item.is_some();
+            let exact_ready = managed_item.is_some_and(|item| {
+                let Ok(spec) = model_for_variant(expected_variant) else {
+                    return false;
+                };
+                let managed_file = item.target.join(spec.file_name);
+                same_existing_path(&readiness.whisper.configured_path, &managed_file)
+                    && identify_pinned_model(&managed_file).ok().flatten() == Some(expected_variant)
+            });
             (
                 EngineKind::Accurate,
-                readiness.whisper.state,
+                readiness.whisper.state == UiReadinessState::Ready && exact_ready,
                 expected,
                 managed,
             )
         }
         RecognitionMode::Instant => {
-            let managed = ["vosk-runtime-win64-0-3-45", "vosk-model-small-en-us-0-15"]
-                .iter()
-                .all(|id| {
-                    installed
-                        .iter()
-                        .any(|item| item.receipt.asset().asset_id().as_str() == *id)
-                });
-            (EngineKind::Instant, readiness.vosk.state, None, managed)
+            let managed_paths = vosk_paths(&installed);
+            let managed = managed_paths.is_some() && language == Language::English;
+            let exact_ready = managed_paths.is_some_and(|(runtime, model)| {
+                same_existing_path(&readiness.vosk.runtime_path, &runtime)
+                    && same_existing_path(&readiness.vosk.model_path, &model)
+            });
+            (
+                EngineKind::Instant,
+                readiness.vosk.state == UiReadinessState::Ready && exact_ready,
+                None,
+                managed,
+            )
         }
     };
-    let state = if ui_ready == UiReadinessState::Ready {
+    let state = if ui_ready {
         RecognitionProbeState::Ready { resident: false }
     } else if all_managed {
         RecognitionProbeState::InstalledUnvalidated
@@ -426,12 +702,34 @@ fn parse_ollama_digest(value: &str) -> Option<Sha256Digest> {
 fn present_action(
     presentation: &crate::setup_host::ActionPresentation,
     active: Option<&ActionEvent>,
+    dependencies_ready: bool,
+    recovery_in_progress: bool,
 ) -> SetupAction {
     let state = active
         .filter(|event| event.action_id == presentation.id)
         .map(|event| &event.state);
-    let another_is_active = active
-        .is_some_and(|event| event.action_id != presentation.id && !event.state.is_terminal());
+    let another_is_active = active.is_some_and(|event| {
+        event.action_id != presentation.id && (!event.state.is_terminal() || recovery_in_progress)
+    });
+    let needs_recovery = state.is_some_and(recovery_required);
+    let host_supported = !matches!(
+        presentation.key,
+        ActionKey::GuidedExternalInstall { .. }
+            | ActionKey::StartExternalTool { .. }
+            | ActionKey::PullOllamaModel { .. }
+            | ActionKey::GrantMicrophoneAccess
+            | ActionKey::Probe(_)
+            | ActionKey::ImportVerifiedAssets { .. }
+    );
+    let currently_executing = state.is_some_and(|state| {
+        matches!(
+            state,
+            ActionState::Running { .. }
+                | ActionState::AwaitingConsent { .. }
+                | ActionState::Queued
+                | ActionState::Cancelling
+        )
+    });
     let (progress_percent, running, can_retry, complete) = match state {
         Some(ActionState::Running { progress }) => (
             progress.total_units.and_then(|total| {
@@ -448,6 +746,9 @@ fn present_action(
         ) => (None, true, false, false),
         Some(ActionState::Failed { retryable, .. }) => (None, false, *retryable, false),
         Some(ActionState::Succeeded) => (Some(100), false, false, true),
+        Some(state) if recovery_required(state) => {
+            (None, recovery_in_progress, !recovery_in_progress, false)
+        }
         _ => (None, false, false, false),
     };
     let (title, detail) = action_copy(&presentation.key);
@@ -456,16 +757,38 @@ fn present_action(
         title: title.to_owned(),
         detail: detail.to_owned(),
         progress_percent,
-        consent: presentation
-            .required_consent
-            .iter()
-            .map(|item| consent_copy(*item).to_owned())
-            .collect(),
+        consent: if needs_recovery {
+            Vec::new()
+        } else {
+            presentation
+                .required_consent
+                .iter()
+                .map(|item| consent_copy(*item).to_owned())
+                .collect()
+        },
         running,
         can_retry,
         complete,
-        available: !another_is_active,
+        available: !another_is_active
+            && (needs_recovery || currently_executing || (host_supported && dependencies_ready)),
     }
+}
+
+fn same_existing_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    std::fs::canonicalize(left)
+        .and_then(|left| std::fs::canonicalize(right).map(|right| left == right))
+        .unwrap_or(false)
+}
+
+fn recovery_required(state: &ActionState) -> bool {
+    matches!(
+        state,
+        ActionState::RollbackRetryPending { .. }
+            | ActionState::FailedExternalSideEffectsMayRemain { .. }
+            | ActionState::Cancelled {
+                outcome: phorminx_setup::CancellationOutcome::ExternalSideEffectsMayRemain
+            }
+    )
 }
 
 fn action_copy(key: &ActionKey) -> (&'static str, &'static str) {
@@ -495,8 +818,8 @@ fn action_copy(key: &ActionKey) -> (&'static str, &'static str) {
             "Run the signed package-manager flow for Ollama. This is optional; Light formatting remains available.",
         ),
         ActionKey::StartExternalTool { .. } => (
-            "Start Ollama",
-            "Start the local Ollama service as a background process.",
+            "Start Ollama manually",
+            "Phorminx will not execute an unverified user-writable binary. Start Ollama yourself, then inspect again.",
         ),
         ActionKey::PullOllamaModel { .. } => (
             "Acquire the selected Ollama model",
@@ -613,6 +936,7 @@ struct ProductionAdapters {
     compensation: Mutex<BTreeMap<ActionKey, Compensation>>,
 }
 
+#[derive(Clone)]
 struct Compensation {
     previous: Settings,
     written: Settings,
@@ -716,6 +1040,7 @@ impl ActionAdapters for ProductionAdapters {
                 );
                 identify_pinned_model(&file)
                     .map_err(|_| verification_error())?
+                    .filter(|variant| variant.manifest_id() == Some(expected_id))
                     .ok_or_else(verification_error)
                     .map(|_| ())
             }
@@ -817,43 +1142,10 @@ impl ActionAdapters for ProductionAdapters {
 
     fn start_ollama(&self, cancel: &AtomicBool) -> Result<(), HostActionError> {
         Self::check_cancel(cancel)?;
-        let executable = trusted_ollama_executable(cancel)?;
-        let mut child = Command::new(executable)
-            .arg("serve")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| platform_error())?;
-        let timeouts = ClientTimeouts {
-            connect: Duration::from_millis(300),
-            response_headers: Duration::from_millis(500),
-            response_body: Duration::from_millis(500),
-            overall: Duration::from_millis(750),
-        };
-        let client =
-            OllamaClient::new(OllamaEndpoint::default(), timeouts).map_err(|_| platform_error())?;
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            if cancel.load(Ordering::Acquire) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(HostActionError::new(ActionFailure::Cancelled, true));
-            }
-            if client.discover(&CancellationToken::new()).is_ok() {
-                return Ok(());
-            }
-            if child.try_wait().map_err(|_| platform_error())?.is_some() {
-                return Err(platform_error());
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        Err(HostActionError::new(
-            ActionFailure::PlatformOperationFailed,
-            true,
-        ))
+        // LocalAppData is user-writable, and `--version` output cannot prove a
+        // publisher identity. Until a pinned Authenticode signer contract is
+        // compiled into the host, Phorminx must not execute this binary.
+        Err(verification_error())
     }
 
     fn pull_ollama_model(
@@ -883,23 +1175,24 @@ impl ActionAdapters for ProductionAdapters {
             ));
         }
         set_launch_at_login(&executable, enabled).map_err(|_| platform_error())?;
-        let verified = launch_at_login_state(&executable).map_err(|_| platform_error())?;
-        if matches!(
-            (enabled, verified),
-            (true, LaunchAtLoginState::Enabled) | (false, LaunchAtLoginState::Disabled)
-        ) {
-            let saved = self.save_settings(ActionKey::ApplyLaunchAtLogin { enabled }, |settings| {
-                settings.startup.launch_at_login = enabled;
-                Ok(())
-            });
-            if saved.is_err() {
-                let restore_enabled = matches!(before, LaunchAtLoginState::Enabled);
-                let _ = set_launch_at_login(&executable, restore_enabled);
-            }
-            saved
-        } else {
-            Err(verification_error())
+        let applied = launch_at_login_state(&executable).is_ok_and(|state| {
+            matches!(
+                (enabled, state),
+                (true, LaunchAtLoginState::Enabled) | (false, LaunchAtLoginState::Disabled)
+            )
+        });
+        if !applied {
+            restore_launch_at_login(&executable, &before)?;
+            return Err(verification_error());
         }
+        let saved = self.save_settings(ActionKey::ApplyLaunchAtLogin { enabled }, |settings| {
+            settings.startup.launch_at_login = enabled;
+            Ok(())
+        });
+        if saved.is_err() {
+            restore_launch_at_login(&executable, &before)?;
+        }
+        saved
     }
 
     fn run_benchmark(
@@ -911,19 +1204,22 @@ impl ActionAdapters for ProductionAdapters {
     }
 
     fn rollback(&self, action: &ActionKey, _cancel: &AtomicBool) -> Result<(), HostActionError> {
-        let previous = self
+        let compensation = self
             .compensation
             .lock()
             .map_err(|_| platform_error())?
-            .remove(action);
-        let Some(compensation) = previous else {
+            .get(action)
+            .cloned();
+        let Some(compensation) = compensation else {
             // No completed compensating write exists for this action.
             return Ok(());
         };
-        if !self
-            .store
-            .compare_and_save(&compensation.written, &compensation.previous)
-            .map_err(|_| platform_error())?
+        let current = self.store.load().map_err(|_| platform_error())?;
+        if current != compensation.previous
+            && !self
+                .store
+                .compare_and_save(&compensation.written, &compensation.previous)
+                .map_err(|_| platform_error())?
         {
             return Err(HostActionError::new(
                 ActionFailure::ConsistencyFailure,
@@ -942,13 +1238,18 @@ impl ActionAdapters for ProductionAdapters {
                 return Err(verification_error());
             }
         }
+        self.compensation
+            .lock()
+            .map_err(|_| platform_error())?
+            .remove(action);
         Ok(())
     }
     fn reconcile_external(
         &self,
         action: &ActionKey,
-        _cancel: &AtomicBool,
+        cancel: &AtomicBool,
     ) -> Result<(), HostActionError> {
+        Self::check_cancel(cancel)?;
         match action {
             ActionKey::StartExternalTool { tool } if tool.as_str() == "ollama" => {
                 let client = OllamaClient::new(
@@ -961,10 +1262,12 @@ impl ActionAdapters for ProductionAdapters {
                     },
                 )
                 .map_err(|_| platform_error())?;
-                client
+                let result = client
                     .discover(&CancellationToken::new())
                     .map(|_| ())
-                    .map_err(|_| platform_error())
+                    .map_err(|_| platform_error());
+                Self::check_cancel(cancel)?;
+                result
             }
             _ => Err(HostActionError::new(
                 ActionFailure::ConsistencyFailure,
@@ -972,6 +1275,27 @@ impl ActionAdapters for ProductionAdapters {
             )),
         }
     }
+}
+
+fn restore_launch_at_login(
+    executable: &std::path::Path,
+    before: &LaunchAtLoginState,
+) -> Result<(), HostActionError> {
+    let restore_enabled = matches!(before, LaunchAtLoginState::Enabled);
+    if set_launch_at_login(executable, restore_enabled).is_err()
+        || !launch_at_login_state(executable).is_ok_and(|state| {
+            matches!(
+                (restore_enabled, state),
+                (true, LaunchAtLoginState::Enabled) | (false, LaunchAtLoginState::Disabled)
+            )
+        })
+    {
+        return Err(HostActionError::rollback_blocked(
+            ActionFailure::ConsistencyFailure,
+            true,
+        ));
+    }
+    Ok(())
 }
 
 fn vosk_paths(installed: &[ManagedInstall]) -> Option<(PathBuf, PathBuf)> {
@@ -993,85 +1317,6 @@ const fn verification_error() -> HostActionError {
 }
 const fn platform_error() -> HostActionError {
     HostActionError::new(ActionFailure::PlatformOperationFailed, true)
-}
-
-/// Resolves only Ollama's documented per-user install location. The version
-/// probe is bounded and the executable itself must not be a link. No PATH or
-/// current-directory lookup is used.
-fn trusted_ollama_executable(cancel: &AtomicBool) -> Result<PathBuf, HostActionError> {
-    let local = std::env::var_os("LOCALAPPDATA").ok_or_else(verification_error)?;
-    let expected_parent = PathBuf::from(local).join("Programs/Ollama");
-    let expected = expected_parent.join("ollama.exe");
-    let metadata = std::fs::symlink_metadata(&expected).map_err(|_| verification_error())?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
-        return Err(verification_error());
-    }
-    let canonical_parent =
-        std::fs::canonicalize(&expected_parent).map_err(|_| verification_error())?;
-    let canonical = std::fs::canonicalize(&expected).map_err(|_| verification_error())?;
-    if canonical.parent() != Some(canonical_parent.as_path())
-        || canonical.file_name().and_then(|name| name.to_str()) != Some("ollama.exe")
-    {
-        return Err(verification_error());
-    }
-    let mut child = Command::new(&canonical)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| verification_error())?;
-    wait_bounded(&mut child, cancel, Duration::from_secs(3))?;
-    let mut output = String::new();
-    child
-        .stdout
-        .take()
-        .ok_or_else(verification_error)?
-        .take(4096)
-        .read_to_string(&mut output)
-        .map_err(|_| verification_error())?;
-    if !output.to_ascii_lowercase().contains("ollama version") {
-        return Err(verification_error());
-    }
-    Ok(canonical)
-}
-
-#[cfg(windows)]
-fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-const fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
-    false
-}
-
-fn wait_bounded(
-    child: &mut Child,
-    cancel: &AtomicBool,
-    timeout: Duration,
-) -> Result<(), HostActionError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cancel.load(Ordering::Acquire) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(HostActionError::new(ActionFailure::Cancelled, true));
-        }
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(_)) => return Err(verification_error()),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(platform_error());
-            }
-            Err(_) => return Err(platform_error()),
-        }
-    }
 }
 
 #[cfg(test)]

@@ -205,7 +205,10 @@ fn setup(
                 if planned.complete {
                     metadata(ui, "Complete");
                 } else if !planned.available {
-                    metadata(ui, "Waiting for the active operation");
+                    metadata(
+                        ui,
+                        "Unavailable until its verified prerequisite is satisfied",
+                    );
                 } else if planned.running {
                     if action(ui, "Cancel", ActionTone::Secondary).clicked() {
                         outbox.push(ShellEvent::CancelSetupAction(planned.id.clone()));
