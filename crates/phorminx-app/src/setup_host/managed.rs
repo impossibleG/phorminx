@@ -11,7 +11,7 @@ use phorminx_setup::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{Packaging, PinnedArtifact};
+use super::{Packaging, PinnedArtifact, PinnedCatalog};
 
 const JOURNAL_FILE_LIMIT: u64 = 32 * 1024;
 const IO_BUFFER_BYTES: usize = 128 * 1024;
@@ -37,11 +37,12 @@ impl Default for AcquisitionLimits {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ActivationFault {
+pub(super) enum ActivationFault {
     Rename,
     ActivatedJournal,
     Receipt,
     JournalDeletion,
+    Cleanup,
 }
 
 /// Fetches one exact HTTPS URL into a host-provided bounded writer.
@@ -80,12 +81,10 @@ impl ManagedRoot {
         if !root.is_absolute() {
             return Err(ManagedRootError::RootNotAbsolute);
         }
-        fs::create_dir_all(&root).map_err(ManagedRootError::Io)?;
-        reject_symlink(&root)?;
+        create_directory_tree_without_links(&root)?;
         for child in ["staging", "active", "journal", "receipts"] {
             let path = root.join(child);
-            fs::create_dir_all(&path).map_err(ManagedRootError::Io)?;
-            reject_symlink(&path)?;
+            create_directory_tree_without_links(&path)?;
         }
         Ok(Self {
             root,
@@ -104,7 +103,10 @@ impl ManagedRoot {
     }
 
     #[cfg(test)]
-    fn for_test_with_fault(root: &Path, fault: ActivationFault) -> Result<Self, ManagedRootError> {
+    pub(super) fn for_test_with_fault(
+        root: &Path,
+        fault: ActivationFault,
+    ) -> Result<Self, ManagedRootError> {
         let mut managed = Self::open(root.to_path_buf(), AcquisitionLimits::default())?;
         managed.activation_fault = Some(fault);
         Ok(managed)
@@ -119,10 +121,20 @@ impl ManagedRoot {
         progress: &mut dyn FnMut(ActionPhase, u64, Option<u64>),
     ) -> Result<ManagedInstall, ManagedRootError> {
         let transaction = transaction_id()?;
-        let staging = self.root.join("staging").join(transaction.as_str());
+        let staging_root = self.root.join("staging");
+        ensure_existing_path_without_links(&self.root, &staging_root)?;
+        let staging = staging_root.join(transaction.as_str());
         fs::create_dir(&staging).map_err(ManagedRootError::Io)?;
         let transaction_marker = TransactionMarker::new(&transaction, action.id());
-        write_json_atomic(&staging.join(".transaction.json"), &transaction_marker)?;
+        if let Err(error) =
+            write_json_atomic(&staging.join(".transaction.json"), &transaction_marker)
+        {
+            return if fs::remove_dir(&staging).is_ok() {
+                Err(error)
+            } else {
+                Err(ManagedRootError::CleanupIncomplete)
+            };
+        }
 
         let slot = ManagedSlot::new(pinned.activation_slot().to_owned())?;
         let mut journal = DiskJournal::new(
@@ -132,7 +144,12 @@ impl ManagedRoot {
             pinned.descriptor().asset_id(),
             pinned.descriptor().digest(),
         );
-        self.write_journal(&journal)?;
+        if let Err(error) = self.write_journal(&journal) {
+            return match self.remove_owned_staging(&journal) {
+                Ok(true) => Err(error),
+                Ok(false) | Err(_) => Err(ManagedRootError::CleanupIncomplete),
+            };
+        }
         let result = (|| {
             check_cancel(cancel)?;
             let archive = staging.join("artifact.download");
@@ -194,7 +211,7 @@ impl ManagedRoot {
             }
             progress(ActionPhase::Committing, 0, Some(1));
             phorminx_windows::atomic_activate_directory(&payload, &target)
-                .map_err(|error| ManagedRootError::AtomicReplace(error.to_string()))?;
+                .map_err(|_| ManagedRootError::AtomicReplace)?;
             progress(ActionPhase::Committing, 1, Some(1));
             let install = ManagedInstall {
                 receipt,
@@ -232,17 +249,35 @@ impl ManagedRoot {
             }
             Ok(install)
         })();
-        if result.is_err() {
-            // Only transaction-owned staging is automatically removed here.
-            // An activated target is retained for explicit marker reconciliation.
-            let _ = self.remove_owned_staging(&journal);
+        match result {
+            Ok(install) => Ok(install),
+            Err(error) => {
+                // Every error above occurs before the atomic activation commit
+                // point. Report the original failure only after the exact
+                // transaction staging and journal are durably gone; otherwise
+                // the lifecycle must remain rollback-blocked for Repair.
+                match self.remove_owned_staging(&journal) {
+                    Ok(true) if self.remove_journal(&journal.transaction_id).is_ok() => Err(error),
+                    Ok(true) | Ok(false) | Err(_) => Err(ManagedRootError::CleanupIncomplete),
+                }
+            }
         }
-        result
     }
 
     pub fn recover(&self) -> Result<RecoveryReport, ManagedRootError> {
+        let catalog = PinnedCatalog::phorminx().map_err(|_| ManagedRootError::InvalidCatalog)?;
+        self.recover_with_catalog(&catalog)
+    }
+
+    fn recover_with_catalog(
+        &self,
+        catalog: &PinnedCatalog,
+    ) -> Result<RecoveryReport, ManagedRootError> {
         let mut report = RecoveryReport::default();
         let journal_root = self.root.join("journal");
+        let active_root = self.root.join("active");
+        ensure_existing_path_without_links(&self.root, &journal_root)?;
+        ensure_existing_path_without_links(&self.root, &active_root)?;
         for entry in fs::read_dir(&journal_root).map_err(ManagedRootError::Io)? {
             let entry = entry.map_err(ManagedRootError::Io)?;
             if !entry.file_type().map_err(ManagedRootError::Io)?.is_file() {
@@ -263,24 +298,72 @@ impl ManagedRoot {
                     continue;
                 }
             };
+            let Some(pinned) = catalog.artifact(&journal.asset_id) else {
+                report.rejected_journals += 1;
+                continue;
+            };
+            let pinned_slot = ManagedSlot::new(pinned.activation_slot().to_owned())?;
+            let pinned_action = ActionId::for_key(&phorminx_setup::ActionKey::DownloadArtifact {
+                artifact: Box::new(pinned.descriptor().clone()),
+            });
+            if pinned.descriptor().digest() != &journal.digest
+                || pinned_slot != journal.slot
+                || pinned_action != journal.action_id
+            {
+                report.rejected_journals += 1;
+                continue;
+            }
             let target = self.target(&journal.slot)?;
+            let target_exists = match fs::symlink_metadata(&target) {
+                Ok(metadata) => {
+                    if is_link_or_reparse(&metadata)
+                        || !metadata.is_dir()
+                        || ensure_existing_path_without_links(&active_root, &target).is_err()
+                    {
+                        report.rejected_journals += 1;
+                        continue;
+                    }
+                    true
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => {
+                    report.rejected_journals += 1;
+                    continue;
+                }
+            };
             // Atomic directory activation can complete immediately before the
             // journal's phase update. The prewritten owner marker is the
             // durable commit witness in either phase.
             if matches!(owner_marker_matches(&target, &journal), Ok(true)) {
-                let install = self.install_from_target(&journal, target)?;
-                self.persist_receipt(&install.receipt)?;
+                let Ok(install) = self.install_from_target(&journal, pinned, target) else {
+                    report.rejected_journals += 1;
+                    continue;
+                };
+                if self.persist_receipt(&install.receipt).is_err() {
+                    report.rejected_journals += 1;
+                    continue;
+                }
                 report.activated_targets.push(install.target.clone());
                 report.recovered_installs.push(install);
-                let _ = self.remove_owned_staging(&journal)?;
-            } else if journal.phase == DiskPhase::Activated {
+                if self.remove_owned_staging(&journal).is_err() {
+                    report.rejected_journals += 1;
+                    continue;
+                }
+            } else if target_exists || journal.phase == DiskPhase::Activated {
+                // A target at the pinned slot with a missing or mismatched
+                // witness is never ours. Preserve the journal as evidence for
+                // explicit repair instead of deleting it and leaving a silent,
+                // permanently blocking orphan.
                 report.rejected_journals += 1;
                 continue;
-            } else if self.remove_owned_staging(&journal)? {
-                report.removed_staging += 1;
             } else {
-                report.rejected_journals += 1;
-                continue;
+                match self.remove_owned_staging(&journal) {
+                    Ok(true) => report.removed_staging += 1,
+                    Ok(false) | Err(_) => {
+                        report.rejected_journals += 1;
+                        continue;
+                    }
+                }
             }
             self.remove_journal(&journal.transaction_id)?;
         }
@@ -314,8 +397,20 @@ impl ManagedRoot {
     /// Reloads durable receipts only when the fixed target and owner marker
     /// still match every receipt identity field.
     pub fn installed(&self) -> Result<Vec<ManagedInstall>, ManagedRootError> {
+        let catalog = PinnedCatalog::phorminx().map_err(|_| ManagedRootError::InvalidCatalog)?;
+        self.installed_from_catalog(&catalog)
+    }
+
+    fn installed_from_catalog(
+        &self,
+        catalog: &PinnedCatalog,
+    ) -> Result<Vec<ManagedInstall>, ManagedRootError> {
         let mut installs = Vec::new();
-        for entry in fs::read_dir(self.root.join("receipts")).map_err(ManagedRootError::Io)? {
+        let receipts_root = self.root.join("receipts");
+        let active_root = self.root.join("active");
+        ensure_existing_path_without_links(&self.root, &receipts_root)?;
+        ensure_existing_path_without_links(&self.root, &active_root)?;
+        for entry in fs::read_dir(receipts_root).map_err(ManagedRootError::Io)? {
             let entry = entry.map_err(ManagedRootError::Io)?;
             if !entry.file_type().map_err(ManagedRootError::Io)?.is_file() {
                 continue;
@@ -330,8 +425,19 @@ impl ManagedRoot {
             {
                 continue;
             }
+            let Some(pinned) = catalog.exact_artifact(receipt.asset().descriptor()) else {
+                continue;
+            };
+            if ManagedSlot::new(pinned.activation_slot().to_owned())? != *receipt.asset().slot() {
+                continue;
+            }
             let target = self.target(receipt.asset().slot())?;
-            if owner_matches_receipt(&target, &receipt)? {
+            let target_is_safe = fs::symlink_metadata(&target).is_ok_and(|metadata| {
+                metadata.is_dir()
+                    && !is_link_or_reparse(&metadata)
+                    && ensure_existing_path_without_links(&active_root, &target).is_ok()
+            });
+            if target_is_safe && matches!(owner_matches_receipt(&target, &receipt), Ok(true)) {
                 let action_id = ActionId::for_key(&phorminx_setup::ActionKey::DownloadArtifact {
                     artifact: Box::new(receipt.asset().descriptor().clone()),
                 });
@@ -406,6 +512,7 @@ impl ManagedRoot {
     fn install_from_target(
         &self,
         journal: &DiskJournal,
+        pinned: &PinnedArtifact,
         target: PathBuf,
     ) -> Result<ManagedInstall, ManagedRootError> {
         let receipt = read_bounded_json::<AssetReceipt>(
@@ -416,6 +523,8 @@ impl ManagedRoot {
             || receipt.asset().asset_id() != &journal.asset_id
             || receipt.asset().digest() != &journal.digest
             || receipt.asset().slot() != &journal.slot
+            || pinned.descriptor() != receipt.asset().descriptor()
+            || ManagedSlot::new(pinned.activation_slot().to_owned())? != *receipt.asset().slot()
             || !owner_matches_receipt(&target, &receipt)?
         {
             return Err(ManagedRootError::NotOwned);
@@ -429,6 +538,9 @@ impl ManagedRoot {
     }
 
     fn remove_owned_staging(&self, journal: &DiskJournal) -> Result<bool, ManagedRootError> {
+        if self.fault_at(ActivationFault::Cleanup) {
+            return Err(ManagedRootError::CleanupIncomplete);
+        }
         let staging = self
             .root
             .join("staging")
@@ -676,9 +788,14 @@ impl Write for VerifyingWriter<'_> {
         let next = self
             .written
             .checked_add(buffer.len() as u64)
-            .ok_or_else(|| std::io::Error::other("download size overflow"))?;
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "download size overflow")
+            })?;
         if next > self.expected {
-            return Err(std::io::Error::other("download exceeds pinned size"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "download exceeds pinned size",
+            ));
         }
         self.file.write_all(buffer)?;
         self.hasher.update(buffer);
@@ -872,11 +989,41 @@ fn reject_symlink(path: &Path) -> Result<(), ManagedRootError> {
     Ok(())
 }
 
+/// Creates an absolute directory path one component at a time, rejecting an
+/// existing symlink or Windows reparse point anywhere in the ancestry before
+/// any child is created through it.
+fn create_directory_tree_without_links(path: &Path) -> Result<(), ManagedRootError> {
+    if !path.is_absolute() {
+        return Err(ManagedRootError::RootNotAbsolute);
+    }
+    let mut ancestry = path.ancestors().collect::<Vec<_>>();
+    ancestry.reverse();
+    for current in ancestry {
+        if current.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::symlink_metadata(current) {
+            Ok(metadata) => {
+                if is_link_or_reparse(&metadata) || !metadata.is_dir() {
+                    return Err(ManagedRootError::ManagedPathIsLink);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(current).map_err(ManagedRootError::Io)?;
+                reject_symlink(current)?;
+            }
+            Err(error) => return Err(ManagedRootError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
 fn ensure_parents_without_links(
     base: &Path,
     parent: Option<&Path>,
 ) -> Result<(), ManagedRootError> {
     let parent = parent.ok_or(ManagedRootError::PathEscaped)?;
+    reject_directory_link(base)?;
     if !parent.starts_with(base) {
         return Err(ManagedRootError::PathEscaped);
     }
@@ -904,6 +1051,7 @@ fn ensure_parents_without_links(
 }
 
 fn ensure_existing_path_without_links(base: &Path, target: &Path) -> Result<(), ManagedRootError> {
+    reject_directory_link(base)?;
     if !target.starts_with(base) {
         return Err(ManagedRootError::PathEscaped);
     }
@@ -961,29 +1109,47 @@ fn ensure_tree_without_links(root: &Path) -> Result<(), ManagedRootError> {
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), ManagedRootError> {
     let parent = path.parent().ok_or(ManagedRootError::PathEscaped)?;
     fs::create_dir_all(parent).map_err(ManagedRootError::Io)?;
+    reject_symlink(parent)?;
     let temporary = parent.join(format!(
         ".journal-{}-{}.tmp",
         std::process::id(),
         TRANSACTION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .map_err(ManagedRootError::Io)?;
-    serde_json::to_writer(&mut file, value).map_err(ManagedRootError::Json)?;
-    file.flush().map_err(ManagedRootError::Io)?;
-    file.sync_all().map_err(ManagedRootError::Io)?;
-    drop(file);
-    phorminx_windows::atomic_replace_file(&temporary, path)
-        .map_err(|error| ManagedRootError::AtomicReplace(error.to_string()))
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(ManagedRootError::Io)?;
+        serde_json::to_writer(&mut file, value).map_err(ManagedRootError::Json)?;
+        file.flush().map_err(ManagedRootError::Io)?;
+        file.sync_all().map_err(ManagedRootError::Io)?;
+        drop(file);
+        phorminx_windows::atomic_replace_file(&temporary, path)
+            .map_err(|_| ManagedRootError::AtomicReplace)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+fn reject_directory_link(path: &Path) -> Result<(), ManagedRootError> {
+    let metadata = fs::symlink_metadata(path).map_err(ManagedRootError::Io)?;
+    if is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(ManagedRootError::ManagedPathIsLink);
+    }
+    Ok(())
 }
 
 fn read_bounded_json<T: for<'de> Deserialize<'de>>(
     path: &Path,
     maximum: u64,
 ) -> Result<T, ManagedRootError> {
-    let metadata = fs::metadata(path).map_err(ManagedRootError::Io)?;
+    let metadata = fs::symlink_metadata(path).map_err(ManagedRootError::Io)?;
+    if is_link_or_reparse(&metadata) {
+        return Err(ManagedRootError::ManagedPathIsLink);
+    }
     if !metadata.is_file() || metadata.len() > maximum {
         return Err(ManagedRootError::JournalTooLarge);
     }
@@ -997,6 +1163,8 @@ pub enum FetchError {
     Network,
     #[error("the response stream failed")]
     Response,
+    #[error("writing the response to managed storage failed: {0}")]
+    Output(std::io::Error),
     #[error("the operation was cancelled")]
     Cancelled,
 }
@@ -1005,6 +1173,8 @@ pub enum FetchError {
 pub enum ManagedRootError {
     #[error("LocalAppData is unavailable")]
     LocalAppDataUnavailable,
+    #[error("the embedded setup catalog is invalid")]
+    InvalidCatalog,
     #[error("the managed root must be absolute")]
     RootNotAbsolute,
     #[error("a managed path is a link or reparse-like alias")]
@@ -1017,6 +1187,8 @@ pub enum ManagedRootError {
     NotOwned,
     #[error("the transaction identity is invalid")]
     InvalidTransaction,
+    #[error("transaction cleanup is incomplete and requires repair")]
+    CleanupIncomplete,
     #[error("the operation was cancelled")]
     Cancelled,
     #[error("the response length was {actual}, expected {expected}")]
@@ -1049,8 +1221,8 @@ pub enum ManagedRootError {
     Io(std::io::Error),
     #[error("managed setup metadata is invalid: {0}")]
     Json(serde_json::Error),
-    #[error("atomic metadata replacement failed: {0}")]
-    AtomicReplace(String),
+    #[error("atomic managed-storage replacement failed")]
+    AtomicReplace,
 }
 
 #[cfg(test)]
@@ -1245,6 +1417,40 @@ mod tests {
             ),
             Err(ManagedRootError::Zip(_))
         ));
+        assert_eq!(fs::read_dir(root.root.join("journal")).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(root.root.join("staging")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn acquisition_failure_never_claims_cleanup_when_owned_staging_is_locked() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::for_test_with_fault(
+            &temporary.path().join("managed"),
+            ActivationFault::Cleanup,
+        )
+        .unwrap();
+        let artifact = pinned(
+            b"good".to_vec(),
+            Packaging::RawFile {
+                file_name: "model.bin".to_owned(),
+            },
+            "raw/cleanup-failure",
+        );
+        assert!(matches!(
+            root.install(
+                &action(&artifact),
+                &artifact,
+                &BytesFetcher {
+                    bytes: b"evil".to_vec(),
+                    cancel_first: false,
+                },
+                &AtomicBool::new(false),
+                &mut |_, _, _| {},
+            ),
+            Err(ManagedRootError::CleanupIncomplete)
+        ));
+        assert_eq!(fs::read_dir(root.root.join("journal")).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(root.root.join("staging")).unwrap().count(), 1);
     }
 
     #[test]
@@ -1341,6 +1547,7 @@ mod tests {
             },
             "models/x",
         );
+        let catalog = PinnedCatalog::for_test([artifact.clone()]).unwrap();
         let action = action(&artifact);
         let transaction = ContentFreeId::new("tx-recovery").unwrap();
         let journal = DiskJournal::new(
@@ -1359,7 +1566,7 @@ mod tests {
         .unwrap();
         fs::write(staging.join("partial"), b"partial").unwrap();
         root.write_journal(&journal).unwrap();
-        let report = root.recover().unwrap();
+        let report = root.recover_with_catalog(&catalog).unwrap();
         assert_eq!(report.removed_staging, 1);
         assert!(!staging.exists());
 
@@ -1376,7 +1583,7 @@ mod tests {
         );
         fs::create_dir(root.root.join("staging/tx-bad")).unwrap();
         root.write_journal(&bad).unwrap();
-        let report = root.recover().unwrap();
+        let report = root.recover_with_catalog(&catalog).unwrap();
         assert_eq!(report.rejected_journals, 1);
         assert!(hostile.join("keep").exists());
     }
@@ -1396,6 +1603,7 @@ mod tests {
             },
             "models/x",
         );
+        let catalog = PinnedCatalog::for_test([artifact.clone()]).unwrap();
         let action = action(&artifact);
 
         let orphan_id = ContentFreeId::new("tx-orphan").unwrap();
@@ -1419,7 +1627,7 @@ mod tests {
         marker.schema_version = 2;
         write_json_atomic(&wrong_schema.join(".transaction.json"), &marker).unwrap();
 
-        let report = root.recover().unwrap();
+        let report = root.recover_with_catalog(&catalog).unwrap();
         assert_eq!(report.removed_staging, 1);
         assert_eq!(report.rejected_journals, 2);
         assert!(!orphan.exists());
@@ -1442,6 +1650,7 @@ mod tests {
             },
             "models/x",
         );
+        let catalog = PinnedCatalog::for_test([artifact.clone()]).unwrap();
         let action = action(&artifact);
         let transaction = ContentFreeId::new("tx-commit-window").unwrap();
         let slot = ManagedSlot::new("models/x").unwrap();
@@ -1477,11 +1686,233 @@ mod tests {
         .unwrap();
         root.write_journal(&journal).unwrap();
 
-        let report = root.recover().unwrap();
+        let report = root.recover_with_catalog(&catalog).unwrap();
         assert_eq!(report.activated_targets, vec![target.clone()]);
         assert!(target.exists());
         assert!(!staging.exists());
         assert!(!root.journal_path(&transaction).exists());
+    }
+
+    #[test]
+    fn self_consistent_forged_metadata_cannot_mint_a_catalog_install() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::for_test(
+            &temporary.path().join("managed"),
+            AcquisitionLimits::default(),
+        )
+        .unwrap();
+        let legitimate = pinned(
+            b"x".to_vec(),
+            Packaging::RawFile {
+                file_name: "x".to_owned(),
+            },
+            "models/x",
+        );
+        let catalog = PinnedCatalog::for_test([legitimate.clone()]).unwrap();
+        let forged_descriptor = ArtifactDescriptor::new(
+            legitimate.descriptor().asset_id().clone(),
+            legitimate.descriptor().digest().clone(),
+            legitimate.descriptor().size_bytes(),
+            ContentFreeId::new("forged-vendor").unwrap(),
+            ContentFreeId::new("forged-version").unwrap(),
+            ContentFreeId::new("forged-license").unwrap(),
+            "https://attacker.invalid/payload",
+            ArtifactKind::Data,
+            None,
+            EngineKind::Accurate,
+            [Language::English],
+        )
+        .unwrap();
+        let transaction = ContentFreeId::new("tx-forged").unwrap();
+        let slot = ManagedSlot::new("models/x").unwrap();
+        let acquired = AcquiredArtifact {
+            digest: forged_descriptor.digest().clone(),
+            size_bytes: forged_descriptor.size_bytes(),
+            signer: None,
+        };
+        let managed =
+            ManagedAsset::from_verified(forged_descriptor, &acquired, slot.clone()).unwrap();
+        let receipt = AssetReceipt::new(transaction.clone(), managed, 1);
+        let target = root.target(&slot).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        write_json_atomic(
+            &target.join(".phorminx-owner.json"),
+            &OwnerMarker::for_receipt(&receipt),
+        )
+        .unwrap();
+        write_json_atomic(&target.join(".phorminx-receipt.json"), &receipt).unwrap();
+        let action = action(&legitimate);
+        let journal = DiskJournal::new(
+            &transaction,
+            action.id(),
+            &slot,
+            legitimate.descriptor().asset_id(),
+            legitimate.descriptor().digest(),
+        );
+        root.write_journal(&journal).unwrap();
+
+        let report = root.recover_with_catalog(&catalog).unwrap();
+        assert_eq!(report.rejected_journals, 1);
+        assert!(report.recovered_installs.is_empty());
+        assert!(root.installed_from_catalog(&catalog).unwrap().is_empty());
+        assert!(root.journal_path(&transaction).exists());
+    }
+
+    #[test]
+    fn journal_action_identity_must_match_the_pinned_download() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::for_test(
+            &temporary.path().join("managed"),
+            AcquisitionLimits::default(),
+        )
+        .unwrap();
+        let artifact = pinned(
+            b"x".to_vec(),
+            Packaging::RawFile {
+                file_name: "x".to_owned(),
+            },
+            "models/x",
+        );
+        let catalog = PinnedCatalog::for_test([artifact.clone()]).unwrap();
+        let transaction = ContentFreeId::new("tx-wrong-action").unwrap();
+        let wrong_action = ActionId::for_key(&phorminx_setup::ActionKey::SelectMicrophone);
+        let journal = DiskJournal::new(
+            &transaction,
+            &wrong_action,
+            &ManagedSlot::new("models/x").unwrap(),
+            artifact.descriptor().asset_id(),
+            artifact.descriptor().digest(),
+        );
+        root.write_journal(&journal).unwrap();
+
+        let report = root.recover_with_catalog(&catalog).unwrap();
+        assert_eq!(report.rejected_journals, 1);
+        assert!(root.journal_path(&transaction).exists());
+    }
+
+    #[test]
+    fn recovery_preserves_a_mismatched_existing_target_and_its_journal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::for_test(
+            &temporary.path().join("managed"),
+            AcquisitionLimits::default(),
+        )
+        .unwrap();
+        let artifact = pinned(
+            b"x".to_vec(),
+            Packaging::RawFile {
+                file_name: "x".to_owned(),
+            },
+            "models/x",
+        );
+        let catalog = PinnedCatalog::for_test([artifact.clone()]).unwrap();
+        let action = action(&artifact);
+        let transaction = ContentFreeId::new("tx-mismatch").unwrap();
+        let journal = DiskJournal::new(
+            &transaction,
+            action.id(),
+            &ManagedSlot::new("models/x").unwrap(),
+            artifact.descriptor().asset_id(),
+            artifact.descriptor().digest(),
+        );
+        let staging = root.root.join("staging/tx-mismatch");
+        fs::create_dir(&staging).unwrap();
+        write_json_atomic(
+            &staging.join(".transaction.json"),
+            &TransactionMarker::new(&transaction, action.id()),
+        )
+        .unwrap();
+        let target = root.root.join("active/models/x");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("user-data"), b"keep").unwrap();
+        root.write_journal(&journal).unwrap();
+
+        let report = root.recover_with_catalog(&catalog).unwrap();
+        assert_eq!(report.rejected_journals, 1);
+        assert_eq!(fs::read(target.join("user-data")).unwrap(), b"keep");
+        assert!(staging.exists());
+        assert!(root.journal_path(&transaction).exists());
+    }
+
+    #[test]
+    fn one_stale_receipt_does_not_hide_other_valid_installs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::for_test(
+            &temporary.path().join("managed"),
+            AcquisitionLimits::default(),
+        )
+        .unwrap();
+        let bytes = b"valid".to_vec();
+        let artifact = pinned(
+            bytes.clone(),
+            Packaging::RawFile {
+                file_name: "model.bin".to_owned(),
+            },
+            "models/valid",
+        );
+        let catalog = PinnedCatalog::for_test([artifact.clone()]).unwrap();
+        let install = root
+            .install(
+                &action(&artifact),
+                &artifact,
+                &BytesFetcher {
+                    bytes,
+                    cancel_first: false,
+                },
+                &AtomicBool::new(false),
+                &mut |_, _, _| {},
+            )
+            .unwrap();
+        let mut stale = serde_json::to_value(&install.receipt).unwrap();
+        stale["asset"]["descriptor"]["asset_id"] = serde_json::json!("aaa-stale");
+        stale["asset"]["slot"] = serde_json::json!("models/stale");
+        write_json_atomic(&root.root.join("receipts/aaa-stale.json"), &stale).unwrap();
+
+        let installed = root.installed_from_catalog(&catalog).unwrap();
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].target, install.target);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reparse_target_never_becomes_installed_or_recovered_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::for_test(
+            &temporary.path().join("managed"),
+            AcquisitionLimits::default(),
+        )
+        .unwrap();
+        let outside = temporary.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let target = root.root.join("active/models/reparse");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        if std::os::windows::fs::symlink_dir(&outside, &target).is_err() {
+            return;
+        }
+        let artifact = pinned(
+            b"x".to_vec(),
+            Packaging::RawFile {
+                file_name: "x".to_owned(),
+            },
+            "models/reparse",
+        );
+        let catalog = PinnedCatalog::for_test([artifact.clone()]).unwrap();
+        let action = action(&artifact);
+        let transaction = ContentFreeId::new("tx-reparse").unwrap();
+        let journal = DiskJournal::new(
+            &transaction,
+            action.id(),
+            &ManagedSlot::new("models/reparse").unwrap(),
+            artifact.descriptor().asset_id(),
+            artifact.descriptor().digest(),
+        );
+        root.write_journal(&journal).unwrap();
+
+        let report = root.recover_with_catalog(&catalog).unwrap();
+        assert_eq!(report.rejected_journals, 1);
+        assert!(report.recovered_installs.is_empty());
+        assert!(root.installed_from_catalog(&catalog).unwrap().is_empty());
+        assert!(root.journal_path(&transaction).exists());
     }
 
     #[test]
@@ -1523,6 +1954,7 @@ mod tests {
                 [Language::English],
             )
             .unwrap();
+            let catalog = PinnedCatalog::for_test([artifact.clone()]).unwrap();
             let install = root
                 .install(
                     &action(&artifact),
@@ -1536,8 +1968,8 @@ mod tests {
                 )
                 .unwrap();
             assert!(install.target.exists());
-            let _ = root.recover().unwrap();
-            let installed = root.installed().unwrap();
+            let _ = root.recover_with_catalog(&catalog).unwrap();
+            let installed = root.installed_from_catalog(&catalog).unwrap();
             assert_eq!(installed.len(), 1, "fault point {fault:?}");
             root.rollback(&installed[0]).unwrap();
             assert!(!install.target.exists());

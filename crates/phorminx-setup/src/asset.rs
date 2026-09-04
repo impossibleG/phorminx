@@ -391,12 +391,41 @@ pub enum AssetLocation {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AssetReceipt {
     schema_version: u32,
     transaction_id: ContentFreeId,
     asset: ManagedAsset,
     installed_at_epoch_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssetReceiptWire {
+    schema_version: u32,
+    transaction_id: ContentFreeId,
+    asset: ManagedAsset,
+    installed_at_epoch_ms: u64,
+}
+
+impl<'de> Deserialize<'de> for AssetReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AssetReceiptWire::deserialize(deserializer)?;
+        if wire.schema_version != Self::SCHEMA_VERSION {
+            return Err(serde::de::Error::custom(
+                OwnershipError::UnsupportedReceiptVersion,
+            ));
+        }
+        Ok(Self {
+            schema_version: wire.schema_version,
+            transaction_id: wire.transaction_id,
+            asset: wire.asset,
+            installed_at_epoch_ms: wire.installed_at_epoch_ms,
+        })
+    }
 }
 
 impl AssetReceipt {
@@ -1009,6 +1038,14 @@ mod tests {
             "a".repeat(64)
         );
         assert!(serde_json::from_str::<AssetRegistry>(&invalid).is_err());
+    }
+
+    #[test]
+    fn direct_receipt_deserialization_rejects_unsupported_schema() {
+        let receipt = receipt(managed("runtime", "assets/runtime"), 1);
+        let mut value = serde_json::to_value(receipt).unwrap();
+        value["schema_version"] = serde_json::json!(2);
+        assert!(serde_json::from_value::<AssetReceipt>(value).is_err());
     }
 
     #[test]

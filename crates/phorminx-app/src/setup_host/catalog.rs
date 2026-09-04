@@ -169,6 +169,22 @@ impl PinnedCatalog {
             .map(|artifact| artifact.descriptor.clone())
             .collect()
     }
+
+    #[cfg(test)]
+    pub(super) fn for_test(
+        artifacts: impl IntoIterator<Item = PinnedArtifact>,
+    ) -> Result<Self, CatalogError> {
+        let mut indexed = BTreeMap::new();
+        for artifact in artifacts {
+            insert_unique(&mut indexed, artifact)?;
+        }
+        let policy =
+            PlanningPolicy::phorminx(indexed.values().map(|artifact| artifact.descriptor.clone()));
+        Ok(Self {
+            artifacts: indexed,
+            policy,
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

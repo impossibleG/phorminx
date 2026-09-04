@@ -11,7 +11,7 @@ use phorminx_setup::{
     CapabilityId, CapabilityRecord, ConsentCategory, Coordinator, DesiredConfiguration, EngineKind,
     Language, Planner, SetupAction, SetupPlan, Sha256Digest,
 };
-use phorminx_windows::SetupOperationLock;
+use phorminx_windows::{SetupOperationLock, SetupOperationLockError};
 
 use super::managed::{ArtifactFetcher, FetchError};
 use super::{
@@ -173,12 +173,17 @@ pub trait ActionAdapters: Send + Sync + 'static {
 pub struct HostActionError {
     pub failure: ActionFailure,
     pub retryable: bool,
+    rollback_blocked: bool,
 }
 
 impl HostActionError {
     #[must_use]
     pub const fn new(failure: ActionFailure, retryable: bool) -> Self {
-        Self { failure, retryable }
+        Self {
+            failure,
+            retryable,
+            rollback_blocked: false,
+        }
     }
 }
 
@@ -265,6 +270,11 @@ impl SetupExecutor {
         if granted_consent != *authorized.action.consent() {
             return Err(SetupExecutorError::Consent(ConsentError::ExactSetRequired));
         }
+        // Acquire cross-process mutation authority before the coordinator is
+        // moved into Running. If another process owns the lease, this action
+        // has performed no work and must never enter a compensating rollback
+        // path for side effects it did not create.
+        let operation_lock = SetupOperationLock::try_acquire()?;
         let ticket = {
             let mut coordinator = self.lock_coordinator()?;
             let ticket = coordinator.start(authorized.action.clone())?;
@@ -291,9 +301,9 @@ impl SetupExecutor {
         let spawned = thread::Builder::new()
             .name("phorminx-setup-action".to_owned())
             .spawn(move || {
-                let lock = SetupOperationLock::try_acquire();
-                let result = match lock {
-                    Ok(_lease) => execute_action(
+                let _operation_lock = operation_lock;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute_action(
                         &root,
                         adapters.as_ref(),
                         fetcher.as_ref(),
@@ -303,12 +313,14 @@ impl SetupExecutor {
                         &coordinator,
                         &events,
                         &worker_ticket,
-                    ),
-                    Err(_) => Err(HostActionError::new(
-                        ActionFailure::ConsistencyFailure,
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    Err(HostActionError::new(
+                        ActionFailure::PlatformOperationFailed,
                         true,
-                    )),
-                };
+                    ))
+                });
                 complete_action(
                     result,
                     &root,
@@ -631,6 +643,11 @@ fn complete_action(
         ) {
             let rollback = match &result {
                 Ok(Some(install)) => root.rollback(install).map_err(map_managed_error),
+                Err(error) if error.rollback_blocked => Err(HostActionError::new(
+                    ActionFailure::ConsistencyFailure,
+                    false,
+                )),
+                Err(_) if matches!(action.key(), ActionKey::DownloadArtifact { .. }) => Ok(()),
                 _ => adapters.rollback(action.key(), &AtomicBool::new(false)),
             };
             let command = match rollback {
@@ -672,7 +689,16 @@ fn complete_action(
                 Some(ActionState::FailedPendingRollback { .. })
             ) {
                 let _ = coordinator.command(ticket, ActionCommand::RequestRollback);
-                let rollback = adapters.rollback(action.key(), cancel);
+                let rollback = if error.rollback_blocked {
+                    Err(HostActionError::new(
+                        ActionFailure::ConsistencyFailure,
+                        false,
+                    ))
+                } else if matches!(action.key(), ActionKey::DownloadArtifact { .. }) {
+                    Ok(())
+                } else {
+                    adapters.rollback(action.key(), cancel)
+                };
                 let command = match rollback {
                     Ok(()) => ActionCommand::RollbackCompleted,
                     Err(rollback) => ActionCommand::Fail {
@@ -703,9 +729,24 @@ fn emit_locked(coordinator: &Coordinator, events: &EventSink) {
 }
 
 fn map_managed_error(error: ManagedRootError) -> HostActionError {
+    let rollback_blocked = matches!(error, ManagedRootError::CleanupIncomplete);
     let failure = match error {
         ManagedRootError::Cancelled => ActionFailure::Cancelled,
-        ManagedRootError::Fetch(_) => ActionFailure::NetworkUnavailable,
+        ManagedRootError::Fetch(FetchError::Cancelled) => ActionFailure::Cancelled,
+        ManagedRootError::Fetch(FetchError::Output(ref error))
+            if error.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            ActionFailure::PermissionDenied
+        }
+        ManagedRootError::Fetch(FetchError::Output(ref error))
+            if error.kind() == std::io::ErrorKind::InvalidData =>
+        {
+            ActionFailure::VerificationFailed
+        }
+        ManagedRootError::Fetch(FetchError::Output(_)) => ActionFailure::PlatformOperationFailed,
+        ManagedRootError::Fetch(FetchError::Network | FetchError::Response) => {
+            ActionFailure::NetworkUnavailable
+        }
         ManagedRootError::WrongSize { .. }
         | ManagedRootError::WrongDigest
         | ManagedRootError::UnsafeArchivePath
@@ -722,10 +763,12 @@ fn map_managed_error(error: ManagedRootError) -> HostActionError {
         ManagedRootError::Io(_) => ActionFailure::PlatformOperationFailed,
         _ => ActionFailure::ConsistencyFailure,
     };
-    HostActionError::new(
+    let mut error = HostActionError::new(
         failure,
         matches!(failure, ActionFailure::NetworkUnavailable),
-    )
+    );
+    error.rollback_blocked = rollback_blocked;
+    error
 }
 
 const fn cancelled_error() -> HostActionError {
@@ -768,7 +811,7 @@ impl ArtifactFetcher for HttpsFetcher {
                 if error.kind() == std::io::ErrorKind::Interrupted {
                     FetchError::Cancelled
                 } else {
-                    FetchError::Response
+                    FetchError::Output(error)
                 }
             })?;
             downloaded = downloaded.saturating_add(count as u64);
@@ -825,6 +868,8 @@ pub enum SetupExecutorError {
     Consent(#[from] ConsentError),
     #[error(transparent)]
     ManagedRoot(#[from] ManagedRootError),
+    #[error(transparent)]
+    OperationLock(#[from] SetupOperationLockError),
     #[error("another setup action is still executing")]
     Busy,
     #[error("the setup action worker could not start: {0}")]
@@ -853,6 +898,7 @@ mod tests {
         launch_applied: AtomicUsize,
         rollbacks: AtomicUsize,
         delay_ms: AtomicU64,
+        panic_select: AtomicBool,
     }
 
     impl ActionAdapters for FakeAdapters {
@@ -890,6 +936,10 @@ mod tests {
         }
         fn select_microphone(&self, _cancel: &AtomicBool) -> Result<(), HostActionError> {
             self.selected.fetch_add(1, Ordering::AcqRel);
+            assert!(
+                !self.panic_select.swap(false, Ordering::AcqRel),
+                "injected adapter panic"
+            );
             thread::sleep(Duration::from_millis(self.delay_ms.load(Ordering::Acquire)));
             Ok(())
         }
@@ -1208,6 +1258,87 @@ mod tests {
     }
 
     #[test]
+    fn adapter_panic_becomes_a_retryable_terminal_failure() {
+        let _serial = EXECUTOR_TEST_LOCK.lock().unwrap();
+        let authority = SetupAuthority::phorminx().unwrap();
+        let mut facts = ready_baseline();
+        facts[0] = NormalizedProbeFact::Microphone {
+            selected_is_available: false,
+            permission_denied: false,
+        };
+        let plan = authority
+            .plan(&desired(FormattingChoice::Deterministic), facts)
+            .unwrap();
+        let presented = plan.actions().into_iter().next().unwrap();
+        let action = plan.authorize(&presented.id).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::for_test(
+            &temporary.path().join("managed"),
+            super::super::AcquisitionLimits::default(),
+        )
+        .unwrap();
+        let adapters = Arc::new(FakeAdapters {
+            panic_select: AtomicBool::new(true),
+            ..FakeAdapters::default()
+        });
+        let mut executor = SetupExecutor::new(root, adapters, Arc::new(EmptyFetcher));
+
+        executor.start(action, BTreeSet::new()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            if executor.try_event().unwrap().is_some_and(|event| {
+                matches!(
+                    event.state,
+                    ActionState::Failed {
+                        failure: ActionFailure::PlatformOperationFailed,
+                        retryable: true
+                    }
+                )
+            }) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        executor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn cross_process_contention_never_runs_or_rolls_back_an_action() {
+        let _serial = EXECUTOR_TEST_LOCK.lock().unwrap();
+        let authority = SetupAuthority::phorminx().unwrap();
+        let mut desired = desired(FormattingChoice::Deterministic);
+        desired.launch_at_login = true;
+        let plan = authority.plan(&desired, ready_baseline()).unwrap();
+        let presented = plan
+            .actions()
+            .into_iter()
+            .find(|action| matches!(action.key, ActionKey::ApplyLaunchAtLogin { .. }))
+            .unwrap();
+        let consent = presented.required_consent.clone();
+        let action = plan.authorize(&presented.id).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::for_test(
+            &temporary.path().join("managed"),
+            super::super::AcquisitionLimits::default(),
+        )
+        .unwrap();
+        let adapters = Arc::new(FakeAdapters::default());
+        let mut executor = SetupExecutor::new(root, adapters.clone(), Arc::new(EmptyFetcher));
+        let _other_process = SetupOperationLock::try_acquire().unwrap();
+
+        assert!(matches!(
+            executor.start(action, consent),
+            Err(SetupExecutorError::OperationLock(
+                SetupOperationLockError::Busy
+            ))
+        ));
+        assert_eq!(adapters.launch_applied.load(Ordering::Acquire), 0);
+        assert_eq!(adapters.rollbacks.load(Ordering::Acquire), 0);
+        assert!(executor.current_state().unwrap().is_none());
+    }
+
+    #[test]
     fn cancellation_of_a_compensating_action_finishes_rollback() {
         let _serial = EXECUTOR_TEST_LOCK.lock().unwrap();
         let authority = SetupAuthority::phorminx().unwrap();
@@ -1258,6 +1389,100 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(adapters.rollbacks.load(Ordering::Acquire), 1);
+        executor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn managed_cleanup_failure_is_reported_as_rollback_blocked() {
+        let _serial = EXECUTOR_TEST_LOCK.lock().unwrap();
+        let authority = SetupAuthority::phorminx().unwrap();
+        let mut facts = ready_baseline();
+        facts[1] = NormalizedProbeFact::Recognition {
+            engine: EngineKind::Accurate,
+            language: Language::English,
+            model_digest: None,
+            state: super::super::RecognitionProbeState::Missing,
+        };
+        let plan = authority
+            .plan(&desired(FormattingChoice::Deterministic), facts)
+            .unwrap();
+        let presented = plan
+            .actions()
+            .into_iter()
+            .find(|action| matches!(action.key, ActionKey::DownloadArtifact { .. }))
+            .unwrap();
+        let consent = presented.required_consent.clone();
+        let action = plan.authorize(&presented.id).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::for_test_with_fault(
+            &temporary.path().join("managed"),
+            super::super::managed::ActivationFault::Cleanup,
+        )
+        .unwrap();
+        let adapters = Arc::new(FakeAdapters::default());
+        let mut executor = SetupExecutor::new(root, adapters.clone(), Arc::new(EmptyFetcher));
+
+        executor.start(action, consent).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            if executor
+                .try_event()
+                .unwrap()
+                .is_some_and(|event| matches!(event.state, ActionState::RollbackBlocked { .. }))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(adapters.rollbacks.load(Ordering::Acquire), 0);
+        executor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn failed_managed_download_never_delegates_cleanup_to_an_adapter() {
+        let _serial = EXECUTOR_TEST_LOCK.lock().unwrap();
+        let authority = SetupAuthority::phorminx().unwrap();
+        let mut facts = ready_baseline();
+        facts[1] = NormalizedProbeFact::Recognition {
+            engine: EngineKind::Accurate,
+            language: Language::English,
+            model_digest: None,
+            state: super::super::RecognitionProbeState::Missing,
+        };
+        let plan = authority
+            .plan(&desired(FormattingChoice::Deterministic), facts)
+            .unwrap();
+        let presented = plan
+            .actions()
+            .into_iter()
+            .find(|action| matches!(action.key, ActionKey::DownloadArtifact { .. }))
+            .unwrap();
+        let consent = presented.required_consent.clone();
+        let action = plan.authorize(&presented.id).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::for_test(
+            &temporary.path().join("managed"),
+            super::super::AcquisitionLimits::default(),
+        )
+        .unwrap();
+        let adapters = Arc::new(FakeAdapters::default());
+        let mut executor = SetupExecutor::new(root, adapters.clone(), Arc::new(EmptyFetcher));
+
+        executor.start(action, consent).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            if executor
+                .try_event()
+                .unwrap()
+                .is_some_and(|event| event.state == ActionState::RolledBack)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(adapters.rollbacks.load(Ordering::Acquire), 0);
         executor.shutdown().unwrap();
     }
 
@@ -1323,5 +1548,26 @@ mod tests {
             ),
             Err(FetchError::Network)
         ));
+    }
+
+    #[test]
+    fn managed_sink_failures_are_not_misreported_as_network_failures() {
+        let oversized = map_managed_error(ManagedRootError::Fetch(FetchError::Output(
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "too large"),
+        )));
+        assert_eq!(oversized.failure, ActionFailure::VerificationFailed);
+        assert!(!oversized.retryable);
+
+        let denied = map_managed_error(ManagedRootError::Fetch(FetchError::Output(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        )));
+        assert_eq!(denied.failure, ActionFailure::PermissionDenied);
+        assert!(!denied.retryable);
+
+        let disk = map_managed_error(ManagedRootError::Fetch(FetchError::Output(
+            std::io::Error::other("disk write failed"),
+        )));
+        assert_eq!(disk.failure, ActionFailure::PlatformOperationFailed);
+        assert!(!disk.retryable);
     }
 }

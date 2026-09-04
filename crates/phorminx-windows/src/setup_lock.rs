@@ -14,6 +14,12 @@ pub struct SetupOperationLock {
     handle: HANDLE,
 }
 
+// Windows kernel mutex handles are process-wide and may be closed from a
+// different thread than the one which created them. This lease does not use
+// mutex ownership (CreateMutexW is called with bInitialOwner = FALSE); the
+// handle's lifetime alone reserves the name.
+unsafe impl Send for SetupOperationLock {}
+
 impl SetupOperationLock {
     pub fn try_acquire() -> Result<Self, SetupOperationLockError> {
         acquire_named(SETUP_OPERATION_NAME)
