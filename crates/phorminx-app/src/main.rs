@@ -18,6 +18,9 @@ use phorminx_app::incremental::{
 use phorminx_app::model::{
     ModelDownload, ModelDownloadEvent, identify_pinned_model, model_for_variant,
 };
+use phorminx_app::performance_runtime::{
+    RuntimeActivityKind, RuntimeActivityLease, WorkloadCoordinator, production_workload_coordinator,
+};
 use phorminx_app::product_shell::{ProductShell, ProductShellControl, ProductShellEvent};
 use phorminx_app::runtime::{
     AppIo, AppRuntime, FinishedAudio, InsertDisposition, ReleaseTiming, RuntimeNotice, UiStatus,
@@ -417,6 +420,8 @@ fn run() -> Result<()> {
     let mut model_download = None;
     let mut restart_requested = false;
     let mut last_shell_status = UiRuntimeStatus::Ready;
+    let workloads = production_workload_coordinator();
+    let mut active_dictation_activity: Option<RuntimeActivityLease> = None;
 
     let run_result: Result<()> = 'event_loop: loop {
         if shutting_down.load(Ordering::Acquire) {
@@ -457,6 +462,9 @@ fn run() -> Result<()> {
                 ) {
                     break Err(error);
                 }
+                if runtime.is_clean_idle() {
+                    active_dictation_activity.take();
+                }
                 continue 'event_loop;
             }
             Ok(ShellAction::TestDictation) => {
@@ -469,6 +477,8 @@ fn run() -> Result<()> {
                     &mut dictation_context,
                     &settings,
                     &capture,
+                    &workloads,
+                    &mut active_dictation_activity,
                 )?;
             }
             Ok(ShellAction::ReloadAliases) => {
@@ -522,6 +532,9 @@ fn run() -> Result<()> {
                 ) {
                     break Err(error);
                 }
+                if runtime.is_clean_idle() {
+                    active_dictation_activity.take();
+                }
                 continue 'event_loop;
             }
             Ok(ShellAction::TestDictation) => {
@@ -534,6 +547,8 @@ fn run() -> Result<()> {
                     &mut dictation_context,
                     &settings,
                     &capture,
+                    &workloads,
+                    &mut active_dictation_activity,
                 )?;
             }
             Ok(ShellAction::ReloadAliases) => {
@@ -597,6 +612,26 @@ fn run() -> Result<()> {
                         dictation_context.language.clone(),
                         dictation_context.runtime_formatting,
                     )?;
+                }
+                if release_received_at.is_none()
+                    && runtime.state() == RuntimeState::Idle
+                    && active_dictation_activity.is_none()
+                {
+                    match workloads.try_begin(RuntimeActivityKind::Dictation) {
+                        Ok(lease) => active_dictation_activity = Some(lease),
+                        Err(error) => {
+                            eprintln!(
+                                "dictation_id=0 state=Idle event=activation_blocked reason=performance_lane error={error}"
+                            );
+                            show_shell_status(
+                                &overlay,
+                                &tray,
+                                OverlayStatus::Error,
+                                TrayStatus::Error,
+                            );
+                            continue 'event_loop;
+                        }
+                    }
                 }
                 let notices = {
                     let mut io = ProductionIo {
@@ -712,6 +747,9 @@ fn run() -> Result<()> {
                 ) {
                     break Err(error);
                 }
+                if runtime.is_clean_idle() {
+                    active_dictation_activity.take();
+                }
                 continue 'event_loop;
             }
             Ok(ShellAction::TestDictation) => {
@@ -724,6 +762,8 @@ fn run() -> Result<()> {
                     &mut dictation_context,
                     &settings,
                     &capture,
+                    &workloads,
+                    &mut active_dictation_activity,
                 )?;
             }
             Ok(ShellAction::ReloadAliases) => {
@@ -888,6 +928,9 @@ fn run() -> Result<()> {
                     ));
                 }
             }
+        }
+        if runtime.is_clean_idle() {
+            active_dictation_activity.take();
         }
         let shell_status = runtime_shell_status(runtime.state());
         if shell_status != last_shell_status {
@@ -2699,8 +2742,17 @@ fn handle_test_dictation(
     context: &mut DictationContext,
     settings: &Settings,
     capture: &ExtendedCaptureFactory,
+    workloads: &Arc<WorkloadCoordinator>,
+    active_dictation_activity: &mut Option<RuntimeActivityLease>,
 ) -> Result<()> {
     if runtime.state() == RuntimeState::Idle {
+        if active_dictation_activity.is_none() {
+            *active_dictation_activity = Some(
+                workloads
+                    .try_begin(RuntimeActivityKind::Dictation)
+                    .map_err(|error| anyhow!(error))?,
+            );
+        }
         *context = DictationContext::global(settings, context.verified_variant)?;
         runtime.configure_next_dictation(context.language.clone(), context.runtime_formatting)?;
     }
@@ -2726,6 +2778,9 @@ fn handle_test_dictation(
         _ => Vec::new(),
     };
     report_notices(notices);
+    if runtime.is_clean_idle() {
+        active_dictation_activity.take();
+    }
     Ok(())
 }
 
@@ -3133,6 +3188,11 @@ impl TranscriptionWorker {
                     let _ = thread::Builder::new()
                         .name("phorminx-ollama-warmup".to_owned())
                         .spawn(move || {
+                            let Ok(_activity) = production_workload_coordinator()
+                                .try_begin(RuntimeActivityKind::Ollama)
+                            else {
+                                return;
+                            };
                             let cancel = CancellationToken::new();
                             let event = match client.warm_up(&model, keep_alive, &cancel) {
                                 Ok(()) => "ollama_warmup_ready",

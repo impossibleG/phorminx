@@ -21,6 +21,8 @@ mod ollama;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
+mod performance;
+#[cfg(windows)]
 mod profile_window;
 #[cfg(windows)]
 mod settings_window;
@@ -64,6 +66,11 @@ pub use ollama::{
 };
 #[cfg(windows)]
 pub use overlay::{OverlayError, OverlayStatus, StatusOverlay};
+#[cfg(windows)]
+pub use performance::{
+    HostResourceError, HostResourceSnapshot, host_cpu_busy_per_mille, host_resource_snapshot,
+    vulkan_driver_manifests,
+};
 #[cfg(windows)]
 pub use profile_window::{
     ProfileFormatting, ProfileInsertion, ProfileItem, ProfileWindow, ProfileWindowError,

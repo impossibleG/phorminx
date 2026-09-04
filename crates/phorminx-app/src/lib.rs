@@ -5,6 +5,7 @@ pub mod incremental;
 pub mod model;
 pub mod ollama_onboarding;
 pub mod performance;
+pub mod performance_runtime;
 pub mod product_shell;
 pub mod runtime;
 pub mod settings;
