@@ -27,7 +27,8 @@ use phorminx_app::runtime::{
 };
 use phorminx_app::settings::{
     AccurateBackendPreference, AccurateModelVariant, FormattingStrength, HistoryRetention,
-    OllamaLifecycle, RecognitionMode, RecordingMode, RuntimeFormatting, Settings, SettingsStore,
+    OllamaLifecycle, OllamaModelIdentity, RecognitionMode, RecordingMode, RuntimeFormatting,
+    Settings, SettingsStore,
 };
 use phorminx_app::ui_bridge::{UiMutation, UiRoute, UiRuntimeStatus, UiVoskProbe};
 use phorminx_audio::{
@@ -195,13 +196,9 @@ fn run() -> Result<()> {
     if let Some(formatting) = cli.formatting {
         settings.formatting.strength = formatting.into();
     }
-    settings
-        .validate_and_normalize()
-        .context("invalid effective settings")?;
-    settings
-        .ensure_runtime_supported()
-        .context("invalid effective formatting settings")?;
+    prepare_effective_settings(&mut settings)?;
     let formatting = RuntimeFormatting::try_from(settings.formatting.strength)?;
+
     let model_override = cli.model.is_some();
     let model = match cli.model {
         Some(model) => model,
@@ -1023,6 +1020,29 @@ fn run() -> Result<()> {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+fn prepare_effective_settings(settings: &mut Settings) -> Result<()> {
+    settings
+        .validate_and_normalize()
+        .context("invalid effective settings")?;
+    if let Err(error) = settings.ensure_runtime_supported() {
+        if matches!(
+            error,
+            phorminx_app::settings::SettingsError::FormattingModelIdentityRequired
+        ) {
+            // Schema-five settings could name a mutable Ollama tag without an
+            // immutable identity. Preserve the durable selection, but keep the
+            // active process deterministic until the user explicitly re-trusts it.
+            settings.formatting.strength = FormattingStrength::Light;
+            eprintln!(
+                "dictation_id=0 state=Starting event=ollama_identity_required recovery=settings"
+            );
+        } else {
+            return Err(error).context("invalid effective formatting settings");
+        }
+    }
+    Ok(())
 }
 
 fn runtime_shell_status(state: RuntimeState) -> UiRuntimeStatus {
@@ -2139,6 +2159,9 @@ fn apply_settings_form(
     } else {
         Some(form.custom_instructions)
     };
+    if candidate.formatting.ollama_model != form.ollama_model {
+        candidate.formatting.ollama_model_identity = None;
+    }
     candidate.formatting.ollama_model = form.ollama_model;
     candidate.formatting.ollama_lifecycle = match form.ollama_lifecycle {
         SettingsOllamaLifecycle::Instant => OllamaLifecycle::Instant,
@@ -2161,9 +2184,6 @@ fn apply_settings_form(
     candidate
         .validate_and_normalize()
         .context("The settings are not valid")?;
-    candidate
-        .ensure_runtime_supported()
-        .context("This formatting profile is not ready")?;
     if matches!(
         candidate.formatting.strength,
         FormattingStrength::Balanced | FormattingStrength::Strong | FormattingStrength::Custom
@@ -2178,10 +2198,32 @@ fn apply_settings_form(
         let catalog = production_ollama_client()
             .discover(&CancellationToken::new())
             .context("Could not verify the selected model with local Ollama")?;
-        catalog
+        let installed = catalog
             .select(&policy)
             .context("The selected Ollama model is not installed")?;
+        let observed = OllamaModelIdentity::new(
+            installed
+                .digest
+                .as_deref()
+                .context("The selected Ollama model did not report a manifest digest")?,
+            installed
+                .size
+                .context("The selected Ollama model did not report an exact size")?,
+        )
+        .context("The selected Ollama model reported an invalid identity")?;
+        if let Some(expected) = &candidate.formatting.ollama_model_identity {
+            if expected != &observed {
+                return Err(anyhow!(
+                    "The selected Ollama model changed after it was selected. Choose the model again before enabling AI formatting."
+                ));
+            }
+        } else {
+            candidate.formatting.ollama_model_identity = Some(observed);
+        }
     }
+    candidate
+        .ensure_runtime_supported()
+        .context("This formatting profile is not ready")?;
     let resolved_model = store.resolve_model_path(&candidate.recognition.model_path);
     if !resolved_model.is_file() {
         return Err(anyhow!(
@@ -3171,11 +3213,48 @@ impl TranscriptionWorker {
                         None
                     }
                 };
+                let mut formatting = formatting;
+                let mut ollama = formatting.model.as_ref().map(|_| production_ollama_client());
+                let ollama_activity = if formatting.uses_ollama() {
+                    production_workload_coordinator()
+                        .try_begin(RuntimeActivityKind::OllamaModelPin)
+                        .ok()
+                } else {
+                    None
+                };
+                if formatting.uses_ollama() {
+                    let verified = match (
+                        ollama.as_ref(),
+                        formatting.model.as_ref(),
+                        formatting.model_identity.as_ref(),
+                        ollama_activity.as_ref(),
+                    ) {
+                        (Some(client), Some(model), Some(identity), Some(_activity)) => {
+                            installed_ollama_identity_matches(
+                                client,
+                                model,
+                                identity,
+                                &CancellationToken::new(),
+                            )
+                        }
+                        _ => false,
+                    };
+                    if !verified {
+                        formatting.profile = FormatProfile::Light;
+                        ollama = None;
+                        eprintln!(
+                            "dictation_id=0 state=Starting event=ollama_identity_unverified recovery=deterministic"
+                        );
+                    }
+                }
                 if ready_tx.send(Ok(readiness)).is_err() {
                     return;
                 }
 
-                let ollama = formatting.model.as_ref().map(|_| production_ollama_client());
+                // Keep the app-owned Ollama workload lease for the worker's
+                // lifetime. Setup pulls cannot replace the selected tag while
+                // this verified resident formatting session is active.
+                let _ollama_activity = ollama_activity;
                 let mut aliases = aliases;
                 let mut incremental_sessions = HashMap::new();
                 let mut instant_sessions = HashMap::new();
@@ -3188,7 +3267,7 @@ impl TranscriptionWorker {
                     let _ = thread::Builder::new()
                         .name("phorminx-ollama-warmup".to_owned())
                         .spawn(move || {
-                            let Ok(_activity) = production_workload_coordinator()
+                            let Ok(_compute) = production_workload_coordinator()
                                 .try_begin(RuntimeActivityKind::Ollama)
                             else {
                                 return;
@@ -4953,6 +5032,7 @@ fn profile_language_matches_resident_model(
 struct WorkerFormatting {
     profile: FormatProfile,
     model: Option<ModelName>,
+    model_identity: Option<OllamaModelIdentity>,
     keep_alive: KeepAlive,
 }
 
@@ -4978,6 +5058,16 @@ impl WorkerFormatting {
             .map(ModelName::parse)
             .transpose()
             .context("invalid selected Ollama model")?;
+        let model_identity = settings.formatting.ollama_model_identity.clone();
+        if matches!(
+            &profile,
+            FormatProfile::Balanced | FormatProfile::Strong | FormatProfile::Custom(_)
+        ) && (model.is_none() || model_identity.is_none())
+        {
+            return Err(anyhow!(
+                "AI formatting requires a verified immutable Ollama model identity"
+            ));
+        }
         let keep_alive = match settings.formatting.ollama_lifecycle {
             OllamaLifecycle::Instant => KeepAlive::Indefinite,
             OllamaLifecycle::Balanced => KeepAlive::For(Duration::from_secs(15 * 60)),
@@ -4986,6 +5076,7 @@ impl WorkerFormatting {
         Ok(Self {
             profile,
             model,
+            model_identity,
             keep_alive,
         })
     }
@@ -5040,11 +5131,20 @@ fn process_transcript(
     let formatting_started = Instant::now();
     let mut warnings = Vec::new();
     let mut terminal = TerminalMetadata::default();
+    let _ollama_compute = formatting
+        .uses_ollama()
+        .then(|| production_workload_coordinator().try_begin(RuntimeActivityKind::Ollama))
+        .transpose()
+        .ok()
+        .flatten();
     let (selected, cleaned_text) = match &formatting.profile {
         FormatProfile::Raw => (raw_text.clone(), None),
         FormatProfile::Light => (normalized_text.clone(), None),
         FormatProfile::Balanced | FormatProfile::Strong | FormatProfile::Custom(_) => {
-            match (ollama, formatting.model.as_ref()) {
+            match (
+                ollama.filter(|_| _ollama_compute.is_some()),
+                formatting.model.as_ref(),
+            ) {
                 (Some(client), Some(model)) => {
                     if normalized_text.len() > 64 * 1024 {
                         match client.format_document(
@@ -5088,7 +5188,7 @@ fn process_transcript(
                     }
                 }
                 _ => {
-                    warnings.push("ollama_fallback:model_not_configured".to_owned());
+                    warnings.push("ollama_fallback:model_identity_unverified".to_owned());
                     (normalized_text.clone(), None)
                 }
             }
@@ -5109,6 +5209,24 @@ fn process_transcript(
         lifecycle: None,
         terminal,
     }
+}
+
+fn installed_ollama_identity_matches(
+    client: &OllamaClient,
+    model: &ModelName,
+    expected: &OllamaModelIdentity,
+    cancel: &CancellationToken,
+) -> bool {
+    client
+        .discover(cancel)
+        .ok()
+        .and_then(|catalog| {
+            catalog
+                .select(&SelectionPolicy::Exact(model.clone()))
+                .ok()
+                .cloned()
+        })
+        .is_some_and(|installed| expected.matches(installed.digest.as_deref(), installed.size))
 }
 
 fn document_disposition(disposition: DocumentFormatDisposition) -> &'static str {
@@ -5378,6 +5496,8 @@ fn elapsed_since_release(released_at: Instant, stage_at: Instant) -> Duration {
 mod composition_tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     use super::*;
     use phorminx_persistence::NewLexiconEntry;
@@ -5951,6 +6071,8 @@ mod composition_tests {
         let mut settings = Settings::default();
         settings.formatting.strength = FormattingStrength::Strong;
         settings.formatting.ollama_model = Some("qwen2.5:3b".to_owned());
+        settings.formatting.ollama_model_identity =
+            Some(OllamaModelIdentity::new("a".repeat(64), 1_000).unwrap());
         settings.formatting.ollama_lifecycle = OllamaLifecycle::MemorySaver;
 
         let worker = WorkerFormatting::from_settings(&settings).unwrap();
@@ -5958,6 +6080,130 @@ mod composition_tests {
         assert_eq!(worker.profile, FormatProfile::Strong);
         assert_eq!(worker.model.unwrap().as_str(), "qwen2.5:3b");
         assert_eq!(worker.keep_alive, KeepAlive::UnloadAfterRequest);
+    }
+
+    #[test]
+    fn release_formatting_does_not_requery_slow_model_tags() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (paths_tx, paths_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                let header_end = loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let path = headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_owned();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                while request.len() - header_end < content_length {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                paths_tx.send(path.clone()).unwrap();
+                let body = if path == "/api/tags" {
+                    thread::sleep(Duration::from_millis(750));
+                    format!(
+                        "{{\"models\":[{{\"name\":\"qwen2.5:3b\",\"digest\":\"{}\",\"size\":1000}}]}}",
+                        "a".repeat(64)
+                    )
+                } else {
+                    "{\"response\":\"Hello world.\",\"done\":true}".to_owned()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+                if path == "/api/generate" {
+                    break;
+                }
+            }
+        });
+        let client = OllamaClient::new(
+            OllamaEndpoint::ipv4(port),
+            ClientTimeouts {
+                connect: Duration::from_secs(1),
+                response_headers: Duration::from_secs(2),
+                response_body: Duration::from_secs(1),
+                overall: Duration::from_secs(3),
+            },
+        )
+        .unwrap();
+        let formatting = WorkerFormatting {
+            profile: FormatProfile::Strong,
+            model: Some(ModelName::parse("qwen2.5:3b").unwrap()),
+            model_identity: Some(OllamaModelIdentity::new("a".repeat(64), 1_000).unwrap()),
+            keep_alive: KeepAlive::UnloadAfterRequest,
+        };
+
+        let started = Instant::now();
+        let _ = process_transcript(
+            transcript("hello world"),
+            "en",
+            &formatting,
+            Some(&client),
+            &[],
+            None,
+            &CancellationToken::new(),
+        );
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(
+            paths_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "/api/generate"
+        );
+        assert!(paths_rx.try_recv().is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn schema_five_ai_settings_start_with_deterministic_formatting_until_retrusted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 5\n[formatting]\nstrength = 'strong'\nollama_model = 'qwen2.5:3b'\n",
+        )
+        .unwrap();
+        let store = SettingsStore::new(path).unwrap();
+        let mut effective = store.load().unwrap();
+
+        prepare_effective_settings(&mut effective).unwrap();
+
+        assert_eq!(effective.formatting.strength, FormattingStrength::Light);
+        assert_eq!(
+            effective.formatting.ollama_model.as_deref(),
+            Some("qwen2.5:3b")
+        );
+        assert!(WorkerFormatting::from_settings(&effective).is_ok());
+        let durable = store.load().unwrap();
+        assert_eq!(durable.formatting.strength, FormattingStrength::Strong);
+        assert_eq!(durable.formatting.ollama_model_identity, None);
     }
 
     #[test]
@@ -6499,6 +6745,7 @@ mod composition_tests {
             &WorkerFormatting {
                 profile: FormatProfile::Raw,
                 model: None,
+                model_identity: None,
                 keep_alive: KeepAlive::UnloadAfterRequest,
             },
             None,
@@ -6564,6 +6811,7 @@ mod composition_tests {
             &WorkerFormatting {
                 profile: FormatProfile::Raw,
                 model: None,
+                model_identity: None,
                 keep_alive: KeepAlive::UnloadAfterRequest,
             },
             None,

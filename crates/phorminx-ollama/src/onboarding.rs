@@ -7,7 +7,7 @@
 
 use std::fmt;
 use std::io::{BufRead, BufReader, Read};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,11 @@ const MAX_PROGRESS_LINE_BYTES: usize = 16 * 1024;
 const MAX_PROGRESS_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROGRESS_EVENTS: usize = 10_000;
 const DISK_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
-static GLOBAL_PULL_LOCK: Mutex<()> = Mutex::new(());
+static GLOBAL_PULL_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+
+fn global_pull_lock() -> Arc<Mutex<()>> {
+    Arc::clone(GLOBAL_PULL_LOCK.get_or_init(|| Arc::new(Mutex::new(()))))
+}
 
 /// A stable key for one model Phorminx has reviewed for transcript cleanup.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -415,15 +419,27 @@ pub struct OllamaOnboarding<T> {
     transport: T,
     catalog: CuratedModelCatalog,
     pull_lock: Mutex<()>,
+    process_pull_lock: Arc<Mutex<()>>,
 }
 
 impl<T: OllamaOnboardingTransport> OllamaOnboarding<T> {
     #[must_use]
-    pub const fn new(transport: T) -> Self {
+    pub fn new(transport: T) -> Self {
         Self {
             transport,
             catalog: CuratedModelCatalog,
             pull_lock: Mutex::new(()),
+            process_pull_lock: global_pull_lock(),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_pull_lock(transport: T, process_pull_lock: Arc<Mutex<()>>) -> Self {
+        Self {
+            transport,
+            catalog: CuratedModelCatalog,
+            pull_lock: Mutex::new(()),
+            process_pull_lock,
         }
     }
 
@@ -493,7 +509,8 @@ impl<T: OllamaOnboardingTransport> OllamaOnboarding<T> {
         cancel: &CancellationToken,
         mut progress: impl FnMut(ModelPullProgress),
     ) -> Result<ModelPullOutcome, PullFailure> {
-        let _global_guard = GLOBAL_PULL_LOCK
+        let _global_guard = self
+            .process_pull_lock
             .try_lock()
             .map_err(|_| failure(PullFailureKind::Busy, PullResidue::None))?;
         let _guard = self
@@ -1194,6 +1211,10 @@ mod tests {
         review.authorize(&phrase).unwrap()
     }
 
+    fn isolated_service<T: OllamaOnboardingTransport>(transport: T) -> OllamaOnboarding<T> {
+        OllamaOnboarding::new_with_pull_lock(transport, Arc::new(Mutex::new(())))
+    }
+
     #[test]
     fn catalog_search_is_bounded_and_local() {
         let catalog = CuratedModelCatalog;
@@ -1220,7 +1241,7 @@ mod tests {
 
     #[test]
     fn exact_confirmation_is_required_and_authorization_is_not_cloneable() {
-        let service = OllamaOnboarding::new(FakeTransport::new(vec![]));
+        let service = isolated_service(FakeTransport::new(vec![]));
         let review = service.review_pull(CuratedModelId::Gemma3OneB);
         assert!(review.clone().authorize("yes").is_err());
         assert!(review.confirmation().contains("disk required"));
@@ -1228,7 +1249,7 @@ mod tests {
 
     #[test]
     fn concurrent_pull_is_rejected_without_waiting_or_mutating() {
-        let service = OllamaOnboarding::new(FakeTransport::new(vec![]));
+        let service = isolated_service(FakeTransport::new(vec![]));
         let guard = service.pull_lock.lock().unwrap();
         let error = service
             .pull(
@@ -1246,8 +1267,12 @@ mod tests {
 
     #[test]
     fn pull_is_serialized_across_service_instances() {
-        let global = GLOBAL_PULL_LOCK.lock().unwrap();
-        let service = OllamaOnboarding::new(FakeTransport::new(vec![]));
+        let process_lock = Arc::new(Mutex::new(()));
+        let global = process_lock.lock().unwrap();
+        let service = OllamaOnboarding::new_with_pull_lock(
+            FakeTransport::new(vec![]),
+            Arc::clone(&process_lock),
+        );
         let error = service
             .pull(
                 authorize(&service, CuratedModelId::Gemma3OneB),
@@ -1264,7 +1289,7 @@ mod tests {
     #[test]
     fn missing_capacity_stops_before_model_acquisition() {
         let model = CuratedModelCatalog.get(CuratedModelId::Gemma3OneB);
-        let service = OllamaOnboarding::new(FakeTransport::new(vec![Vec::new()]));
+        let service = isolated_service(FakeTransport::new(vec![Vec::new()]));
         let error = service
             .pull(
                 authorize(&service, model.id),
@@ -1280,7 +1305,7 @@ mod tests {
 
     #[test]
     fn probe_distinguishes_missing_stopped_incompatible_and_model_missing() {
-        let service = OllamaOnboarding::new(FakeTransport::new(vec![Vec::new()]));
+        let service = isolated_service(FakeTransport::new(vec![Vec::new()]));
         assert_eq!(
             service.probe(false, &CancellationToken::new()),
             DaemonState::NotInstalled
@@ -1293,14 +1318,14 @@ mod tests {
         let mut stopped = FakeTransport::new(vec![]);
         stopped.version = Err(TransportError::Unavailable);
         assert_eq!(
-            OllamaOnboarding::new(stopped).probe(true, &CancellationToken::new()),
+            isolated_service(stopped).probe(true, &CancellationToken::new()),
             DaemonState::InstalledButStopped
         );
 
         let mut old = FakeTransport::new(vec![]);
         old.version = Ok(OllamaVersion::new(0, 5, 9));
         assert!(matches!(
-            OllamaOnboarding::new(old).probe(true, &CancellationToken::new()),
+            isolated_service(old).probe(true, &CancellationToken::new()),
             DaemonState::Incompatible { .. }
         ));
     }
@@ -1308,7 +1333,7 @@ mod tests {
     #[test]
     fn model_state_distinguishes_missing_ready_and_wrong_identity() {
         let model = CuratedModelCatalog.get(CuratedModelId::Gemma3OneB);
-        let service = OllamaOnboarding::new(FakeTransport::new(vec![]));
+        let service = isolated_service(FakeTransport::new(vec![]));
         assert_eq!(
             service.model_state(model.id, &[]),
             CuratedModelState::Missing
@@ -1329,7 +1354,7 @@ mod tests {
     fn pull_uses_only_compiled_fully_qualified_source_and_verifies_readback() {
         let model = CuratedModelCatalog.get(CuratedModelId::Gemma3OneB);
         let fake = FakeTransport::new(vec![Vec::new(), vec![installed(model)]]);
-        let service = OllamaOnboarding::new(fake);
+        let service = isolated_service(fake);
         let action = authorize(&service, model.id);
         let mut events = Vec::new();
         let outcome = service
@@ -1350,7 +1375,7 @@ mod tests {
         let model = CuratedModelCatalog.get(CuratedModelId::Gemma3OneB);
         let mut wrong = installed(model);
         wrong.manifest_sha256 = "a".repeat(64);
-        let service = OllamaOnboarding::new(FakeTransport::new(vec![vec![wrong]]));
+        let service = isolated_service(FakeTransport::new(vec![vec![wrong]]));
         let result = service.pull(
             authorize(&service, model.id),
             u64::MAX,
@@ -1373,7 +1398,7 @@ mod tests {
         let mut wrong = installed(model);
         wrong.manifest_sha256 = "b".repeat(64);
         let fake = FakeTransport::new(vec![Vec::new(), vec![wrong], Vec::new()]);
-        let service = OllamaOnboarding::new(fake);
+        let service = isolated_service(fake);
         let result = service.pull(
             authorize(&service, model.id),
             u64::MAX,
@@ -1394,7 +1419,7 @@ mod tests {
         let model = CuratedModelCatalog.get(CuratedModelId::Gemma3OneB);
         let mut fake = FakeTransport::new(vec![Vec::new(), vec![installed(model)], Vec::new()]);
         fake.pull_result = Err(TransportError::TimedOut);
-        let service = OllamaOnboarding::new(fake);
+        let service = isolated_service(fake);
         let error = service
             .pull(
                 authorize(&service, model.id),
@@ -1420,7 +1445,7 @@ mod tests {
             pulled_names: Mutex::new(Vec::new()),
             cancel_during_pull: false,
         };
-        let service = OllamaOnboarding::new(fake);
+        let service = isolated_service(fake);
         let error = service
             .pull(
                 authorize(&service, model.id),
@@ -1436,7 +1461,7 @@ mod tests {
     #[test]
     fn panicking_progress_consumer_is_contained_and_reconciled() {
         let model = CuratedModelCatalog.get(CuratedModelId::Gemma3OneB);
-        let service = OllamaOnboarding::new(FakeTransport::new(vec![Vec::new(), Vec::new()]));
+        let service = isolated_service(FakeTransport::new(vec![Vec::new(), Vec::new()]));
         let result = service.pull(
             authorize(&service, model.id),
             u64::MAX,
@@ -1455,7 +1480,7 @@ mod tests {
     #[test]
     fn cancellation_before_pull_has_no_residue_and_mid_pull_is_truthful() {
         let model = CuratedModelCatalog.get(CuratedModelId::Gemma3OneB);
-        let service = OllamaOnboarding::new(FakeTransport::new(vec![]));
+        let service = isolated_service(FakeTransport::new(vec![]));
         let cancel = CancellationToken::new();
         cancel.cancel();
         assert_eq!(
@@ -1468,7 +1493,7 @@ mod tests {
 
         let mut fake = FakeTransport::new(vec![Vec::new(), Vec::new()]);
         fake.cancel_during_pull = true;
-        let service = OllamaOnboarding::new(fake);
+        let service = isolated_service(fake);
         let error = service
             .pull(
                 authorize(&service, model.id),
@@ -1572,7 +1597,7 @@ mod tests {
         let mut oversized = installed(model);
         oversized.bytes += 1;
         let fake = FakeTransport::new(vec![Vec::new(), vec![oversized], Vec::new()]);
-        let service = OllamaOnboarding::new(fake);
+        let service = isolated_service(fake);
         let error = service
             .pull(
                 authorize(&service, model.id),

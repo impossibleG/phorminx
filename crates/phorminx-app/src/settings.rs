@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use phorminx_windows::atomic_replace_file;
 use serde::{Deserialize, Serialize};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 pub const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 pub const MAX_CUSTOM_INSTRUCTIONS_CHARS: usize = 4_096;
 
@@ -51,7 +51,7 @@ impl Settings {
     pub fn validate_and_normalize(&mut self) -> Result<(), SettingsError> {
         match self.schema_version {
             CURRENT_SCHEMA_VERSION => {}
-            1..=4 => self.schema_version = CURRENT_SCHEMA_VERSION,
+            1..=5 => self.schema_version = CURRENT_SCHEMA_VERSION,
             0 => return Err(SettingsError::MissingOrInvalidVersion),
             version if version > CURRENT_SCHEMA_VERSION => {
                 return Err(SettingsError::FutureVersion {
@@ -127,6 +127,12 @@ impl Settings {
                 *model = normalized.to_owned();
             }
         }
+        if let Some(identity) = &mut self.formatting.ollama_model_identity {
+            identity.validate_and_normalize()?;
+            if self.formatting.ollama_model.is_none() {
+                return Err(SettingsError::OrphanedOllamaModelIdentity);
+            }
+        }
 
         Ok(())
     }
@@ -134,8 +140,13 @@ impl Settings {
     pub fn ensure_runtime_supported(&self) -> Result<(), SettingsError> {
         match self.formatting.strength {
             FormattingStrength::Raw | FormattingStrength::Light => Ok(()),
-            _ if self.formatting.ollama_model.is_some() => Ok(()),
-            strength => Err(SettingsError::FormattingModelRequired(strength)),
+            _ if self.formatting.ollama_model.is_none() => Err(
+                SettingsError::FormattingModelRequired(self.formatting.strength),
+            ),
+            _ if self.formatting.ollama_model_identity.is_none() => {
+                Err(SettingsError::FormattingModelIdentityRequired)
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -246,6 +257,10 @@ pub struct FormattingSettings {
     /// Explicitly selected installed Ollama model. Never chosen implicitly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ollama_model: Option<String>,
+    /// Immutable manifest identity observed when the user explicitly selected
+    /// `ollama_model`. Runtime use fails closed if the mutable tag is replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ollama_model_identity: Option<OllamaModelIdentity>,
     pub ollama_lifecycle: OllamaLifecycle,
 }
 
@@ -255,8 +270,51 @@ impl Default for FormattingSettings {
             strength: FormattingStrength::Light,
             custom_instructions: None,
             ollama_model: None,
+            ollama_model_identity: None,
             ollama_lifecycle: OllamaLifecycle::Balanced,
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OllamaModelIdentity {
+    pub manifest_sha256: String,
+    pub bytes: u64,
+}
+
+impl OllamaModelIdentity {
+    pub fn new(manifest_sha256: impl Into<String>, bytes: u64) -> Result<Self, SettingsError> {
+        let mut identity = Self {
+            manifest_sha256: manifest_sha256.into(),
+            bytes,
+        };
+        identity.validate_and_normalize()?;
+        Ok(identity)
+    }
+
+    fn validate_and_normalize(&mut self) -> Result<(), SettingsError> {
+        let digest = self
+            .manifest_sha256
+            .strip_prefix("sha256:")
+            .unwrap_or(&self.manifest_sha256)
+            .to_ascii_lowercase();
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(SettingsError::InvalidOllamaModelDigest);
+        }
+        if self.bytes == 0 {
+            return Err(SettingsError::InvalidOllamaModelSize);
+        }
+        self.manifest_sha256 = digest;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn matches(&self, digest: Option<&str>, bytes: Option<u64>) -> bool {
+        digest
+            .and_then(|value| value.strip_prefix("sha256:").or(Some(value)))
+            .is_some_and(|value| value.eq_ignore_ascii_case(&self.manifest_sha256))
+            && bytes == Some(self.bytes)
     }
 }
 
@@ -728,8 +786,16 @@ pub enum SettingsError {
     MissingCustomInstructions,
     #[error("formatting.ollama_model must not exceed 256 characters")]
     OllamaModelNameTooLong,
+    #[error("formatting.ollama_model_identity cannot exist without formatting.ollama_model")]
+    OrphanedOllamaModelIdentity,
+    #[error("formatting.ollama_model_identity.manifest_sha256 must be a SHA-256 digest")]
+    InvalidOllamaModelDigest,
+    #[error("formatting.ollama_model_identity.bytes must be positive")]
+    InvalidOllamaModelSize,
     #[error("{0} formatting requires an explicitly selected installed Ollama model")]
     FormattingModelRequired(FormattingStrength),
+    #[error("AI formatting requires a verified immutable Ollama model identity")]
+    FormattingModelIdentityRequired,
     #[error("failed to open settings file {path}: {source}")]
     Open {
         path: PathBuf,
@@ -1049,8 +1115,49 @@ language = "pt-BR"
                 Err(SettingsError::FormattingModelRequired(found)) if found == strength
             ));
             settings.formatting.ollama_model = Some("qwen2.5:3b".to_owned());
+            assert!(matches!(
+                settings.ensure_runtime_supported(),
+                Err(SettingsError::FormattingModelIdentityRequired)
+            ));
+            settings.formatting.ollama_model_identity =
+                Some(OllamaModelIdentity::new("a".repeat(64), 42).unwrap());
             assert!(settings.ensure_runtime_supported().is_ok());
         }
+    }
+
+    #[test]
+    fn schema_five_model_name_migrates_without_trusting_the_live_tag() {
+        let directory = TestDirectory::new("migrate-v5-ollama-identity");
+        let path = directory.0.join("settings.toml");
+        fs::write(
+            &path,
+            "schema_version = 5\n[formatting]\nstrength = 'balanced'\nollama_model = 'qwen2.5:3b'\n",
+        )
+        .unwrap();
+
+        let loaded = SettingsStore::new(path).unwrap().load().unwrap();
+
+        assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            loaded.formatting.ollama_model.as_deref(),
+            Some("qwen2.5:3b")
+        );
+        assert_eq!(loaded.formatting.ollama_model_identity, None);
+        assert!(matches!(
+            loaded.ensure_runtime_supported(),
+            Err(SettingsError::FormattingModelIdentityRequired)
+        ));
+    }
+
+    #[test]
+    fn ollama_identity_is_normalized_and_strictly_validated() {
+        let identity = OllamaModelIdentity::new(format!("sha256:{}", "A".repeat(64)), 42).unwrap();
+        assert_eq!(identity.manifest_sha256, "a".repeat(64));
+        assert!(identity.matches(Some(&format!("sha256:{}", "A".repeat(64))), Some(42)));
+        assert!(!identity.matches(Some(&"a".repeat(64)), Some(43)));
+        assert!(OllamaModelIdentity::new("a".repeat(63), 42).is_err());
+        assert!(OllamaModelIdentity::new("g".repeat(64), 42).is_err());
+        assert!(OllamaModelIdentity::new("a".repeat(64), 0).is_err());
     }
 
     #[test]

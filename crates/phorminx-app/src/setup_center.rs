@@ -683,16 +683,14 @@ fn normalized_facts(
 
 fn selected_ollama_digest(
     settings: &Settings,
-    readiness: &UiReadinessSnapshot,
+    _readiness: &UiReadinessSnapshot,
 ) -> Option<Sha256Digest> {
-    let selected = settings.formatting.ollama_model.as_ref()?;
-    readiness
-        .ollama
-        .models
-        .iter()
-        .find(|model| &model.name == selected)
-        .and_then(|model| model.digest.as_deref())
-        .and_then(parse_ollama_digest)
+    let _selected = settings.formatting.ollama_model.as_ref()?;
+    settings
+        .formatting
+        .ollama_model_identity
+        .as_ref()
+        .and_then(|identity| Sha256Digest::new(&identity.manifest_sha256).ok())
 }
 
 fn parse_ollama_digest(value: &str) -> Option<Sha256Digest> {
@@ -1421,6 +1419,8 @@ mod tests {
         let mut settings = Settings::default();
         settings.formatting.strength = FormattingStrength::Strong;
         settings.formatting.ollama_model = Some("curated:local".to_owned());
+        settings.formatting.ollama_model_identity =
+            Some(crate::settings::OllamaModelIdentity::new(digest.clone(), 1_000).unwrap());
         settings.recognition.accurate_backend = AccurateBackendPreference::Cpu;
         let desired = desired_configuration(
             &settings,

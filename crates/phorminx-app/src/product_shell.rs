@@ -653,6 +653,7 @@ impl ProductShellApp {
             ShellEvent::SelectOllamaModel(model) => {
                 let mut settings = self.bridge.settings().clone();
                 settings.formatting.ollama_model = Some(model);
+                settings.formatting.ollama_model_identity = None;
                 self.execute(UiCommand::SaveSettings(settings));
             }
             ShellEvent::SaveSettings(form) => {

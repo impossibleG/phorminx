@@ -1015,6 +1015,10 @@ pub enum RuntimeActivityKind {
     CalibrationCapture,
     Whisper,
     Ollama,
+    /// Long-lived, non-compute guard for a verified mutable Ollama tag.
+    OllamaModelPin,
+    /// App-owned operation that can replace an Ollama tag (for example pull).
+    OllamaModelMutation,
 }
 
 #[derive(Default)]
@@ -1024,6 +1028,8 @@ struct WorkloadState {
     dictation: u32,
     whisper: u32,
     ollama: u32,
+    ollama_model_pins: u32,
+    ollama_model_mutations: u32,
 }
 
 #[derive(Default)]
@@ -1053,7 +1059,11 @@ impl WorkloadCoordinator {
             return Err(BenchmarkPreflightFailure::DictationActive);
         }
         if kind == RuntimeActivityKind::CalibrationCapture {
-            if state.dictation != 0 || state.whisper != 0 || state.ollama != 0 {
+            if state.dictation != 0
+                || state.whisper != 0
+                || state.ollama != 0
+                || state.ollama_model_mutations != 0
+            {
                 return Err(BenchmarkPreflightFailure::ComputeContention);
             }
             state.calibration = true;
@@ -1066,11 +1076,24 @@ impl WorkloadCoordinator {
         if kind == RuntimeActivityKind::Dictation && state.dictation != 0 {
             return Err(BenchmarkPreflightFailure::DictationActive);
         }
+        if kind == RuntimeActivityKind::Ollama && state.ollama != 0 {
+            return Err(BenchmarkPreflightFailure::ComputeContention);
+        }
+        if kind == RuntimeActivityKind::OllamaModelPin && state.ollama_model_mutations != 0 {
+            return Err(BenchmarkPreflightFailure::ComputeContention);
+        }
+        if kind == RuntimeActivityKind::OllamaModelMutation
+            && (state.ollama_model_mutations != 0 || state.ollama_model_pins != 0)
+        {
+            return Err(BenchmarkPreflightFailure::ComputeContention);
+        }
         let counter = match kind {
             RuntimeActivityKind::Dictation => &mut state.dictation,
             RuntimeActivityKind::CalibrationCapture => unreachable!(),
             RuntimeActivityKind::Whisper => &mut state.whisper,
             RuntimeActivityKind::Ollama => &mut state.ollama,
+            RuntimeActivityKind::OllamaModelPin => &mut state.ollama_model_pins,
+            RuntimeActivityKind::OllamaModelMutation => &mut state.ollama_model_mutations,
         };
         *counter = counter
             .checked_add(1)
@@ -1093,7 +1116,7 @@ impl WorkloadCoordinator {
         if state.dictation != 0 || state.calibration {
             return Err(BenchmarkPreflightFailure::DictationActive);
         }
-        if state.whisper != 0 || state.ollama != 0 {
+        if state.whisper != 0 || state.ollama != 0 || state.ollama_model_mutations != 0 {
             return Err(BenchmarkPreflightFailure::ComputeContention);
         }
         state.benchmark = true;
@@ -1130,6 +1153,8 @@ impl Drop for RuntimeActivityLease {
                 }
                 RuntimeActivityKind::Whisper => &mut state.whisper,
                 RuntimeActivityKind::Ollama => &mut state.ollama,
+                RuntimeActivityKind::OllamaModelPin => &mut state.ollama_model_pins,
+                RuntimeActivityKind::OllamaModelMutation => &mut state.ollama_model_mutations,
             };
             *counter = counter.saturating_sub(1);
         }
@@ -2319,6 +2344,10 @@ mod tests {
         drop(whisper);
         let ollama = coordinator.try_begin(RuntimeActivityKind::Ollama).unwrap();
         assert!(matches!(
+            coordinator.try_begin(RuntimeActivityKind::Ollama),
+            Err(BenchmarkPreflightFailure::ComputeContention)
+        ));
+        assert!(matches!(
             coordinator.try_begin_benchmark(),
             Err(BenchmarkPreflightFailure::ComputeContention)
         ));
@@ -2408,6 +2437,34 @@ mod tests {
                 .try_begin(RuntimeActivityKind::Dictation)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn idle_ollama_identity_pin_allows_benchmark_but_excludes_tag_mutation() {
+        let coordinator = WorkloadCoordinator::default();
+        let pin = coordinator
+            .try_begin(RuntimeActivityKind::OllamaModelPin)
+            .unwrap();
+        assert!(matches!(
+            coordinator.try_begin(RuntimeActivityKind::OllamaModelMutation),
+            Err(BenchmarkPreflightFailure::ComputeContention)
+        ));
+        let benchmark = coordinator.try_begin_benchmark().unwrap();
+        assert!(matches!(
+            coordinator.try_begin(RuntimeActivityKind::Ollama),
+            Err(BenchmarkPreflightFailure::ComputeContention)
+        ));
+        drop(benchmark);
+        drop(pin);
+
+        let mutation = coordinator
+            .try_begin(RuntimeActivityKind::OllamaModelMutation)
+            .unwrap();
+        assert!(matches!(
+            coordinator.try_begin_benchmark(),
+            Err(BenchmarkPreflightFailure::ComputeContention)
+        ));
+        drop(mutation);
     }
 
     #[test]

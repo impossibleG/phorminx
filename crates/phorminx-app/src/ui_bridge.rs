@@ -21,8 +21,8 @@ use phorminx_whisper::{WhisperBackendPreference, WhisperReadiness, probe_backend
 
 use crate::model::{identify_pinned_model, model_for_variant};
 use crate::settings::{
-    AccurateModelVariant, FormattingStrength, HistoryRetention, Settings, SettingsError,
-    SettingsStore,
+    AccurateModelVariant, FormattingStrength, HistoryRetention, OllamaModelIdentity, Settings,
+    SettingsError, SettingsStore,
 };
 
 pub const DEFAULT_HISTORY_LIMIT: usize = 100;
@@ -270,11 +270,6 @@ impl UiReadinessSnapshot {
                 installed: false,
             },
         }
-    }
-
-    fn has_installed_ollama_model(&self, name: &str) -> bool {
-        self.ollama.state == UiReadinessState::Ready
-            && self.ollama.models.iter().any(|model| model.name == name)
     }
 }
 
@@ -879,9 +874,6 @@ impl UiBridge {
         candidate
             .validate_and_normalize()
             .map_err(UiBridgeError::settings)?;
-        candidate
-            .ensure_runtime_supported()
-            .map_err(UiBridgeError::settings)?;
         match candidate.recognition.mode {
             crate::settings::RecognitionMode::Accurate => {
                 let resolved_model = self
@@ -972,13 +964,48 @@ impl UiBridge {
                 .ok_or_else(|| {
                     UiBridgeError::validation("ollama_model", "Select an installed Ollama model.")
                 })?;
-            if !readiness.has_installed_ollama_model(selected) {
+            let installed = readiness
+                .ollama
+                .models
+                .iter()
+                .find(|model| model.name == selected)
+                .ok_or_else(|| {
+                    UiBridgeError::validation(
+                        "ollama_model",
+                        "The selected Ollama model is not currently installed.",
+                    )
+                })?;
+            let observed = OllamaModelIdentity::new(
+                installed.digest.as_deref().ok_or_else(|| {
+                    UiBridgeError::validation(
+                        "ollama_model",
+                        "The selected Ollama model did not report an exact digest.",
+                    )
+                })?,
+                installed.size_bytes.ok_or_else(|| {
+                    UiBridgeError::validation(
+                        "ollama_model",
+                        "The selected Ollama model did not report an exact size.",
+                    )
+                })?,
+            )
+            .map_err(UiBridgeError::settings)?;
+            if candidate
+                .formatting
+                .ollama_model_identity
+                .as_ref()
+                .is_some_and(|expected| expected != &observed)
+            {
                 return Err(UiBridgeError::validation(
                     "ollama_model",
-                    "The selected Ollama model is not currently installed.",
+                    "The selected Ollama model identity changed. Select it again to trust the new local model.",
                 ));
             }
+            candidate.formatting.ollama_model_identity = Some(observed);
         }
+        candidate
+            .ensure_runtime_supported()
+            .map_err(UiBridgeError::settings)?;
 
         let old_settings = self.settings.clone();
         self.store
@@ -1563,6 +1590,60 @@ mod tests {
             .execute(UiCommand::SaveSettings(missing_ollama), &readiness, 10)
             .unwrap_err();
         assert_eq!(error.field, Some("ollama_model"));
+    }
+
+    #[test]
+    fn settings_pin_exact_ollama_identity_and_reject_tag_replacement() {
+        let mut test = TestBridge::new();
+        let readiness = test.readiness();
+        let mut candidate = test.bridge.settings().clone();
+        candidate.formatting.strength = FormattingStrength::Strong;
+        candidate.formatting.ollama_model = Some("qwen2.5:3b".to_owned());
+        test.bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+            .unwrap();
+        let pinned = test
+            .bridge
+            .settings()
+            .formatting
+            .ollama_model_identity
+            .clone()
+            .unwrap();
+        assert_eq!(pinned.manifest_sha256, "a".repeat(64));
+        assert_eq!(pinned.bytes, 1_000);
+
+        let mut replaced = readiness.clone();
+        replaced.ollama.models[0].digest = Some("b".repeat(64));
+        let candidate = test.bridge.settings().clone();
+        let error = test
+            .bridge
+            .execute(UiCommand::SaveSettings(candidate), &replaced, 11)
+            .unwrap_err();
+        assert_eq!(error.field, Some("ollama_model"));
+        assert_eq!(
+            test.bridge
+                .settings()
+                .formatting
+                .ollama_model_identity
+                .as_ref(),
+            Some(&pinned)
+        );
+
+        let mut explicitly_retrusted = test.bridge.settings().clone();
+        explicitly_retrusted.formatting.ollama_model_identity = None;
+        test.bridge
+            .execute(UiCommand::SaveSettings(explicitly_retrusted), &replaced, 12)
+            .unwrap();
+        assert_eq!(
+            test.bridge
+                .settings()
+                .formatting
+                .ollama_model_identity
+                .as_ref()
+                .unwrap()
+                .manifest_sha256,
+            "b".repeat(64)
+        );
     }
 
     #[test]

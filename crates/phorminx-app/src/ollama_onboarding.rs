@@ -148,7 +148,7 @@ impl<T: OllamaOnboardingTransport, P: OllamaInstallProbe> OllamaOnboardingHost<T
             })?;
         let _activity = self
             .workloads
-            .try_begin(RuntimeActivityKind::Ollama)
+            .try_begin(RuntimeActivityKind::OllamaModelMutation)
             .map_err(|_| PullFailure {
                 kind: PullFailureKind::Busy,
                 residue: PullResidue::None,

@@ -15,6 +15,7 @@ use phorminx_setup::{
 };
 use phorminx_windows::atomic_replace_file;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::settings::{
     AccurateBackendPreference, AccurateModelVariant, RecognitionMode, Settings, SettingsStore,
@@ -26,8 +27,12 @@ const MIN_BENCHMARK_DURATION: Duration = Duration::from_secs(5);
 const MAX_BENCHMARK_DURATION: Duration = Duration::from_secs(15 * 60);
 static EVIDENCE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static EVIDENCE_SAVE_LOCK: Mutex<()> = Mutex::new(());
+static ROLLBACK_SAVE_LOCK: Mutex<()> = Mutex::new(());
+static ROLLBACK_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static GLOBAL_BENCHMARK_PERMIT: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 static RECOMMENDER_AUTHORITY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const ROLLBACK_SCHEMA_VERSION: u32 = 1;
+const MAX_ROLLBACK_BYTES: u64 = 32 * 1024;
 
 /// Content-free output of one production measurement. Raw audio, prompt text,
 /// and recognized text stay inside the adapter call.
@@ -772,8 +777,60 @@ pub struct ApplyConsent {
 pub struct AppliedRecommendation {
     authority_id: u64,
     generation: u64,
-    previous: Settings,
-    applied: Settings,
+    rollback_nonce: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecognitionRollbackFields {
+    language: String,
+    mode: RecognitionMode,
+    accurate_model: AccurateModelVariant,
+    accurate_backend: AccurateBackendPreference,
+    model_path: PathBuf,
+    instant_model_path: PathBuf,
+    instant_runtime_path: PathBuf,
+}
+
+impl RecognitionRollbackFields {
+    fn from_settings(settings: &Settings) -> Self {
+        Self {
+            language: settings.recognition.language.clone(),
+            mode: settings.recognition.mode,
+            accurate_model: settings.recognition.accurate_model,
+            accurate_backend: settings.recognition.accurate_backend,
+            model_path: settings.recognition.model_path.clone(),
+            instant_model_path: settings.recognition.instant_model_path.clone(),
+            instant_runtime_path: settings.recognition.instant_runtime_path.clone(),
+        }
+    }
+
+    fn apply_to(&self, settings: &mut Settings) {
+        settings.recognition.language.clone_from(&self.language);
+        settings.recognition.mode = self.mode;
+        settings.recognition.accurate_model = self.accurate_model;
+        settings.recognition.accurate_backend = self.accurate_backend;
+        settings.recognition.model_path.clone_from(&self.model_path);
+        settings
+            .recognition
+            .instant_model_path
+            .clone_from(&self.instant_model_path);
+        settings
+            .recognition
+            .instant_runtime_path
+            .clone_from(&self.instant_runtime_path);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedRollbackReceipt {
+    schema_version: u32,
+    generation: u64,
+    nonce: u64,
+    applied_settings_sha256: String,
+    previous: RecognitionRollbackFields,
+    applied: RecognitionRollbackFields,
 }
 
 impl std::fmt::Debug for AppliedRecommendation {
@@ -782,7 +839,7 @@ impl std::fmt::Debug for AppliedRecommendation {
             .debug_struct("AppliedRecommendation")
             .field("authority_id", &self.authority_id)
             .field("generation", &self.generation)
-            .field("settings", &"[REDACTED]")
+            .field("rollback_nonce", &"[REDACTED]")
             .finish()
     }
 }
@@ -801,6 +858,8 @@ pub enum ApplyError {
     StaleRollback,
     #[error("settings changed before the recommendation could be committed")]
     ConcurrentSettingsChange,
+    #[error("a previous applied recommendation still has a rollback available")]
+    RollbackPending,
     #[error("settings validation or atomic commit failed")]
     Settings,
 }
@@ -814,6 +873,7 @@ impl std::fmt::Debug for ApplyError {
             Self::StaleConsent => "ApplyError::StaleConsent",
             Self::StaleRollback => "ApplyError::StaleRollback",
             Self::ConcurrentSettingsChange => "ApplyError::ConcurrentSettingsChange",
+            Self::RollbackPending => "ApplyError::RollbackPending",
             Self::Settings => "ApplyError::Settings",
         })
     }
@@ -1025,18 +1085,47 @@ impl PerformanceRecommender {
         applied
             .validate_and_normalize()
             .map_err(|_| ApplyError::Settings)?;
-        if !store
-            .compare_and_save(&previous, &applied)
-            .map_err(|_| ApplyError::Settings)?
-        {
-            return Err(ApplyError::ConcurrentSettingsChange);
+        let rollback_nonce = ROLLBACK_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let persisted = PersistedRollbackReceipt {
+            schema_version: ROLLBACK_SCHEMA_VERSION,
+            generation: consent.generation,
+            nonce: rollback_nonce,
+            applied_settings_sha256: settings_digest(&applied)?,
+            previous: RecognitionRollbackFields::from_settings(&previous),
+            applied: RecognitionRollbackFields::from_settings(&applied),
+        };
+        let _rollback_guard = ROLLBACK_SAVE_LOCK
+            .lock()
+            .map_err(|_| ApplyError::Settings)?;
+        if let Ok(existing) = load_rollback_receipt(store) {
+            let current = store.load().map_err(|_| ApplyError::Settings)?;
+            if settings_digest(&current)? == existing.applied_settings_sha256 {
+                return Err(ApplyError::RollbackPending);
+            }
+            remove_rollback_receipt(store)?;
+        } else if rollback_receipt_path(store)?.exists() {
+            // Corrupt or future receipts require explicit discard. Silently
+            // overwriting them would destroy the user's only possible undo.
+            return Err(ApplyError::Settings);
+        }
+        write_rollback_receipt(store, &persisted)?;
+        let committed = store.compare_and_save(&previous, &applied);
+        match committed {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = remove_rollback_receipt(store);
+                return Err(ApplyError::ConcurrentSettingsChange);
+            }
+            Err(_) => {
+                let _ = remove_rollback_receipt(store);
+                return Err(ApplyError::Settings);
+            }
         }
         self.latest_applied_generation = Some(consent.generation);
         Ok(AppliedRecommendation {
             authority_id: self.authority_id,
             generation: consent.generation,
-            previous,
-            applied,
+            rollback_nonce,
         })
     }
 
@@ -1050,22 +1139,160 @@ impl PerformanceRecommender {
         {
             return Err(ApplyError::StaleRollback);
         }
-        if store.load().map_err(|_| ApplyError::Settings)? != receipt.applied {
-            return Err(ApplyError::StaleRollback);
-        }
-        let mut previous = receipt.previous;
-        previous
-            .validate_and_normalize()
+        let _rollback_guard = ROLLBACK_SAVE_LOCK
+            .lock()
             .map_err(|_| ApplyError::Settings)?;
-        if !store
-            .compare_and_save(&receipt.applied, &previous)
-            .map_err(|_| ApplyError::Settings)?
-        {
-            return Err(ApplyError::StaleRollback);
-        }
+        rollback_persisted_locked(store, Some(receipt.rollback_nonce))?;
         self.latest_applied_generation = None;
         Ok(())
     }
+
+    /// Reverts the latest performance recommendation after a process restart.
+    /// Only the recognition fields changed by the recommender are persisted,
+    /// and rollback is rejected if any setting changed after application.
+    pub fn rollback_after_restart(store: &SettingsStore) -> Result<(), ApplyError> {
+        let _rollback_guard = ROLLBACK_SAVE_LOCK
+            .lock()
+            .map_err(|_| ApplyError::Settings)?;
+        rollback_persisted_locked(store, None)
+    }
+
+    /// Permanently discards the pending rollback without changing settings.
+    pub fn discard_persisted_rollback(store: &SettingsStore) -> Result<(), ApplyError> {
+        let _rollback_guard = ROLLBACK_SAVE_LOCK
+            .lock()
+            .map_err(|_| ApplyError::Settings)?;
+        remove_rollback_receipt(store)
+    }
+}
+
+fn rollback_receipt_path(store: &SettingsStore) -> Result<PathBuf, ApplyError> {
+    store
+        .path()
+        .parent()
+        .map(|directory| directory.join("performance-recommendation-rollback.toml"))
+        .ok_or(ApplyError::Settings)
+}
+
+fn write_rollback_receipt(
+    store: &SettingsStore,
+    receipt: &PersistedRollbackReceipt,
+) -> Result<(), ApplyError> {
+    let path = rollback_receipt_path(store)?;
+    let directory = path.parent().ok_or(ApplyError::Settings)?;
+    fs::create_dir_all(directory).map_err(|_| ApplyError::Settings)?;
+    let serialized = toml::to_string(receipt).map_err(|_| ApplyError::Settings)?;
+    if serialized.len() as u64 > MAX_ROLLBACK_BYTES {
+        return Err(ApplyError::Settings);
+    }
+    let sequence = ROLLBACK_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = directory.join(format!(
+        ".performance-recommendation-rollback.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|_| ApplyError::Settings)?;
+        file.write_all(serialized.as_bytes())
+            .and_then(|_| file.flush())
+            .and_then(|_| file.sync_all())
+            .map_err(|_| ApplyError::Settings)?;
+        drop(file);
+        atomic_replace_file(&temporary, &path).map_err(|_| ApplyError::Settings)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn load_rollback_receipt(store: &SettingsStore) -> Result<PersistedRollbackReceipt, ApplyError> {
+    let path = rollback_receipt_path(store)?;
+    let mut file = File::open(path).map_err(|_| ApplyError::StaleRollback)?;
+    if file.metadata().map_err(|_| ApplyError::Settings)?.len() > MAX_ROLLBACK_BYTES {
+        return Err(ApplyError::Settings);
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_ROLLBACK_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ApplyError::Settings)?;
+    if bytes.len() as u64 > MAX_ROLLBACK_BYTES {
+        return Err(ApplyError::Settings);
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| ApplyError::Settings)?;
+    let receipt: PersistedRollbackReceipt =
+        toml::from_str(text).map_err(|_| ApplyError::Settings)?;
+    if receipt.schema_version != ROLLBACK_SCHEMA_VERSION || receipt.nonce == 0 {
+        return Err(ApplyError::Settings);
+    }
+    if receipt.applied_settings_sha256.len() != 64
+        || !receipt
+            .applied_settings_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ApplyError::Settings);
+    }
+    Ok(receipt)
+}
+
+fn remove_rollback_receipt(store: &SettingsStore) -> Result<(), ApplyError> {
+    let path = rollback_receipt_path(store)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(ApplyError::Settings),
+    }
+}
+
+fn rollback_persisted_locked(
+    store: &SettingsStore,
+    expected_nonce: Option<u64>,
+) -> Result<(), ApplyError> {
+    let receipt = load_rollback_receipt(store)?;
+    if expected_nonce.is_some_and(|nonce| nonce != receipt.nonce) {
+        return Err(ApplyError::StaleRollback);
+    }
+    let current = store.load().map_err(|_| ApplyError::Settings)?;
+    let current_recognition = RecognitionRollbackFields::from_settings(&current);
+    if current_recognition != receipt.applied
+        || settings_digest(&current)? != receipt.applied_settings_sha256
+    {
+        // A prepared receipt whose settings commit never happened, a replay,
+        // or a newer recognition edit must never overwrite the current state.
+        remove_rollback_receipt(store)?;
+        return Err(ApplyError::StaleRollback);
+    }
+    let mut restored = current.clone();
+    receipt.previous.apply_to(&mut restored);
+    restored
+        .validate_and_normalize()
+        .map_err(|_| ApplyError::Settings)?;
+    if !store
+        .compare_and_save(&current, &restored)
+        .map_err(|_| ApplyError::Settings)?
+    {
+        return Err(ApplyError::StaleRollback);
+    }
+    remove_rollback_receipt(store)?;
+    Ok(())
+}
+
+fn settings_digest(settings: &Settings) -> Result<String, ApplyError> {
+    let canonical = toml::to_string(settings).map_err(|_| ApplyError::Settings)?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(canonical.as_bytes());
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(encoded)
 }
 
 fn application_matches(
@@ -1811,6 +2038,66 @@ mod tests {
             AccurateBackendPreference::Vulkan
         );
         recommender.rollback(receipt, &store).unwrap();
+        assert_eq!(store.load().unwrap(), original);
+    }
+
+    #[test]
+    fn restart_rollback_is_narrow_content_free_and_one_use() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(directory.path().join("settings.toml")).unwrap();
+        let mut original = Settings::default();
+        original.recognition.microphone = Some("private microphone label".to_owned());
+        original.formatting.custom_instructions = Some("private writing preference".to_owned());
+        store.save(&original).unwrap();
+        let mut recommender = recommender();
+        let (_, consent) = recommender.evaluate(
+            Language::English,
+            RecommendationPreference::Balanced,
+            [evidence()],
+        );
+        let _receipt = recommender.apply(consent.unwrap(), &store).unwrap();
+
+        let receipt_text = fs::read_to_string(rollback_receipt_path(&store).unwrap()).unwrap();
+        assert!(!receipt_text.contains("private microphone label"));
+        assert!(!receipt_text.contains("private writing preference"));
+        PerformanceRecommender::rollback_after_restart(&store).unwrap();
+        assert_eq!(store.load().unwrap(), original);
+        assert!(matches!(
+            PerformanceRecommender::rollback_after_restart(&store),
+            Err(ApplyError::StaleRollback)
+        ));
+    }
+
+    #[test]
+    fn failed_second_apply_preserves_the_first_valid_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(directory.path().join("settings.toml")).unwrap();
+        let original = Settings::default();
+        store.save(&original).unwrap();
+        let mut first = recommender();
+        let (_, consent) = first.evaluate(
+            Language::English,
+            RecommendationPreference::Balanced,
+            [evidence()],
+        );
+        let first_receipt = first.apply(consent.unwrap(), &store).unwrap();
+        let receipt_before = fs::read(rollback_receipt_path(&store).unwrap()).unwrap();
+
+        let mut second = recommender();
+        let (_, consent) = second.evaluate(
+            Language::English,
+            RecommendationPreference::Balanced,
+            [evidence()],
+        );
+        assert!(matches!(
+            second.apply(consent.unwrap(), &store),
+            Err(ApplyError::RollbackPending)
+        ));
+        assert_eq!(
+            fs::read(rollback_receipt_path(&store).unwrap()).unwrap(),
+            receipt_before
+        );
+        first.rollback(first_receipt, &store).unwrap();
         assert_eq!(store.load().unwrap(), original);
     }
 
