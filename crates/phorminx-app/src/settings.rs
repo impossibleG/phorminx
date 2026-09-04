@@ -795,7 +795,7 @@ pub enum SettingsError {
     InvalidOllamaModelSize,
     #[error("{0} formatting requires an explicitly selected installed Ollama model")]
     FormattingModelRequired(FormattingStrength),
-    #[error("AI formatting requires a verified immutable Ollama model identity")]
+    #[error("AI formatting requires a verified pinned Ollama model identity")]
     FormattingModelIdentityRequired,
     #[error("failed to open settings file {path}: {source}")]
     Open {

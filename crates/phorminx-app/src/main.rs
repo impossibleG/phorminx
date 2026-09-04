@@ -5067,7 +5067,7 @@ impl WorkerFormatting {
         ) && (model.is_none() || model_identity.is_none())
         {
             return Err(anyhow!(
-                "AI formatting requires a verified immutable Ollama model identity"
+                "AI formatting requires a verified pinned Ollama model identity"
             ));
         }
         let keep_alive = match settings.formatting.ollama_lifecycle {
