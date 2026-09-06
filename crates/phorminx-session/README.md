@@ -2,6 +2,12 @@
 
 Platform-neutral foundations for dictation sessions longer than the live in-memory capture window.
 
+Production capture uses a 45-second rolling in-memory audio ring and reclaims
+samples after recognition owns their text, with boundary context retained.
+Production disk spill is disabled. See `docs/ADR-015-EXTENDED-DICTATION.md` for
+the current integration; this crate's reusable ledger and legacy spool are
+not by themselves the production recognition state machine.
+
 ## Invariants
 
 - Every audio position is an absolute half-open sample range at 16 kHz mono.
@@ -19,6 +25,10 @@ Platform-neutral foundations for dictation sessions longer than the live in-memo
   preventing truncated or duplicate persistence/insertion by construction.
 
 ## Encrypted audio spool
+
+This is a legacy compatibility/test facility. Healthy production dictation
+does not create or append audio spool files. Its tests qualify the facility
+itself and must not be represented as proof of rolling-capture integration.
 
 Each spool receives a fresh 256-bit key from `ring::rand::SystemRandom`. The key is held only in
 memory and is never serialized. A random nonce prefix and monotonic record counter give every

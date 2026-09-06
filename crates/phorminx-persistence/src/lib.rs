@@ -7,6 +7,8 @@ mod history;
 mod lexicon;
 mod migration;
 mod profile;
+mod recovery;
+pub use recovery::{RecoveryRecord, RecoveryRepository};
 
 use std::ffi::OsString;
 use std::{fs, path::Path, path::PathBuf, time::Duration};
@@ -28,6 +30,8 @@ pub type Result<T> = std::result::Result<T, PersistenceError>;
 
 #[derive(Debug, Error)]
 pub enum PersistenceError {
+    #[error("interrupted text could not be protected or recovered for this Windows account")]
+    Protection,
     #[error("the database parent directory could not be created")]
     CreateDirectory(#[source] std::io::Error),
     #[error("the local database operation failed")]
@@ -95,6 +99,10 @@ impl Persistence {
 
     pub fn history(&self) -> HistoryRepository<'_> {
         HistoryRepository::new(&self.connection)
+    }
+
+    pub fn recovery(&self) -> RecoveryRepository<'_> {
+        RecoveryRepository::new(&self.connection)
     }
 
     pub fn lexicon(&self) -> LexiconRepository<'_> {

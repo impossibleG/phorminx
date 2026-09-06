@@ -39,6 +39,31 @@ fn draft(created_at_ms: i64, text: &str) -> DictationDraft {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn new_completed_dictation_also_purges_expired_interrupted_text() {
+    let (_directory, database) = open_temp();
+    database
+        .history()
+        .set_retention(RetentionPolicy::Hours24, NOW)
+        .unwrap();
+    let epoch = database.recovery().epoch().unwrap();
+    database
+        .recovery()
+        .save("expired", epoch, NOW - 2 * DAY_MS, "expired draft")
+        .unwrap();
+    database
+        .recovery()
+        .save("recent", epoch, NOW, "current draft")
+        .unwrap();
+    database.history().insert(&draft(NOW, "completed")).unwrap();
+    assert!(database.recovery().text("expired").unwrap().is_none());
+    assert_eq!(
+        database.recovery().text("recent").unwrap().as_deref(),
+        Some("current draft")
+    );
+}
+
 fn terminal_metadata() -> TerminalMetadata {
     TerminalMetadata {
         checkpoint_count: Some(47),

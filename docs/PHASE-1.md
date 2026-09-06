@@ -1,5 +1,10 @@
 # Phase 1: push-to-talk walking skeleton
 
+> Historical milestone and reference-machine evidence. ADR-015 supersedes the
+> 120-second capture ceiling and complete-recording retention below. Later
+> phases also expanded insertion compatibility and the product UI; this file
+> is not the current feature or release-acceptance checklist.
+
 The current executable implements:
 
 ```text

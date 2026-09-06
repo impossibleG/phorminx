@@ -1,5 +1,10 @@
 # ADR-005: Bounded callback-safe audio capture
 
+> Historical decision. ADR-015 supersedes the 120-second recording ceiling,
+> full-recording retention, and post-stop-only resampling described below.
+> Production now uses bounded rolling capture and reclaims recognized audio.
+> Callback constraints and the PCM-format policy remain applicable.
+
 - Status: Accepted
 - Date: 2026-08-30
 

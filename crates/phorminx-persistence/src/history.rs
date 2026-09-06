@@ -177,12 +177,19 @@ impl<'connection> HistoryRepository<'connection> {
         match policy {
             RetentionPolicy::Disabled => {
                 transaction.execute("DELETE FROM dictation_history", [])?;
+                transaction.execute("DELETE FROM interrupted_dictation", [])?;
+                transaction.execute("DELETE FROM recovery_tombstones", [])?;
+                transaction.execute("UPDATE persistence_settings SET value=CAST(value AS INTEGER)+1 WHERE key='recovery_epoch'", [])?;
             }
             RetentionPolicy::Indefinite => {}
             bounded => {
                 let cutoff = now_ms.saturating_sub(bounded.max_age_ms().unwrap_or_default());
                 transaction.execute(
                     "DELETE FROM dictation_history WHERE created_at_ms < ?1",
+                    [cutoff],
+                )?;
+                transaction.execute(
+                    "DELETE FROM interrupted_dictation WHERE updated_at_ms < ?1",
                     [cutoff],
                 )?;
             }
@@ -215,6 +222,10 @@ impl<'connection> HistoryRepository<'connection> {
             let cutoff = draft.created_at_ms.saturating_sub(max_age_ms);
             transaction.execute(
                 "DELETE FROM dictation_history WHERE created_at_ms < ?1",
+                [cutoff],
+            )?;
+            transaction.execute(
+                "DELETE FROM interrupted_dictation WHERE updated_at_ms < ?1",
                 [cutoff],
             )?;
         }
@@ -443,19 +454,30 @@ impl<'connection> HistoryRepository<'connection> {
             RetentionPolicy::Indefinite => Ok(0),
             policy => {
                 let cutoff = now_ms.saturating_sub(policy.max_age_ms().unwrap_or_default());
-                Ok(self.connection.execute(
+                let transaction = self.connection.unchecked_transaction()?;
+                let removed = transaction.execute(
                     "DELETE FROM dictation_history WHERE created_at_ms < ?1",
                     [cutoff],
-                )?)
+                )?;
+                transaction.execute(
+                    "DELETE FROM interrupted_dictation WHERE updated_at_ms < ?1",
+                    [cutoff],
+                )?;
+                transaction.commit()?;
+                Ok(removed)
             }
         }
     }
 
     /// Immediately deletes all persisted dictations.
     pub fn clear(&self) -> Result<usize> {
-        Ok(self
-            .connection
-            .execute("DELETE FROM dictation_history", [])?)
+        let transaction = self.connection.unchecked_transaction()?;
+        let removed = transaction.execute("DELETE FROM dictation_history", [])?;
+        transaction.execute("DELETE FROM interrupted_dictation", [])?;
+        transaction.execute("DELETE FROM recovery_tombstones", [])?;
+        transaction.execute("UPDATE persistence_settings SET value=CAST(value AS INTEGER)+1 WHERE key='recovery_epoch'", [])?;
+        transaction.commit()?;
+        Ok(removed)
     }
 
     pub fn count(&self) -> Result<u64> {

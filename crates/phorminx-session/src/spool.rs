@@ -348,6 +348,83 @@ impl<S: SpoolStorage> EncryptedAudioSpool<S> {
         self.index.iter().map(|record| record.range)
     }
 
+    /// Physically removes every complete encrypted record ending at or before
+    /// `frontier`. The record intersecting the frontier is retained so callers
+    /// never discard uncommitted audio; with the default record size this keeps
+    /// at most one extra second.
+    ///
+    /// Returns the earliest sample still readable from the spool, or the
+    /// append frontier when no records remain.
+    pub fn discard_complete_before(&mut self, frontier: u64) -> Result<u64, SpoolError> {
+        self.ensure_healthy()?;
+        let Some(end) = self.next_sample else {
+            return Ok(frontier);
+        };
+        let origin = self.origin_sample.unwrap_or(end);
+        if frontier <= origin {
+            return Ok(origin);
+        }
+        if frontier > end {
+            return Err(SpoolError::ReadOutOfBounds {
+                available: SampleRange::new(origin, end)
+                    .expect("spool origin cannot exceed its frontier"),
+                requested: SampleRange::new(origin, frontier)
+                    .expect("discard frontier follows the spool origin"),
+            });
+        }
+
+        let remove_count = self
+            .index
+            .iter()
+            .take_while(|record| record.range.end() <= frontier)
+            .count();
+        if remove_count == 0 {
+            return Ok(origin);
+        }
+
+        // Copy retained ciphertext toward the file prefix in ascending order.
+        // Source ranges can overlap the destination, but every destination is
+        // strictly before its source, so an ascending copy cannot overwrite a
+        // later unread record. Record headers/AAD remain byte-for-byte intact.
+        let mut destination = FILE_PREFIX_LEN as u64;
+        for record in &mut self.index[remove_count..] {
+            let record_len = (RECORD_HEADER_LEN as u64)
+                .checked_add(u64::from(record.sealed_len))
+                .ok_or(SpoolError::QuotaExceeded)?;
+            let allocation = usize::try_from(record_len).map_err(|_| SpoolError::RecordTooLarge)?;
+            let mut bytes = Zeroizing::new(Vec::new());
+            bytes
+                .try_reserve_exact(allocation)
+                .map_err(|_| SpoolError::AllocationFailed)?;
+            bytes.resize(allocation, 0);
+            self.storage.seek(SeekFrom::Start(record.offset))?;
+            read_exact_classified(&mut self.storage, &mut bytes)?;
+            self.storage.seek(SeekFrom::Start(destination))?;
+            if let Err(error) = self.storage.write_all(&bytes) {
+                self.poisoned = true;
+                return Err(SpoolError::Io(error));
+            }
+            record.offset = destination;
+            destination = destination
+                .checked_add(record_len)
+                .ok_or(SpoolError::QuotaExceeded)?;
+        }
+        if let Err(error) = self.storage.set_len(destination) {
+            self.poisoned = true;
+            return Err(SpoolError::Io(error));
+        }
+        if let Err(error) = self.storage.sync_all() {
+            self.poisoned = true;
+            return Err(SpoolError::Io(error));
+        }
+
+        self.index.drain(..remove_count);
+        self.file_len = destination;
+        self.origin_sample = self.index.first().map(|record| record.range.start());
+        self.sample_count = self.index.iter().map(|record| record.range.len()).sum();
+        Ok(self.origin_sample.unwrap_or(end))
+    }
+
     pub fn append(&mut self, span: &AudioSpan) -> Result<(), SpoolError> {
         self.ensure_healthy()?;
         if let Some(expected) = self.next_sample

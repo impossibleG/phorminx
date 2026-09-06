@@ -20,7 +20,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{CaptureError, StreamingAudio, WHISPER_SAMPLE_RATE};
 
-const DEFAULT_SHORT_LIMIT: Duration = Duration::from_secs(120);
+const DEFAULT_SHORT_LIMIT: Duration = Duration::from_secs(45);
 const DEFAULT_TRANSITION_LEAD: Duration = Duration::from_secs(5);
 const DEFAULT_CALLBACK_BUFFER: Duration = Duration::from_secs(2);
 const DEFAULT_SPOOL_RECORD: Duration = Duration::from_secs(1);
@@ -30,6 +30,7 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 const FINALIZATION_TIMEOUT: Duration = Duration::from_secs(5);
 const RESAMPLER_CHUNK_FRAMES: usize = 1_024;
 const MAX_PUMP_BATCH_FRAMES: usize = 262_144;
+const SPEECH_EVIDENCE_WINDOW_SAMPLES: u64 = 1_600; // 100 ms at 16 kHz
 
 /// Extended capture policy. Durations are converted to exact canonical 16 kHz sample bounds.
 #[derive(Clone, Debug)]
@@ -42,6 +43,10 @@ pub struct ExtendedCaptureConfig {
     pub spool_record_duration: Duration,
     pub pump_batch_frames: usize,
     pub pump_poll_interval: Duration,
+    /// Compatibility escape hatch for tests and older recovery paths. The
+    /// production default is memory-only rolling capture: a stalled recognizer
+    /// reports a typed backlog fault instead of accumulating a recording.
+    pub spill_uncommitted_to_disk: bool,
 }
 
 /// Startup-validated capture resources reused by every hotkey activation.
@@ -124,6 +129,7 @@ impl ExtendedCaptureConfig {
             spool_record_duration: DEFAULT_SPOOL_RECORD,
             pump_batch_frames: DEFAULT_PUMP_BATCH_FRAMES,
             pump_poll_interval: DEFAULT_POLL_INTERVAL,
+            spill_uncommitted_to_disk: false,
         }
     }
 
@@ -157,6 +163,7 @@ impl ExtendedCaptureConfig {
             short_limit,
             record_samples: u32::try_from(record_samples)
                 .map_err(|_| ExtendedCaptureFault::InvalidConfiguration)?,
+            spill_uncommitted_to_disk: self.spill_uncommitted_to_disk,
         })
     }
 }
@@ -167,6 +174,7 @@ struct CaptureBounds {
     transition_at: u64,
     short_limit: u64,
     record_samples: u32,
+    spill_uncommitted_to_disk: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,17 +188,57 @@ pub enum ExtendedStorageKind {
 pub struct ExtendedCaptureProgress {
     pub native_frames_observed: u64,
     pub canonical_samples: u64,
+    /// Absolute canonical sample frontier before which audio has been safely
+    /// committed to text and evicted.
+    pub retained_from: u64,
     pub resident_samples: u64,
     pub peak_resident_samples: u64,
     pub dropped_native_frames: u64,
     pub backend_warning_count: u64,
     pub storage: ExtendedStorageKind,
     pub sticky_fault: Option<ExtendedCaptureFault>,
+    /// Bitwise `f64` mean-square energy for the complete session observed so
+    /// far. Kept private so callers use `session_rms()` and cannot mistake the
+    /// transport representation for an audio sample count.
+    session_mean_square_bits: u64,
+    /// Highest bounded-window RMS observed anywhere in the session. Unlike
+    /// whole-session RMS, this cannot be diluted by a long pause after speech.
+    peak_window_mean_square_bits: u64,
+    /// Recognition-backed speech evidence published by the app after a worker
+    /// owns nonempty text.
+    pub recognized_speech: bool,
+}
+
+/// Wait-free, coalescing transcript-ownership publication from a recognizer
+/// directly to the capture pump. The main UI loop is deliberately bypassed.
+#[derive(Clone)]
+pub struct OwnershipAcknowledger {
+    progress: Arc<SharedProgress>,
+    wake: SyncSender<()>,
+}
+
+impl OwnershipAcknowledger {
+    pub fn acknowledge(&self, frontier: u64) {
+        self.progress
+            .requested_reclaim
+            .fetch_max(frontier, Ordering::AcqRel);
+        let _ = self.wake.try_send(());
+    }
 }
 
 impl ExtendedCaptureProgress {
     pub fn duration(self) -> Duration {
         Duration::from_secs_f64(self.canonical_samples as f64 / f64::from(WHISPER_SAMPLE_RATE))
+    }
+
+    /// RMS across the entire canonical session, including audio already
+    /// committed to text and reclaimed from the rolling buffer.
+    pub fn session_rms(self) -> f32 {
+        f64::from_bits(self.session_mean_square_bits).sqrt() as f32
+    }
+
+    pub fn peak_window_rms(self) -> f32 {
+        f64::from_bits(self.peak_window_mean_square_bits).sqrt() as f32
     }
 }
 
@@ -222,6 +270,8 @@ pub enum ExtendedCaptureFault {
     FinalizerBusy,
     #[error("audio finalization exceeded its bounded deadline")]
     FinalizationTimeout,
+    #[error("speech recognition could not safely commit audio before the rolling buffer filled")]
+    UncommittedAudioBacklog,
 }
 
 impl ExtendedCaptureFault {
@@ -240,6 +290,7 @@ impl ExtendedCaptureFault {
             Self::StreamFailed => 11,
             Self::FinalizerBusy => 12,
             Self::FinalizationTimeout => 13,
+            Self::UncommittedAudioBacklog => 14,
         }
     }
 
@@ -258,6 +309,7 @@ impl ExtendedCaptureFault {
             11 => Some(Self::StreamFailed),
             12 => Some(Self::FinalizerBusy),
             13 => Some(Self::FinalizationTimeout),
+            14 => Some(Self::UncommittedAudioBacklog),
             _ => None,
         }
     }
@@ -266,12 +318,17 @@ impl ExtendedCaptureFault {
 struct SharedProgress {
     native_frames: AtomicU64,
     canonical_samples: AtomicU64,
+    retained_from: AtomicU64,
     resident_samples: AtomicU64,
     peak_resident_samples: AtomicU64,
     dropped_frames: AtomicU64,
     backend_warnings: AtomicU64,
     storage: AtomicU8,
     fault: AtomicU8,
+    session_mean_square: AtomicU64,
+    peak_window_mean_square: AtomicU64,
+    recognized_speech: AtomicBool,
+    requested_reclaim: AtomicU64,
 }
 
 impl SharedProgress {
@@ -279,12 +336,17 @@ impl SharedProgress {
         Self {
             native_frames: AtomicU64::new(0),
             canonical_samples: AtomicU64::new(0),
+            retained_from: AtomicU64::new(0),
             resident_samples: AtomicU64::new(0),
             peak_resident_samples: AtomicU64::new(0),
             dropped_frames: AtomicU64::new(0),
             backend_warnings: AtomicU64::new(0),
             storage: AtomicU8::new(0),
             fault: AtomicU8::new(0),
+            session_mean_square: AtomicU64::new(0.0_f64.to_bits()),
+            peak_window_mean_square: AtomicU64::new(0.0_f64.to_bits()),
+            recognized_speech: AtomicBool::new(false),
+            requested_reclaim: AtomicU64::new(0),
         }
     }
 
@@ -297,12 +359,16 @@ impl SharedProgress {
         ExtendedCaptureProgress {
             native_frames_observed: self.native_frames.load(Ordering::Acquire),
             canonical_samples: self.canonical_samples.load(Ordering::Acquire),
+            retained_from: self.retained_from.load(Ordering::Acquire),
             resident_samples: self.resident_samples.load(Ordering::Acquire),
             peak_resident_samples: self.peak_resident_samples.load(Ordering::Acquire),
             dropped_native_frames: self.dropped_frames.load(Ordering::Acquire),
             backend_warning_count: self.backend_warnings.load(Ordering::Acquire),
             storage,
             sticky_fault: ExtendedCaptureFault::from_code(self.fault.load(Ordering::Acquire)),
+            session_mean_square_bits: self.session_mean_square.load(Ordering::Acquire),
+            peak_window_mean_square_bits: self.peak_window_mean_square.load(Ordering::Acquire),
+            recognized_speech: self.recognized_speech.load(Ordering::Acquire),
         }
     }
 
@@ -319,10 +385,15 @@ enum PumpCommand {
         reply: SyncSender<Result<AudioSpan, ExtendedCaptureFault>>,
         cancelled: Arc<AtomicBool>,
     },
+    DiscardBefore {
+        frontier: u64,
+        reply: SyncSender<Result<u64, ExtendedCaptureFault>>,
+    },
 }
 
 struct PumpControl {
     commands: Receiver<PumpCommand>,
+    ownership_wake: Receiver<()>,
     stop: Arc<AtomicBool>,
     progress: Arc<SharedProgress>,
 }
@@ -335,6 +406,7 @@ pub struct ExtendedRecording {
     worker: Option<JoinHandle<()>>,
     finalized: Option<Receiver<Result<FinalizedCapture, ExtendedCaptureFault>>>,
     progress: Arc<SharedProgress>,
+    ownership_wake: SyncSender<()>,
     streaming_cursor: u64,
     auto_stopped: bool,
 }
@@ -352,8 +424,22 @@ impl ExtendedRecording {
         self.progress.snapshot()
     }
 
+    pub fn ownership_acknowledger(&self) -> OwnershipAcknowledger {
+        OwnershipAcknowledger {
+            progress: Arc::clone(&self.progress),
+            wake: self.ownership_wake.clone(),
+        }
+    }
+
     pub fn mark_auto_stopped(&mut self) {
         self.auto_stopped = true;
+    }
+
+    /// Records recognition-backed evidence without moving any audio frontier.
+    pub fn mark_recognized_speech(&self) {
+        self.progress
+            .recognized_speech
+            .store(true, Ordering::Release);
     }
 
     pub const fn was_auto_stopped(&self) -> bool {
@@ -444,6 +530,30 @@ impl ExtendedRecording {
                     ExtendedCaptureFault::WorkerUnavailable,
                 ))
             }
+        }
+    }
+
+    /// Evicts audio strictly behind a transcript commit frontier. The returned
+    /// absolute sample is the earliest sample still readable; storage record
+    /// granularity may conservatively retain a small prefix.
+    pub fn discard_before(&self, frontier: u64) -> Result<u64, CaptureError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        match self
+            .commands
+            .try_send(PumpCommand::DiscardBefore { frontier, reply })
+        {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                return Err(CaptureError::Extended(
+                    ExtendedCaptureFault::WorkerUnavailable,
+                ));
+            }
+        }
+        match response.recv_timeout(SNAPSHOT_TIMEOUT) {
+            Ok(result) => result.map_err(CaptureError::Extended),
+            Err(_) => Err(CaptureError::Extended(
+                ExtendedCaptureFault::WorkerUnavailable,
+            )),
         }
     }
 
@@ -556,6 +666,13 @@ impl Drop for FinalizedCapture {
 }
 
 impl ExtendedCapturedAudio {
+    pub const fn retained_from(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .expect("captured audio owns finalized storage")
+            .retained_from
+    }
+
     pub const fn total_samples(&self) -> u64 {
         self.inner
             .as_ref()
@@ -571,13 +688,11 @@ impl ExtendedCapturedAudio {
     }
 
     pub const fn is_extended(&self) -> bool {
-        matches!(
-            self.inner
-                .as_ref()
-                .expect("captured audio owns finalized storage")
-                .storage,
-            FinalizedStorage::Spool(_)
-        )
+        let inner = self
+            .inner
+            .as_ref()
+            .expect("captured audio owns finalized storage");
+        inner.retained_from != 0 || matches!(inner.storage, FinalizedStorage::Spool(_))
     }
 
     pub fn snapshot(&mut self, range: SampleRange) -> Result<AudioSpan, CaptureError> {
@@ -736,6 +851,7 @@ fn start_extended_prepared(
     // The app only needs the newest synchronous snapshot. Bounding this lane prevents
     // stale requests from forming an unbounded FIFO behind microphone ingest.
     let (commands, command_rx) = mpsc::sync_channel(1);
+    let (ownership_wake, ownership_wake_rx) = mpsc::sync_channel(1);
     let stream = build_extended_stream(
         &device,
         &stream_config,
@@ -760,6 +876,7 @@ fn start_extended_prepared(
                 spool_root,
                 PumpControl {
                     commands: command_rx,
+                    ownership_wake: ownership_wake_rx,
                     stop: worker_stop,
                     progress: worker_progress,
                 },
@@ -773,7 +890,16 @@ fn start_extended_prepared(
                     }));
                 }
                 Err(fault) => {
-                    finalizer_permit.block();
+                    if !fault_requires_finalizer_quarantine(fault) {
+                        // The rolling buffer deliberately stops before it can
+                        // overwrite uncommitted audio. No disk-backed storage
+                        // exists on this production path, so there is nothing
+                        // to quarantine after the pump exits. Releasing the
+                        // permit lets the next dictation start normally.
+                        drop(finalizer_permit);
+                    } else {
+                        finalizer_permit.block();
+                    }
                     let _ = finalized_tx.try_send(Err(fault));
                 }
             }
@@ -808,9 +934,14 @@ fn start_extended_prepared(
         worker: Some(worker),
         finalized: Some(finalized_rx),
         progress,
+        ownership_wake,
         streaming_cursor: 0,
         auto_stopped: false,
     })
+}
+
+const fn fault_requires_finalizer_quarantine(fault: ExtendedCaptureFault) -> bool {
+    !matches!(fault, ExtendedCaptureFault::UncommittedAudioBacklog)
 }
 
 fn build_extended_stream(
@@ -920,6 +1051,7 @@ fn run_pump(
     let spool_quota = config.spool_quota;
     let PumpControl {
         commands,
+        ownership_wake,
         stop,
         progress,
     } = control;
@@ -946,8 +1078,37 @@ fn run_pump(
         .map_err(|_| ExtendedCaptureFault::InvalidConfiguration)?;
     batch.resize(config.pump_batch_frames, 0.0);
     loop {
-        let count = consumer.pop_slice(&mut batch);
         propagate_shared_fault(&mut engine, &progress);
+        while ownership_wake.try_recv().is_ok() {
+            apply_published_ownership(&mut engine, &progress);
+        }
+        // Ownership ACKs already waiting in the bounded command lane must be
+        // applied before another capture batch consumes the final free ring
+        // capacity. This makes the worker/capture frontier linearizable at the
+        // exact backlog boundary.
+        if stop.load(Ordering::Acquire) && consumer.is_empty() {
+            break;
+        }
+        if let Ok(command) = commands.try_recv() {
+            service_pump_command(&mut engine, command);
+        }
+
+        let count = consumer.pop_slice(&mut batch);
+        if count != 0 && engine.would_exceed_uncommitted_memory(count) {
+            // A worker ACK wakes this dedicated lane immediately; it cannot
+            // sit behind the app's hotkey/UI polling interval. The frontier is
+            // loaded even on timeout because publishing it and sending this
+            // best-effort wake are deliberately separate operations.
+            wait_for_published_ownership(
+                &mut engine,
+                &progress,
+                &ownership_wake,
+                config.pump_poll_interval,
+            );
+            if let Ok(command) = commands.try_recv() {
+                service_pump_command(&mut engine, command);
+            }
+        }
         if count != 0
             && engine.fault.is_none()
             && let Err(fault) = engine.ingest_native(&batch[..count])
@@ -955,34 +1116,64 @@ fn run_pump(
             progress.set_fault(fault);
         }
         batch[..count].zeroize();
-
-        // Stop/finalize has priority over diagnostic snapshots, and the bounded
-        // command lane permits at most one request per ingest turn.
-        if stop.load(Ordering::Acquire) && consumer.is_empty() {
-            break;
-        }
-        if let Ok(command) = commands.try_recv() {
-            match command {
-                PumpCommand::Snapshot {
-                    range,
-                    reply,
-                    cancelled,
-                } => {
-                    if !cancelled.load(Ordering::Acquire) {
-                        let result = engine.snapshot(range);
-                        if !cancelled.load(Ordering::Acquire) {
-                            let _ = reply.try_send(result);
-                        }
-                    }
-                }
-            }
-        }
         if count == 0 {
             thread::sleep(config.pump_poll_interval);
         }
     }
     propagate_shared_fault(&mut engine, &progress);
     engine.finalize(progress.backend_warnings.load(Ordering::Acquire))
+}
+
+fn apply_published_ownership<S, C>(engine: &mut CaptureEngine<S, C>, progress: &SharedProgress)
+where
+    S: SpoolStorage,
+    C: FnMut() -> Result<EncryptedAudioSpool<S>, SpoolError>,
+{
+    let frontier = progress.requested_reclaim.load(Ordering::Acquire);
+    if frontier > engine.retained_from
+        && frontier <= engine.canonical_samples
+        && let Err(fault) = engine.discard_before(frontier)
+    {
+        progress.set_fault(fault);
+    }
+}
+
+fn wait_for_published_ownership<S, C>(
+    engine: &mut CaptureEngine<S, C>,
+    progress: &SharedProgress,
+    wake: &Receiver<()>,
+    timeout: Duration,
+) where
+    S: SpoolStorage,
+    C: FnMut() -> Result<EncryptedAudioSpool<S>, SpoolError>,
+{
+    let _ = wake.recv_timeout(timeout);
+    apply_published_ownership(engine, progress);
+}
+
+fn service_pump_command<S, C>(engine: &mut CaptureEngine<S, C>, command: PumpCommand)
+where
+    S: SpoolStorage,
+    C: FnMut() -> Result<EncryptedAudioSpool<S>, SpoolError>,
+{
+    match command {
+        PumpCommand::Snapshot {
+            range,
+            reply,
+            cancelled,
+        } => {
+            if !cancelled.load(Ordering::Acquire) {
+                let result = engine.snapshot(range);
+                if !cancelled.load(Ordering::Acquire) {
+                    let _ = reply.try_send(result);
+                }
+            }
+        }
+        PumpCommand::DiscardBefore { frontier, reply } => {
+            let result = engine.discard_before(frontier);
+            let _ = reply.try_send(result);
+        }
+    }
 }
 
 fn propagate_shared_fault<S, C>(engine: &mut CaptureEngine<S, C>, progress: &SharedProgress)
@@ -1000,8 +1191,118 @@ enum FinalizedStorage<S: SpoolStorage> {
     Spool(EncryptedAudioSpool<S>),
 }
 
+/// Fixed-capacity canonical-audio ring. Advancing the committed frontier only
+/// moves metadata; it never memmoves audio on the capture pump.
+struct RollingAudio {
+    samples: Zeroizing<Vec<f32>>,
+    head: usize,
+    len: usize,
+    origin: u64,
+}
+
+impl RollingAudio {
+    fn new(capacity: usize) -> Result<Self, ExtendedCaptureFault> {
+        let mut samples = Zeroizing::new(Vec::new());
+        samples
+            .try_reserve_exact(capacity)
+            .map_err(|_| ExtendedCaptureFault::InvalidConfiguration)?;
+        samples.resize(capacity, 0.0);
+        Ok(Self {
+            samples,
+            head: 0,
+            len: 0,
+            origin: 0,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn end(&self) -> u64 {
+        self.origin.saturating_add(self.len as u64)
+    }
+
+    fn push(&mut self, input: &[f32]) -> Result<(), ExtendedCaptureFault> {
+        if input.len() > self.samples.len().saturating_sub(self.len) {
+            return Err(ExtendedCaptureFault::UncommittedAudioBacklog);
+        }
+        if input.is_empty() {
+            return Ok(());
+        }
+        let capacity = self.samples.len();
+        let tail = (self.head + self.len) % capacity;
+        let first = input.len().min(capacity - tail);
+        self.samples[tail..tail + first].copy_from_slice(&input[..first]);
+        if first < input.len() {
+            self.samples[..input.len() - first].copy_from_slice(&input[first..]);
+        }
+        self.len += input.len();
+        Ok(())
+    }
+
+    fn discard_before(&mut self, frontier: u64) -> Result<(), ExtendedCaptureFault> {
+        if frontier < self.origin || frontier > self.end() {
+            return Err(ExtendedCaptureFault::InvalidSnapshot);
+        }
+        let count = usize::try_from(frontier - self.origin)
+            .map_err(|_| ExtendedCaptureFault::SampleAccountingOverflow)?;
+        if !self.samples.is_empty() {
+            let first = count.min(self.samples.len() - self.head);
+            self.samples[self.head..self.head + first].zeroize();
+            if first < count {
+                self.samples[..count - first].zeroize();
+            }
+            self.head = (self.head + count) % self.samples.len();
+        }
+        self.len -= count;
+        self.origin = frontier;
+        Ok(())
+    }
+
+    fn copy_range(&self, range: SampleRange) -> Result<Vec<f32>, ExtendedCaptureFault> {
+        if range.start() < self.origin || range.end() > self.end() {
+            return Err(ExtendedCaptureFault::InvalidSnapshot);
+        }
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
+        let offset = usize::try_from(range.start() - self.origin)
+            .map_err(|_| ExtendedCaptureFault::InvalidSnapshot)?;
+        let length =
+            usize::try_from(range.len()).map_err(|_| ExtendedCaptureFault::InvalidSnapshot)?;
+        let capacity = self.samples.len();
+        let start = (self.head + offset) % capacity;
+        let first = length.min(capacity - start);
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(length)
+            .map_err(|_| ExtendedCaptureFault::InvalidSnapshot)?;
+        output.extend_from_slice(&self.samples[start..start + first]);
+        if first < length {
+            output.extend_from_slice(&self.samples[..length - first]);
+        }
+        Ok(output)
+    }
+
+    fn into_samples(self) -> Result<Zeroizing<Vec<f32>>, ExtendedCaptureFault> {
+        let end = self.end();
+        let range = SampleRange::new(self.origin, end)
+            .map_err(|_| ExtendedCaptureFault::InvalidSnapshot)?;
+        if range.is_empty() {
+            return Ok(Zeroizing::new(Vec::new()));
+        }
+        self.copy_range(range).map(Zeroizing::new)
+    }
+}
+
 struct EngineFinalized<S: SpoolStorage> {
     storage: FinalizedStorage<S>,
+    retained_from: u64,
     total_samples: u64,
     backend_warning_count: u64,
     fault: Option<ExtendedCaptureFault>,
@@ -1012,14 +1313,17 @@ impl<S: SpoolStorage> EngineFinalized<S> {
         if let Some(fault) = self.fault {
             return Err(fault);
         }
-        if range.is_empty() || range.end() > self.total_samples {
+        if range.is_empty()
+            || range.start() < self.retained_from
+            || range.end() > self.total_samples
+        {
             return Err(ExtendedCaptureFault::InvalidSnapshot);
         }
         let result = match &mut self.storage {
             FinalizedStorage::Memory(samples) => {
-                let start = usize::try_from(range.start())
+                let start = usize::try_from(range.start() - self.retained_from)
                     .map_err(|_| ExtendedCaptureFault::InvalidSnapshot)?;
-                let end = usize::try_from(range.end())
+                let end = usize::try_from(range.end() - self.retained_from)
                     .map_err(|_| ExtendedCaptureFault::InvalidSnapshot)?;
                 AudioSpan::new(range.start(), samples[start..end].to_vec())
                     .map_err(|_| ExtendedCaptureFault::InvalidSnapshot)
@@ -1046,8 +1350,13 @@ where
     spool: Option<EncryptedAudioSpool<S>>,
     spool_pending: Zeroizing<Vec<f32>>,
     spooled_through: u64,
-    memory: Zeroizing<Vec<f32>>,
+    memory: RollingAudio,
+    retained_from: u64,
     canonical_samples: u64,
+    session_square_sum: f64,
+    evidence_window_square_sum: f64,
+    evidence_window_samples: u64,
+    peak_window_mean_square: f64,
     fault: Option<ExtendedCaptureFault>,
     progress: Option<Arc<SharedProgress>>,
 }
@@ -1065,10 +1374,7 @@ where
     ) -> Result<Self, ExtendedCaptureFault> {
         let memory_capacity = usize::try_from(bounds.short_limit)
             .map_err(|_| ExtendedCaptureFault::InvalidConfiguration)?;
-        let mut memory = Zeroizing::new(Vec::new());
-        memory
-            .try_reserve_exact(memory_capacity)
-            .map_err(|_| ExtendedCaptureFault::InvalidConfiguration)?;
+        let memory = RollingAudio::new(memory_capacity)?;
         Ok(Self {
             canonicalizer: StreamingCanonicalizer::new(source_rate)?,
             bounds,
@@ -1077,7 +1383,12 @@ where
             spool_pending: Zeroizing::new(Vec::with_capacity(bounds.record_samples as usize)),
             spooled_through: 0,
             memory,
+            retained_from: 0,
             canonical_samples: 0,
+            session_square_sum: 0.0,
+            evidence_window_square_sum: 0.0,
+            evidence_window_samples: 0,
+            peak_window_mean_square: 0.0,
             fault: None,
             progress,
         })
@@ -1098,17 +1409,37 @@ where
         self.store_canonical(&canonical)
     }
 
+    fn would_exceed_uncommitted_memory(&self, native_samples: usize) -> bool {
+        if self.bounds.spill_uncommitted_to_disk || self.fault.is_some() {
+            return false;
+        }
+        let Some(native_end) = self
+            .canonicalizer
+            .native_received
+            .checked_add(native_samples as u64)
+        else {
+            return true;
+        };
+        let Ok(target_end) = resampled_len(native_end, self.canonicalizer.source_rate) else {
+            return true;
+        };
+        let possible_output = target_end.saturating_sub(self.canonicalizer.canonical_emitted);
+        self.canonical_samples
+            .saturating_add(possible_output)
+            .saturating_sub(self.retained_from)
+            > self.bounds.short_limit
+    }
+
     fn snapshot(&mut self, range: SampleRange) -> Result<AudioSpan, ExtendedCaptureFault> {
         self.ensure_healthy()?;
-        if range.is_empty() || range.end() > self.canonical_samples {
+        if range.is_empty()
+            || range.start() < self.retained_from
+            || range.end() > self.canonical_samples
+        {
             return Err(ExtendedCaptureFault::InvalidSnapshot);
         }
         if !self.memory.is_empty() {
-            let start = usize::try_from(range.start())
-                .map_err(|_| ExtendedCaptureFault::InvalidSnapshot)?;
-            let end =
-                usize::try_from(range.end()).map_err(|_| ExtendedCaptureFault::InvalidSnapshot)?;
-            return AudioSpan::new(range.start(), self.memory[start..end].to_vec())
+            return AudioSpan::new(range.start(), self.memory.copy_range(range)?)
                 .map_err(|_| ExtendedCaptureFault::InvalidSnapshot);
         }
         // Live snapshots must not force a partial record to disk: doing so makes
@@ -1145,28 +1476,69 @@ where
             .map_err(|_| ExtendedCaptureFault::InvalidSnapshot)
     }
 
+    fn discard_before(&mut self, frontier: u64) -> Result<u64, ExtendedCaptureFault> {
+        self.ensure_healthy()?;
+        if frontier <= self.retained_from {
+            return Ok(self.retained_from);
+        }
+        if frontier > self.canonical_samples {
+            return Err(ExtendedCaptureFault::InvalidSnapshot);
+        }
+
+        if !self.memory.is_empty() {
+            self.memory.discard_before(frontier)?;
+            self.retained_from = frontier;
+            self.spooled_through = frontier;
+        } else {
+            // Pending samples are deliberately retained. Evicting only complete
+            // encrypted records avoids rewriting recognition-adjacent partial
+            // records and keeps at most one record of extra audio.
+            let actual = self
+                .spool
+                .as_mut()
+                .ok_or(ExtendedCaptureFault::SampleAccountingOverflow)?
+                .discard_complete_before(frontier.min(self.spooled_through))
+                .map_err(map_spool_error)?;
+            self.retained_from = actual;
+        }
+        self.update_progress();
+        Ok(self.retained_from)
+    }
+
     fn finalize(
         mut self,
         backend_warning_count: u64,
     ) -> Result<EngineFinalized<S>, ExtendedCaptureFault> {
-        self.ensure_healthy()?;
-        let tail = self
-            .canonicalizer
-            .finish()
-            .map_err(|fault| self.set_fault(fault))?;
-        self.store_canonical(&tail)?;
-        self.ensure_healthy()?;
+        let stopped_for_backlog = self.fault == Some(ExtendedCaptureFault::UncommittedAudioBacklog);
+        if stopped_for_backlog {
+            // This fault is the rolling buffer doing its job: it stopped before
+            // overwriting audio that the recognizer had not committed. Hand the
+            // complete canonical prefix already resident in the buffer to the
+            // final recognizer instead of turning the protective stop into a
+            // transcription failure. The native batch that did not fit was
+            // never counted as captured audio.
+            self.fault = None;
+        } else {
+            self.ensure_healthy()?;
+            let tail = self
+                .canonicalizer
+                .finish()
+                .map_err(|fault| self.set_fault(fault))?;
+            self.store_canonical(&tail)?;
+            self.ensure_healthy()?;
+        }
 
         if backend_warning_count != 0 {
             return Err(self.set_fault(ExtendedCaptureFault::StreamFailed));
         }
 
-        if self.canonical_samples <= self.bounds.short_limit {
+        if self.canonical_samples.saturating_sub(self.retained_from) <= self.bounds.short_limit {
             if let Some(spool) = self.spool.take() {
                 spool.cleanup().map_err(map_spool_error)?;
             }
             return Ok(EngineFinalized {
-                storage: FinalizedStorage::Memory(self.memory),
+                storage: FinalizedStorage::Memory(self.memory.into_samples()?),
+                retained_from: self.retained_from,
                 total_samples: self.canonical_samples,
                 backend_warning_count,
                 fault: None,
@@ -1180,6 +1552,7 @@ where
         spool.flush().map_err(map_spool_error)?;
         Ok(EngineFinalized {
             storage: FinalizedStorage::Spool(spool),
+            retained_from: self.retained_from,
             total_samples: self.canonical_samples,
             backend_warning_count,
             fault: None,
@@ -1197,15 +1570,25 @@ where
             .checked_add(sample_count)
             .ok_or_else(|| self.set_fault(ExtendedCaptureFault::SampleAccountingOverflow))?;
 
-        if next <= self.bounds.short_limit {
-            self.memory.extend_from_slice(samples);
-            if self.spool.is_none() && next >= self.bounds.prepare_at {
+        let retained_next = next
+            .checked_sub(self.retained_from)
+            .ok_or_else(|| self.set_fault(ExtendedCaptureFault::SampleAccountingOverflow))?;
+        if retained_next <= self.bounds.short_limit {
+            self.memory
+                .push(samples)
+                .map_err(|fault| self.set_fault(fault))?;
+            if self.bounds.spill_uncommitted_to_disk
+                && self.spool.is_none()
+                && retained_next >= self.bounds.prepare_at
+            {
                 self.spool = Some((self._create_spool)().map_err(|error| {
                     let fault = map_spool_error(error);
                     self.set_fault(fault)
                 })?);
             }
             self.backfill_memory(Some(4))?;
+        } else if !self.bounds.spill_uncommitted_to_disk {
+            return Err(self.set_fault(ExtendedCaptureFault::UncommittedAudioBacklog));
         } else if !self.memory.is_empty() {
             if self.spool.is_none() {
                 self.spool = Some((self._create_spool)().map_err(|error| {
@@ -1214,19 +1597,23 @@ where
                 })?);
             }
             self.backfill_memory(None)?;
-            let pending_start = usize::try_from(self.spooled_through)
-                .map_err(|_| ExtendedCaptureFault::SampleAccountingOverflow)?;
-            self.spool_pending
-                .extend_from_slice(&self.memory[pending_start..]);
+            let pending = self.memory.copy_range(
+                SampleRange::new(self.spooled_through, self.memory.end())
+                    .map_err(|_| ExtendedCaptureFault::SampleAccountingOverflow)?,
+            )?;
+            self.spool_pending.extend_from_slice(&pending);
             self.spool_pending.extend_from_slice(samples);
             self.flush_spool_pending(false)?;
-            self.memory.zeroize();
-            self.memory.clear();
-            self.memory.shrink_to_fit();
+            self.memory = RollingAudio::new(0)?;
         } else {
             self.spool_pending.extend_from_slice(samples);
             self.flush_spool_pending(false)?;
         }
+        self.session_square_sum += samples
+            .iter()
+            .map(|sample| f64::from(*sample) * f64::from(*sample))
+            .sum::<f64>();
+        self.observe_speech_energy(samples);
         self.canonical_samples = next;
         self.update_progress();
         Ok(())
@@ -1236,8 +1623,13 @@ where
         &mut self,
         maximum_records: Option<usize>,
     ) -> Result<(), ExtendedCaptureFault> {
-        let available = u64::try_from(self.memory.len())
-            .map_err(|_| self.set_fault(ExtendedCaptureFault::SampleAccountingOverflow))?;
+        let available = self
+            .retained_from
+            .checked_add(
+                u64::try_from(self.memory.len())
+                    .map_err(|_| self.set_fault(ExtendedCaptureFault::SampleAccountingOverflow))?,
+            )
+            .ok_or_else(|| self.set_fault(ExtendedCaptureFault::SampleAccountingOverflow))?;
         if self.spool.is_none() || self.spooled_through >= available {
             return Ok(());
         }
@@ -1252,16 +1644,16 @@ where
         if capped_end <= self.spooled_through {
             return Ok(());
         }
-        let start = usize::try_from(self.spooled_through)
-            .map_err(|_| ExtendedCaptureFault::SampleAccountingOverflow)?;
-        let end = usize::try_from(capped_end)
-            .map_err(|_| ExtendedCaptureFault::SampleAccountingOverflow)?;
+        let buffered = self.memory.copy_range(
+            SampleRange::new(self.spooled_through, capped_end)
+                .map_err(|_| ExtendedCaptureFault::SampleAccountingOverflow)?,
+        )?;
         let result = append_records(
             self.spool
                 .as_mut()
                 .ok_or(ExtendedCaptureFault::SampleAccountingOverflow)?,
             self.spooled_through,
-            &self.memory[start..end],
+            &buffered,
             self.bounds.record_samples,
         );
         if let Err(error) = result {
@@ -1321,9 +1713,31 @@ where
 
     fn update_progress(&self) {
         if let Some(progress) = &self.progress {
+            let mean_square = if self.canonical_samples == 0 {
+                0.0
+            } else {
+                self.session_square_sum / self.canonical_samples as f64
+            };
+            progress
+                .session_mean_square
+                .store(mean_square.to_bits(), Ordering::Release);
+            let partial_mean_square = if self.evidence_window_samples == 0 {
+                0.0
+            } else {
+                self.evidence_window_square_sum / self.evidence_window_samples as f64
+            };
+            progress.peak_window_mean_square.store(
+                self.peak_window_mean_square
+                    .max(partial_mean_square)
+                    .to_bits(),
+                Ordering::Release,
+            );
             progress
                 .canonical_samples
                 .store(self.canonical_samples, Ordering::Release);
+            progress
+                .retained_from
+                .store(self.retained_from, Ordering::Release);
             progress.resident_samples.store(
                 self.memory.len() as u64
                     + self.spool_pending.len() as u64
@@ -1336,7 +1750,8 @@ where
                     + self.canonicalizer.pending.len() as u64,
                 Ordering::AcqRel,
             );
-            let storage = if self.canonical_samples < self.bounds.transition_at {
+            let retained_samples = self.canonical_samples.saturating_sub(self.retained_from);
+            let storage = if retained_samples < self.bounds.transition_at {
                 0
             } else if self.memory.is_empty() {
                 2
@@ -1344,6 +1759,27 @@ where
                 1
             };
             progress.storage.store(storage, Ordering::Release);
+        }
+    }
+
+    fn observe_speech_energy(&mut self, mut samples: &[f32]) {
+        while !samples.is_empty() {
+            let remaining = SPEECH_EVIDENCE_WINDOW_SAMPLES
+                .saturating_sub(self.evidence_window_samples) as usize;
+            let take = samples.len().min(remaining.max(1));
+            self.evidence_window_square_sum += samples[..take]
+                .iter()
+                .map(|sample| f64::from(*sample) * f64::from(*sample))
+                .sum::<f64>();
+            self.evidence_window_samples = self.evidence_window_samples.saturating_add(take as u64);
+            samples = &samples[take..];
+            if self.evidence_window_samples == SPEECH_EVIDENCE_WINDOW_SAMPLES {
+                self.peak_window_mean_square = self
+                    .peak_window_mean_square
+                    .max(self.evidence_window_square_sum / SPEECH_EVIDENCE_WINDOW_SAMPLES as f64);
+                self.evidence_window_square_sum = 0.0;
+                self.evidence_window_samples = 0;
+            }
         }
     }
 }
@@ -1750,6 +2186,7 @@ mod tests {
             transition_at: short_limit.saturating_sub(u64::from(WHISPER_SAMPLE_RATE)),
             short_limit,
             record_samples: WHISPER_SAMPLE_RATE,
+            spill_uncommitted_to_disk: true,
         }
     }
 
@@ -1823,6 +2260,249 @@ mod tests {
             engine.ingest_native(&block).unwrap();
             start = end;
         }
+    }
+
+    #[test]
+    fn recognition_backlog_releases_the_next_recording_permit() {
+        assert!(!fault_requires_finalizer_quarantine(
+            ExtendedCaptureFault::UncommittedAudioBacklog
+        ));
+        assert!(fault_requires_finalizer_quarantine(
+            ExtendedCaptureFault::SpoolIntegrity
+        ));
+    }
+
+    #[test]
+    fn rolling_audio_reclaims_in_place_and_preserves_wraparound_order() {
+        let mut ring = RollingAudio::new(8).unwrap();
+        let allocation = ring.samples.as_ptr();
+        ring.push(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        ring.discard_before(4).unwrap();
+
+        assert_eq!(ring.origin, 4);
+        assert_eq!(&ring.samples[..4], &[0.0; 4]);
+        ring.push(&[6.0, 7.0, 8.0, 9.0, 10.0, 11.0]).unwrap();
+        assert_eq!(
+            ring.samples.as_ptr(),
+            allocation,
+            "ring must not reallocate"
+        );
+        assert_eq!(ring.len(), 8);
+        assert_eq!(
+            ring.copy_range(SampleRange::new(4, 12).unwrap()).unwrap(),
+            vec![4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0]
+        );
+    }
+
+    #[test]
+    fn rolling_audio_fails_closed_before_overwriting_uncommitted_samples() {
+        let mut ring = RollingAudio::new(4).unwrap();
+        ring.push(&[1.0, 2.0, 3.0, 4.0]).unwrap();
+        assert_eq!(
+            ring.push(&[5.0]).unwrap_err(),
+            ExtendedCaptureFault::UncommittedAudioBacklog
+        );
+        assert_eq!(
+            ring.copy_range(SampleRange::new(0, 4).unwrap()).unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn recognition_backlog_safe_stop_finalizes_the_complete_retained_prefix() {
+        let mut bounds = test_bounds(1.0);
+        bounds.spill_uncommitted_to_disk = false;
+        let creator = || {
+            let (storage, _) = MemoryStorage::new();
+            EncryptedAudioSpool::from_empty_storage(storage, SpoolQuota::default())
+        };
+        let mut engine = CaptureEngine::new(WHISPER_SAMPLE_RATE, bounds, creator, None).unwrap();
+        let retained = (0..u64::from(WHISPER_SAMPLE_RATE))
+            .map(pattern_sample)
+            .collect::<Vec<_>>();
+        engine.ingest_native(&retained).unwrap();
+        assert_eq!(
+            engine.ingest_native(&[0.75]).unwrap_err(),
+            ExtendedCaptureFault::UncommittedAudioBacklog
+        );
+
+        let mut finalized = engine.finalize(0).unwrap();
+        assert_eq!(finalized.retained_from, 0);
+        assert_eq!(finalized.total_samples, u64::from(WHISPER_SAMPLE_RATE));
+        let recovered = finalized
+            .snapshot(SampleRange::new(0, finalized.total_samples).unwrap())
+            .unwrap();
+        assert_eq!(recovered.samples(), retained);
+    }
+
+    #[test]
+    fn last_chance_ack_preflight_reclaims_before_the_capacity_crossing_batch() {
+        let mut bounds = test_bounds(1.0);
+        bounds.spill_uncommitted_to_disk = false;
+        let creator = || {
+            let (storage, _) = MemoryStorage::new();
+            EncryptedAudioSpool::from_empty_storage(storage, SpoolQuota::default())
+        };
+        let mut engine = CaptureEngine::new(WHISPER_SAMPLE_RATE, bounds, creator, None).unwrap();
+        engine.ingest_native(&vec![0.1; 15_000]).unwrap();
+
+        assert!(engine.would_exceed_uncommitted_memory(2_000));
+        engine.discard_before(8_000).unwrap();
+        assert!(!engine.would_exceed_uncommitted_memory(2_000));
+        engine.ingest_native(&vec![0.1; 2_000]).unwrap();
+        assert_eq!(engine.canonical_samples, 17_000);
+        assert_eq!(engine.retained_from, 8_000);
+    }
+
+    #[test]
+    fn worker_ack_reaches_capture_while_its_ui_result_remains_undispatched() {
+        let mut bounds = test_bounds(1.0);
+        bounds.spill_uncommitted_to_disk = false;
+        let progress = Arc::new(SharedProgress::new());
+        let creator = || {
+            let (storage, _) = MemoryStorage::new();
+            EncryptedAudioSpool::from_empty_storage(storage, SpoolQuota::default())
+        };
+        let mut engine = CaptureEngine::new(
+            WHISPER_SAMPLE_RATE,
+            bounds,
+            creator,
+            Some(Arc::clone(&progress)),
+        )
+        .unwrap();
+        engine.ingest_native(&vec![0.1; 15_000]).unwrap();
+        let (wake, wake_rx) = mpsc::sync_channel(1);
+        let acknowledger = OwnershipAcknowledger {
+            progress: Arc::clone(&progress),
+            wake,
+        };
+        let (worker_result, undispatched_result) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            acknowledger.acknowledge(8_000);
+            worker_result.send("partial_completed").unwrap();
+        });
+        wake_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        apply_published_ownership(&mut engine, &progress);
+
+        // The UI/main-loop result has deliberately not been received, yet the
+        // ownership frontier already freed capture capacity.
+        assert_eq!(progress.snapshot().retained_from, 8_000);
+        engine.ingest_native(&vec![0.1; 2_000]).unwrap();
+        assert_eq!(undispatched_result.recv().unwrap(), "partial_completed");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn published_ack_is_applied_even_when_its_best_effort_wake_is_not_observed() {
+        let mut bounds = test_bounds(1.0);
+        bounds.spill_uncommitted_to_disk = false;
+        let progress = Arc::new(SharedProgress::new());
+        let creator = || {
+            let (storage, _) = MemoryStorage::new();
+            EncryptedAudioSpool::from_empty_storage(storage, SpoolQuota::default())
+        };
+        let mut engine = CaptureEngine::new(
+            WHISPER_SAMPLE_RATE,
+            bounds,
+            creator,
+            Some(Arc::clone(&progress)),
+        )
+        .unwrap();
+        engine.ingest_native(&vec![0.1; 15_000]).unwrap();
+        let (_wake, wake_rx) = mpsc::sync_channel(1);
+
+        // Model the exact split-publication race: the monotonic frontier is
+        // visible, but the worker has not yet executed its best-effort wake.
+        progress.requested_reclaim.store(8_000, Ordering::Release);
+        wait_for_published_ownership(&mut engine, &progress, &wake_rx, Duration::ZERO);
+
+        assert_eq!(progress.snapshot().retained_from, 8_000);
+        engine.ingest_native(&vec![0.1; 2_000]).unwrap();
+        assert_eq!(engine.canonical_samples, 17_000);
+        assert_eq!(engine.fault, None);
+    }
+
+    #[test]
+    fn rolling_capture_runs_for_hours_without_disk_or_unbounded_memory() {
+        let mut bounds = test_bounds(45.0);
+        bounds.spill_uncommitted_to_disk = false;
+        let spool_creations = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&spool_creations);
+        let creator = move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+            let (storage, _) = MemoryStorage::new();
+            EncryptedAudioSpool::from_empty_storage(storage, SpoolQuota::default())
+        };
+        let mut engine = CaptureEngine::new(WHISPER_SAMPLE_RATE, bounds, creator, None).unwrap();
+        let chunk = u64::from(WHISPER_SAMPLE_RATE) * 20;
+        let overlap = u64::from(WHISPER_SAMPLE_RATE) * 2;
+
+        for index in 0..(3 * 60 * 60 / 20) {
+            let start = index * chunk;
+            let samples = (start..start + chunk)
+                .map(pattern_sample)
+                .collect::<Vec<_>>();
+            engine.ingest_native(&samples).unwrap();
+            let committed = engine.canonical_samples.saturating_sub(overlap);
+            engine.discard_before(committed).unwrap();
+            assert!(engine.memory.len() as u64 <= overlap);
+            assert!(engine.spool.is_none());
+        }
+
+        assert_eq!(spool_creations.load(Ordering::Relaxed), 0);
+        let retained_from = engine.retained_from;
+        let total = engine.canonical_samples;
+        let mut finalized = engine.finalize(0).unwrap();
+        assert_eq!(finalized.retained_from, retained_from);
+        assert!(matches!(finalized.storage, FinalizedStorage::Memory(_)));
+        let tail = finalized
+            .snapshot(SampleRange::new(retained_from, total).unwrap())
+            .unwrap();
+        assert_eq!(
+            tail.samples(),
+            &(retained_from..total)
+                .map(pattern_sample)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn session_rms_includes_speech_that_was_reclaimed_before_release_silence() {
+        let mut bounds = test_bounds(45.0);
+        bounds.spill_uncommitted_to_disk = false;
+        let progress = Arc::new(SharedProgress::new());
+        let observed = Arc::clone(&progress);
+        let creator = || {
+            let (storage, _) = MemoryStorage::new();
+            EncryptedAudioSpool::from_empty_storage(storage, SpoolQuota::default())
+        };
+        let mut engine =
+            CaptureEngine::new(WHISPER_SAMPLE_RATE, bounds, creator, Some(progress)).unwrap();
+
+        engine
+            .ingest_native(&vec![0.25; WHISPER_SAMPLE_RATE as usize])
+            .unwrap();
+        engine
+            .discard_before(u64::from(WHISPER_SAMPLE_RATE))
+            .unwrap();
+        for _ in 0..120 {
+            engine
+                .ingest_native(&vec![0.0; WHISPER_SAMPLE_RATE as usize])
+                .unwrap();
+            engine
+                .discard_before(engine.canonical_samples.saturating_sub(16_000 * 2))
+                .unwrap();
+        }
+
+        let snapshot = observed.snapshot();
+        let expected = (0.25_f32 * 0.25 / 121.0).sqrt();
+        assert!((snapshot.session_rms() - expected).abs() < 1e-6);
+        assert!((snapshot.peak_window_rms() - 0.25).abs() < 1e-6);
+        assert_eq!(
+            snapshot.retained_from,
+            engine.canonical_samples.saturating_sub(16_000 * 2)
+        );
     }
 
     #[test]
@@ -2239,6 +2919,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(SharedProgress::new());
         let (commands, _requests) = mpsc::sync_channel(1);
+        let (ownership_wake, _ownership_wake_rx) = mpsc::sync_channel(1);
         let (finalized_tx, finalized_rx) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
             thread::sleep(Duration::from_millis(150));
@@ -2251,6 +2932,7 @@ mod tests {
             worker: Some(worker),
             finalized: Some(finalized_rx),
             progress,
+            ownership_wake,
             streaming_cursor: 0,
             auto_stopped: false,
         };

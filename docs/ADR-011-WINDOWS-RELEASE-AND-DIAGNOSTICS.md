@@ -61,3 +61,18 @@ cargo clippy --locked -p phorminx-windows --all-targets -- -D warnings
 ```
 
 The first command validates installer invariants, creates and inspects a default diagnostic bundle, and exercises compatibility-run persistence. It does not compile an installer, sign artifacts, or perform physical compatibility tests.
+
+To produce both private-test installers, build CPU first into a separate
+output directory and then rebuild the default Vulkan edition:
+
+```powershell
+.\scripts\Build-PhorminxInstaller.ps1 -Cpu -OutputDirectory .\artifacts\installer-cpu
+.\scripts\Build-PhorminxInstaller.ps1
+```
+
+Both builds use the same intermediate executable path. The separate CPU output
+directory preserves its installer, and the final default build leaves the
+Vulkan executable and installer in the normal release locations. Do not use
+`-SkipBuild` to switch editions: it packages whichever executable currently
+occupies that shared path. The Vulkan edition still supports the CPU runtime
+backend and Auto fallback. Neither command signs the development artifacts.

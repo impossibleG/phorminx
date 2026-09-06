@@ -1,5 +1,10 @@
 # ADR-014: Accurate recognition is resident, preemptible, timestamp-stable, and backend-observable
 
+> ADR-015 supersedes the 120-second archival ceiling and full-clip fallback
+> after reclamation. Accurate recognition now repairs bounded retained audio
+> and preserves its owned text prefix. Residency, backend selection, model
+> identity, cancellation, and readiness decisions below remain applicable.
+
 ## Status
 
 Accepted for the Accurate recognition track.

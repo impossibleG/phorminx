@@ -579,6 +579,25 @@ impl ProductShellApp {
                 self.shell.clear_history_detail();
                 self.execute(UiCommand::ClearHistory);
             }
+            ShellEvent::DiscardInterrupted(session) => {
+                if let Err(error) = self.bridge.discard_interrupted(&session) {
+                    self.set_error(error.to_string());
+                }
+                self.refresh();
+            }
+            ShellEvent::CopyInterrupted(session) => {
+                match self.bridge.interrupted_text(&session) {
+                    Ok(Some(text)) => {
+                        match phorminx_windows::copy_and_maybe_paste(None, &text) {
+                            Ok(_) => { self.notice = Some(InlineNotice { kind: NoticeKind::Information, title: "Copied.".into(), detail: "Interrupted text is on the clipboard. The saved copy remains until discarded.".into(), action: None }); },
+                            Err(_) => self.set_error("The clipboard could not be updated. Your recovery text is still saved.".to_owned()),
+                        }
+                    },
+                    Ok(None) => self.set_error("This interrupted dictation is no longer available.".to_owned()),
+                    Err(_) => self.set_error("This text cannot be decrypted by this Windows account. You can discard it.".to_owned()),
+                }
+                self.refresh();
+            }
             ShellEvent::SaveLexicon(draft) => {
                 if self.execute(UiCommand::SaveLexicon(UiLexiconDraft {
                     id: draft.id,
@@ -1147,6 +1166,11 @@ fn map_snapshot(
             ),
         ],
         history_enabled: snapshot.history_enabled,
+        interrupted: snapshot
+            .interrupted
+            .into_iter()
+            .map(|record| (record.session, format_timestamp(record.updated_at_ms)))
+            .collect(),
         history,
         lexicon,
         profiles,

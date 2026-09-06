@@ -24,6 +24,11 @@ pub struct FinishedAudio<Audio = AudioClip> {
     pub audio: Audio,
     pub duration: Duration,
     pub rms: f32,
+    /// Highest bounded-window RMS seen during capture. This preserves real
+    /// speech evidence when later silence would dilute whole-session RMS.
+    pub peak_window_rms: f32,
+    /// A streaming recognizer already owns nonempty text for this audio.
+    pub recognized_speech: bool,
     pub backend_warning_count: u64,
 }
 
@@ -54,6 +59,9 @@ pub trait AppIo {
     type Recording;
     type Audio;
     type ClipboardReason;
+
+    fn begin_recording(&mut self, _id: DictationId) {}
+    fn discard_recovery(&mut self, _id: DictationId) {}
 
     fn start_recording(&mut self) -> Result<Self::Recording, String>;
     fn finish_recording(
@@ -233,6 +241,7 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
         }
 
         let id = self.machine.begin_dictation()?;
+        io.begin_recording(id);
         match io.start_recording() {
             Ok(recording) => {
                 self.recording = Some(recording);
@@ -324,8 +333,13 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
             });
         }
 
-        if captured.duration < Duration::from_millis(200) || captured.rms < self.minimum_rms {
+        let acoustically_quiet =
+            captured.rms < self.minimum_rms && captured.peak_window_rms < self.minimum_rms;
+        if captured.duration < Duration::from_millis(200)
+            || (acoustically_quiet && !captured.recognized_speech)
+        {
             self.machine.cancel()?;
+            io.discard_recovery(id);
             notices.push(RuntimeNotice::NoSpeech {
                 id,
                 event: "silence_rejected",
@@ -414,6 +428,7 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
         };
         if normalized.is_empty() {
             self.machine.cancel()?;
+            io.discard_recovery(id);
             notices.push(RuntimeNotice::NoSpeech {
                 id,
                 event: "empty_transcript_rejected",
@@ -429,6 +444,7 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
         self.machine.transition(RuntimeState::Inserting)?;
         match io.insert(self.target.take(), &normalized) {
             Ok(InsertDisposition::Pasted) => {
+                io.discard_recovery(id);
                 notices.push(RuntimeNotice::Inserted {
                     id,
                     inference_time: transcript.inference_time,
@@ -437,6 +453,7 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
                 self.machine.transition(RuntimeState::Idle)?;
             }
             Ok(InsertDisposition::ClipboardOnly(reason)) => {
+                io.discard_recovery(id);
                 notices.push(RuntimeNotice::ClipboardReady { id, reason });
                 Self::show_status(io, UiStatus::ClipboardReady, &mut notices);
                 self.machine.transition(RuntimeState::Idle)?;
@@ -588,6 +605,8 @@ mod tests {
         Speech,
         Short,
         Quiet,
+        SpeechThenSilence,
+        RecognizedQuietSpeech,
         Failure,
     }
 
@@ -620,6 +639,8 @@ mod tests {
         max_outstanding: usize,
         statuses: Vec<UiStatus>,
         recording_drops: Arc<AtomicUsize>,
+        recovery_begins: Vec<(DictationId, usize)>,
+        recovery_discards: Vec<DictationId>,
     }
 
     impl Default for FakeIo {
@@ -642,6 +663,8 @@ mod tests {
                 max_outstanding: 0,
                 statuses: Vec::new(),
                 recording_drops: Arc::new(AtomicUsize::new(0)),
+                recovery_begins: Vec::new(),
+                recovery_discards: Vec::new(),
             }
         }
     }
@@ -669,6 +692,13 @@ mod tests {
         type Audio = AudioClip;
         type ClipboardReason = FakeReason;
 
+        fn begin_recording(&mut self, id: DictationId) {
+            self.recovery_begins.push((id, self.starts));
+        }
+        fn discard_recovery(&mut self, id: DictationId) {
+            self.recovery_discards.push(id);
+        }
+
         fn start_recording(&mut self) -> Result<Self::Recording, String> {
             self.starts += 1;
             if self.start_fails {
@@ -691,18 +721,40 @@ mod tests {
                     audio: clip(3_200, 0.1),
                     duration: Duration::from_millis(200),
                     rms: 0.1,
+                    peak_window_rms: 0.1,
+                    recognized_speech: false,
                     backend_warning_count: 0,
                 }),
                 FinishPlan::Short => Ok(FinishedAudio {
                     audio: clip(1_600, 0.1),
                     duration: Duration::from_millis(100),
                     rms: 0.1,
+                    peak_window_rms: 0.1,
+                    recognized_speech: false,
                     backend_warning_count: 0,
                 }),
                 FinishPlan::Quiet => Ok(FinishedAudio {
                     audio: clip(3_200, 0.000_1),
                     duration: Duration::from_millis(200),
                     rms: 0.000_1,
+                    peak_window_rms: 0.000_1,
+                    recognized_speech: false,
+                    backend_warning_count: 0,
+                }),
+                FinishPlan::SpeechThenSilence => Ok(FinishedAudio {
+                    audio: clip(160_000, 0.0),
+                    duration: Duration::from_secs(10),
+                    rms: 0.001,
+                    peak_window_rms: 0.02,
+                    recognized_speech: false,
+                    backend_warning_count: 0,
+                }),
+                FinishPlan::RecognizedQuietSpeech => Ok(FinishedAudio {
+                    audio: clip(3_200, 0.000_1),
+                    duration: Duration::from_millis(200),
+                    rms: 0.000_1,
+                    peak_window_rms: 0.000_1,
+                    recognized_speech: true,
                     backend_warning_count: 0,
                 }),
                 FinishPlan::Failure => Err("finish failed".to_owned()),
@@ -815,6 +867,42 @@ mod tests {
         assert!(physical.is_empty());
         assert_eq!(io.submitted.len(), 1);
         assert_eq!(io.recording_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.state(), RuntimeState::Transcribing);
+    }
+
+    #[test]
+    fn prior_speech_is_not_diluted_by_release_after_long_silence() {
+        let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".to_owned()).unwrap();
+        let mut io = FakeIo::default();
+        io.reset_plan(1);
+        io.finish_plan = FinishPlan::SpeechThenSilence;
+        runtime.hold_started(Some(1), &mut io).unwrap();
+
+        let notices = runtime.hold_ended(&mut io).unwrap();
+
+        assert!(
+            notices
+                .iter()
+                .any(|notice| matches!(notice, RuntimeNotice::TranscriptionStarted { .. }))
+        );
+        assert_eq!(runtime.state(), RuntimeState::Transcribing);
+    }
+
+    #[test]
+    fn recognition_backed_text_overrides_a_conservative_acoustic_gate() {
+        let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".to_owned()).unwrap();
+        let mut io = FakeIo::default();
+        io.reset_plan(1);
+        io.finish_plan = FinishPlan::RecognizedQuietSpeech;
+        runtime.hold_started(Some(1), &mut io).unwrap();
+
+        let notices = runtime.hold_ended(&mut io).unwrap();
+
+        assert!(
+            notices
+                .iter()
+                .any(|notice| matches!(notice, RuntimeNotice::TranscriptionStarted { .. }))
+        );
         assert_eq!(runtime.state(), RuntimeState::Transcribing);
     }
 
@@ -1110,5 +1198,35 @@ mod tests {
                 ..
             } if *audio_finalization_time >= Duration::from_millis(10)
         )));
+    }
+
+    #[test]
+    fn recovery_policy_is_captured_before_microphone_starts_and_delivery_discards() {
+        let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".into()).unwrap();
+        let mut io = FakeIo::default();
+        let id = advance_to_transcribing(&mut runtime, &mut io, 1);
+        assert_eq!(io.recovery_begins, [(id, 0)]);
+        runtime
+            .transcription_completed(id, Ok(transcript("delivered")), &mut io)
+            .unwrap();
+        assert_eq!(io.recovery_discards, [id]);
+    }
+
+    #[test]
+    fn failed_insertion_keeps_recovery_but_empty_transcript_discards() {
+        let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".into()).unwrap();
+        let mut io = FakeIo::default();
+        let id = advance_to_transcribing(&mut runtime, &mut io, 1);
+        io.insertion_fails = true;
+        runtime
+            .transcription_completed(id, Ok(transcript("still recoverable")), &mut io)
+            .unwrap();
+        assert!(io.recovery_discards.is_empty());
+        io.reset_plan(2);
+        let id = advance_to_transcribing(&mut runtime, &mut io, 2);
+        runtime
+            .transcription_completed(id, Ok(transcript("")), &mut io)
+            .unwrap();
+        assert_eq!(io.recovery_discards, [id]);
     }
 }

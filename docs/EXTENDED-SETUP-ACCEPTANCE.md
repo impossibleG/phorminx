@@ -4,6 +4,60 @@ This document is the release-blocking evidence checklist for ADR-015 and
 ADR-016. A checked implementation test is not a substitute for the physical
 hardware gates at the end.
 
+## Rolling-capture evidence snapshot (2026-09-06)
+
+The current change replaces full-recording scratch audio with a 45-second
+in-memory backlog window. This snapshot distinguishes implemented regression
+coverage from physical qualification; unchecked items below are not claims of
+completed testing.
+
+- [x] Ring wraparound, exact retained ranges, reclaimed-slot zeroization, and a
+  three-hour synthetic capture through the real capture engine create no audio
+  spool and retain only a bounded window.
+- [x] Recognition backlog safe-stop preserves the retained prefix and permits
+  the next recording; whole-session RMS includes reclaimed speech.
+- [x] Accurate tests exercise timestamps across silence and speech, uncertain
+  seams, repair overlap, repeated words, and release after a long owned prefix.
+- [x] Instant tests exercise endpoint ownership, word-aware forced rollover,
+  replay boundaries, energetic empty tails, and retained-tail failure recovery.
+- [x] Independent adversarial reviews produced regression fixes for both
+  recognition modes. Native Vosk runtime smoke verifies the installed ABI and
+  PCM input path; scripted hours-long recognition tests remain synthetic.
+- [x] Native Vosk processed 70.355 seconds of neutral synthesized English
+  through production streaming/release functions. Natural endpoints matched
+  the full-clip baseline; six deliberately triggered decoder rollovers kept
+  all twelve distinctive clauses in order and the three-second release tail.
+  Reference errors were 10/241 words versus the baseline's 11/241, with a
+  conjunction omitted at one restart seam. See
+  [the reproducible spoken-rollover report](INSTANT-SPOKEN-ROLLOVER-VALIDATION.md)
+  for the test timing override, exact bounds, and limitations.
+- [x] Independent recovery-journal run passed seven Windows tests: coherent
+  snapshot replacement, pending/late save versus delivery discard, Clear
+  before first recognition, disabled-at-activation privacy, active-session
+  cleanup on quit, unique identity after runtime reload, and bounded mailbox
+  coalescing. Read-only UI review confirms Copy has no insertion target and
+  individual Discard requires confirmation.
+- [x] Final integrated workspace: 627 tests passed; documentation tests,
+  formatting, strict all-targets workspace Clippy, and release-policy checks
+  passed. The two opt-in spoken Vosk tests passed separately.
+- [x] Recovery storage tests cover Unicode, tampered and swapped ciphertext,
+  two-connection stale writes, restart invalidation, disable/re-enable,
+  retention during normal dictation insertion, and metadata-only enumeration.
+- [x] CPU and Vulkan development installers built with static CRT dependency
+  checks and release-policy validation. See [release evidence](ROLLING-RELEASE-VALIDATION.md).
+- [ ] Installed-binary verification: requires the previously running Phorminx
+  process to exit before replacement and startup checks.
+- [ ] Continuous native long-speech corpora in English and PT-BR, with seam
+  accuracy compared against the same model's reference transcription.
+- [ ] Physical latency samples and long microphone/device-loss/resource soaks
+  for both engines on CPU and Vulkan where supported.
+
+Text-only interrupted-dictation recovery follows the lifecycle in ADR-015.
+The journal tests use real local persistence and DPAPI on Windows; they do not
+simulate sudden power loss or establish the maximum recoverable prefix age
+under a stalled disk. Recovery remains best effort, and audio ring tests do not
+establish crash durability.
+
 ## Extended Dictation
 
 - Generated lifecycle traces permit one owner, terminal outcome, insertion,
@@ -14,17 +68,20 @@ hardware gates at the end.
   seams, and duplicated results without advancing the committed frontier.
 - 119.9, 120.0, and 120.1-second sessions have identical terminal semantics;
   longer sessions have no full-duration RAM allocation or release-time copy.
-- Decoder, formatter, UI, and scratch-store stalls cannot block or allocate in
+- Decoder, formatter, UI, and text-checkpoint stalls cannot block or allocate in
   the microphone callback. Work queues remain bounded and final work preempts
   obsolete speculative work.
 - Release/cancel/finalize/sleep/device-loss/shutdown races produce no deadlock,
   stale insertion, use-after-free, or duplicate persistence.
-- Scratch short writes, quota/disk exhaustion, permission loss, corruption,
-  truncation, crash residue, and cleanup failures fail closed and never expose
-  recoverable raw audio without the in-memory session key.
-- Long synthetic captures demonstrate bounded RAM, bounded handles/threads,
-  documented scratch growth, and cleanup on success, cancel, error, and later
-  startup scavenging.
+- Production capture creates no audio spool file. Recognition lag stops capture
+  before uncommitted audio can be overwritten, preserves recoverable text, and
+  allows the next recording to start. Legacy spool corruption, quota, and
+  cleanup tests qualify only the dormant compatibility facility.
+- Long synthetic captures demonstrate bounded retained audio and decoder
+  context. Text growth is reported separately; process handles/threads require
+  a native soak. Terminal cleanup covers success, cancel, and failure.
+- Text-only crash checkpoints honor history privacy and deletion controls;
+  restart recovery never automatically inserts stale text into a new target.
 - English and PT-BR seam corpora show zero checkpoint omissions or duplicates;
   accuracy does not materially regress against the same engine's reference.
 - Raw/Light release latency is measured over at least 50 physical dictations;
@@ -83,4 +140,3 @@ hardware gates at the end.
 - Install, upgrade, reboot, launch-at-login drift, repair, and uninstall.
 - Full workspace tests, strict Clippy, formatting, release-asset policy, native
   startup smoke, memory/resource soak, and exact installed-binary audit.
-

@@ -33,7 +33,8 @@ use phorminx_app::settings::{
 use phorminx_app::ui_bridge::{UiMutation, UiRoute, UiRuntimeStatus, UiVoskProbe};
 use phorminx_audio::{
     DeferredCapturedAudio, ExtendedCaptureConfig, ExtendedCaptureFactory, ExtendedCaptureFault,
-    ExtendedCapturedAudio, ExtendedRecording, ExtendedStorageKind, input_devices,
+    ExtendedCapturedAudio, ExtendedRecording, ExtendedStorageKind, OwnershipAcknowledger,
+    WHISPER_SAMPLE_RATE, input_devices,
 };
 #[cfg(test)]
 use phorminx_core::recommended_audio_context;
@@ -51,7 +52,10 @@ use phorminx_persistence::{
     TerminalMetadata, TimingMetadata,
 };
 use phorminx_session::SampleRange;
-use phorminx_vosk::{AssetLayout as VoskAssetLayout, VoskModel, VoskSession};
+use phorminx_vosk::{
+    AssetLayout as VoskAssetLayout, FinalizedSegment as VoskFinalizedSegment, VoskModel,
+    VoskSession,
+};
 use phorminx_whisper::{
     WhisperBackendPreference, WhisperError, WhisperReadiness, WhisperRecognizer,
 };
@@ -329,9 +333,15 @@ fn run() -> Result<()> {
             runtime_bundle: instant_runtime,
             model: instant_model,
             language: settings.recognition.language.clone(),
+            minimum_rms: settings.recognition.minimum_rms,
         },
     };
-    let worker = match TranscriptionWorker::start(recognizer, worker_formatting, aliases) {
+    let worker = match TranscriptionWorker::start(
+        recognizer,
+        worker_formatting,
+        aliases,
+        database_path.clone(),
+    ) {
         Ok(worker) => worker,
         Err(error) if settings.recognition.mode == RecognitionMode::Instant => {
             eprintln!(
@@ -686,29 +696,6 @@ fn run() -> Result<()> {
             }
         }
 
-        auto_stop_failed_capture(
-            &mut runtime,
-            &overlay,
-            &tray,
-            &worker,
-            effective_microphone.as_deref(),
-            &dictation_context,
-            &capture,
-        )?;
-
-        match settings.recognition.mode {
-            RecognitionMode::Accurate => poll_incremental_transcription(
-                &runtime,
-                &mut incremental,
-                &worker,
-                &dictation_context.language,
-                settings.recognition.minimum_rms,
-            ),
-            RecognitionMode::Instant => {
-                poll_instant_transcription(&mut runtime, &mut instant_pump, &worker)
-            }
-        }
-
         match poll_shell_events(
             &tray,
             &overlay,
@@ -781,10 +768,40 @@ fn run() -> Result<()> {
                     id,
                     sequence,
                     succeeded,
+                    committed_through,
+                    repair_from,
+                    recognized_speech,
                     compute_time,
                     audio_duration,
                 }) => {
-                    incremental.partial_completed(id, sequence, succeeded);
+                    incremental.partial_completed(
+                        id,
+                        sequence,
+                        succeeded,
+                        repair_from.map(canonical_duration),
+                    );
+                    if succeeded
+                        && runtime.active_id() == Some(id)
+                        && runtime.state() == RuntimeState::Listening
+                        && let Some(recording) = runtime.active_recording_mut()
+                    {
+                        if recognized_speech {
+                            recording.mark_recognized_speech();
+                        }
+                        // Keep a bounded repair overlap, but reclaim everything
+                        // older only after the worker owns committed text.
+                        if let Some(frontier) = committed_through
+                            && let Err(error) = recording.discard_before(
+                                frontier.saturating_sub(ACCURATE_REPAIR_OVERLAP_SAMPLES),
+                            )
+                        {
+                            incremental.degrade(id);
+                            eprintln!(
+                                "dictation_id={} state=Listening event=rolling_audio_reclaim_failed error={error}",
+                                id.0
+                            );
+                        }
+                    }
                     eprintln!(
                         "dictation_id={} state={:?} event=incremental_partial_completed sequence={} success={} audio_ms={} partial_compute_ms={}",
                         id.0,
@@ -794,6 +811,54 @@ fn run() -> Result<()> {
                         audio_duration.as_millis(),
                         compute_time.as_millis()
                     );
+                }
+                Ok(WorkerEvent::InstantCommitted {
+                    id,
+                    committed_through,
+                }) => {
+                    if runtime.active_id() == Some(id)
+                        && runtime.state() == RuntimeState::Listening
+                        && let Some(recording) = runtime.active_recording_mut()
+                        && let Err(error) = recording.discard_before(committed_through)
+                    {
+                        instant_pump.degraded = true;
+                        worker.degrade_instant(id);
+                        eprintln!(
+                            "dictation_id={} state=Listening event=instant_audio_reclaim_failed frontier={} error={error}",
+                            id.0, committed_through
+                        );
+                    }
+                }
+                Ok(WorkerEvent::InstantDegraded { id, reason }) => {
+                    if runtime.active_id() == Some(id) && runtime.state() == RuntimeState::Listening
+                    {
+                        if let Some(recording) = runtime.active_recording_mut() {
+                            recording.mark_auto_stopped();
+                        }
+                        let stopped_at = Instant::now();
+                        eprintln!(
+                            "uptime_ms={} dictation_id={} state=FinalizingAudio event=automatic_safe_stop auto_stopped=true reason=instant_{}",
+                            monotonic_uptime_ms(),
+                            id.0,
+                            reason
+                        );
+                        let notices = {
+                            let mut io = ProductionIo {
+                                overlay: &overlay,
+                                tray: &tray,
+                                worker: &worker,
+                                microphone: effective_microphone.as_deref(),
+                                context: &dictation_context,
+                                capture: &capture,
+                                released_at: Some(stopped_at),
+                            };
+                            match runtime.hold_ended_at(stopped_at, &mut io) {
+                                Ok(notices) => notices,
+                                Err(error) => break 'event_loop Err(error.into()),
+                            }
+                        };
+                        report_notices(notices);
+                    }
                 }
                 Ok(WorkerEvent::CleanupStarted { id }) => {
                     let notices = {
@@ -865,6 +930,7 @@ fn run() -> Result<()> {
                     if is_current && let Some(processed) = processed_for_history.as_ref() {
                         let outcome = terminal_outcome(&notices);
                         if outcome.is_success() {
+                            worker.recovery.discard(completed.id.0);
                             if let Some(lifecycle) = processed.lifecycle {
                                 eprintln!(
                                     "uptime_ms={} dictation_id={} state=Inserting event=release_terminal outcome={} release_to_insert_ms={} insertion_ms={}",
@@ -895,6 +961,7 @@ fn run() -> Result<()> {
                             }
                         } else {
                             record_terminal_failure(completed.id, outcome);
+                            worker.recovery.interrupted(completed.id.0);
                         }
                     }
                     report_notices(notices);
@@ -924,6 +991,32 @@ fn run() -> Result<()> {
                         "the transcription worker stopped unexpectedly"
                     ));
                 }
+            }
+        }
+
+        // Worker ownership ACKs must win over resource-pressure observation.
+        // Otherwise an ACK already queued at the exact rolling-buffer boundary
+        // can lose to an avoidable automatic backlog stop.
+        auto_stop_failed_capture(
+            &mut runtime,
+            &overlay,
+            &tray,
+            &worker,
+            effective_microphone.as_deref(),
+            &dictation_context,
+            &capture,
+        )?;
+
+        match settings.recognition.mode {
+            RecognitionMode::Accurate => poll_incremental_transcription(
+                &runtime,
+                &mut incremental,
+                &worker,
+                &dictation_context.language,
+                settings.recognition.minimum_rms,
+            ),
+            RecognitionMode::Instant => {
+                poll_instant_transcription(&mut runtime, &mut instant_pump, &worker)
             }
         }
         if runtime.is_clean_idle() {
@@ -2368,8 +2461,27 @@ fn require_audio_cleanup<T>(
 }
 
 fn sample_range_for_duration(start: Duration, end: Duration) -> Result<SampleRange, String> {
-    let samples = |duration: Duration| (duration.as_secs_f64() * 16_000.0).floor() as u64;
-    SampleRange::new(samples(start), samples(end)).map_err(|error| error.to_string())
+    SampleRange::new(canonical_sample(start), canonical_sample(end))
+        .map_err(|error| error.to_string())
+}
+
+fn canonical_sample(duration: Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_mul(u64::from(WHISPER_SAMPLE_RATE))
+        .saturating_add(
+            u64::from(duration.subsec_nanos()).saturating_mul(u64::from(WHISPER_SAMPLE_RATE))
+                / 1_000_000_000,
+        )
+}
+
+fn canonical_duration(samples: u64) -> Duration {
+    Duration::from_secs(samples / u64::from(WHISPER_SAMPLE_RATE)).saturating_add(
+        Duration::from_nanos(
+            (samples % u64::from(WHISPER_SAMPLE_RATE)).saturating_mul(1_000_000_000)
+                / u64::from(WHISPER_SAMPLE_RATE),
+        ),
+    )
 }
 
 fn audio_span_to_clip(
@@ -2396,6 +2508,20 @@ impl AppIo for ProductionIo<'_> {
     type Audio = FinalAudioSource;
     type ClipboardReason = ClipboardOnlyReason;
 
+    fn begin_recording(&mut self, id: DictationId) {
+        let epoch = self
+            .worker
+            .recovery_policy
+            .recovery()
+            .eligibility_epoch()
+            .ok()
+            .flatten();
+        self.worker.recovery.begin(id.0, epoch);
+    }
+    fn discard_recovery(&mut self, id: DictationId) {
+        self.worker.recovery.discard(id.0);
+    }
+
     fn start_recording(&mut self) -> Result<Self::Recording, String> {
         match self.capture.start_input(self.microphone) {
             Ok(recording) => Ok(recording),
@@ -2419,7 +2545,9 @@ impl AppIo for ProductionIo<'_> {
     ) -> Result<FinishedAudio<FinalAudioSource>, String> {
         let progress = recording.progress();
         let auto_stopped = recording.was_auto_stopped();
-        if let Some(fault) = progress.sticky_fault {
+        if let Some(fault) = progress.sticky_fault
+            && !capture_fault_has_recoverable_audio(fault)
+        {
             // Still drive the stopped pump through its bounded finalization
             // owner. This confirms or quarantines scratch cleanup instead of
             // abandoning the session at the first observed backend fault.
@@ -2431,7 +2559,7 @@ impl AppIo for ProductionIo<'_> {
             return Err(fault.to_string());
         }
         let duration = progress.duration();
-        if progress.storage == ExtendedStorageKind::Memory {
+        if progress.storage == ExtendedStorageKind::Memory && progress.retained_from == 0 {
             let captured = recording.finalize().map_err(|error| error.to_string())?;
             let backend_warning_count = captured.backend_warning_count();
             let clip = captured
@@ -2451,15 +2579,15 @@ impl AppIo for ProductionIo<'_> {
                 },
                 duration,
                 rms,
+                peak_window_rms: progress.peak_window_rms(),
+                recognized_speech: progress.recognized_speech,
                 backend_warning_count,
             });
         }
         let rms = if progress.canonical_samples == 0 {
             0.0
         } else {
-            recording
-                .recent_rms(Duration::from_secs(2))
-                .map_err(|error| error.to_string())?
+            progress.session_rms()
         };
         let backend_warning_count = progress.backend_warning_count;
         let audio = FinalAudioSource::Pending {
@@ -2477,6 +2605,8 @@ impl AppIo for ProductionIo<'_> {
             audio,
             duration,
             rms,
+            peak_window_rms: progress.peak_window_rms(),
+            recognized_speech: progress.recognized_speech,
             backend_warning_count,
         })
     }
@@ -2554,6 +2684,7 @@ enum AutoStopReason {
     ScratchIo,
     CaptureWorker,
     SampleAccounting,
+    RecognitionBacklog,
 }
 
 impl AutoStopReason {
@@ -2567,6 +2698,7 @@ impl AutoStopReason {
             Self::ScratchIo => "scratch_io",
             Self::CaptureWorker => "capture_worker",
             Self::SampleAccounting => "sample_accounting",
+            Self::RecognitionBacklog => "recognition_backlog",
         }
     }
 }
@@ -2583,10 +2715,15 @@ fn auto_stop_reason(fault: ExtendedCaptureFault) -> Option<AutoStopReason> {
         | ExtendedCaptureFault::WorkerPanicked
         | ExtendedCaptureFault::FinalizationTimeout => Some(AutoStopReason::CaptureWorker),
         ExtendedCaptureFault::SampleAccountingOverflow => Some(AutoStopReason::SampleAccounting),
+        ExtendedCaptureFault::UncommittedAudioBacklog => Some(AutoStopReason::RecognitionBacklog),
         ExtendedCaptureFault::InvalidConfiguration
         | ExtendedCaptureFault::InvalidSnapshot
         | ExtendedCaptureFault::FinalizerBusy => None,
     }
+}
+
+const fn capture_fault_has_recoverable_audio(fault: ExtendedCaptureFault) -> bool {
+    matches!(fault, ExtendedCaptureFault::UncommittedAudioBacklog)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2720,7 +2857,13 @@ fn poll_incremental_transcription(
         }
     };
     let audio_duration = clip.duration();
-    match worker.transcribe_partial(plan, clip, language.to_owned()) {
+    match worker.transcribe_partial(
+        plan,
+        clip,
+        language.to_owned(),
+        silence_threshold,
+        recording.ownership_acknowledger(),
+    ) {
         Ok(()) => eprintln!(
             "dictation_id={} state=Listening event=incremental_partial_submitted sequence={} boundary={:?} audio_ms={}",
             id.0,
@@ -3037,6 +3180,8 @@ fn whisper_backend_preference(value: AccurateBackendPreference) -> WhisperBacken
 }
 
 struct TranscriptionWorker {
+    recovery: phorminx_app::text_recovery::RecoveryJournal,
+    recovery_policy: Persistence,
     commands: Sender<WorkerCommand>,
     instant_audio: mpsc::SyncSender<InstantAudioCommand>,
     results: Receiver<WorkerEvent>,
@@ -3050,6 +3195,7 @@ struct TranscriptionWorker {
 struct InstantPump {
     active_id: Option<DictationId>,
     degraded: bool,
+    submitted_through: u64,
 }
 
 fn poll_instant_transcription(
@@ -3083,11 +3229,35 @@ fn poll_instant_transcription(
             let _ = worker.cancel_incremental(stale);
         }
         pump.degraded = false;
-        worker.instant_begin(id, recording.sample_rate());
+        pump.submitted_through = 0;
+        if !worker.instant_begin(
+            id,
+            recording.sample_rate(),
+            recording.ownership_acknowledger(),
+        ) {
+            pump.degraded = true;
+        }
+    }
+    if pump.degraded {
+        return;
     }
     match recording.drain_streaming(16_384) {
         Ok(batch) => {
-            worker.instant_audio(id, batch.samples, batch.sample_rate, batch.dropped_samples)
+            let sample_count = batch.samples.len() as u64;
+            if sample_count != 0 {
+                if worker.instant_audio(
+                    id,
+                    pump.submitted_through,
+                    batch.samples,
+                    batch.sample_rate,
+                    batch.dropped_samples,
+                ) {
+                    pump.submitted_through = pump.submitted_through.saturating_add(sample_count);
+                } else {
+                    pump.degraded = true;
+                    worker.degrade_instant(id);
+                }
+            }
         }
         Err(error) => {
             if !pump.degraded {
@@ -3111,31 +3281,143 @@ enum RecognizerConfig {
         runtime_bundle: PathBuf,
         model: PathBuf,
         language: String,
+        minimum_rms: f32,
     },
 }
 
 enum LoadedRecognizer {
     Accurate(WhisperRecognizer),
-    Instant(VoskModel),
+    Instant { model: VoskModel, minimum_rms: f32 },
 }
 
 struct InstantSession {
     recognizer: VoskSession,
     sample_rate: u32,
-    accepted_samples: u64,
+    /// Absolute canonical sample accepted by the streaming decoder.
+    accepted_through: u64,
+    /// Absolute sample corresponding to local sample zero in `recognizer`.
+    decoder_origin: u64,
     inference_time: Duration,
     degraded: bool,
     continuity_prefix: Vec<f32>,
     checkpoint_count: u64,
+    ownership: InstantTranscriptOwnership,
+    evidence: InstantAudioEvidence,
+    /// Audio not yet transferred to `ownership`, retained so a replacement
+    /// decoder can re-read the lexical boundary at a forced rollover.
+    uncommitted_audio: Vec<f32>,
+    minimum_rms: f32,
+    ownership_acknowledger: Option<OwnershipAcknowledger>,
 }
+
+#[derive(Default)]
+struct InstantAudioEvidence {
+    peak_window_mean_square: f64,
+    window_square_sum: f64,
+    window_samples: u64,
+}
+
+impl InstantAudioEvidence {
+    fn observe(&mut self, samples: &[f32]) {
+        let mut cursor = 0;
+        while cursor < samples.len() {
+            let needed = usize::try_from(
+                INSTANT_EVIDENCE_WINDOW_SAMPLES.saturating_sub(self.window_samples),
+            )
+            .unwrap_or(0);
+            let take = needed.min(samples.len() - cursor);
+            let energy = samples[cursor..cursor + take]
+                .iter()
+                .map(|sample| f64::from(*sample) * f64::from(*sample))
+                .sum::<f64>();
+            self.window_square_sum += energy;
+            self.window_samples = self.window_samples.saturating_add(take as u64);
+            cursor += take;
+            if self.window_samples == INSTANT_EVIDENCE_WINDOW_SAMPLES {
+                self.peak_window_mean_square = self
+                    .peak_window_mean_square
+                    .max(self.window_square_sum / self.window_samples as f64);
+                self.window_square_sum = 0.0;
+                self.window_samples = 0;
+            }
+        }
+    }
+
+    fn peak_window_rms(&self) -> f64 {
+        let partial = if self.window_samples == 0 {
+            0.0
+        } else {
+            self.window_square_sum / self.window_samples as f64
+        };
+        self.peak_window_mean_square.max(partial).sqrt()
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    #[cfg(test)]
+    fn observe_constant(&mut self, amplitude: f32, samples: u64) {
+        let block = vec![amplitude; INSTANT_EVIDENCE_WINDOW_SAMPLES as usize];
+        let mut remaining = samples;
+        while remaining >= INSTANT_EVIDENCE_WINDOW_SAMPLES {
+            self.observe(&block);
+            remaining -= INSTANT_EVIDENCE_WINDOW_SAMPLES;
+        }
+        if remaining != 0 {
+            self.observe(&block[..remaining as usize]);
+        }
+    }
+}
+
+#[derive(Default)]
+struct InstantTranscriptOwnership {
+    text: String,
+    committed_through: u64,
+}
+
+impl InstantTranscriptOwnership {
+    fn commit(&mut self, through: u64, text: &str) -> Result<bool, &'static str> {
+        if through < self.committed_through {
+            return Err("stale instant transcript frontier");
+        }
+        if through == self.committed_through {
+            return Ok(false);
+        }
+        append_owned_text(&mut self.text, text);
+        self.committed_through = through;
+        Ok(true)
+    }
+}
+
+fn append_owned_text(destination: &mut String, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    if !destination.is_empty() {
+        destination.push(' ');
+    }
+    destination.push_str(text);
+}
+
+#[cfg(test)]
+mod spoken_rollover_tests;
+
+const INSTANT_ROLLOVER_TARGET_SAMPLES: u64 = WHISPER_SAMPLE_RATE as u64 * 30;
+const INSTANT_ROLLOVER_OVERLAP_SAMPLES: u64 = WHISPER_SAMPLE_RATE as u64 * 2;
+const INSTANT_EVIDENCE_WINDOW_SAMPLES: u64 = WHISPER_SAMPLE_RATE as u64 / 50;
+const VOSK_FEED_BATCH_SAMPLES: usize = 4_096;
 
 enum InstantAudioCommand {
     Begin {
         id: DictationId,
         sample_rate: u32,
+        ownership_acknowledger: OwnershipAcknowledger,
     },
     Audio {
         id: DictationId,
+        start_sample: u64,
         samples: Vec<f32>,
         sample_rate: u32,
         dropped_samples: u64,
@@ -3150,7 +3432,12 @@ impl TranscriptionWorker {
         recognizer: RecognizerConfig,
         formatting: WorkerFormatting,
         aliases: Vec<LexiconEntry>,
+        database_path: std::path::PathBuf,
     ) -> Result<Self> {
+        let recovery_policy =
+            Persistence::open_with_busy_timeout(&database_path, Duration::from_millis(50))?;
+        let recovery = phorminx_app::text_recovery::RecoveryJournal::start(database_path)?;
+        let worker_recovery = recovery.clone();
         let (command_tx, command_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let (instant_audio_tx, instant_audio_rx) = mpsc::sync_channel(8);
@@ -3172,6 +3459,7 @@ impl TranscriptionWorker {
                         runtime_bundle,
                         model,
                         language,
+                        minimum_rms,
                     } => load_and_probe_resident(
                         || VoskModel::load(&runtime_bundle, &model, &language),
                         |model| {
@@ -3182,7 +3470,7 @@ impl TranscriptionWorker {
                             Ok(())
                         },
                     )
-                        .map(LoadedRecognizer::Instant)
+                        .map(|model| LoadedRecognizer::Instant { model, minimum_rms })
                         .map_err(|error| error.to_string()),
                 };
                 let recognizer = match recognizer {
@@ -3205,7 +3493,7 @@ impl TranscriptionWorker {
                         );
                         Some(readiness)
                     }
-                    LoadedRecognizer::Instant(model) => {
+                    LoadedRecognizer::Instant { model, .. } => {
                         eprintln!(
                             "dictation_id=0 state=Starting event=stt_backend_ready backend=vosk device_present=false model_load_ms={}",
                             model.load_time().as_millis()
@@ -3258,8 +3546,9 @@ impl TranscriptionWorker {
                 // re-runs the identity probe before formatting is enabled.
                 let _ollama_activity = ollama_activity;
                 let mut aliases = aliases;
-                let mut incremental_sessions = HashMap::new();
-                let mut instant_sessions = HashMap::new();
+                let mut incremental_sessions: HashMap<DictationId, PartialAccumulator> = HashMap::new();
+                let mut instant_sessions: HashMap<DictationId, InstantSession> = HashMap::new();
+                let mut checkpoint_clock = phorminx_app::text_recovery::CheckpointClock::default();
                 if formatting.uses_ollama()
                     && let (Some(client), Some(model)) = (&ollama, &formatting.model)
                 {
@@ -3293,7 +3582,11 @@ impl TranscriptionWorker {
                         &recognizer,
                         &instant_audio_rx,
                         &mut instant_sessions,
+                        &result_tx,
                     );
+                    for (id, session) in &instant_sessions {
+                        worker_recovery.checkpoint(&mut checkpoint_clock, id.0, &session.ownership.text, false);
+                    }
                     let command = match command_rx.recv_timeout(Duration::from_millis(10)) {
                         Ok(command) => command,
                         Err(RecvTimeoutError::Timeout) => continue,
@@ -3315,6 +3608,8 @@ impl TranscriptionWorker {
                             plan,
                             clip,
                             language,
+                            silence_threshold,
+                            ownership_acknowledger,
                         } => {
                             if worker_job_cancelled(
                                 &worker_cancellations,
@@ -3327,6 +3622,9 @@ impl TranscriptionWorker {
                                         id: plan.id,
                                         sequence: plan.sequence,
                                         succeeded: false,
+                                        committed_through: None,
+                                        repair_from: None,
+                                        recognized_speech: false,
                                         compute_time: Duration::ZERO,
                                         audio_duration: clip.duration(),
                                     })
@@ -3347,9 +3645,22 @@ impl TranscriptionWorker {
                                 plan,
                                 clip,
                                 &language,
+                                silence_threshold,
                                 &partial_abort,
                             );
                             worker_cancellations.end_partial(partial_id);
+                            if let Some(session) = incremental_sessions.get(&partial_id) {
+                                worker_recovery.checkpoint(&mut checkpoint_clock, partial_id.0, &session.text, false);
+                            }
+                            if let WorkerEvent::PartialCompleted {
+                                committed_through: Some(frontier),
+                                ..
+                            } = &event
+                            {
+                                ownership_acknowledger.acknowledge(
+                                    frontier.saturating_sub(ACCURATE_REPAIR_OVERLAP_SAMPLES),
+                                );
+                            }
                             if result_tx.send(event).is_err() {
                                 break;
                             }
@@ -3383,6 +3694,7 @@ impl TranscriptionWorker {
                                 &recognizer,
                                 &instant_audio_rx,
                                 &mut instant_sessions,
+                                &result_tx,
                             );
                             let stats = audio.stats();
                             let incremental = incremental_sessions.remove(&id);
@@ -3391,12 +3703,12 @@ impl TranscriptionWorker {
                                 LoadedRecognizer::Accurate(_) => incremental
                                     .as_ref()
                                     .map_or(0, |session| u64::from(session.next_sequence)),
-                                LoadedRecognizer::Instant(_) => instant
+                                LoadedRecognizer::Instant { .. } => instant
                                     .as_ref()
                                     .map_or(0, |session| session.checkpoint_count),
                             };
                             let repair_count = match (&recognizer, &instant) {
-                                (LoadedRecognizer::Instant(_), Some(session)) if session.degraded => 1,
+                                (LoadedRecognizer::Instant { .. }, Some(session)) if session.degraded => 1,
                                 (LoadedRecognizer::Accurate(_), _)
                                     if incremental
                                         .as_ref()
@@ -3414,11 +3726,11 @@ impl TranscriptionWorker {
                                     (LoadedRecognizer::Accurate(recognizer), FinalAudioSource::Extended { audio, stats }) => transcribe_extended_accurate(
                                         recognizer, incremental, audio, *stats, &language, id,
                                     ),
-                                    (LoadedRecognizer::Instant(model), FinalAudioSource::Short { clip, .. }) => transcribe_instant_final(
-                                        model, instant, clip, id,
+                                    (LoadedRecognizer::Instant { model, minimum_rms }, FinalAudioSource::Short { clip, .. }) => transcribe_instant_final(
+                                        model, instant, clip, id, *minimum_rms,
                                     ).map_err(|error| error.to_string()),
-                                    (LoadedRecognizer::Instant(model), FinalAudioSource::Extended { audio, stats }) => transcribe_extended_instant(
-                                        model, instant, audio, *stats, id,
+                                    (LoadedRecognizer::Instant { model, minimum_rms }, FinalAudioSource::Extended { audio, stats }) => transcribe_extended_instant(
+                                        model, instant, audio, *stats, id, *minimum_rms,
                                     ).map_err(|error| error.to_string()),
                                     (_, FinalAudioSource::Pending { .. }) => Err("final audio did not resolve".to_owned()),
                                 };
@@ -3427,6 +3739,7 @@ impl TranscriptionWorker {
                             });
                             let result = match recognition {
                                 Ok(transcript) => {
+                                    worker_recovery.checkpoint(&mut checkpoint_clock, id.0, &transcript.text, true);
                                     if has_pathological_repetition(&transcript.text) {
                                         eprintln!(
                                             "dictation_id={} state=Transcribing event=transcription_rejected reason=repetition_loop",
@@ -3515,6 +3828,7 @@ impl TranscriptionWorker {
                                 }
                                 Err(error) => Err(error.to_string()),
                             };
+                            if result.is_err() { worker_recovery.interrupted(id.0); }
                             if result_tx
                                 .send(WorkerEvent::Completed(Box::new(WorkerResult {
                                     id,
@@ -3532,22 +3846,39 @@ impl TranscriptionWorker {
                         }
                         WorkerCommand::DegradeInstant { id } => {
                             if let Some(session) = instant_sessions.get_mut(&id) {
-                                session.degraded = true;
-                            } else if let LoadedRecognizer::Instant(model) = &recognizer
-                                && let Ok(recognizer) = model.session(16_000)
-                            {
-                                instant_sessions.insert(
+                                mark_instant_degraded(
+                                    session,
                                     id,
-                                    InstantSession {
-                                        recognizer,
-                                        sample_rate: 16_000,
-                                        accepted_samples: 0,
-                                        inference_time: Duration::ZERO,
-                                        degraded: true,
-                                        continuity_prefix: Vec::new(),
-                                        checkpoint_count: 0,
-                                    },
+                                    "transport_backpressure",
+                                    &result_tx,
                                 );
+                            } else {
+                                if let LoadedRecognizer::Instant { model, minimum_rms } = &recognizer
+                                    && let Ok(recognizer) = model.session(16_000)
+                                {
+                                    instant_sessions.insert(
+                                        id,
+                                        InstantSession {
+                                            recognizer,
+                                            sample_rate: 16_000,
+                                            accepted_through: 0,
+                                            decoder_origin: 0,
+                                            inference_time: Duration::ZERO,
+                                            degraded: true,
+                                            continuity_prefix: Vec::new(),
+                                            checkpoint_count: 0,
+                                            ownership: InstantTranscriptOwnership::default(),
+                                            evidence: InstantAudioEvidence::default(),
+                                            uncommitted_audio: Vec::new(),
+                                            minimum_rms: *minimum_rms,
+                                            ownership_acknowledger: None,
+                                        },
+                                    );
+                                }
+                                let _ = result_tx.send(WorkerEvent::InstantDegraded {
+                                    id,
+                                    reason: "transport_backpressure",
+                                });
                             }
                         }
                         WorkerCommand::ReloadAliases(updated) => aliases = updated,
@@ -3558,6 +3889,8 @@ impl TranscriptionWorker {
 
         match ready_rx.recv() {
             Ok(Ok(readiness)) => Ok(Self {
+                recovery,
+                recovery_policy,
                 commands: command_tx,
                 instant_audio: instant_audio_tx,
                 results: result_rx,
@@ -3568,10 +3901,12 @@ impl TranscriptionWorker {
             }),
             Ok(Err(message)) => {
                 let _ = thread.join();
+                recovery.stop();
                 Err(anyhow!(message))
             }
             Err(_) => {
                 let _ = thread.join();
+                recovery.stop();
                 Err(anyhow!("transcription worker exited during startup"))
             }
         }
@@ -3620,40 +3955,58 @@ impl TranscriptionWorker {
         plan: phorminx_app::incremental::ChunkPlan,
         clip: AudioClip,
         language: String,
+        silence_threshold: f32,
+        ownership_acknowledger: OwnershipAcknowledger,
     ) -> Result<()> {
         self.commands
             .send(WorkerCommand::TranscribePartial {
                 plan,
                 clip,
                 language,
+                silence_threshold,
+                ownership_acknowledger,
             })
             .map_err(|_| anyhow!("transcription worker is unavailable"))
     }
 
-    fn instant_begin(&self, id: DictationId, sample_rate: u32) {
+    fn instant_begin(
+        &self,
+        id: DictationId,
+        sample_rate: u32,
+        ownership_acknowledger: OwnershipAcknowledger,
+    ) -> bool {
         if self
             .instant_audio
-            .try_send(InstantAudioCommand::Begin { id, sample_rate })
+            .try_send(InstantAudioCommand::Begin {
+                id,
+                sample_rate,
+                ownership_acknowledger,
+            })
             .is_err()
         {
             let _ = self.commands.send(WorkerCommand::DegradeInstant { id });
+            false
+        } else {
+            true
         }
     }
 
     fn instant_audio(
         &self,
         id: DictationId,
+        start_sample: u64,
         samples: Vec<f32>,
         sample_rate: u32,
         dropped_samples: u64,
-    ) {
+    ) -> bool {
         if samples.is_empty() {
-            return;
+            return true;
         }
         if self
             .instant_audio
             .try_send(InstantAudioCommand::Audio {
                 id,
+                start_sample,
                 samples,
                 sample_rate,
                 dropped_samples,
@@ -3661,6 +4014,9 @@ impl TranscriptionWorker {
             .is_err()
         {
             let _ = self.commands.send(WorkerCommand::DegradeInstant { id });
+            false
+        } else {
+            true
         }
     }
 
@@ -3669,6 +4025,7 @@ impl TranscriptionWorker {
     }
 
     fn cancel_incremental(&self, id: DictationId) -> Result<()> {
+        self.recovery.interrupted(id.0);
         // Cancellation is visible before this FIFO command reaches the worker,
         // so queued stale audio is dropped without another Whisper invocation.
         self.cancellations.cancel(id);
@@ -3702,6 +4059,7 @@ impl TranscriptionWorker {
                 .join()
                 .map_err(|_| anyhow!("transcription worker panicked"))?;
         }
+        self.recovery.stop();
         Ok(())
     }
 }
@@ -3877,6 +4235,8 @@ enum WorkerCommand {
         plan: phorminx_app::incremental::ChunkPlan,
         clip: AudioClip,
         language: String,
+        silence_threshold: f32,
+        ownership_acknowledger: OwnershipAcknowledger,
     },
     Transcribe {
         id: DictationId,
@@ -3908,8 +4268,30 @@ enum WorkerEvent {
         id: DictationId,
         sequence: u32,
         succeeded: bool,
+        /// Absolute 16 kHz frontier backed by transcript text owned by the
+        /// worker. Capture may reclaim older audio only after this ack.
+        committed_through: Option<u64>,
+        /// Earliest absolute 16 kHz sample needed by the next bounded repair
+        /// pass. `None` returns scheduling to the ordinary overlap window.
+        repair_from: Option<u64>,
+        /// True once the Accurate worker owns at least one non-annotation
+        /// transcript token for this dictation.
+        recognized_speech: bool,
         compute_time: Duration,
         audio_duration: Duration,
+    },
+    /// Vosk has transferred ownership of every finalized endpoint through this
+    /// absolute canonical sample. The main loop may now evict that audio.
+    InstantCommitted {
+        id: DictationId,
+        committed_through: u64,
+    },
+    /// The live decoder cannot safely continue. The app stops capture while
+    /// the committed prefix and retained tail are still available to the final
+    /// recovery path.
+    InstantDegraded {
+        id: DictationId,
+        reason: &'static str,
     },
     CleanupStarted {
         id: DictationId,
@@ -3931,20 +4313,37 @@ struct PartialAccumulator {
     partial_compute_time: Duration,
     model_load_time: Duration,
     degraded: Option<&'static str>,
+    /// Latest forced-edge hypothesis. It remains replaceable until a later
+    /// decode with right context confirms its lexical boundary.
+    provisional: Option<AccurateHypothesis>,
 }
+
+struct AccurateHypothesis {
+    text: String,
+    commit_through: Duration,
+    range: phorminx_app::incremental::TimeRange,
+}
+
+const ACCURATE_REPAIR_OVERLAP_SAMPLES: u64 = 16_000 * 2;
+const MAX_ACCURATE_LIVE_REPAIR_SAMPLES: u64 = 16_000 * 12;
 
 fn drain_instant_audio(
     recognizer: &LoadedRecognizer,
     receiver: &Receiver<InstantAudioCommand>,
     sessions: &mut HashMap<DictationId, InstantSession>,
+    results: &Sender<WorkerEvent>,
 ) {
-    let LoadedRecognizer::Instant(model) = recognizer else {
+    let LoadedRecognizer::Instant { model, minimum_rms } = recognizer else {
         while receiver.try_recv().is_ok() {}
         return;
     };
     while let Ok(command) = receiver.try_recv() {
         match command {
-            InstantAudioCommand::Begin { id, sample_rate } => {
+            InstantAudioCommand::Begin {
+                id,
+                sample_rate,
+                ownership_acknowledger,
+            } => {
                 if sessions.contains_key(&id) {
                     continue;
                 }
@@ -3955,11 +4354,17 @@ fn drain_instant_audio(
                             InstantSession {
                                 recognizer,
                                 sample_rate,
-                                accepted_samples: 0,
+                                accepted_through: 0,
+                                decoder_origin: 0,
                                 inference_time: Duration::ZERO,
                                 degraded: false,
                                 continuity_prefix: Vec::new(),
                                 checkpoint_count: 0,
+                                ownership: InstantTranscriptOwnership::default(),
+                                evidence: InstantAudioEvidence::default(),
+                                uncommitted_audio: Vec::new(),
+                                minimum_rms: *minimum_rms,
+                                ownership_acknowledger: Some(ownership_acknowledger),
                             },
                         );
                     }
@@ -3968,11 +4373,16 @@ fn drain_instant_audio(
                             "dictation_id={} state=Listening event=instant_session_degraded reason=create_failed",
                             id.0
                         );
+                        let _ = results.send(WorkerEvent::InstantDegraded {
+                            id,
+                            reason: "create_failed",
+                        });
                     }
                 }
             }
             InstantAudioCommand::Audio {
                 id,
+                start_sample,
                 samples,
                 sample_rate,
                 dropped_samples,
@@ -3980,8 +4390,11 @@ fn drain_instant_audio(
                 let Some(session) = sessions.get_mut(&id) else {
                     continue;
                 };
-                if sample_rate != session.sample_rate || dropped_samples != 0 {
-                    session.degraded = true;
+                if sample_rate != session.sample_rate
+                    || dropped_samples != 0
+                    || start_sample != session.accepted_through
+                {
+                    mark_instant_degraded(session, id, "non_contiguous_audio", results);
                     continue;
                 }
                 if session.degraded {
@@ -3991,15 +4404,52 @@ fn drain_instant_audio(
                 let accepted = session.recognizer.accept_f32(&samples);
                 session.inference_time += started.elapsed();
                 match accepted {
-                    Ok(_) => {
+                    Ok(outcome) => {
+                        let absolute_accepted = session
+                            .decoder_origin
+                            .saturating_add(outcome.accepted_through);
+                        let expected = start_sample.saturating_add(samples.len() as u64);
+                        if absolute_accepted != expected {
+                            mark_instant_degraded(session, id, "sample_accounting", results);
+                            continue;
+                        }
                         let remaining = 2_048usize.saturating_sub(session.continuity_prefix.len());
                         session
                             .continuity_prefix
                             .extend_from_slice(&samples[..samples.len().min(remaining)]);
-                        session.accepted_samples += samples.len() as u64;
-                        session.checkpoint_count = session.checkpoint_count.saturating_add(1);
+                        session.accepted_through = absolute_accepted;
+                        session.evidence.observe(&samples);
+                        session.uncommitted_audio.extend_from_slice(&samples);
+                        if let Some(endpoint) = outcome.endpoint {
+                            let start =
+                                session.decoder_origin.saturating_add(endpoint.start_sample);
+                            let end = session.decoder_origin.saturating_add(endpoint.end_sample);
+                            let safe = !instant_segment_is_unrecognized(
+                                &endpoint.text,
+                                &session.evidence,
+                                session.minimum_rms,
+                            ) && start == session.ownership.committed_through
+                                && commit_instant_text(session, id, end, &endpoint.text, results)
+                                    .is_ok();
+                            if !safe {
+                                mark_instant_degraded(session, id, "unsafe_endpoint", results);
+                            } else {
+                                session.uncommitted_audio.clear();
+                            }
+                        }
+                        if !session.degraded
+                            && instant_rollover_due(
+                                session.accepted_through,
+                                session.ownership.committed_through,
+                            )
+                            && force_instant_rollover(model, session, id, results).is_err()
+                        {
+                            mark_instant_degraded(session, id, "rollover_failed", results);
+                        }
                     }
-                    Err(_) => session.degraded = true,
+                    Err(_) => {
+                        mark_instant_degraded(session, id, "decoder_failed", results);
+                    }
                 }
             }
             InstantAudioCommand::Cancel { id } => {
@@ -4009,17 +4459,216 @@ fn drain_instant_audio(
     }
 }
 
+fn mark_instant_degraded(
+    session: &mut InstantSession,
+    id: DictationId,
+    reason: &'static str,
+    results: &Sender<WorkerEvent>,
+) {
+    if session.degraded {
+        return;
+    }
+    session.degraded = true;
+    eprintln!(
+        "dictation_id={} state=Listening event=instant_session_degraded reason={reason}",
+        id.0
+    );
+    let _ = results.send(WorkerEvent::InstantDegraded { id, reason });
+}
+
+fn instant_rollover_due(accepted_through: u64, committed_through: u64) -> bool {
+    accepted_through.saturating_sub(committed_through) >= INSTANT_ROLLOVER_TARGET_SAMPLES
+}
+
+fn instant_segment_is_unrecognized(
+    text: &str,
+    evidence: &InstantAudioEvidence,
+    minimum_rms: f32,
+) -> bool {
+    let threshold = f64::from(minimum_rms);
+    text.trim().is_empty()
+        && evidence.peak_window_rms() >= threshold - threshold.abs().max(1.0) * 1e-9
+}
+
+fn commit_instant_text(
+    session: &mut InstantSession,
+    id: DictationId,
+    through: u64,
+    text: &str,
+    results: &Sender<WorkerEvent>,
+) -> Result<(), &'static str> {
+    if through > session.accepted_through {
+        return Err("instant transcript frontier exceeds accepted audio");
+    }
+    if publish_instant_commit(
+        &mut session.ownership,
+        &mut session.checkpoint_count,
+        id,
+        through,
+        text,
+        results,
+    )? {
+        if let Some(acknowledger) = &session.ownership_acknowledger {
+            acknowledger.acknowledge(through);
+        }
+        session.evidence.reset();
+    }
+    Ok(())
+}
+
+fn publish_instant_commit(
+    ownership: &mut InstantTranscriptOwnership,
+    checkpoint_count: &mut u64,
+    id: DictationId,
+    through: u64,
+    text: &str,
+    results: &Sender<WorkerEvent>,
+) -> Result<bool, &'static str> {
+    let committed = ownership.commit(through, text)?;
+    if committed {
+        *checkpoint_count = checkpoint_count.saturating_add(1);
+        let _ = results.send(WorkerEvent::InstantCommitted {
+            id,
+            committed_through: through,
+        });
+    }
+    Ok(committed)
+}
+
+struct InstantRolloverPlan {
+    committed_through: u64,
+    stable_text: String,
+    replay_offset: usize,
+}
+
+fn plan_instant_rollover(
+    decoder_origin: u64,
+    prior_committed: u64,
+    accepted_through: u64,
+    uncommitted_samples: usize,
+    terminal: &VoskFinalizedSegment,
+) -> Result<InstantRolloverPlan, phorminx_vosk::VoskError> {
+    if terminal.start_sample.saturating_add(decoder_origin) != prior_committed
+        || terminal.end_sample.saturating_add(decoder_origin) != accepted_through
+        || uncommitted_samples as u64 != accepted_through.saturating_sub(prior_committed)
+    {
+        return Err(phorminx_vosk::VoskError::SampleAccountingOverflow);
+    }
+    let stable_cutoff = accepted_through.saturating_sub(INSTANT_ROLLOVER_OVERLAP_SAMPLES);
+    let stable_words = terminal
+        .words
+        .iter()
+        .take_while(|word| decoder_origin.saturating_add(word.end_sample) <= stable_cutoff)
+        .collect::<Vec<_>>();
+    let Some(last_stable) = stable_words.last() else {
+        return Err(phorminx_vosk::VoskError::DecoderFailed);
+    };
+    let committed_through = decoder_origin.saturating_add(last_stable.end_sample);
+    if committed_through <= prior_committed || committed_through > stable_cutoff {
+        return Err(phorminx_vosk::VoskError::SampleAccountingOverflow);
+    }
+    let stable_text = stable_words
+        .iter()
+        .map(|word| word.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let replay_offset = usize::try_from(committed_through - prior_committed)
+        .map_err(|_| phorminx_vosk::VoskError::SampleAccountingOverflow)?;
+    if uncommitted_samples.saturating_sub(replay_offset) as u64 >= INSTANT_ROLLOVER_TARGET_SAMPLES {
+        return Err(phorminx_vosk::VoskError::DecoderFailed);
+    }
+    Ok(InstantRolloverPlan {
+        committed_through,
+        stable_text,
+        replay_offset,
+    })
+}
+
+fn force_instant_rollover(
+    model: &VoskModel,
+    session: &mut InstantSession,
+    id: DictationId,
+    results: &Sender<WorkerEvent>,
+) -> Result<(), phorminx_vosk::VoskError> {
+    // Construct the replacement first. If allocation fails, the current
+    // decoder and every byte of uncommitted audio remain available for release
+    // recovery.
+    let replacement = model.session(session.sample_rate)?;
+    let prior_committed = session.ownership.committed_through;
+    let previous = std::mem::replace(&mut session.recognizer, replacement);
+    let started = Instant::now();
+    let terminal = previous.finish()?;
+    session.inference_time = session.inference_time.saturating_add(started.elapsed());
+    let absolute_end = session.decoder_origin.saturating_add(terminal.end_sample);
+    let plan = plan_instant_rollover(
+        session.decoder_origin,
+        prior_committed,
+        session.accepted_through,
+        session.uncommitted_audio.len(),
+        &terminal,
+    )?;
+    let replay = session.uncommitted_audio[plan.replay_offset..].to_vec();
+
+    commit_instant_text(
+        session,
+        id,
+        plan.committed_through,
+        &plan.stable_text,
+        results,
+    )
+    .map_err(|_| phorminx_vosk::VoskError::SampleAccountingOverflow)?;
+    session.uncommitted_audio.clear();
+    session.decoder_origin = plan.committed_through;
+    session.accepted_through = plan.committed_through;
+
+    // Re-read the uncommitted lexical boundary in the replacement decoder.
+    // Any endpoint produced during replay owns its exact range and can advance
+    // the ACK; otherwise the replay remains bounded for the next rollover or
+    // release.
+    for batch in replay.chunks(VOSK_FEED_BATCH_SAMPLES) {
+        let started = Instant::now();
+        let outcome = session.recognizer.accept_f32(batch)?;
+        session.inference_time = session.inference_time.saturating_add(started.elapsed());
+        session.accepted_through = session
+            .decoder_origin
+            .saturating_add(outcome.accepted_through);
+        session.evidence.observe(batch);
+        session.uncommitted_audio.extend_from_slice(batch);
+        if let Some(endpoint) = outcome.endpoint {
+            let start = session.decoder_origin.saturating_add(endpoint.start_sample);
+            let end = session.decoder_origin.saturating_add(endpoint.end_sample);
+            if start != session.ownership.committed_through
+                || instant_segment_is_unrecognized(
+                    &endpoint.text,
+                    &session.evidence,
+                    session.minimum_rms,
+                )
+            {
+                return Err(phorminx_vosk::VoskError::DecoderFailed);
+            }
+            commit_instant_text(session, id, end, &endpoint.text, results)
+                .map_err(|_| phorminx_vosk::VoskError::SampleAccountingOverflow)?;
+            session.uncommitted_audio.clear();
+        }
+    }
+    if session.accepted_through != absolute_end {
+        return Err(phorminx_vosk::VoskError::SampleAccountingOverflow);
+    }
+    Ok(())
+}
+
 fn transcribe_instant_final(
     model: &VoskModel,
     session: Option<InstantSession>,
     clip: &AudioClip,
     id: DictationId,
+    minimum_rms: f32,
 ) -> Result<Transcript, phorminx_vosk::VoskError> {
     let mut session = match session {
         Some(session)
             if !session.degraded
                 && instant_stream_is_continuous(
-                    session.accepted_samples,
+                    session.accepted_through,
                     session.sample_rate,
                     &session.continuity_prefix,
                     clip,
@@ -4032,12 +4681,12 @@ fn transcribe_instant_final(
                 "dictation_id={} state=Transcribing event=instant_recovery path=full_clip",
                 id.0
             );
-            return transcribe_instant_full_clip(model, clip);
+            return transcribe_instant_full_clip(model, clip, minimum_rms);
         }
     };
 
     let accepted_at_clip_rate = tail_start_at_clip_rate(
-        session.accepted_samples,
+        session.accepted_through,
         session.sample_rate,
         clip.sample_rate,
     );
@@ -4048,19 +4697,45 @@ fn transcribe_instant_final(
             session.sample_rate,
         )
         .map_err(|_| phorminx_vosk::VoskError::DecoderFailed)?;
-        let started = Instant::now();
-        session.recognizer.accept_f32(&native_tail)?;
-        session.inference_time += started.elapsed();
+        for batch in native_tail.chunks(VOSK_FEED_BATCH_SAMPLES) {
+            session.evidence.observe(batch);
+            let started = Instant::now();
+            let outcome = session.recognizer.accept_f32(batch)?;
+            session.inference_time += started.elapsed();
+            session.accepted_through = session
+                .decoder_origin
+                .saturating_add(outcome.accepted_through);
+            if let Some(endpoint) = outcome.endpoint {
+                let start = session.decoder_origin.saturating_add(endpoint.start_sample);
+                let end = session.decoder_origin.saturating_add(endpoint.end_sample);
+                if instant_segment_is_unrecognized(&endpoint.text, &session.evidence, minimum_rms)
+                    || start != session.ownership.committed_through
+                    || session.ownership.commit(end, &endpoint.text).is_err()
+                {
+                    return transcribe_instant_full_clip(model, clip, minimum_rms);
+                }
+                session.evidence.reset();
+            }
+        }
     }
     let started = Instant::now();
-    let text = session.recognizer.finish()?;
+    let terminal = session.recognizer.finish()?;
     session.inference_time += started.elapsed();
-    if text.trim().is_empty() && clip.rms() >= 0.01 {
+    let start = session.decoder_origin.saturating_add(terminal.start_sample);
+    let end = session.decoder_origin.saturating_add(terminal.end_sample);
+    if instant_segment_is_unrecognized(&terminal.text, &session.evidence, minimum_rms)
+        || start != session.ownership.committed_through
+        || session.ownership.commit(end, &terminal.text).is_err()
+    {
+        return transcribe_instant_full_clip(model, clip, minimum_rms);
+    }
+    let text = session.ownership.text;
+    if text.trim().is_empty() && clip.rms() >= minimum_rms {
         eprintln!(
             "dictation_id={} state=Transcribing event=instant_recovery path=full_clip reason=empty_high_energy",
             id.0
         );
-        return transcribe_instant_full_clip(model, clip);
+        return transcribe_instant_full_clip(model, clip, minimum_rms);
     }
     Ok(Transcript {
         text,
@@ -4074,11 +4749,28 @@ fn transcribe_instant_final(
 fn transcribe_instant_full_clip(
     model: &VoskModel,
     clip: &AudioClip,
+    minimum_rms: f32,
 ) -> Result<Transcript, phorminx_vosk::VoskError> {
     let mut recognizer = model.session(clip.sample_rate)?;
     let started = Instant::now();
-    recognizer.accept_f32(&clip.samples)?;
-    let text = recognizer.finish()?;
+    let mut text = String::new();
+    let mut evidence = InstantAudioEvidence::default();
+    for batch in clip.samples.chunks(VOSK_FEED_BATCH_SAMPLES) {
+        evidence.observe(batch);
+        let outcome = recognizer.accept_f32(batch)?;
+        if let Some(endpoint) = outcome.endpoint {
+            if instant_segment_is_unrecognized(&endpoint.text, &evidence, minimum_rms) {
+                return Err(phorminx_vosk::VoskError::DecoderFailed);
+            }
+            append_owned_text(&mut text, &endpoint.text);
+            evidence.reset();
+        }
+    }
+    let terminal = recognizer.finish()?;
+    if instant_segment_is_unrecognized(&terminal.text, &evidence, minimum_rms) {
+        return Err(phorminx_vosk::VoskError::DecoderFailed);
+    }
+    append_owned_text(&mut text, &terminal.text);
     Ok(Transcript {
         text,
         backend: "vosk",
@@ -4153,101 +4845,176 @@ fn transcribe_extended_instant(
     audio: &mut ExtendedCapturedAudio,
     stats: FinalAudioStats,
     id: DictationId,
+    minimum_rms: f32,
 ) -> Result<Transcript, String> {
-    let continuous = session.as_ref().is_some_and(|session| {
-        !session.degraded
-            && session.sample_rate == 16_000
-            && session.accepted_samples <= stats.total_samples
-            && extended_stream_prefix_matches(session, audio).unwrap_or(false)
-    });
-    if !continuous {
+    let retained_from = audio.retained_from();
+    if retained_from > stats.total_samples {
+        return Err("Instant retained-audio frontier exceeds captured audio".to_owned());
+    }
+    let Some(mut session) = session else {
+        if retained_from != 0 {
+            return Err("Instant committed text is unavailable for retained audio".to_owned());
+        }
+        return transcribe_instant_sequential(model, audio, stats, 0, String::new(), minimum_rms);
+    };
+    if session.ownership.committed_through < retained_from
+        || session.ownership.committed_through > session.accepted_through
+        || session.accepted_through > stats.total_samples
+    {
+        return Err("Instant transcript/audio ownership is inconsistent".to_owned());
+    }
+    if session.degraded || session.sample_rate != WHISPER_SAMPLE_RATE {
         eprintln!(
-            "dictation_id={} state=Transcribing event=instant_recovery path=bounded_spool",
+            "dictation_id={} state=Transcribing event=instant_recovery path=retained_tail reason=stream_degraded",
             id.0
         );
-        return transcribe_instant_sequential(model, audio, stats);
+        let start = session.ownership.committed_through;
+        return transcribe_instant_sequential(
+            model,
+            audio,
+            stats,
+            start,
+            session.ownership.text,
+            minimum_rms,
+        );
     }
 
-    let mut session = session.expect("continuous extended session exists");
-    if session.accepted_samples < stats.total_samples {
-        let range = SampleRange::new(session.accepted_samples, stats.total_samples)
-            .map_err(|error| error.to_string())?;
-        let tail = audio.snapshot(range).map_err(|error| error.to_string())?;
+    let recovery_start = session.ownership.committed_through;
+    let recovery_prefix = session.ownership.text.clone();
+    let streamed = (|| -> Result<Transcript, String> {
+        if session.accepted_through < stats.total_samples {
+            let range = SampleRange::new(session.accepted_through, stats.total_samples)
+                .map_err(|error| error.to_string())?;
+            let tail = audio.snapshot(range).map_err(|error| error.to_string())?;
+            for batch in tail.samples().chunks(VOSK_FEED_BATCH_SAMPLES) {
+                session.evidence.observe(batch);
+                let started = Instant::now();
+                let outcome = session
+                    .recognizer
+                    .accept_f32(batch)
+                    .map_err(|error| error.to_string())?;
+                session.inference_time = session.inference_time.saturating_add(started.elapsed());
+                session.accepted_through = session
+                    .decoder_origin
+                    .saturating_add(outcome.accepted_through);
+                if let Some(endpoint) = outcome.endpoint {
+                    let start = session.decoder_origin.saturating_add(endpoint.start_sample);
+                    let end = session.decoder_origin.saturating_add(endpoint.end_sample);
+                    if instant_segment_is_unrecognized(
+                        &endpoint.text,
+                        &session.evidence,
+                        minimum_rms,
+                    ) {
+                        return Err(
+                            "Instant final endpoint was empty for energetic audio".to_owned()
+                        );
+                    }
+                    if start != session.ownership.committed_through {
+                        return Err("Instant final endpoint is non-contiguous".to_owned());
+                    }
+                    session
+                        .ownership
+                        .commit(end, &endpoint.text)
+                        .map_err(str::to_owned)?;
+                    session.evidence.reset();
+                }
+            }
+            if session.accepted_through != stats.total_samples {
+                return Err("Instant final-tail sample accounting diverged".to_owned());
+            }
+        }
         let started = Instant::now();
-        session
+        let terminal = session
             .recognizer
-            .accept_f32(tail.samples())
+            .finish()
             .map_err(|error| error.to_string())?;
         session.inference_time = session.inference_time.saturating_add(started.elapsed());
+        let start = session.decoder_origin.saturating_add(terminal.start_sample);
+        let end = session.decoder_origin.saturating_add(terminal.end_sample);
+        if instant_segment_is_unrecognized(&terminal.text, &session.evidence, minimum_rms) {
+            return Err("Instant terminal result was empty for energetic audio".to_owned());
+        }
+        if start != session.ownership.committed_through || end != stats.total_samples {
+            return Err("Instant terminal segment is non-contiguous".to_owned());
+        }
+        session
+            .ownership
+            .commit(end, &terminal.text)
+            .map_err(str::to_owned)?;
+        if session.ownership.text.trim().is_empty() && stats.rms >= minimum_rms {
+            return Err("Instant streamed result was empty for energetic audio".to_owned());
+        }
+        Ok(Transcript {
+            text: session.ownership.text,
+            backend: "vosk",
+            model_load_time: model.load_time(),
+            inference_time: session.inference_time,
+            audio_duration: Duration::from_secs_f64(stats.total_samples as f64 / 16_000.0),
+        })
+    })();
+    match streamed {
+        Ok(transcript) => Ok(transcript),
+        Err(error) => {
+            eprintln!(
+                "dictation_id={} state=Transcribing event=instant_recovery path=retained_tail reason=stream_finalization_failed error={error}",
+                id.0
+            );
+            transcribe_instant_sequential(
+                model,
+                audio,
+                stats,
+                recovery_start,
+                recovery_prefix,
+                minimum_rms,
+            )
+        }
     }
-    let started = Instant::now();
-    let text = session
-        .recognizer
-        .finish()
-        .map_err(|error| error.to_string())?;
-    session.inference_time = session.inference_time.saturating_add(started.elapsed());
-    if text.trim().is_empty() && stats.rms >= 0.01 {
-        eprintln!(
-            "dictation_id={} state=Transcribing event=instant_recovery path=bounded_spool reason=empty_high_energy",
-            id.0
-        );
-        return transcribe_instant_sequential(model, audio, stats);
-    }
-    Ok(Transcript {
-        text,
-        backend: "vosk",
-        model_load_time: model.load_time(),
-        inference_time: session.inference_time,
-        audio_duration: Duration::from_secs_f64(stats.total_samples as f64 / 16_000.0),
-    })
-}
-
-fn extended_stream_prefix_matches(
-    session: &InstantSession,
-    audio: &mut ExtendedCapturedAudio,
-) -> Result<bool, String> {
-    if session.accepted_samples == 0 {
-        return Ok(session.continuity_prefix.is_empty());
-    }
-    let length = session.continuity_prefix.len().min(2_048);
-    if length < 64 {
-        return Ok(false);
-    }
-    let span = audio
-        .snapshot(SampleRange::new(0, length as u64).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())?;
-    let observed = &session.continuity_prefix[..length];
-    let expected = span.samples();
-    let observed_energy = observed.iter().map(|sample| sample * sample).sum::<f32>();
-    let expected_energy = expected.iter().map(|sample| sample * sample).sum::<f32>();
-    if observed_energy < 1e-6 || expected_energy < 1e-6 {
-        return Ok(observed_energy < 1e-6 && expected_energy < 1e-6);
-    }
-    let correlation = observed
-        .iter()
-        .zip(expected)
-        .map(|(left, right)| left * right)
-        .sum::<f32>()
-        / (observed_energy * expected_energy).sqrt();
-    Ok(correlation >= 0.70)
 }
 
 fn transcribe_instant_sequential(
     model: &VoskModel,
     audio: &mut ExtendedCapturedAudio,
     stats: FinalAudioStats,
+    start_sample: u64,
+    mut text: String,
+    minimum_rms: f32,
 ) -> Result<Transcript, String> {
     const RECOVERY_CHUNK_SAMPLES: u64 = 16_000 * 30;
+    if start_sample < audio.retained_from() || start_sample > stats.total_samples {
+        return Err("Instant recovery requested unavailable audio".to_owned());
+    }
     let mut recognizer = model.session(16_000).map_err(|error| error.to_string())?;
     let started = Instant::now();
-    for_each_bounded_range(stats.total_samples, RECOVERY_CHUNK_SAMPLES, |range| {
-        let span = audio.snapshot(range).map_err(|error| error.to_string())?;
-        recognizer
-            .accept_f32(span.samples())
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    })?;
-    let text = recognizer.finish().map_err(|error| error.to_string())?;
+    let mut evidence = InstantAudioEvidence::default();
+    for_each_bounded_range_from(
+        start_sample,
+        stats.total_samples,
+        RECOVERY_CHUNK_SAMPLES,
+        |range| {
+            let span = audio.snapshot(range).map_err(|error| error.to_string())?;
+            for batch in span.samples().chunks(VOSK_FEED_BATCH_SAMPLES) {
+                evidence.observe(batch);
+                let outcome = recognizer
+                    .accept_f32(batch)
+                    .map_err(|error| error.to_string())?;
+                if let Some(endpoint) = outcome.endpoint {
+                    if instant_segment_is_unrecognized(&endpoint.text, &evidence, minimum_rms) {
+                        return Err(
+                            "Instant recovery endpoint was empty for energetic audio".to_owned()
+                        );
+                    }
+                    append_owned_text(&mut text, &endpoint.text);
+                    evidence.reset();
+                }
+            }
+            Ok(())
+        },
+    )?;
+    let terminal = recognizer.finish().map_err(|error| error.to_string())?;
+    if instant_segment_is_unrecognized(&terminal.text, &evidence, minimum_rms) {
+        return Err("Instant recovery terminal was empty for energetic audio".to_owned());
+    }
+    append_owned_text(&mut text, &terminal.text);
     Ok(Transcript {
         text,
         backend: "vosk",
@@ -4257,7 +5024,8 @@ fn transcribe_instant_sequential(
     })
 }
 
-fn for_each_bounded_range(
+fn for_each_bounded_range_from(
+    start_sample: u64,
     total_samples: u64,
     maximum_samples: u64,
     mut visit: impl FnMut(SampleRange) -> Result<(), String>,
@@ -4265,13 +5033,25 @@ fn for_each_bounded_range(
     if maximum_samples == 0 {
         return Err("bounded audio traversal requires a non-zero chunk size".to_owned());
     }
-    let mut cursor = 0;
+    if start_sample > total_samples {
+        return Err("bounded audio traversal starts beyond captured audio".to_owned());
+    }
+    let mut cursor = start_sample;
     while cursor < total_samples {
         let end = total_samples.min(cursor.saturating_add(maximum_samples));
         visit(SampleRange::new(cursor, end).map_err(|error| error.to_string())?)?;
         cursor = end;
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn for_each_bounded_range(
+    total_samples: u64,
+    maximum_samples: u64,
+    visit: impl FnMut(SampleRange) -> Result<(), String>,
+) -> Result<(), String> {
+    for_each_bounded_range_from(0, total_samples, maximum_samples, visit)
 }
 
 impl Default for PartialAccumulator {
@@ -4287,6 +5067,7 @@ impl Default for PartialAccumulator {
             partial_compute_time: Duration::ZERO,
             model_load_time: Duration::ZERO,
             degraded: None,
+            provisional: None,
         }
     }
 }
@@ -4297,10 +5078,12 @@ fn process_partial_transcription(
     plan: phorminx_app::incremental::ChunkPlan,
     clip: AudioClip,
     language: &str,
+    silence_threshold: f32,
     abort: &Arc<AtomicBool>,
 ) -> WorkerEvent {
     let audio_duration = clip.duration();
     let accumulator = sessions.entry(plan.id).or_default();
+    let accepted_before = accumulator.accepted_through;
     let mut compute_time = Duration::ZERO;
     let succeeded = if accumulator.degraded.is_some() {
         false
@@ -4328,7 +5111,13 @@ fn process_partial_transcription(
             Ok(mut detailed) => {
                 let transcript = &mut detailed.transcript;
                 transcript.text = strip_known_non_speech_annotations(&transcript.text);
-                append_timestamp_stable_segments(accumulator, plan, &detailed.segments);
+                append_timestamp_stable_segments(
+                    accumulator,
+                    plan,
+                    &clip,
+                    &detailed.segments,
+                    silence_threshold,
+                );
                 accumulator.timestamp_stable = true;
                 accumulator.stable_end = plan.stable_end;
                 // Text was admitted by absolute timestamp and ends no later
@@ -4337,7 +5126,7 @@ fn process_partial_transcription(
                 accumulator.last_boundary = Some(BoundaryKind::Silence);
                 accumulator.next_sequence = accumulator.next_sequence.saturating_add(1);
                 accumulator.model_load_time = transcript.model_load_time;
-                true
+                accumulator.degraded.is_none()
             }
             Err(WhisperError::Aborted) => false,
             Err(_) => {
@@ -4347,10 +5136,21 @@ fn process_partial_transcription(
         }
     };
 
+    let committed_through = (succeeded && accumulator.accepted_through > accepted_before)
+        .then(|| canonical_sample(accumulator.accepted_through));
+    let repair_from = succeeded
+        .then_some(accumulator.unresolved_from)
+        .flatten()
+        .map(canonical_sample)
+        .map(|frontier| frontier.saturating_sub(ACCURATE_REPAIR_OVERLAP_SAMPLES));
+
     WorkerEvent::PartialCompleted {
         id: plan.id,
         sequence: plan.sequence,
         succeeded,
+        committed_through,
+        repair_from,
+        recognized_speech: !accumulator.text.trim().is_empty(),
         compute_time,
         audio_duration,
     }
@@ -4359,54 +5159,312 @@ fn process_partial_transcription(
 fn append_timestamp_stable_segments(
     accumulator: &mut PartialAccumulator,
     plan: phorminx_app::incremental::ChunkPlan,
+    clip: &AudioClip,
     segments: &[phorminx_whisper::TimedSegment],
+    silence_threshold: f32,
 ) {
-    // Once Whisper changes a boundary across the accepted frontier, only the
-    // final pass may resolve it. Admitting later segments would create a
-    // permanent hole while moving `accepted_through` beyond missing audio.
-    if accumulator.unresolved_from.is_some() {
-        return;
-    }
-    let guarded_end = match plan.boundary {
-        BoundaryKind::Silence => plan.stable_end,
-        BoundaryKind::Forced => plan.stable_end.saturating_sub(CHUNK_OVERLAP),
+    const TIMESTAMP_JITTER_SAMPLES: u64 = 16_000 / 20; // 50 ms
+
+    // Uncertainty is retried from retained canonical audio on every partial.
+    // It is deliberately not a permanent latch: ordinary Whisper timestamp
+    // drift and a segment crossing a forced boundary must not freeze an
+    // otherwise healthy hours-long session.
+    accumulator.unresolved_from = None;
+    // A forced cut has no acoustic evidence that the right-edge word is
+    // complete. Keep the final two seconds provisional until a later decode
+    // supplies that much right context. This is also what makes the capture
+    // layer's retained repair overlap semantically necessary rather than just
+    // resident-but-unused audio.
+    let guarded_end = if plan.boundary == BoundaryKind::Forced {
+        plan.stable_end
+            .saturating_sub(canonical_duration(ACCURATE_REPAIR_OVERLAP_SAMPLES))
+    } else {
+        plan.stable_end
     };
+    let guarded_end_sample = canonical_sample(guarded_end);
+    let clip_start_sample = canonical_sample(plan.range.start);
+    let clip_end_sample = clip_start_sample.saturating_add(clip.samples.len() as u64);
+    let mut frontier = canonical_sample(accumulator.accepted_through);
+
+    let current_hypothesis = validated_chunk_hypothesis(
+        plan,
+        clip,
+        segments,
+        silence_threshold,
+        TIMESTAMP_JITTER_SAMPLES,
+    );
+    if let (Some(previous), Some(current)) =
+        (accumulator.provisional.take(), current_hypothesis.as_ref())
+        && previous.commit_through > accumulator.accepted_through
+        && hypothesis_is_confirmed(&previous, current, plan.range)
+    {
+        accumulator.text = merge_confirmed_hypothesis(&accumulator.text, &previous.text);
+        frontier = frontier.max(canonical_sample(previous.commit_through));
+    }
+    accumulator.provisional = (plan.boundary == BoundaryKind::Forced)
+        .then(|| {
+            current_hypothesis.map(|text| AccurateHypothesis {
+                text,
+                commit_through: guarded_end,
+                range: plan.range,
+            })
+        })
+        .flatten();
+
     for segment in segments {
-        let absolute_start = plan.range.start.saturating_add(segment.start);
-        let absolute_end = plan.range.start.saturating_add(segment.end);
-        if absolute_end <= accumulator.accepted_through {
+        let absolute_start = clip_start_sample.saturating_add(canonical_sample(segment.start));
+        let absolute_end = clip_start_sample.saturating_add(canonical_sample(segment.end));
+        if absolute_end <= frontier || absolute_end <= absolute_start {
             continue;
         }
-        // A changed segmentation boundary can straddle already accepted audio.
-        // Freeze the frontier at the first unresolved instant instead of
-        // skipping forward and losing the unaccepted suffix.
-        if absolute_start < accumulator.accepted_through {
-            accumulator.unresolved_from = Some(accumulator.accepted_through);
+
+        // The forced-boundary guard keeps an incomplete right-edge segment in
+        // the repair window. A later chunk re-decodes it with right context.
+        if absolute_end > guarded_end_sample {
+            accumulator.unresolved_from = Some(canonical_duration(frontier));
             break;
         }
-        // A timestamp jump is not proof that the skipped audio was silent.
-        // Freeze at the last contiguous frontier so the final pass re-reads
-        // every unproven sample from the canonical capture source.
-        if absolute_start > accumulator.accepted_through || absolute_end <= absolute_start {
-            accumulator.unresolved_from = Some(accumulator.accepted_through);
-            break;
+
+        if absolute_start > frontier {
+            let gap = absolute_start.saturating_sub(frontier);
+            let gap_is_alignment_jitter = gap <= TIMESTAMP_JITTER_SAMPLES;
+            let gap_is_silence = range_is_low_energy(
+                clip,
+                clip_start_sample,
+                frontier,
+                absolute_start,
+                silence_threshold,
+            );
+            if !gap_is_alignment_jitter && !gap_is_silence {
+                accumulator.unresolved_from = Some(canonical_duration(frontier));
+                break;
+            }
+            // Explicitly validated silence (or sub-frame timestamp jitter) is
+            // represented coverage even though it contributes no text.
+            frontier = absolute_start;
         }
-        // Segments beyond the stability guard are deliberately deferred. The
-        // final tail must resume at the accepted frontier before later
-        // partials can be admitted; timestamps may contain silent gaps before
-        // this segment, and Accurate mode never assumes those gaps are empty.
-        if absolute_end > guarded_end {
-            accumulator.unresolved_from = Some(accumulator.accepted_through);
-            break;
-        }
+
         let text = strip_known_non_speech_annotations(&segment.text);
         let text = text.trim();
-        if text.is_empty() {
+        let body_start = absolute_start.max(frontier);
+        let body_is_silence = range_is_low_energy(
+            clip,
+            clip_start_sample,
+            body_start,
+            absolute_end,
+            silence_threshold,
+        );
+        if text.is_empty() && !body_is_silence {
+            // Removing a known annotation (or receiving an empty segment)
+            // must not turn energetic audio into deletable coverage.
+            accumulator.unresolved_from = Some(canonical_duration(frontier));
+            break;
+        }
+        if !text.is_empty() && body_is_silence {
+            // Whisper text over measured silence is a hallucination. Treat the
+            // audio as explicit silent coverage, but never own the text.
+            frontier = frontier.max(absolute_end);
             continue;
         }
-        append_with_spacing(&mut accumulator.text, text);
-        accumulator.accepted_through = accumulator.accepted_through.max(absolute_end);
+        if !text.is_empty() {
+            if absolute_start < frontier {
+                // Re-segmentation across an already committed boundary is
+                // normal. Prefer a lexical repair; when repetition makes the
+                // overlap ambiguous, conservatively append the new rendering.
+                // This may duplicate words, but it can never delete speech.
+                accumulator.text =
+                    merge_overlapping(&accumulator.text, text, MergeExpectation::LexicalOverlap)
+                        .unwrap_or_else(|_| {
+                            let mut preserved = accumulator.text.clone();
+                            append_with_spacing(&mut preserved, text);
+                            preserved
+                        });
+            } else {
+                append_with_spacing(&mut accumulator.text, text);
+            }
+        }
+        frontier = frontier.max(absolute_end);
     }
+
+    if accumulator.unresolved_from.is_none() && frontier < guarded_end_sample {
+        if range_is_low_energy(
+            clip,
+            clip_start_sample,
+            frontier,
+            guarded_end_sample.min(clip_end_sample),
+            silence_threshold,
+        ) {
+            // Silence at the end of a chunk is explicit transcript coverage.
+            frontier = guarded_end_sample.min(clip_end_sample);
+        } else {
+            accumulator.unresolved_from = Some(canonical_duration(frontier));
+        }
+    }
+
+    if accumulator.unresolved_from.is_none()
+        && plan.boundary == BoundaryKind::Forced
+        && guarded_end_sample < canonical_sample(plan.stable_end)
+    {
+        // Coverage through `guarded_end` is owned, but the right-edge repair
+        // interval is intentionally still live. Tell the planner to include
+        // the retained overlap on its next decode.
+        accumulator.unresolved_from = Some(canonical_duration(frontier));
+    }
+
+    accumulator.accepted_through = canonical_duration(frontier);
+    if let Some(unresolved_from) = accumulator.unresolved_from
+        && guarded_end_sample.saturating_sub(canonical_sample(unresolved_from))
+            > MAX_ACCURATE_LIVE_REPAIR_SAMPLES
+    {
+        // Stop scheduling increasingly large partial decodes. The committed
+        // prefix remains owned, no audio is reclaimed past the uncertainty,
+        // and release recovery reads only the retained unresolved tail.
+        accumulator.degraded = Some("timestamp_repair_exhausted");
+    }
+}
+
+fn hypothesis_is_confirmed(
+    previous: &AccurateHypothesis,
+    current_text: &str,
+    current_range: phorminx_app::incremental::TimeRange,
+) -> bool {
+    const MAX_HYPOTHESIS_WORDS: usize = 256;
+    previous.range.start < current_range.end
+        && current_range.start < previous.range.end
+        && longest_word_overlap(&previous.text, current_text, MAX_HYPOTHESIS_WORDS) >= 2
+}
+
+fn merge_confirmed_hypothesis(left: &str, right: &str) -> String {
+    const MAX_HYPOTHESIS_WORDS: usize = 256;
+    if left.trim().is_empty() {
+        return right.trim().to_owned();
+    }
+    let left_words = normalized_word_ranges(left);
+    let overlaps = matching_word_overlaps(left, right, MAX_HYPOTHESIS_WORDS);
+    let overlap = overlaps.last().copied().unwrap_or(0);
+    if overlap < 2 || overlap > left_words.len() || overlaps.len() != 1 {
+        // Multiple valid alignments are legitimate repeated dictation. Keep
+        // both renderings rather than guessing which occurrence to delete.
+        let mut preserved = left.to_owned();
+        append_with_spacing(&mut preserved, right.trim());
+        return preserved;
+    }
+    let replace_from = left_words[left_words.len() - overlap].1.start;
+    let mut merged = left[..replace_from].trim_end().to_owned();
+    append_with_spacing(&mut merged, right.trim());
+    merged
+}
+
+fn longest_word_overlap(left: &str, right: &str, maximum: usize) -> usize {
+    matching_word_overlaps(left, right, maximum)
+        .last()
+        .copied()
+        .unwrap_or(0)
+}
+
+fn matching_word_overlaps(left: &str, right: &str, maximum: usize) -> Vec<usize> {
+    let left = normalized_word_ranges(left);
+    let right = normalized_word_ranges(right);
+    let maximum = left.len().min(right.len()).min(maximum);
+    (1..=maximum)
+        .filter(|&count| {
+            left[left.len() - count..]
+                .iter()
+                .map(|token| &token.0)
+                .eq(right[..count].iter().map(|token| &token.0))
+        })
+        .collect()
+}
+
+fn normalized_word_ranges(input: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (index, character) in input.char_indices() {
+        if character.is_alphanumeric() || character == '_' {
+            start.get_or_insert(index);
+        } else if let Some(word_start) = start.take() {
+            words.push((input[word_start..index].to_lowercase(), word_start..index));
+        }
+    }
+    if let Some(word_start) = start {
+        words.push((input[word_start..].to_lowercase(), word_start..input.len()));
+    }
+    words
+}
+
+fn validated_chunk_hypothesis(
+    plan: phorminx_app::incremental::ChunkPlan,
+    clip: &AudioClip,
+    segments: &[phorminx_whisper::TimedSegment],
+    silence_threshold: f32,
+    timestamp_jitter_samples: u64,
+) -> Option<String> {
+    let clip_start = canonical_sample(plan.range.start);
+    let clip_end = clip_start.checked_add(clip.samples.len() as u64)?;
+    let mut frontier = clip_start;
+    let mut text = String::new();
+    for segment in segments {
+        let start = clip_start.checked_add(canonical_sample(segment.start))?;
+        let end = clip_start.checked_add(canonical_sample(segment.end))?;
+        if end <= start || start < frontier || end > clip_end {
+            return None;
+        }
+        if start > frontier
+            && start.saturating_sub(frontier) > timestamp_jitter_samples
+            && !range_is_low_energy(clip, clip_start, frontier, start, silence_threshold)
+        {
+            return None;
+        }
+        let segment_text = strip_known_non_speech_annotations(&segment.text);
+        let segment_text = segment_text.trim();
+        let body_is_silence = range_is_low_energy(clip, clip_start, start, end, silence_threshold);
+        if segment_text.is_empty() {
+            if !body_is_silence {
+                return None;
+            }
+        } else if !body_is_silence {
+            append_with_spacing(&mut text, segment_text);
+        }
+        frontier = end;
+    }
+    if frontier < clip_end
+        && !range_is_low_energy(clip, clip_start, frontier, clip_end, silence_threshold)
+    {
+        return None;
+    }
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn range_is_low_energy(
+    clip: &AudioClip,
+    clip_start_sample: u64,
+    absolute_start: u64,
+    absolute_end: u64,
+    silence_threshold: f32,
+) -> bool {
+    if absolute_end <= absolute_start {
+        return true;
+    }
+    if absolute_start < clip_start_sample {
+        return false;
+    }
+    let local_start = absolute_start.saturating_sub(clip_start_sample) as usize;
+    let local_end = absolute_end.saturating_sub(clip_start_sample) as usize;
+    let Some(samples) = clip
+        .samples
+        .get(local_start..local_end.min(clip.samples.len()))
+    else {
+        return false;
+    };
+    if samples.len() != local_end.saturating_sub(local_start) || samples.is_empty() {
+        return false;
+    }
+    let mean_square = samples
+        .iter()
+        .map(|sample| f64::from(*sample) * f64::from(*sample))
+        .sum::<f64>()
+        / samples.len() as f64;
+    mean_square.sqrt() <= f64::from(silence_threshold.max(0.000_1))
 }
 
 fn append_with_spacing(output: &mut String, value: &str) {
@@ -4482,10 +5540,12 @@ fn transcribe_extended_accurate<R>(
 where
     R: SpeechRecognizer,
 {
+    let retained_from = audio.retained_from();
     transcribe_extended_accurate_with_source(
         recognizer,
         incremental,
         stats,
+        retained_from,
         language,
         id,
         |range| {
@@ -4499,6 +5559,7 @@ fn transcribe_extended_accurate_with_source<R>(
     recognizer: &R,
     incremental: Option<PartialAccumulator>,
     stats: FinalAudioStats,
+    retained_from: u64,
     language: &str,
     id: DictationId,
     mut snapshot: impl FnMut(SampleRange) -> Result<AudioClip, String>,
@@ -4511,6 +5572,9 @@ where
         let tail_attempt = (|| {
             let plan = final_tail_plan(&accumulator, full_duration).map_err(str::to_owned)?;
             let start_sample = (plan.start.as_secs_f64() * 16_000.0).floor() as u64;
+            if start_sample < retained_from {
+                return Err("extended Accurate final tail precedes retained audio".to_owned());
+            }
             if start_sample >= stats.total_samples {
                 return Err("extended Accurate capture has an empty final tail".to_owned());
             }
@@ -4529,7 +5593,7 @@ where
             let mut tail_transcript = recognition.map_err(|error| error.to_string())?;
             tail_transcript.inference_time = tail_compute_time;
             suppress_non_speech_annotation(&mut tail_transcript);
-            let transcript = assemble_incremental_transcript(
+            let transcript = assemble_retained_incremental_transcript(
                 &accumulator,
                 tail_transcript,
                 tail.rms(),
@@ -4546,9 +5610,21 @@ where
             );
             Ok(transcript)
         })();
-        if let Ok(transcript) = tail_attempt {
-            return Ok(transcript);
+        match tail_attempt {
+            Ok(transcript) => return Ok(transcript),
+            Err(error) if retained_from != 0 => {
+                return Err(format!(
+                    "extended Accurate retained-tail recovery failed: {error}"
+                ));
+            }
+            Err(_) => {}
         }
+    }
+
+    if retained_from != 0 {
+        return Err(
+            "extended Accurate committed text is unavailable for retained audio".to_owned(),
+        );
     }
 
     eprintln!(
@@ -4826,29 +5902,33 @@ fn final_tail_plan(
     accumulator: &PartialAccumulator,
     full_audio_duration: Duration,
 ) -> Result<FinalTailPlan, &'static str> {
-    if let Some(reason) = accumulator.degraded {
-        return Err(reason);
-    }
     if accumulator.next_sequence == 0 || accumulator.text.trim().is_empty() {
-        return Err("no_stable_partial");
+        return Err(accumulator.degraded.unwrap_or("no_stable_partial"));
     }
-    let boundary = accumulator.last_boundary.ok_or("missing_boundary")?;
     if accumulator.stable_end > full_audio_duration {
         return Err("stable_audio_exceeds_final");
     }
-    Ok(FinalTailPlan {
-        start: if accumulator.timestamp_stable {
+    if accumulator.timestamp_stable {
+        let accepted = canonical_sample(
             accumulator
                 .unresolved_from
-                .unwrap_or(accumulator.accepted_through)
-        } else {
-            accumulator.stable_end.saturating_sub(CHUNK_OVERLAP)
-        },
-        expectation: if accumulator.timestamp_stable {
-            MergeExpectation::Silence
-        } else {
-            MergeExpectation::from(boundary)
-        },
+                .unwrap_or(accumulator.accepted_through),
+        );
+        return Ok(FinalTailPlan {
+            // Re-decode the overlap deliberately retained by capture. This is
+            // bounded regardless of total dictation length and gives Whisper
+            // enough left context to repair the release seam.
+            start: canonical_duration(accepted.saturating_sub(ACCURATE_REPAIR_OVERLAP_SAMPLES)),
+            expectation: MergeExpectation::LexicalOverlap,
+        });
+    }
+    if let Some(reason) = accumulator.degraded {
+        return Err(reason);
+    }
+    let boundary = accumulator.last_boundary.ok_or("missing_boundary")?;
+    Ok(FinalTailPlan {
+        start: accumulator.stable_end.saturating_sub(CHUNK_OVERLAP),
+        expectation: MergeExpectation::from(boundary),
     })
 }
 
@@ -4858,23 +5938,93 @@ fn assemble_incremental_transcript(
     tail_rms: f32,
     full_audio_duration: Duration,
 ) -> Result<Transcript, &'static str> {
+    assemble_incremental_transcript_with_policy(
+        accumulator,
+        tail_transcript,
+        tail_rms,
+        full_audio_duration,
+        false,
+    )
+}
+
+fn assemble_retained_incremental_transcript(
+    accumulator: &PartialAccumulator,
+    tail_transcript: Transcript,
+    tail_rms: f32,
+    full_audio_duration: Duration,
+) -> Result<Transcript, &'static str> {
+    assemble_incremental_transcript_with_policy(
+        accumulator,
+        tail_transcript,
+        tail_rms,
+        full_audio_duration,
+        true,
+    )
+}
+
+fn assemble_incremental_transcript_with_policy(
+    accumulator: &PartialAccumulator,
+    tail_transcript: Transcript,
+    tail_rms: f32,
+    full_audio_duration: Duration,
+    preserve_committed_on_ambiguous_seam: bool,
+) -> Result<Transcript, &'static str> {
     let plan = final_tail_plan(accumulator, full_audio_duration)?;
     if tail_transcript.text.trim().is_empty() && tail_rms > 0.001 {
         return Err("uncertain_empty_tail");
     }
-    if tail_rms <= 0.001
-        && !tail_transcript.text.trim().is_empty()
-        && merge_overlapping(
+    if tail_rms <= 0.001 {
+        if tail_transcript.text.trim().is_empty() {
+            return Ok(Transcript {
+                text: accumulator.text.clone(),
+                backend: tail_transcript.backend,
+                model_load_time: accumulator
+                    .model_load_time
+                    .max(tail_transcript.model_load_time),
+                inference_time: accumulator
+                    .partial_compute_time
+                    .saturating_add(tail_transcript.inference_time),
+                audio_duration: full_audio_duration,
+            });
+        }
+        if merge_overlapping(
             &accumulator.text,
             &tail_transcript.text,
             MergeExpectation::LexicalOverlap,
         )
         .is_err()
-    {
-        return Err("low_energy_unmatched_tail");
+        {
+            // The retained tail is explicit silence. Keep the already-owned
+            // prefix instead of failing the dictation or appending a Whisper
+            // hallucination.
+            if !preserve_committed_on_ambiguous_seam {
+                return Err("low_energy_unmatched_tail");
+            }
+            return Ok(Transcript {
+                text: accumulator.text.clone(),
+                backend: tail_transcript.backend,
+                model_load_time: accumulator
+                    .model_load_time
+                    .max(tail_transcript.model_load_time),
+                inference_time: accumulator
+                    .partial_compute_time
+                    .saturating_add(tail_transcript.inference_time),
+                audio_duration: full_audio_duration,
+            });
+        }
     }
-    let text = merge_overlapping(&accumulator.text, &tail_transcript.text, plan.expectation)
-        .map_err(|_| "tail_overlap_unresolved")?;
+    let text = match merge_overlapping(&accumulator.text, &tail_transcript.text, plan.expectation) {
+        Ok(text) => text,
+        Err(_) if preserve_committed_on_ambiguous_seam => {
+            // An ambiguous lexical seam is not grounds to reject committed
+            // text. Conservatively preserve both sides; possible duplication
+            // is preferable to deleting dictated speech.
+            let mut preserved = accumulator.text.clone();
+            append_with_spacing(&mut preserved, tail_transcript.text.trim());
+            preserved
+        }
+        Err(_) => return Err("tail_overlap_unresolved"),
+    };
 
     Ok(Transcript {
         text,
@@ -5530,6 +6680,7 @@ mod composition_tests {
             partial_compute_time: Duration::from_millis(400),
             model_load_time: Duration::from_millis(100),
             degraded: None,
+            provisional: None,
         }
     }
 
@@ -5541,6 +6692,31 @@ mod composition_tests {
             inference_time: Duration::from_millis(200),
             audio_duration: Duration::from_secs(3),
         }
+    }
+
+    fn append_test_segments(
+        accumulator: &mut PartialAccumulator,
+        plan: phorminx_app::incremental::ChunkPlan,
+        segments: &[phorminx_whisper::TimedSegment],
+        sample: f32,
+    ) {
+        let samples = canonical_sample(plan.range.duration()) as usize;
+        let clip = AudioClip::new(vec![sample; samples], WHISPER_SAMPLE_RATE).unwrap();
+        append_timestamp_stable_segments(accumulator, plan, &clip, segments, 0.003);
+    }
+
+    fn append_test_segments_with_samples(
+        accumulator: &mut PartialAccumulator,
+        plan: phorminx_app::incremental::ChunkPlan,
+        segments: &[phorminx_whisper::TimedSegment],
+        samples: Vec<f32>,
+    ) {
+        assert_eq!(
+            samples.len(),
+            canonical_sample(plan.range.duration()) as usize
+        );
+        let clip = AudioClip::new(samples, WHISPER_SAMPLE_RATE).unwrap();
+        append_timestamp_stable_segments(accumulator, plan, &clip, segments, 0.003);
     }
 
     #[test]
@@ -5586,8 +6762,28 @@ mod composition_tests {
                 ExtendedCaptureFault::SampleAccountingOverflow,
                 "sample_accounting",
             ),
+            (
+                ExtendedCaptureFault::UncommittedAudioBacklog,
+                "recognition_backlog",
+            ),
         ] {
             assert_eq!(auto_stop_reason(fault).unwrap().label(), expected);
+        }
+        assert!(capture_fault_has_recoverable_audio(
+            ExtendedCaptureFault::UncommittedAudioBacklog
+        ));
+        for fatal in [
+            ExtendedCaptureFault::CallbackOverflow,
+            ExtendedCaptureFault::StreamFailed,
+            ExtendedCaptureFault::Resampling,
+            ExtendedCaptureFault::SpoolQuota,
+            ExtendedCaptureFault::SpoolIntegrity,
+            ExtendedCaptureFault::SpoolIo,
+            ExtendedCaptureFault::WorkerUnavailable,
+            ExtendedCaptureFault::WorkerPanicked,
+            ExtendedCaptureFault::SampleAccountingOverflow,
+        ] {
+            assert!(!capture_fault_has_recoverable_audio(fatal));
         }
         for non_active in [
             ExtendedCaptureFault::InvalidConfiguration,
@@ -5615,7 +6811,7 @@ mod composition_tests {
             start_overlap: None,
             boundary: BoundaryKind::Silence,
         };
-        append_timestamp_stable_segments(
+        append_test_segments(
             &mut accumulator,
             first,
             &[TimedSegment {
@@ -5623,6 +6819,7 @@ mod composition_tests {
                 start: Duration::ZERO,
                 end: Duration::from_secs(3),
             }],
+            0.1,
         );
         let second = ChunkPlan {
             id: DictationId(1),
@@ -5635,7 +6832,7 @@ mod composition_tests {
             start_overlap: Some(MergeExpectation::Silence),
             boundary: BoundaryKind::Silence,
         };
-        append_timestamp_stable_segments(
+        append_test_segments(
             &mut accumulator,
             second,
             &[
@@ -5647,13 +6844,14 @@ mod composition_tests {
                 TimedSegment {
                     text: "Gamma.".to_owned(),
                     start: Duration::from_millis(500),
-                    end: Duration::from_secs(2),
+                    end: Duration::from_millis(2_500),
                 },
             ],
+            0.1,
         );
 
         assert_eq!(accumulator.text, "Alpha beta. Gamma.");
-        assert_eq!(accumulator.accepted_through, Duration::from_millis(4_500));
+        assert_eq!(accumulator.accepted_through, Duration::from_secs(5));
     }
 
     #[test]
@@ -5717,7 +6915,7 @@ mod composition_tests {
     }
 
     #[test]
-    fn forced_guard_gap_freezes_frontier_and_final_resumes_before_missing_audio() {
+    fn forced_boundary_is_repaired_by_the_next_overlapping_decode() {
         use phorminx_app::incremental::{ChunkPlan, TimeRange};
         use phorminx_whisper::TimedSegment;
 
@@ -5733,56 +6931,64 @@ mod composition_tests {
             start_overlap: None,
             boundary: BoundaryKind::Forced,
         };
-        append_timestamp_stable_segments(
+        append_test_segments(
             &mut accumulator,
             first,
             &[
                 TimedSegment {
-                    text: "accepted".to_owned(),
+                    text: "well accepted".to_owned(),
                     start: Duration::ZERO,
-                    end: Duration::from_secs(2),
+                    end: Duration::from_millis(800),
                 },
                 TimedSegment {
                     text: "guarded".to_owned(),
-                    start: Duration::from_secs(2),
+                    start: Duration::from_millis(800),
                     end: Duration::from_secs(3),
                 },
             ],
+            0.1,
         );
-        assert_eq!(accumulator.accepted_through, Duration::from_secs(2));
-        assert_eq!(accumulator.unresolved_from, Some(Duration::from_secs(2)));
+        assert_eq!(accumulator.text, "well accepted");
+        assert_eq!(accumulator.accepted_through, Duration::from_millis(800));
+        assert_eq!(
+            accumulator.unresolved_from,
+            Some(Duration::from_millis(800))
+        );
 
         let later = ChunkPlan {
             id: DictationId(9),
             sequence: 1,
             range: TimeRange {
-                start: Duration::from_millis(2_500),
-                end: Duration::from_secs(4),
+                start: Duration::ZERO,
+                end: Duration::from_secs(5),
             },
-            stable_end: Duration::from_secs(4),
+            stable_end: Duration::from_secs(5),
             start_overlap: Some(MergeExpectation::LexicalOverlap),
             boundary: BoundaryKind::Silence,
         };
-        append_timestamp_stable_segments(
+        append_test_segments(
             &mut accumulator,
             later,
             &[TimedSegment {
-                text: "must not jump the gap".to_owned(),
+                text: "well accepted guarded and repaired".to_owned(),
                 start: Duration::ZERO,
-                end: Duration::from_millis(1_500),
+                end: Duration::from_secs(5),
             }],
+            0.1,
         );
         accumulator.timestamp_stable = true;
-        accumulator.stable_end = Duration::from_secs(4);
+        accumulator.stable_end = Duration::from_secs(5);
         accumulator.last_boundary = Some(BoundaryKind::Silence);
         accumulator.next_sequence = 2;
 
-        assert_eq!(accumulator.text, "accepted");
+        assert_eq!(accumulator.text, "well accepted guarded and repaired");
+        assert_eq!(accumulator.accepted_through, Duration::from_secs(5));
+        assert_eq!(accumulator.unresolved_from, None);
         assert_eq!(
-            final_tail_plan(&accumulator, Duration::from_secs(5))
+            final_tail_plan(&accumulator, Duration::from_secs(6))
                 .unwrap()
                 .start,
-            Duration::from_secs(2)
+            Duration::from_secs(3)
         );
     }
 
@@ -5803,7 +7009,7 @@ mod composition_tests {
             start_overlap: None,
             boundary: BoundaryKind::Silence,
         };
-        append_timestamp_stable_segments(
+        append_test_segments(
             &mut accumulator,
             plan,
             &[TimedSegment {
@@ -5811,10 +7017,75 @@ mod composition_tests {
                 start: Duration::from_secs(1),
                 end: Duration::from_secs(2),
             }],
+            0.1,
         );
         assert!(accumulator.text.is_empty());
         assert_eq!(accumulator.accepted_through, Duration::ZERO);
         assert_eq!(accumulator.unresolved_from, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn stripped_empty_segment_over_energy_is_never_acknowledged() {
+        use phorminx_app::incremental::{ChunkPlan, TimeRange};
+        use phorminx_whisper::TimedSegment;
+
+        let mut accumulator = PartialAccumulator::default();
+        append_test_segments(
+            &mut accumulator,
+            ChunkPlan {
+                id: DictationId(120),
+                sequence: 0,
+                range: TimeRange {
+                    start: Duration::ZERO,
+                    end: Duration::from_secs(3),
+                },
+                stable_end: Duration::from_secs(3),
+                start_overlap: None,
+                boundary: BoundaryKind::Silence,
+            },
+            &[TimedSegment {
+                text: "[BLANK_AUDIO]".to_owned(),
+                start: Duration::ZERO,
+                end: Duration::from_secs(3),
+            }],
+            0.1,
+        );
+
+        assert!(accumulator.text.is_empty());
+        assert_eq!(accumulator.accepted_through, Duration::ZERO);
+        assert_eq!(accumulator.unresolved_from, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn hallucinated_segment_over_silence_is_ignored_but_silence_is_covered() {
+        use phorminx_app::incremental::{ChunkPlan, TimeRange};
+        use phorminx_whisper::TimedSegment;
+
+        let mut accumulator = PartialAccumulator::default();
+        append_test_segments(
+            &mut accumulator,
+            ChunkPlan {
+                id: DictationId(121),
+                sequence: 0,
+                range: TimeRange {
+                    start: Duration::ZERO,
+                    end: Duration::from_secs(3),
+                },
+                stable_end: Duration::from_secs(3),
+                start_overlap: None,
+                boundary: BoundaryKind::Silence,
+            },
+            &[TimedSegment {
+                text: "invented words".to_owned(),
+                start: Duration::ZERO,
+                end: Duration::from_secs(3),
+            }],
+            0.0,
+        );
+
+        assert!(accumulator.text.is_empty());
+        assert_eq!(accumulator.accepted_through, Duration::from_secs(3));
+        assert_eq!(accumulator.unresolved_from, None);
     }
 
     #[test]
@@ -5834,7 +7105,7 @@ mod composition_tests {
             start_overlap: None,
             boundary: BoundaryKind::Silence,
         };
-        append_timestamp_stable_segments(
+        append_test_segments(
             &mut accumulator,
             plan,
             &[
@@ -5849,6 +7120,7 @@ mod composition_tests {
                     end: Duration::from_secs(2),
                 },
             ],
+            0.1,
         );
         assert_eq!(accumulator.text, "proven");
         assert_eq!(accumulator.accepted_through, Duration::from_secs(1));
@@ -5860,7 +7132,7 @@ mod composition_tests {
             final_tail_plan(&accumulator, Duration::from_secs(4))
                 .unwrap()
                 .start,
-            Duration::from_secs(1)
+            Duration::ZERO
         );
     }
 
@@ -5885,7 +7157,7 @@ mod composition_tests {
             start_overlap: Some(MergeExpectation::Silence),
             boundary: BoundaryKind::Silence,
         };
-        append_timestamp_stable_segments(
+        append_test_segments(
             &mut accumulator,
             plan,
             &[
@@ -5900,14 +7172,18 @@ mod composition_tests {
                     end: Duration::from_millis(1_500),
                 },
             ],
+            0.1,
         );
-        assert_eq!(accumulator.text, "accepted prefix");
-        assert_eq!(accumulator.accepted_through, Duration::from_secs(2));
-        assert_eq!(accumulator.unresolved_from, Some(Duration::from_secs(2)));
+        assert_eq!(accumulator.text, "accepted prefix straddles frontier");
+        assert_eq!(accumulator.accepted_through, Duration::from_millis(2_500));
+        assert_eq!(
+            accumulator.unresolved_from,
+            Some(Duration::from_millis(2_500))
+        );
     }
 
     #[test]
-    fn segment_straddling_accepted_frontier_defers_its_suffix_to_final() {
+    fn segment_straddling_accepted_frontier_preserves_its_suffix() {
         use phorminx_app::incremental::{ChunkPlan, TimeRange};
         use phorminx_whisper::TimedSegment;
 
@@ -5916,7 +7192,7 @@ mod composition_tests {
             accepted_through: Duration::from_secs(2),
             ..PartialAccumulator::default()
         };
-        append_timestamp_stable_segments(
+        append_test_segments(
             &mut accumulator,
             ChunkPlan {
                 id: DictationId(10),
@@ -5934,9 +7210,297 @@ mod composition_tests {
                 start: Duration::ZERO,
                 end: Duration::from_millis(700),
             }],
+            0.1,
         );
-        assert_eq!(accumulator.accepted_through, Duration::from_secs(2));
-        assert_eq!(accumulator.unresolved_from, Some(Duration::from_secs(2)));
+        assert_eq!(accumulator.text, "accepted changed boundary");
+        assert_eq!(accumulator.accepted_through, Duration::from_millis(2_500));
+        assert_eq!(
+            accumulator.unresolved_from,
+            Some(Duration::from_millis(2_500))
+        );
+    }
+
+    #[test]
+    fn low_energy_pause_is_explicit_coverage_and_does_not_freeze_progress() {
+        use phorminx_app::incremental::{ChunkPlan, TimeRange};
+        use phorminx_whisper::TimedSegment;
+
+        let mut accumulator = PartialAccumulator::default();
+        let plan = ChunkPlan {
+            id: DictationId(20),
+            sequence: 0,
+            range: TimeRange {
+                start: Duration::ZERO,
+                end: Duration::from_secs(3),
+            },
+            stable_end: Duration::from_secs(3),
+            start_overlap: None,
+            boundary: BoundaryKind::Silence,
+        };
+        let mut samples = vec![0.1; 16_000 * 3];
+        samples[16_000..32_000].fill(0.0);
+        append_test_segments_with_samples(
+            &mut accumulator,
+            plan,
+            &[
+                TimedSegment {
+                    text: "before".to_owned(),
+                    start: Duration::ZERO,
+                    end: Duration::from_secs(1),
+                },
+                TimedSegment {
+                    text: "after".to_owned(),
+                    start: Duration::from_secs(2),
+                    end: Duration::from_secs(3),
+                },
+            ],
+            samples,
+        );
+
+        assert_eq!(accumulator.text, "before after");
+        assert_eq!(accumulator.accepted_through, Duration::from_secs(3));
+        assert_eq!(accumulator.unresolved_from, None);
+    }
+
+    #[test]
+    fn sub_frame_timestamp_drift_does_not_create_a_permanent_gap() {
+        use phorminx_app::incremental::{ChunkPlan, TimeRange};
+        use phorminx_whisper::TimedSegment;
+
+        let mut accumulator = PartialAccumulator::default();
+        let plan = ChunkPlan {
+            id: DictationId(21),
+            sequence: 0,
+            range: TimeRange {
+                start: Duration::ZERO,
+                end: Duration::from_secs(3),
+            },
+            stable_end: Duration::from_secs(3),
+            start_overlap: None,
+            boundary: BoundaryKind::Silence,
+        };
+        append_test_segments(
+            &mut accumulator,
+            plan,
+            &[
+                TimedSegment {
+                    text: "one".to_owned(),
+                    start: Duration::ZERO,
+                    end: Duration::from_secs(1),
+                },
+                TimedSegment {
+                    text: "two".to_owned(),
+                    start: Duration::from_millis(1_040),
+                    end: Duration::from_secs(3),
+                },
+            ],
+            0.1,
+        );
+
+        assert_eq!(accumulator.text, "one two");
+        assert_eq!(accumulator.accepted_through, Duration::from_secs(3));
+        assert_eq!(accumulator.unresolved_from, None);
+    }
+
+    #[test]
+    fn energetic_timestamp_gap_is_retried_and_later_repaired_from_audio() {
+        use phorminx_app::incremental::{ChunkPlan, TimeRange};
+        use phorminx_whisper::TimedSegment;
+
+        let mut accumulator = PartialAccumulator::default();
+        append_test_segments(
+            &mut accumulator,
+            ChunkPlan {
+                id: DictationId(22),
+                sequence: 0,
+                range: TimeRange {
+                    start: Duration::ZERO,
+                    end: Duration::from_secs(3),
+                },
+                stable_end: Duration::from_secs(3),
+                start_overlap: None,
+                boundary: BoundaryKind::Silence,
+            },
+            &[TimedSegment {
+                text: "late".to_owned(),
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(2),
+            }],
+            0.1,
+        );
+        assert_eq!(accumulator.unresolved_from, Some(Duration::ZERO));
+
+        append_test_segments(
+            &mut accumulator,
+            ChunkPlan {
+                id: DictationId(22),
+                sequence: 1,
+                range: TimeRange {
+                    start: Duration::ZERO,
+                    end: Duration::from_secs(6),
+                },
+                stable_end: Duration::from_secs(6),
+                start_overlap: Some(MergeExpectation::LexicalOverlap),
+                boundary: BoundaryKind::Silence,
+            },
+            &[TimedSegment {
+                text: "late and repaired".to_owned(),
+                start: Duration::ZERO,
+                end: Duration::from_secs(6),
+            }],
+            0.1,
+        );
+
+        assert_eq!(accumulator.text, "late and repaired");
+        assert_eq!(accumulator.accepted_through, Duration::from_secs(6));
+        assert_eq!(accumulator.unresolved_from, None);
+    }
+
+    #[test]
+    fn persistent_timestamp_uncertainty_never_grows_live_repair_without_bound() {
+        use phorminx_app::incremental::{ChunkPlan, TimeRange};
+        use phorminx_whisper::TimedSegment;
+
+        let mut accumulator = PartialAccumulator::default();
+        append_test_segments(
+            &mut accumulator,
+            ChunkPlan {
+                id: DictationId(25),
+                sequence: 0,
+                range: TimeRange {
+                    start: Duration::ZERO,
+                    end: Duration::from_secs(15),
+                },
+                stable_end: Duration::from_secs(15),
+                start_overlap: None,
+                boundary: BoundaryKind::Forced,
+            },
+            &[TimedSegment {
+                text: "late".to_owned(),
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(2),
+            }],
+            0.1,
+        );
+
+        assert_eq!(accumulator.accepted_through, Duration::ZERO);
+        assert_eq!(accumulator.unresolved_from, Some(Duration::ZERO));
+        assert_eq!(accumulator.degraded, Some("timestamp_repair_exhausted"));
+    }
+
+    #[test]
+    fn repeated_phrase_at_a_straddling_seam_is_preserved_without_stalling() {
+        use phorminx_app::incremental::{ChunkPlan, TimeRange};
+        use phorminx_whisper::TimedSegment;
+
+        let mut accumulator = PartialAccumulator {
+            text: "go go".to_owned(),
+            accepted_through: Duration::from_secs(2),
+            ..PartialAccumulator::default()
+        };
+        append_test_segments(
+            &mut accumulator,
+            ChunkPlan {
+                id: DictationId(23),
+                sequence: 1,
+                range: TimeRange {
+                    start: Duration::from_secs(1),
+                    end: Duration::from_secs(3),
+                },
+                stable_end: Duration::from_secs(3),
+                start_overlap: Some(MergeExpectation::LexicalOverlap),
+                boundary: BoundaryKind::Silence,
+            },
+            &[TimedSegment {
+                text: "go go now".to_owned(),
+                start: Duration::ZERO,
+                end: Duration::from_secs(2),
+            }],
+            0.1,
+        );
+
+        assert_eq!(accumulator.text, "go go now");
+        assert_eq!(accumulator.accepted_through, Duration::from_secs(3));
+        assert_eq!(accumulator.unresolved_from, None);
+    }
+
+    #[test]
+    fn three_hour_continuous_accurate_session_advances_with_constant_audio_state() {
+        use phorminx_app::incremental::IncrementalPlanner;
+        use phorminx_whisper::TimedSegment;
+
+        let id = DictationId(24);
+        let mut planner = IncrementalPlanner::default();
+        planner.start(id);
+        let mut accumulator = PartialAccumulator::default();
+        let mut maximum_decode_samples = 0_usize;
+        for sequence in 0..3_600_u32 {
+            let captured = Duration::from_secs(u64::from(sequence + 1) * 3);
+            assert!(planner.needs_probe(id, captured));
+            let plan = planner.observe(id, captured, false).unwrap();
+            assert_eq!(plan.sequence, sequence);
+            let clip_samples = canonical_sample(plan.range.duration()) as usize;
+            maximum_decode_samples = maximum_decode_samples.max(clip_samples);
+            let clip = AudioClip::new(vec![0.1; clip_samples], 16_000).unwrap();
+            let guarded_end = plan.stable_end - Duration::from_secs(2);
+            let hypothesis = (plan.range.start.as_secs()..plan.range.end.as_secs())
+                .map(|second| format!("word{second} alpha{second} beta{second} omega{second}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            append_timestamp_stable_segments(
+                &mut accumulator,
+                plan,
+                &clip,
+                &[TimedSegment {
+                    text: hypothesis,
+                    start: Duration::ZERO,
+                    end: plan.range.duration(),
+                }],
+                0.003,
+            );
+            let expected = if sequence == 0 {
+                Duration::ZERO
+            } else {
+                guarded_end.saturating_sub(Duration::from_secs(3))
+            };
+            assert_eq!(accumulator.accepted_through, expected);
+            assert_eq!(accumulator.unresolved_from, Some(expected));
+            let repair_from = accumulator
+                .unresolved_from
+                .map(|frontier| frontier.saturating_sub(Duration::from_secs(2)));
+            planner.partial_completed(id, sequence, true, repair_from);
+        }
+
+        assert_eq!(
+            accumulator.accepted_through,
+            Duration::from_secs(3 * 60 * 60 - 5)
+        );
+        assert_eq!(
+            accumulator
+                .provisional
+                .as_ref()
+                .map(|hypothesis| hypothesis.commit_through),
+            Some(Duration::from_secs(3 * 60 * 60 - 2))
+        );
+        // The production worker records this after each successful partial;
+        // this fixture drives the lower-level accumulator directly.
+        accumulator.next_sequence = 3_600;
+        accumulator.timestamp_stable = true;
+        accumulator.last_boundary = Some(BoundaryKind::Forced);
+        let release_plan = final_tail_plan(&accumulator, Duration::from_secs(3 * 60 * 60)).unwrap();
+        assert_eq!(release_plan.start, Duration::from_secs(3 * 60 * 60 - 7));
+        assert_eq!(release_plan.expectation, MergeExpectation::LexicalOverlap);
+        assert!(
+            Duration::from_secs(3 * 60 * 60).saturating_sub(release_plan.start)
+                <= Duration::from_secs(7)
+        );
+        assert!(maximum_decode_samples <= 16_000 * 10);
+        assert!(accumulator.text.contains("word0 alpha0 beta0 omega0"));
+        assert!(
+            accumulator
+                .text
+                .contains("word10794 alpha10794 beta10794 omega10794")
+        );
     }
 
     struct CountingRecognizer {
@@ -6612,6 +8176,7 @@ mod composition_tests {
                 rms: 0.2,
                 auto_stopped: false,
             },
+            0,
             "en",
             DictationId(90),
             |_| {
@@ -6643,6 +8208,7 @@ mod composition_tests {
                 rms: 0.2,
                 auto_stopped: false,
             },
+            0,
             "en",
             DictationId(92),
             |range| {
@@ -6690,6 +8256,7 @@ mod composition_tests {
                 rms: 0.2,
                 auto_stopped: false,
             },
+            16_000 * 118,
             "en",
             DictationId(91),
             |range| {
@@ -6701,10 +8268,129 @@ mod composition_tests {
         .unwrap();
         assert_eq!(
             requested.borrow().as_slice(),
-            &[SampleRange::new(16_000 * 120, 16_000 * 130).unwrap()]
+            &[SampleRange::new(16_000 * 118, 16_000 * 130).unwrap()]
         );
-        assert_eq!(recognizer.clip_lengths.borrow().as_slice(), &[16_000 * 10]);
+        assert_eq!(recognizer.clip_lengths.borrow().as_slice(), &[16_000 * 12]);
         assert_eq!(transcript.audio_duration, Duration::from_secs(130));
+    }
+
+    #[test]
+    fn extended_accurate_preserves_committed_text_after_a_late_partial_failure() {
+        let recognizer = CountingRecognizer::returning("stable seam final words");
+        let accumulator = PartialAccumulator {
+            text: "stable seam".to_owned(),
+            stable_end: Duration::from_secs(120),
+            accepted_through: Duration::from_secs(120),
+            timestamp_stable: true,
+            last_boundary: Some(BoundaryKind::Forced),
+            next_sequence: 40,
+            degraded: Some("partial_recognition_failed"),
+            ..PartialAccumulator::default()
+        };
+        let requested = RefCell::new(Vec::new());
+        let transcript = transcribe_extended_accurate_with_source(
+            &recognizer,
+            Some(accumulator),
+            FinalAudioStats {
+                total_samples: 16_000 * 130,
+                peak_retained_samples: 16_000 * 45,
+                rms: 0.2,
+                auto_stopped: false,
+            },
+            16_000 * 118,
+            "en",
+            DictationId(93),
+            |range| {
+                requested.borrow_mut().push(range);
+                AudioClip::new(vec![0.2; range.len() as usize], 16_000)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(transcript.text, "stable seam final words");
+        assert_eq!(
+            requested.borrow().as_slice(),
+            &[SampleRange::new(16_000 * 118, 16_000 * 130).unwrap()]
+        );
+    }
+
+    #[test]
+    fn retained_accurate_ambiguous_seam_keeps_both_owned_sides() {
+        let recognizer = CountingRecognizer::returning("unrelated final words");
+        let accumulator = PartialAccumulator {
+            text: "committed prefix".to_owned(),
+            stable_end: Duration::from_secs(180),
+            accepted_through: Duration::from_secs(180),
+            timestamp_stable: true,
+            last_boundary: Some(BoundaryKind::Forced),
+            next_sequence: 60,
+            ..PartialAccumulator::default()
+        };
+        let transcript = transcribe_extended_accurate_with_source(
+            &recognizer,
+            Some(accumulator),
+            FinalAudioStats {
+                total_samples: 16_000 * 183,
+                peak_retained_samples: 16_000 * 45,
+                rms: 0.2,
+                auto_stopped: false,
+            },
+            16_000 * 178,
+            "en",
+            DictationId(94),
+            |range| {
+                AudioClip::new(vec![0.2; range.len() as usize], 16_000)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(transcript.text, "committed prefix unrelated final words");
+    }
+
+    #[test]
+    fn three_hour_accurate_release_decodes_only_constant_repair_overlap() {
+        let recognizer = CountingRecognizer::returning("closing phrase");
+        let total = 16_000 * 3 * 60 * 60;
+        let accepted = total - 16_000;
+        let accumulator = PartialAccumulator {
+            text: "three hour prefix".to_owned(),
+            stable_end: canonical_duration(accepted),
+            accepted_through: canonical_duration(accepted),
+            timestamp_stable: true,
+            last_boundary: Some(BoundaryKind::Forced),
+            next_sequence: 3_600,
+            ..PartialAccumulator::default()
+        };
+        let requested = RefCell::new(Vec::new());
+        let transcript = transcribe_extended_accurate_with_source(
+            &recognizer,
+            Some(accumulator),
+            FinalAudioStats {
+                total_samples: total,
+                peak_retained_samples: 16_000 * 45,
+                rms: 0.2,
+                auto_stopped: false,
+            },
+            accepted - ACCURATE_REPAIR_OVERLAP_SAMPLES,
+            "en",
+            DictationId(95),
+            |range| {
+                requested.borrow_mut().push(range);
+                AudioClip::new(vec![0.2; range.len() as usize], 16_000)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(requested.borrow().len(), 1);
+        assert_eq!(
+            requested.borrow()[0].len(),
+            ACCURATE_REPAIR_OVERLAP_SAMPLES + 16_000
+        );
+        assert_eq!(recognizer.clip_lengths.borrow()[0], 16_000 * 3);
+        assert_eq!(transcript.audio_duration, Duration::from_secs(3 * 60 * 60));
     }
 
     #[test]
@@ -6725,6 +8411,244 @@ mod composition_tests {
                 .windows(2)
                 .all(|pair| pair[0].end() == pair[1].start())
         );
+    }
+
+    #[test]
+    fn instant_owned_text_commits_repeated_phrases_and_silence_exactly_once() {
+        let mut ownership = InstantTranscriptOwnership::default();
+        assert!(ownership.commit(16_000, "yes yes").unwrap());
+        assert!(ownership.commit(32_000, "").unwrap());
+        assert!(ownership.commit(48_000, "yes yes").unwrap());
+        assert!(!ownership.commit(48_000, "must not duplicate").unwrap());
+        assert_eq!(ownership.text, "yes yes yes yes");
+        assert_eq!(ownership.committed_through, 48_000);
+    }
+
+    #[test]
+    fn instant_owned_text_rejects_stale_frontiers_without_losing_committed_text() {
+        let mut ownership = InstantTranscriptOwnership::default();
+        ownership.commit(16_000 * 30, "already safe").unwrap();
+        assert!(ownership.commit(16_000 * 29, "stale").is_err());
+        assert_eq!(ownership.text, "already safe");
+        assert_eq!(ownership.committed_through, 16_000 * 30);
+    }
+
+    #[test]
+    fn forced_instant_rollover_retains_a_word_that_crosses_the_overlap_cutoff() {
+        let rate = u64::from(WHISPER_SAMPLE_RATE);
+        let terminal = VoskFinalizedSegment {
+            text: "safe crossing trailing".to_owned(),
+            start_sample: 0,
+            end_sample: 30 * rate,
+            words: vec![
+                phorminx_vosk::FinalizedWord {
+                    text: "safe".to_owned(),
+                    start_sample: 27 * rate,
+                    end_sample: 27 * rate + 14_400,
+                },
+                phorminx_vosk::FinalizedWord {
+                    text: "crossing".to_owned(),
+                    start_sample: 27 * rate + 14_400,
+                    end_sample: 28 * rate + 6_400,
+                },
+                phorminx_vosk::FinalizedWord {
+                    text: "trailing".to_owned(),
+                    start_sample: 29 * rate,
+                    end_sample: 30 * rate,
+                },
+            ],
+        };
+        let plan = plan_instant_rollover(0, 0, 30 * rate, (30 * rate) as usize, &terminal).unwrap();
+        assert_eq!(plan.stable_text, "safe");
+        assert_eq!(plan.committed_through, 27 * rate + 14_400);
+        assert_eq!(
+            30 * rate - plan.replay_offset as u64,
+            2 * rate + 1_600,
+            "the complete crossing word stays in the replay tail"
+        );
+    }
+
+    #[test]
+    fn continuous_multi_hour_rollover_emits_acks_reclaims_and_releases_only_the_tail() {
+        struct SimulatedCapture {
+            chunks: VecDeque<SampleRange>,
+            retained_from: u64,
+            total: u64,
+            peak_retained: u64,
+        }
+
+        impl SimulatedCapture {
+            fn accept(&mut self, samples: u64) {
+                let end = self.total + samples;
+                while self.total < end {
+                    let chunk_end = end.min(self.total + 4_096);
+                    self.chunks
+                        .push_back(SampleRange::new(self.total, chunk_end).unwrap());
+                    self.total = chunk_end;
+                }
+                self.peak_retained = self
+                    .peak_retained
+                    .max(self.chunks.iter().map(|chunk| chunk.len()).sum());
+                self.assert_contiguous();
+            }
+
+            fn apply(&mut self, event: WorkerEvent) {
+                let WorkerEvent::InstantCommitted {
+                    committed_through, ..
+                } = event
+                else {
+                    panic!("expected Instant ownership ACK");
+                };
+                assert!(committed_through >= self.retained_from);
+                assert!(committed_through <= self.total);
+                while self
+                    .chunks
+                    .front()
+                    .is_some_and(|chunk| chunk.end() <= committed_through)
+                {
+                    self.chunks.pop_front();
+                }
+                if let Some(front) = self.chunks.front_mut()
+                    && front.start() < committed_through
+                {
+                    *front = SampleRange::new(committed_through, front.end()).unwrap();
+                }
+                self.retained_from = committed_through;
+                self.assert_contiguous();
+            }
+
+            fn assert_contiguous(&self) {
+                if self.retained_from == self.total {
+                    assert!(self.chunks.is_empty());
+                    return;
+                }
+                assert_eq!(self.chunks.front().unwrap().start(), self.retained_from);
+                assert_eq!(self.chunks.back().unwrap().end(), self.total);
+                assert!(
+                    self.chunks
+                        .iter()
+                        .zip(self.chunks.iter().skip(1))
+                        .all(|(left, right)| left.end() == right.start())
+                );
+            }
+        }
+
+        let mut ownership = InstantTranscriptOwnership::default();
+        let mut capture = SimulatedCapture {
+            chunks: VecDeque::new(),
+            retained_from: 0,
+            total: 0,
+            peak_retained: 0,
+        };
+        let (events, received) = mpsc::channel();
+        let mut checkpoint_count = 0;
+        let target_total = u64::from(WHISPER_SAMPLE_RATE) * 60 * 60 * 3;
+        let mut rollovers = 0;
+
+        while capture.total < target_total {
+            let buffered = capture.total - ownership.committed_through;
+            capture.accept(INSTANT_ROLLOVER_TARGET_SAMPLES - buffered);
+            assert!(instant_rollover_due(
+                capture.total,
+                ownership.committed_through
+            ));
+            let decoder_origin = ownership.committed_through;
+            let words = (0..30_u64)
+                .map(|second| phorminx_vosk::FinalizedWord {
+                    text: format!("word{second}"),
+                    start_sample: second * u64::from(WHISPER_SAMPLE_RATE),
+                    end_sample: (second + 1) * u64::from(WHISPER_SAMPLE_RATE),
+                })
+                .collect::<Vec<_>>();
+            let terminal = VoskFinalizedSegment {
+                text: words
+                    .iter()
+                    .map(|word| word.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                start_sample: 0,
+                end_sample: INSTANT_ROLLOVER_TARGET_SAMPLES,
+                words,
+            };
+            let plan = plan_instant_rollover(
+                decoder_origin,
+                ownership.committed_through,
+                capture.total,
+                INSTANT_ROLLOVER_TARGET_SAMPLES as usize,
+                &terminal,
+            )
+            .unwrap();
+            assert_eq!(
+                INSTANT_ROLLOVER_TARGET_SAMPLES - plan.replay_offset as u64,
+                INSTANT_ROLLOVER_OVERLAP_SAMPLES
+            );
+            publish_instant_commit(
+                &mut ownership,
+                &mut checkpoint_count,
+                DictationId(77),
+                plan.committed_through,
+                &plan.stable_text,
+                &events,
+            )
+            .unwrap();
+            capture.apply(received.recv().unwrap());
+            assert_eq!(capture.retained_from, ownership.committed_through);
+            rollovers += 1;
+        }
+
+        assert!(rollovers > 300);
+        assert_eq!(checkpoint_count, rollovers);
+        assert_eq!(
+            capture.peak_retained, INSTANT_ROLLOVER_TARGET_SAMPLES,
+            "worker ACKs bound capture ownership even without silence"
+        );
+
+        let release_tail = u64::from(WHISPER_SAMPLE_RATE) * 7;
+        capture.accept(release_tail);
+        let mut recovery = Vec::new();
+        for_each_bounded_range_from(capture.retained_from, capture.total, 16_000 * 30, |range| {
+            recovery.push(range);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            recovery,
+            [SampleRange::new(capture.retained_from, capture.total).unwrap()]
+        );
+    }
+
+    #[test]
+    fn instant_empty_result_uses_the_effective_configured_speech_threshold() {
+        let mut evidence = InstantAudioEvidence::default();
+        evidence.observe_constant(0.0, 16_000 * 29);
+        evidence.observe_constant(0.003, INSTANT_EVIDENCE_WINDOW_SAMPLES);
+        assert!(instant_segment_is_unrecognized("", &evidence, 0.003));
+        assert!(!instant_segment_is_unrecognized("", &evidence, 0.004));
+        assert!(!instant_segment_is_unrecognized(
+            "recognized",
+            &evidence,
+            0.003
+        ));
+
+        evidence.reset();
+        evidence.observe_constant(0.02, 16_000);
+        assert!(instant_segment_is_unrecognized("", &evidence, 0.015));
+        assert!(!instant_segment_is_unrecognized("", &evidence, 0.025));
+    }
+
+    #[test]
+    fn instant_tail_recovery_never_reopens_reclaimed_sample_zero() {
+        let total = u64::from(WHISPER_SAMPLE_RATE) * 60 * 60 * 3;
+        let retained_from = total - u64::from(WHISPER_SAMPLE_RATE) * 12;
+        let maximum = u64::from(WHISPER_SAMPLE_RATE) * 30;
+        let mut ranges = Vec::new();
+        for_each_bounded_range_from(retained_from, total, maximum, |range| {
+            ranges.push(range);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ranges, [SampleRange::new(retained_from, total).unwrap()]);
+        assert_ne!(ranges[0].start(), 0);
     }
 
     #[test]

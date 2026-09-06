@@ -58,6 +58,10 @@ struct Session {
     in_flight: Option<ChunkPlan>,
     next_probe_at: Duration,
     last_boundary: Option<BoundaryKind>,
+    /// Earliest canonical audio required by the recognizer to repair an
+    /// unresolved timestamp boundary. This is worker feedback, not a new
+    /// scheduling frontier, so capture remains authoritative.
+    repair_from: Option<Duration>,
     degraded: bool,
 }
 
@@ -70,6 +74,7 @@ impl IncrementalPlanner {
             in_flight: None,
             next_probe_at: MIN_CHUNK_DURATION,
             last_boundary: None,
+            repair_from: None,
             degraded: false,
         });
     }
@@ -115,7 +120,10 @@ impl IncrementalPlanner {
             session.next_probe_at = captured.saturating_add(PROBE_INTERVAL);
             return None;
         };
-        let start = session.stable_end.saturating_sub(CHUNK_OVERLAP);
+        let ordinary_start = session.stable_end.saturating_sub(CHUNK_OVERLAP);
+        let start = session.repair_from.map_or(ordinary_start, |repair_from| {
+            repair_from.min(ordinary_start)
+        });
         let plan = ChunkPlan {
             id,
             sequence: session.next_sequence,
@@ -129,7 +137,13 @@ impl IncrementalPlanner {
         Some(plan)
     }
 
-    pub fn partial_completed(&mut self, id: DictationId, sequence: u32, succeeded: bool) {
+    pub fn partial_completed(
+        &mut self,
+        id: DictationId,
+        sequence: u32,
+        succeeded: bool,
+        repair_from: Option<Duration>,
+    ) {
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -143,6 +157,7 @@ impl IncrementalPlanner {
         if succeeded {
             session.stable_end = plan.stable_end;
             session.last_boundary = Some(plan.boundary);
+            session.repair_from = repair_from;
             session.next_probe_at = plan.stable_end.saturating_add(MIN_CHUNK_DURATION);
         } else {
             session.degraded = true;
@@ -414,7 +429,7 @@ mod tests {
         assert_eq!(first.range.end, Duration::from_secs(2));
         assert_eq!(planner.observe(id(1), Duration::from_secs(10), true), None);
 
-        planner.partial_completed(id(1), first.sequence, true);
+        planner.partial_completed(id(1), first.sequence, true, None);
         let second = planner
             .observe(id(1), Duration::from_secs(4), true)
             .unwrap();
@@ -436,6 +451,33 @@ mod tests {
         assert_eq!(plan.boundary, BoundaryKind::Forced);
         assert_eq!(plan.range.end, Duration::from_secs(3));
         assert!(plan.range.duration() <= MAX_CHUNK_DURATION + CHUNK_OVERLAP);
+    }
+
+    #[test]
+    fn worker_requested_repair_keeps_the_unresolved_audio_in_the_next_window() {
+        let mut planner = IncrementalPlanner::default();
+        planner.start(id(72));
+        let first = planner
+            .observe(id(72), Duration::from_secs(3), false)
+            .unwrap();
+        planner.partial_completed(
+            id(72),
+            first.sequence,
+            true,
+            Some(Duration::from_millis(1_250)),
+        );
+
+        let repair = planner
+            .observe(id(72), Duration::from_secs(6), false)
+            .unwrap();
+        assert_eq!(repair.range.start, Duration::from_millis(1_250));
+        assert_eq!(repair.range.end, Duration::from_secs(6));
+
+        planner.partial_completed(id(72), repair.sequence, true, None);
+        let ordinary = planner
+            .observe(id(72), Duration::from_secs(9), false)
+            .unwrap();
+        assert_eq!(ordinary.range.start, Duration::from_millis(5_500));
     }
 
     #[test]
@@ -471,7 +513,7 @@ mod tests {
             .observe(id(8), Duration::from_secs(3), false)
             .unwrap();
         assert_eq!(forced.start_overlap, None);
-        planner.partial_completed(id(8), forced.sequence, true);
+        planner.partial_completed(id(8), forced.sequence, true, None);
 
         let ending_at_silence = planner
             .observe(id(8), Duration::from_secs(5), true)
@@ -480,7 +522,7 @@ mod tests {
             ending_at_silence.start_overlap,
             Some(MergeExpectation::LexicalOverlap)
         );
-        planner.partial_completed(id(8), ending_at_silence.sequence, true);
+        planner.partial_completed(id(8), ending_at_silence.sequence, true, None);
 
         let ending_forced = planner
             .observe(id(8), Duration::from_secs(8), false)
@@ -495,9 +537,9 @@ mod tests {
         let plan = planner
             .observe(id(2), Duration::from_secs(3), false)
             .unwrap();
-        planner.partial_completed(id(99), plan.sequence, true);
+        planner.partial_completed(id(99), plan.sequence, true, None);
         assert_eq!(planner.active_id(), Some(id(2)));
-        planner.partial_completed(id(2), plan.sequence, false);
+        planner.partial_completed(id(2), plan.sequence, false, None);
         assert!(!planner.needs_probe(id(2), Duration::from_secs(20)));
         planner.finish(id(99));
         assert_eq!(planner.active_id(), Some(id(2)));
@@ -526,7 +568,7 @@ mod tests {
             if let Some(plan) = planner.observe(id(4), captured, false) {
                 assert_eq!(plan.sequence as usize, plans.len());
                 assert!(plan.range.duration() <= MAX_CHUNK_DURATION + CHUNK_OVERLAP);
-                planner.partial_completed(id(4), plan.sequence, true);
+                planner.partial_completed(id(4), plan.sequence, true, None);
                 plans.push(plan);
             }
         }

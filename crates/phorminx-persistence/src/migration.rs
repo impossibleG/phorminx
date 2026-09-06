@@ -127,6 +127,10 @@ pub(crate) fn apply(connection: &Connection) -> Result<()> {
             transaction.execute_batch(statement)?;
         }
     }
+    transaction.execute_batch("CREATE TABLE IF NOT EXISTS interrupted_dictation (session TEXT PRIMARY KEY, updated_at_ms INTEGER NOT NULL, protected_text BLOB NOT NULL); INSERT OR IGNORE INTO persistence_settings(key,value) VALUES ('recovery_epoch','0');")?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS recovery_tombstones (session TEXT PRIMARY KEY);",
+    )?;
     if current == TRANSITIONAL_ADDITIVE_VERSION {
         // Pre-release builds briefly labeled the same nullable extension as
         // schema 2. Normalize only that known shape so the previous binary can

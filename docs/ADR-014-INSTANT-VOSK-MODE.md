@@ -1,5 +1,10 @@
 # ADR-014: Resident Vosk streaming for Instant mode
 
+> ADR-015 supersedes the 120-second archival ring and untouched full-clip
+> fallback described below. Instant recognition now acknowledges owned text,
+> reclaims audio, and rolls continuous speech with word-aware retained context.
+> Residency, language compatibility, readiness, and privacy policies remain.
+
 Status: Accepted
 
 ## Context

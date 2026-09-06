@@ -9,10 +9,17 @@ The product is local-first:
   bundle and language-matched unpacked model are explicitly configured.
 - Deterministic rules handle safe normalization and explicit aliases.
 - Ollama optionally cleans and formats transcripts.
-- Longer dictations are transcribed incrementally with bounded overlapping
-  chunks; short dictations retain the single-shot path, and uncertain overlap
-  automatically falls back to the untouched full recording.
-- Raw audio is not retained by default.
+- Longer dictations are transcribed while you speak. Committed audio is erased
+  from a fixed rolling memory buffer; only uncommitted audio and boundary
+  context remain. Recording duration does not determine audio memory usage.
+- Accurate mode repairs overlapping Whisper segments; Instant mode uses Vosk
+  word timestamps to preserve whole words across decoder rollovers.
+- The production capture path writes no audio recordings to disk.
+- With history enabled, interrupted text is periodically encrypted for the
+  current Windows account. History offers explicit Copy and Discard actions;
+  the latest unrecognized or uncheckpointed speech may be missing after a crash.
+- Clearing or disabling history also removes interrupted text. History Off
+  keeps dictated text in memory only.
 - Dictation remains usable when Ollama is missing or unavailable.
 
 Start with [docs/BLUEPRINT.md](docs/BLUEPRINT.md), [docs/ROADMAP.md](docs/ROADMAP.md), [docs/PHASE-2-4-STATUS.md](docs/PHASE-2-4-STATUS.md), the Phase 0 benchmark results, and the [Phase 1 walking-skeleton guide](docs/PHASE-1.md).
@@ -45,7 +52,7 @@ $env:RUSTFLAGS = '-C target-feature=+crt-static'
 cargo build --release -p phorminx-app --features desktop,vulkan
 ```
 
-Runtime settings load from `%LOCALAPPDATA%\Phorminx\settings.toml`; local history and product data use `phorminx.db` beside it. Open the tray menu for Settings, History, Personal lexicon, and Application profiles. Settings discovers installed Ollama models without choosing one implicitly, controls model residency, and offers five formatting strengths. History defaults to disabled, raw audio is never stored, and unavailable Ollama always falls back to deterministic local output.
+Runtime settings load from `%LOCALAPPDATA%\Phorminx\settings.toml`; local history and product data use `phorminx.db` beside it. Open the tray menu for Settings, History, Personal lexicon, and Application profiles. Settings discovers installed Ollama models without choosing one implicitly, controls model residency, and offers five formatting strengths. New application settings retain history for seven days; select History Off to disable transcript persistence. Production capture keeps audio in memory, and unavailable Ollama falls back to deterministic local output.
 
 The model picker offers an explicit download for the pinned recommended English Whisper model. Downloads stream to a temporary file and must match the manifest size and SHA-256 before atomic promotion. Saving validates and atomically persists settings, then restarts Phorminx when runtime state must be reloaded. If the selected model is missing at startup, Phorminx remains in setup mode instead of terminating. Command-line values such as `--model`, `--language`, `--minimum-rms`, and `--formatting raw|light|balanced|strong|custom` override settings for one run; `--config PATH` selects a development/test settings file.
 

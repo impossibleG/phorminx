@@ -3,6 +3,9 @@
 > Partially superseded by ADR-014. Capture ownership and bounded memory remain;
 > Accurate mode now uses shorter chunks, timestamp-stable segment admission,
 > release-priority abort, and the native model encoder context.
+> ADR-015 subsequently supersedes the archival ring, 120-second ceiling, and
+> full-clip recovery after audio reclamation. The text below records the
+> original implementation; current ownership uses bounded rolling audio.
 
 - Status: Accepted
 - Date: 2026-09-01

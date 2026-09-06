@@ -21,6 +21,7 @@ pub(crate) struct PageState {
     pub history_variant: HistoryVariant,
     pub history_page: usize,
     pub confirm_clear_history: bool,
+    pub confirm_discard_interrupted: Option<String>,
     pub lexicon_id: Option<i64>,
     pub lexicon_draft: Option<LexiconDraft>,
     pub confirm_lexicon_delete: Option<i64>,
@@ -50,6 +51,7 @@ impl PageState {
                 .unwrap_or(HistoryVariant::Output),
             history_page: 0,
             confirm_clear_history: false,
+            confirm_discard_interrupted: None,
             lexicon_id: snapshot.lexicon.first().map(|item| item.id),
             lexicon_draft: None,
             confirm_lexicon_delete: None,
@@ -950,7 +952,48 @@ fn history(
 ) {
     let tokens = ui.tokens();
     page_header(ui, Route::History.title(), Route::History.context(), None);
-    if !snapshot.history.is_empty() {
+    if !snapshot.interrupted.is_empty() {
+        metadata(ui, "Interrupted dictations");
+        ui.label("Saved text from an interrupted session. The most recent speech may be missing. Nothing is inserted automatically.");
+        ScrollArea::vertical()
+            .id_salt("interrupted-dictations")
+            .max_height(180.0)
+            .show(ui, |ui| {
+                for (session, timestamp) in &snapshot.interrupted {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Interrupted dictation · {timestamp}"));
+                        if action(ui, "Copy text", ActionTone::Secondary).clicked() {
+                            outbox.push(ShellEvent::CopyInterrupted(session.clone()));
+                        }
+                        let confirmed = state.confirm_discard_interrupted.as_ref() == Some(session);
+                        if action(
+                            ui,
+                            if confirmed {
+                                "Permanently discard"
+                            } else {
+                                "Discard"
+                            },
+                            ActionTone::Destructive,
+                        )
+                        .clicked()
+                        {
+                            if confirmed {
+                                outbox.push(ShellEvent::DiscardInterrupted(session.clone()));
+                                state.confirm_discard_interrupted = None;
+                            } else {
+                                state.confirm_discard_interrupted = Some(session.clone());
+                            }
+                        }
+                        if confirmed && action(ui, "Keep", ActionTone::Quiet).clicked() {
+                            state.confirm_discard_interrupted = None;
+                        }
+                    });
+                }
+            });
+        hairline(ui);
+    }
+    ui.label("With History on, interrupted text is encrypted for your Windows account and follows history retention. History off saves no recovery text.");
+    if !snapshot.history.is_empty() || !snapshot.interrupted.is_empty() {
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width(), 44.0),
             Layout::right_to_left(Align::Center),

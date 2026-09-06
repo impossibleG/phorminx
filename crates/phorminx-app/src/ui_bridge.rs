@@ -587,6 +587,7 @@ pub struct UiSnapshot {
     pub settings: UiSettingsSnapshot,
     pub readiness: UiReadinessSnapshot,
     pub history_enabled: bool,
+    pub interrupted: Vec<phorminx_persistence::RecoveryRecord>,
     pub history: Vec<UiHistoryItem>,
     pub lexicon: Vec<UiLexiconItem>,
     pub profiles: Vec<UiProfileItem>,
@@ -730,6 +731,14 @@ impl UiBridge {
             },
             readiness,
             history_enabled: self.settings.privacy.history_retention != HistoryRetention::Disabled,
+            interrupted: self
+                .persistence
+                .recovery()
+                .list()
+                .map_err(UiBridgeError::persistence)?
+                .into_iter()
+                .filter(|record| crate::text_recovery::is_interrupted(&record.session))
+                .collect(),
             history,
             lexicon,
             profiles,
@@ -737,6 +746,27 @@ impl UiBridge {
     }
 
     /// Loads one exact transcript variant only after a detail or copy request.
+    pub fn interrupted_text(&self, session: &str) -> Result<Option<String>, UiBridgeError> {
+        if !crate::text_recovery::is_interrupted(session) {
+            return Ok(None);
+        }
+        self.persistence
+            .recovery()
+            .text(session)
+            .map_err(UiBridgeError::persistence)
+    }
+    pub fn discard_interrupted(&self, session: &str) -> Result<(), UiBridgeError> {
+        if !crate::text_recovery::is_interrupted(session) {
+            return Ok(());
+        }
+        self.persistence
+            .recovery()
+            .discard(session)
+            .map_err(UiBridgeError::persistence)?;
+        crate::text_recovery::forget_interrupted(session);
+        Ok(())
+    }
+
     pub fn history_text(
         &self,
         id: i64,

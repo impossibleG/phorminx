@@ -31,6 +31,7 @@ type RecognizerNew = unsafe extern "C" fn(*mut c_void, c_float) -> *mut c_void;
 type RecognizerFree = unsafe extern "C" fn(*mut c_void);
 type AcceptWaveform = unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_int;
 type ResultFn = unsafe extern "C" fn(*mut c_void) -> *const c_char;
+type SetWords = unsafe extern "C" fn(*mut c_void, c_int);
 type SetLogLevel = unsafe extern "C" fn(c_int);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,6 +150,7 @@ struct Api {
     accept_waveform: AcceptWaveform,
     result: ResultFn,
     final_result: ResultFn,
+    set_words: SetWords,
 }
 
 impl Api {
@@ -171,6 +173,7 @@ impl Api {
         let accept_waveform = symbol!("vosk_recognizer_accept_waveform", AcceptWaveform);
         let result = symbol!("vosk_recognizer_result", ResultFn);
         let final_result = symbol!("vosk_recognizer_final_result", ResultFn);
+        let set_words = symbol!("vosk_recognizer_set_words", SetWords);
         let set_log_level = symbol!("vosk_set_log_level", SetLogLevel);
         // SAFETY: public Vosk API; suppress native path/content-adjacent logs so
         // Phorminx owns its content-free diagnostic boundary.
@@ -184,6 +187,7 @@ impl Api {
             accept_waveform,
             result,
             final_result,
+            set_words,
         })
     }
 }
@@ -271,10 +275,15 @@ impl VoskModel {
         if raw.is_null() {
             return Err(VoskError::RecognizerCreateFailed);
         }
+        // SAFETY: `raw` is a live recognizer. Word timestamps let callers move
+        // transcript ownership only through complete lexical boundaries.
+        unsafe { (self.inner.api.set_words)(raw, 1) };
         Ok(VoskSession {
             model: Rc::clone(&self.inner),
             raw,
-            finalized: FinalizedText::default(),
+            sample_rate,
+            accepted_samples: 0,
+            segment_start: 0,
         })
     }
 }
@@ -294,45 +303,88 @@ fn model_matches_language(model: &Path, language: &str) -> bool {
 pub struct VoskSession {
     model: Rc<ModelInner>,
     raw: *mut c_void,
-    finalized: FinalizedText,
+    sample_rate: u32,
+    accepted_samples: u64,
+    segment_start: u64,
+}
+
+/// Text whose ownership has moved out of Vosk together with the exact native
+/// sample range it represents. Callers may reclaim the range only after they
+/// have durably retained `text` (an empty string legitimately owns silence).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinalizedSegment {
+    pub text: String,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub words: Vec<FinalizedWord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinalizedWord {
+    pub text: String,
+    pub start_sample: u64,
+    pub end_sample: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptOutcome {
+    pub accepted_through: u64,
+    pub endpoint: Option<FinalizedSegment>,
 }
 
 impl VoskSession {
     /// Accepts native-rate mono f32 samples. Conversion happens on the decoder
     /// worker, never in the audio callback.
-    pub fn accept_f32(&mut self, samples: &[f32]) -> Result<bool, VoskError> {
+    pub fn accept_f32(&mut self, samples: &[f32]) -> Result<AcceptOutcome, VoskError> {
         if samples.is_empty() {
-            return Ok(false);
+            return Ok(AcceptOutcome {
+                accepted_through: self.accepted_samples,
+                endpoint: None,
+            });
         }
-        let mut pcm = Vec::with_capacity(samples.len() * 2);
-        for sample in samples {
-            pcm.extend_from_slice(
-                &((*sample).clamp(-1.0, 1.0) * i16::MAX as f32)
-                    .round()
-                    .to_le_bytes(),
-            );
-        }
+        let pcm = pcm16_bytes(samples);
         let len = c_int::try_from(pcm.len()).map_err(|_| VoskError::AudioBatchTooLarge)?;
         // SAFETY: pcm remains live for the duration of the synchronous call.
         let accepted =
             unsafe { (self.model.api.accept_waveform)(self.raw, pcm.as_ptr().cast(), len) };
+        self.accepted_samples = self
+            .accepted_samples
+            .checked_add(samples.len() as u64)
+            .ok_or(VoskError::SampleAccountingOverflow)?;
         match accepted {
-            0 => Ok(false),
+            0 => Ok(AcceptOutcome {
+                accepted_through: self.accepted_samples,
+                endpoint: None,
+            }),
             1 => {
-                let text = self.read_json(self.model.api.result)?;
-                self.finalized.endpoint(text);
-                Ok(true)
+                let (text, words) = self.read_result(self.model.api.result)?;
+                let endpoint = FinalizedSegment {
+                    text,
+                    start_sample: self.segment_start,
+                    end_sample: self.accepted_samples,
+                    words,
+                };
+                self.segment_start = self.accepted_samples;
+                Ok(AcceptOutcome {
+                    accepted_through: self.accepted_samples,
+                    endpoint: Some(endpoint),
+                })
             }
             _ => Err(VoskError::DecoderFailed),
         }
     }
 
-    pub fn finish(mut self) -> Result<String, VoskError> {
-        let text = self.read_json(self.model.api.final_result)?;
-        Ok(std::mem::take(&mut self.finalized).finish(text))
+    pub fn finish(self) -> Result<FinalizedSegment, VoskError> {
+        let (text, words) = self.read_result(self.model.api.final_result)?;
+        Ok(FinalizedSegment {
+            text,
+            start_sample: self.segment_start,
+            end_sample: self.accepted_samples,
+            words,
+        })
     }
 
-    fn read_json(&self, function: ResultFn) -> Result<String, VoskError> {
+    fn read_result(&self, function: ResultFn) -> Result<(String, Vec<FinalizedWord>), VoskError> {
         // SAFETY: Vosk owns the returned NUL-terminated buffer until the next
         // recognizer call; we deserialize before returning.
         let pointer = unsafe { function(self.raw) };
@@ -340,27 +392,7 @@ impl VoskSession {
             return Err(VoskError::NullResult);
         }
         let bytes = unsafe { CStr::from_ptr(pointer) }.to_bytes();
-        parse_text(bytes)
-    }
-}
-
-#[derive(Default)]
-struct FinalizedText {
-    endpoints: Vec<String>,
-}
-
-impl FinalizedText {
-    fn endpoint(&mut self, text: String) {
-        if !text.is_empty() {
-            self.endpoints.push(text);
-        }
-    }
-
-    fn finish(mut self, terminal: String) -> String {
-        if !terminal.is_empty() {
-            self.endpoints.push(terminal);
-        }
-        self.endpoints.join(" ")
+        parse_result(bytes, self.sample_rate, self.accepted_samples)
     }
 }
 
@@ -375,12 +407,15 @@ impl Drop for VoskSession {
 struct ResultDocument {
     #[serde(default)]
     text: String,
+    #[serde(default)]
+    result: Vec<ResultWordDocument>,
 }
 
-fn parse_text(json: &[u8]) -> Result<String, VoskError> {
-    serde_json::from_slice::<ResultDocument>(json)
-        .map(|document| document.text.trim().to_owned())
-        .map_err(VoskError::InvalidJson)
+#[derive(Deserialize)]
+struct ResultWordDocument {
+    start: f64,
+    end: f64,
+    word: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -409,6 +444,63 @@ pub enum VoskError {
     NullResult,
     #[error("Vosk returned malformed result JSON: {0}")]
     InvalidJson(serde_json::Error),
+    #[error("Vosk returned invalid or non-monotonic word timestamps")]
+    InvalidWordTimestamp,
+    #[error("Vosk sample accounting overflowed")]
+    SampleAccountingOverflow,
+}
+
+fn parse_result(
+    json: &[u8],
+    sample_rate: u32,
+    accepted_samples: u64,
+) -> Result<(String, Vec<FinalizedWord>), VoskError> {
+    let document =
+        serde_json::from_slice::<ResultDocument>(json).map_err(VoskError::InvalidJson)?;
+    let mut words = Vec::with_capacity(document.result.len());
+    for word in document.result {
+        let Some(start_sample) = timestamp_sample(word.start, sample_rate) else {
+            return Err(VoskError::InvalidWordTimestamp);
+        };
+        let Some(end_sample) = timestamp_sample(word.end, sample_rate) else {
+            return Err(VoskError::InvalidWordTimestamp);
+        };
+        if word.word.trim().is_empty()
+            || end_sample < start_sample
+            || end_sample > accepted_samples
+            || words
+                .last()
+                .is_some_and(|previous: &FinalizedWord| end_sample < previous.end_sample)
+        {
+            return Err(VoskError::InvalidWordTimestamp);
+        }
+        words.push(FinalizedWord {
+            text: word.word.trim().to_owned(),
+            start_sample,
+            end_sample,
+        });
+    }
+    Ok((document.text.trim().to_owned(), words))
+}
+
+fn timestamp_sample(seconds: f64, sample_rate: u32) -> Option<u64> {
+    let sample = seconds * f64::from(sample_rate);
+    (sample.is_finite() && sample >= 0.0 && sample <= u64::MAX as f64)
+        .then(|| sample.round() as u64)
+}
+
+fn pcm16_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut pcm = Vec::with_capacity(samples.len() * std::mem::size_of::<i16>());
+    for sample in samples {
+        let sample = (*sample).clamp(-1.0, 1.0);
+        let sample = if sample < 0.0 {
+            (sample * -(i16::MIN as f32)).round() as i16
+        } else {
+            (sample * i16::MAX as f32).round() as i16
+        };
+        pcm.extend_from_slice(&sample.to_le_bytes());
+    }
+    pcm
 }
 
 #[cfg(test)]
@@ -419,8 +511,54 @@ mod tests {
     #[test]
     fn parses_text_without_exposing_other_result_fields() {
         assert_eq!(
-            parse_text(br#"{"text":"  hello world  ","result":[{"word":"hello"}]}"#).unwrap(),
+            parse_result(
+                br#"{"text":"  hello world  ","result":[{"start":0.0,"end":0.4,"word":"hello"}]}"#,
+                16_000,
+                16_000,
+            )
+            .unwrap()
+            .0,
             "hello world"
+        );
+    }
+
+    #[test]
+    fn parses_monotonic_word_timestamps_into_native_samples() {
+        let (text, words) = parse_result(
+            br#"{"text":"hello world","result":[{"start":0.1,"end":0.4,"word":"hello"},{"start":0.5,"end":0.9,"word":"world"}]}"#,
+            16_000,
+            16_000,
+        )
+        .unwrap();
+        assert_eq!(text, "hello world");
+        assert_eq!(
+            words,
+            [
+                FinalizedWord {
+                    text: "hello".to_owned(),
+                    start_sample: 1_600,
+                    end_sample: 6_400,
+                },
+                FinalizedWord {
+                    text: "world".to_owned(),
+                    start_sample: 8_000,
+                    end_sample: 14_400,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn native_audio_is_encoded_as_signed_little_endian_pcm16() {
+        assert_eq!(
+            pcm16_bytes(&[-1.0, -0.5, 0.0, 0.5, 1.0]),
+            [
+                0x00, 0x80, // -32768
+                0x00, 0xc0, // -16384
+                0x00, 0x00, // 0
+                0x00, 0x40, // 16384
+                0xff, 0x7f, // 32767
+            ]
         );
     }
 
@@ -490,26 +628,22 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_segments_and_terminal_result_are_committed_exactly_once() {
-        let mut text = FinalizedText::default();
-        text.endpoint("the first phrase".to_owned());
-        text.endpoint("the second phrase".to_owned());
-        assert_eq!(
-            text.finish("the final phrase".to_owned()),
-            "the first phrase the second phrase the final phrase"
-        );
-    }
-
-    #[test]
-    fn natural_pauses_silence_and_legitimate_repeated_words_do_not_duplicate_segments() {
-        let mut text = FinalizedText::default();
-        text.endpoint("very very useful".to_owned());
-        // Fifteen seconds of silence produces no endpoint text.
-        text.endpoint(String::new());
-        assert_eq!(
-            text.finish("after the pause".to_owned()),
-            "very very useful after the pause"
-        );
+    fn finalized_segments_expose_owned_ranges_without_text_deduplication() {
+        let first = FinalizedSegment {
+            text: "very very useful".to_owned(),
+            start_sample: 0,
+            end_sample: 16_000,
+            words: Vec::new(),
+        };
+        let silence = FinalizedSegment {
+            text: String::new(),
+            start_sample: first.end_sample,
+            end_sample: 32_000,
+            words: Vec::new(),
+        };
+        assert_eq!(first.text, "very very useful");
+        assert_eq!(silence.start_sample, first.end_sample);
+        assert!(silence.text.is_empty());
     }
 
     #[test]
@@ -523,9 +657,10 @@ mod tests {
             let mut session = loaded.session(sample_rate).unwrap();
             let silence = vec![0.0; sample_rate as usize];
             for batch in silence.chunks(1_337) {
-                session.accept_f32(batch).unwrap();
+                let outcome = session.accept_f32(batch).unwrap();
+                assert!(outcome.accepted_through > 0);
             }
-            assert!(session.finish().unwrap().is_empty());
+            assert!(session.finish().unwrap().text.is_empty());
         }
     }
 }

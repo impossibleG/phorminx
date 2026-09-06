@@ -1515,12 +1515,19 @@ impl ResidentRecognitionEngine for ProductionResidentEngine {
                 let mut session = recognizer
                     .session(clip.sample_rate)
                     .map_err(|_| MeasurementFailure::RecognitionFailed)?;
-                session
-                    .accept_f32(&clip.samples)
-                    .map_err(|_| MeasurementFailure::RecognitionFailed)?;
-                let text = session
+                let mut text = String::new();
+                for batch in clip.samples.chunks(4_096) {
+                    let outcome = session
+                        .accept_f32(batch)
+                        .map_err(|_| MeasurementFailure::RecognitionFailed)?;
+                    if let Some(endpoint) = outcome.endpoint {
+                        append_vosk_text(&mut text, &endpoint.text);
+                    }
+                }
+                let terminal = session
                     .finish()
                     .map_err(|_| MeasurementFailure::RecognitionFailed)?;
+                append_vosk_text(&mut text, &terminal.text);
                 if abort.load(Ordering::Acquire) {
                     return Err(MeasurementFailure::Cancelled);
                 }
@@ -1534,6 +1541,17 @@ impl ResidentRecognitionEngine for ProductionResidentEngine {
             }
         }
     }
+}
+
+fn append_vosk_text(destination: &mut String, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    if !destination.is_empty() {
+        destination.push(' ');
+    }
+    destination.push_str(text);
 }
 
 struct EngineRequest {
@@ -2023,6 +2041,16 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn benchmark_vosk_text_assembly_preserves_endpoints_and_terminal_text() {
+        let mut text = String::new();
+        append_vosk_text(&mut text, "first endpoint");
+        append_vosk_text(&mut text, "");
+        append_vosk_text(&mut text, "first endpoint");
+        append_vosk_text(&mut text, "terminal");
+        assert_eq!(text, "first endpoint first endpoint terminal");
+    }
 
     static NATIVE_WORKER_TEST_LOCK: Mutex<()> = Mutex::new(());
 

@@ -5,7 +5,7 @@ mod extended;
 pub use extended::{
     DeferredCapturedAudio, ExtendedCaptureConfig, ExtendedCaptureFactory, ExtendedCaptureFault,
     ExtendedCaptureProgress, ExtendedCapturedAudio, ExtendedRecording, ExtendedStorageKind,
-    start_extended_default, start_extended_input,
+    OwnershipAcknowledger, start_extended_default, start_extended_input,
 };
 
 use std::collections::TryReserveError;
