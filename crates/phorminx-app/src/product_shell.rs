@@ -23,6 +23,9 @@ use phorminx_whisper::WhisperReadiness;
 use phorminx_windows::{SystemAppearance, system_appearance};
 
 use crate::history_loader::{HistoryLoadIntent, HistoryLoadKey, HistoryLoadResult, HistoryLoader};
+use crate::library_search::{
+    LibrarySearchConfig, LibrarySearchUpdate, LibrarySearchWorker, embedding_identity,
+};
 use crate::settings::{
     AccurateBackendPreference, AccurateModelVariant, AppearancePreference as StoredAppearance,
     FormattingStrength, HistoryRetention, OllamaLifecycle, RecognitionMode, RecordingMode,
@@ -34,6 +37,10 @@ use crate::ui_bridge::{
     DEFAULT_HISTORY_LIMIT, UiBridge, UiCommand, UiEffect, UiLexiconDraft, UiMutation,
     UiProfileDraft, UiReadinessSnapshot, UiReadinessState, UiRoute, UiRuntimeStatus, UiSnapshot,
     UiVoskProbe,
+};
+use phorminx_ui::{
+    LibraryEmbeddingModel, LibraryIndexState, LibrarySearchMode, LibrarySearchStatus,
+    LibrarySnapshot,
 };
 
 #[cfg(windows)]
@@ -58,6 +65,7 @@ pub enum ProductShellControl {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProductShellEvent {
     TestDictation,
+    ShortcutCapture(bool),
     ChangeWhisperModel(AccurateModelVariant),
     InstallVerifiedVoskAssets,
     CancelWhisperModelDownload,
@@ -177,6 +185,7 @@ fn run_shell(
     let bridge =
         UiBridge::open(store.clone(), database_path.clone()).map_err(|error| error.to_string())?;
     let history_loader = HistoryLoader::new(database_path.clone());
+    let library_search = LibrarySearchWorker::spawn(database_path.clone()).ok();
     // Setup is an optional child subsystem. Failure to recover it must never
     // make dictation or the unified shell fail to start.
     let setup_center =
@@ -233,6 +242,7 @@ fn run_shell(
         store,
         loaded_whisper,
         history_loader,
+        library_search,
         setup_center,
         setup_features,
         readiness_started,
@@ -306,9 +316,20 @@ struct ProductShellApp {
     download_active: bool,
     quitting: bool,
     history_loader: HistoryLoader,
+    library_search: Option<LibrarySearchWorker>,
+    library: LibrarySnapshot,
+    library_generation: u64,
+    library_selected_history: Option<i64>,
     setup_center: Option<SetupCenter>,
     setup_features: SetupFeatures,
     window_visible: bool,
+}
+
+impl Drop for ProductShellApp {
+    fn drop(&mut self) {
+        // Also cover unexpected window/renderer exit, not just the close button.
+        let _ = phorminx_windows::set_global_shortcut_capture(false);
+    }
 }
 
 impl ProductShellApp {
@@ -325,6 +346,7 @@ impl ProductShellApp {
         store: SettingsStore,
         loaded_whisper: Option<WhisperReadiness>,
         history_loader: HistoryLoader,
+        library_search: Option<LibrarySearchWorker>,
         setup_center: Option<SetupCenter>,
         setup_features: SetupFeatures,
         readiness_started: bool,
@@ -352,10 +374,16 @@ impl ProductShellApp {
             download_active: false,
             quitting: false,
             history_loader,
+            library_search,
+            library: LibrarySnapshot::default(),
+            library_generation: 0,
+            library_selected_history: None,
             setup_center,
             setup_features,
             window_visible: initially_visible,
         };
+        app.configure_library();
+        app.refresh();
         if !readiness_started {
             app.set_error("Local readiness inspection could not start.".to_owned());
             app.refresh();
@@ -372,19 +400,26 @@ impl ProductShellApp {
             self.readiness.clone(),
             DEFAULT_HISTORY_LIMIT,
         ) {
-            Ok(snapshot) => {
+            Ok(mut snapshot) => {
+                if let Some(id) = self.library_selected_history
+                    && !snapshot.history.iter().any(|item| item.id == id)
+                {
+                    if let Ok(Some(item)) = self.bridge.history_summary(id) {
+                        snapshot.history.push(item);
+                    } else {
+                        self.library_selected_history = None;
+                    }
+                }
                 let mut setup = self
                     .setup_center
                     .as_ref()
                     .map(|center| center.snapshot(&self.readiness))
                     .unwrap_or_else(unavailable_setup_snapshot);
                 self.setup_features.enrich(&mut setup);
-                self.shell.apply_snapshot(map_snapshot_with_setup(
-                    snapshot,
-                    self.route,
-                    self.notice.clone(),
-                    Some(setup),
-                ))
+                let mut mapped =
+                    map_snapshot_with_setup(snapshot, self.route, self.notice.clone(), Some(setup));
+                mapped.library = self.library.clone();
+                self.shell.apply_snapshot(mapped);
             }
             Err(error) => self.set_error(error.to_string()),
         }
@@ -397,6 +432,184 @@ impl ProductShellApp {
             detail: message,
             action: None,
         });
+    }
+
+    fn configure_library(&mut self) {
+        let settings = self.bridge.settings();
+        let selected = settings.search.embedding_model.clone();
+        let identity = selected.as_ref().and_then(|name| {
+            self.readiness
+                .ollama
+                .models
+                .iter()
+                .find(|model| &model.name == name)
+                .and_then(|model| {
+                    model
+                        .digest
+                        .as_ref()
+                        .map(|digest| embedding_identity(name, digest))
+                })
+        });
+        self.library.index.selected_model = selected.clone();
+        self.library.index.models = self
+            .readiness
+            .ollama
+            .models
+            .iter()
+            .filter(|model| !model.name.to_ascii_lowercase().contains("cloud"))
+            .map(|model| LibraryEmbeddingModel {
+                name: model.name.clone(),
+                detail: "Installed locally; embedding capability is checked before use.".into(),
+                available: model.digest.is_some(),
+            })
+            .collect();
+        if let Some(worker) = &self.library_search {
+            let changed = worker.handle().configure(LibrarySearchConfig {
+                model: selected.clone(),
+                model_identity: identity,
+                history_enabled: settings.privacy.history_retention != HistoryRetention::Disabled,
+            });
+            worker
+                .handle()
+                .set_paused(library_runtime_busy(self.runtime_status));
+            if changed && !self.library.query.is_empty() {
+                self.library_generation = self.library_generation.wrapping_add(1).max(1);
+                self.library.results.clear();
+                self.library.status = LibrarySearchStatus::Searching;
+                worker.handle().search(
+                    self.library_generation,
+                    self.library.query.clone(),
+                    self.library.mode == LibrarySearchMode::Semantic,
+                );
+            }
+        } else {
+            self.library.index.state = LibraryIndexState::Error;
+            self.library.index.detail =
+                "The background search service could not start. Dictation remains available."
+                    .into();
+        }
+        if settings.privacy.history_retention == HistoryRetention::Disabled {
+            self.clear_library_search();
+            self.library.index.state = LibraryIndexState::Disabled;
+            self.library.index.detail = "History is off. No dictations are indexed.".into();
+        } else if selected.is_none() {
+            self.library.index.state = LibraryIndexState::Disabled;
+            self.library.index.detail =
+                "Exact-word search is ready. Choose a local embedding model to search by meaning."
+                    .into();
+        }
+    }
+
+    fn search_library(&mut self, query: String, mode: LibrarySearchMode) {
+        self.library_generation = self.library_generation.wrapping_add(1).max(1);
+        self.library.query = normalize_library_query(&query);
+        self.library.mode = mode;
+        self.library.results.clear();
+        self.library_selected_history = None;
+        self.library.detail = None;
+        self.library.status = if self.library.query.is_empty() {
+            LibrarySearchStatus::Idle
+        } else {
+            LibrarySearchStatus::Searching
+        };
+        if let Some(worker) = &self.library_search {
+            worker.handle().search(
+                self.library_generation,
+                self.library.query.clone(),
+                mode == LibrarySearchMode::Semantic,
+            );
+        } else {
+            self.library.status = LibrarySearchStatus::Unavailable;
+            self.library.detail = Some("The background search service is unavailable. Your saved dictations remain accessible below.".into());
+        }
+    }
+
+    fn clear_library_search(&mut self) {
+        self.search_library(String::new(), LibrarySearchMode::Keyword);
+    }
+
+    fn invalidate_library_sources(&mut self) {
+        let query = self.library.query.clone();
+        let mode = self.library.mode;
+        self.history_loader.invalidate();
+        self.shell.clear_history_detail();
+        self.search_library(query, mode);
+        self.refresh();
+    }
+
+    fn apply_library_update(&mut self, update: LibrarySearchUpdate) {
+        if self.bridge.settings().privacy.history_retention == HistoryRetention::Disabled {
+            return;
+        }
+        if update.generation == 0
+            && let Some(identity) = update.stats.model_identity.as_deref()
+        {
+            let Some(selected) = self.bridge.settings().search.embedding_model.as_deref() else {
+                return;
+            };
+            let expected = self
+                .readiness
+                .ollama
+                .models
+                .iter()
+                .find(|model| model.name == selected)
+                .and_then(|model| model.digest.as_deref())
+                .map(|digest| embedding_identity(selected, digest));
+            if !identity.starts_with(&format!("{selected}@"))
+                || expected
+                    .as_deref()
+                    .is_some_and(|expected| expected != identity)
+            {
+                return;
+            }
+        }
+        // Query generations are separate from progress updates, so an idle
+        // indexing tick cannot replace an explicit search or resurrect old hits.
+        if update.generation != 0
+            && (update.generation != self.library_generation || update.query != self.library.query)
+        {
+            return;
+        }
+        self.library.index.indexed_passages = update.stats.indexed_passages;
+        self.library.index.total_passages =
+            (update.stats.pending_documents == 0).then_some(update.stats.indexed_passages);
+        self.library.index.state = if self.library.index.selected_model.is_none() {
+            LibraryIndexState::Disabled
+        } else if update.failed {
+            LibraryIndexState::Error
+        } else if !update.semantic_available && update.generation == 0 {
+            LibraryIndexState::MissingModel
+        } else if update.stats.pending_documents > 0 {
+            LibraryIndexState::Building
+        } else {
+            LibraryIndexState::Ready
+        };
+        if update.generation == 0 {
+            self.library.index.detail = update.status;
+        } else {
+            self.library.status = if update.failed {
+                LibrarySearchStatus::Error
+            } else if update.query.is_empty() {
+                LibrarySearchStatus::Idle
+            } else {
+                LibrarySearchStatus::Ready
+            };
+            self.library.detail = Some(update.status);
+            self.library.results = update
+                .hits
+                .into_iter()
+                .enumerate()
+                .map(|(index, hit)| phorminx_ui::LibrarySearchHit {
+                    history_id: hit.history_id,
+                    passage_id: format!("{}:{}", hit.start_char, hit.end_char),
+                    time: format_timestamp(hit.created_at_ms),
+                    application: "Saved dictation".into(),
+                    excerpt: hit.passage,
+                    rank: index + 1,
+                })
+                .collect();
+        }
+        self.refresh();
     }
 
     fn setup_mutation_active(&self) -> bool {
@@ -479,6 +692,7 @@ impl ProductShellApp {
     }
 
     fn history_item_missing(&mut self) {
+        self.clear_library_search();
         self.history_loader.invalidate();
         self.shell.clear_history_detail();
         self.notice = Some(InlineNotice {
@@ -494,8 +708,16 @@ impl ProductShellApp {
     }
 
     fn execute(&mut self, command: UiCommand) -> bool {
+        let history_changes = matches!(&command, UiCommand::ClearHistory)
+            || matches!(&command, UiCommand::SaveSettings(candidate)
+                if candidate.privacy != self.bridge.settings().privacy);
         match self.bridge.execute(command, &self.readiness, now_ms()) {
             Ok(outcome) => {
+                if history_changes {
+                    self.clear_library_search();
+                    self.history_loader.invalidate();
+                    self.shell.clear_history_detail();
+                }
                 self.notice = None;
                 for effect in outcome.effects.into_iter().rev() {
                     let event = match effect {
@@ -507,6 +729,10 @@ impl ProductShellApp {
                         }
                     };
                     let _ = self.events.send(event);
+                }
+                self.configure_library();
+                if let Some(worker) = &self.library_search {
+                    worker.handle().refresh();
                 }
                 if matches!(outcome.mutation, UiMutation::SettingsSaved) {
                     // The resident recognizer still represents the old saved
@@ -524,6 +750,7 @@ impl ProductShellApp {
             }
             Err(error) => {
                 self.set_error(error.to_string());
+                self.refresh();
                 false
             }
         }
@@ -551,6 +778,60 @@ impl ProductShellApp {
 
     fn handle_shell_event(&mut self, event: ShellEvent) {
         match event {
+            ShellEvent::SearchLibrary { query, mode } => {
+                self.search_library(query, mode);
+                self.refresh();
+            }
+            ShellEvent::ClearLibrarySearch => {
+                self.clear_library_search();
+                self.refresh();
+            }
+            ShellEvent::SelectLibraryPassage {
+                history_id,
+                passage_id,
+            } => {
+                if let Some(hit) = self
+                    .library
+                    .results
+                    .iter()
+                    .find(|hit| hit.history_id == history_id && hit.passage_id == passage_id)
+                {
+                    let start = hit
+                        .passage_id
+                        .split(':')
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0);
+                    self.library_selected_history = Some(history_id);
+                    self.history_loader.invalidate();
+                    self.refresh();
+                    self.shell.select_history_passage(history_id, start);
+                    self.ensure_history_detail();
+                }
+            }
+            ShellEvent::SelectEmbeddingModel(model) => {
+                let mut settings = self.bridge.settings().clone();
+                settings.search.embedding_model = optional(model.trim().to_owned());
+                self.clear_library_search();
+                self.execute(UiCommand::SaveSettings(settings));
+                self.refresh();
+            }
+            ShellEvent::RebuildLibraryIndex => {
+                self.clear_library_search();
+                if let Some(worker) = &self.library_search {
+                    worker.handle().rebuild();
+                }
+                self.refresh();
+            }
+            ShellEvent::ShortcutCapture(active) => {
+                if phorminx_windows::set_global_shortcut_capture(active).is_err() {
+                    self.set_error(
+                        "Shortcut capture is unavailable. Your existing shortcut is unchanged."
+                            .into(),
+                    );
+                }
+                let _ = self.events.send(ProductShellEvent::ShortcutCapture(active));
+            }
             ShellEvent::Navigate(route) => {
                 let destination = unmap_route(route);
                 if self.route == UiRoute::Setup && destination != UiRoute::Setup {
@@ -575,6 +856,7 @@ impl ProductShellApp {
                 self.request_history_copy(id, variant);
             }
             ShellEvent::ClearHistory => {
+                self.clear_library_search();
                 self.history_loader.invalidate();
                 self.shell.clear_history_detail();
                 self.execute(UiCommand::ClearHistory);
@@ -918,6 +1200,9 @@ impl eframe::App for ProductShellApp {
                 }
                 ProductShellControl::SetRuntimeStatus(status) => {
                     self.runtime_status = status;
+                    if let Some(worker) = &self.library_search {
+                        worker.handle().set_paused(library_runtime_busy(status));
+                    }
                     self.shell.set_runtime_status(map_runtime_status(status));
                 }
                 ProductShellControl::Refresh => {
@@ -958,6 +1243,11 @@ impl eframe::App for ProductShellApp {
                     self.refresh();
                 }
                 ProductShellControl::Quit => {
+                    let _ = phorminx_windows::set_global_shortcut_capture(false);
+                    let _ = self.events.send(ProductShellEvent::ShortcutCapture(false));
+                    if let Some(worker) = &self.library_search {
+                        worker.handle().set_paused(true);
+                    }
                     self.setup_features.deactivate();
                     self.window_visible = false;
                     self.history_loader.invalidate();
@@ -975,6 +1265,7 @@ impl eframe::App for ProductShellApp {
                     return;
                 }
                 self.readiness = readiness;
+                self.configure_library();
                 self.setup_features.reconfigure(self.bridge.settings());
                 if let Some(center) = self.setup_center.as_mut()
                     && center
@@ -1037,6 +1328,9 @@ impl eframe::App for ProductShellApp {
             self.refresh();
         }
         if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
+            let _ = phorminx_windows::set_global_shortcut_capture(false);
+            let _ = self.events.send(ProductShellEvent::ShortcutCapture(false));
+            self.clear_library_search();
             self.setup_features.deactivate();
             self.window_visible = false;
             self.history_loader.invalidate();
@@ -1049,10 +1343,29 @@ impl eframe::App for ProductShellApp {
         // intentionally process controls and close requests first so a stale
         // copy cannot win a navigation or shutdown race.
         if !self.quitting
+            && self
+                .library_search
+                .as_ref()
+                .is_some_and(|worker| worker.take_invalidated())
+        {
+            self.invalidate_library_sources();
+        }
+        if !self.quitting
             && self.route == UiRoute::History
             && let Some(result) = self.history_loader.take_result()
         {
             self.apply_history_result(result, ctx);
+        }
+        if !self.quitting {
+            // The worker has a bounded latest-result mailbox; polling never waits
+            // for SQLite, an embedding model, or a network response.
+            if let Some(update) = self
+                .library_search
+                .as_ref()
+                .and_then(|worker| worker.try_recv())
+            {
+                self.apply_library_update(update);
+            }
         }
         ctx.request_repaint_after(Duration::from_millis(100));
     }
@@ -1146,7 +1459,7 @@ fn map_snapshot(
     ShellSnapshot {
         route: map_route(route),
         status: map_runtime_status(snapshot.runtime_status),
-        shortcut: "Ctrl  Alt  Space".to_owned(),
+        shortcut: settings.interaction.launcher_shortcut.clone(),
         systems: vec![
             SystemReadiness::new(
                 "Microphone",
@@ -1172,6 +1485,7 @@ fn map_snapshot(
             .map(|record| (record.session, format_timestamp(record.updated_at_ms)))
             .collect(),
         history,
+        library: LibrarySnapshot::default(),
         lexicon,
         profiles,
         whisper: ModelSystem {
@@ -1332,6 +1646,12 @@ fn map_settings(
             RecordingMode::Hold => ShellRecording::Hold,
             RecordingMode::Toggle => ShellRecording::Toggle,
         },
+        launcher_shortcut: settings.interaction.launcher_shortcut.clone(),
+        direct_dictation_shortcut: settings
+            .interaction
+            .direct_dictation_shortcut
+            .clone()
+            .unwrap_or_default(),
         language: match settings.recognition.language.as_str() {
             "en" => "English".to_owned(),
             "pt-br" => "Português (Brasil)".to_owned(),
@@ -1398,6 +1718,9 @@ fn apply_settings_snapshot(current: &Settings, form: &SettingsSnapshot) -> Setti
         ShellRecording::Hold => RecordingMode::Hold,
         ShellRecording::Toggle => RecordingMode::Toggle,
     };
+    settings.interaction.launcher_shortcut = form.launcher_shortcut.clone();
+    settings.interaction.direct_dictation_shortcut =
+        optional(form.direct_dictation_shortcut.trim().to_owned());
     settings.formatting.strength = unmap_formatting(form.formatting);
     settings.formatting.custom_instructions =
         (form.formatting == ShellFormatting::Custom).then(|| form.custom_instruction.clone());
@@ -1460,6 +1783,11 @@ fn map_route(route: UiRoute) -> Route {
         UiRoute::Profiles => Route::Profiles,
         UiRoute::Models => Route::Models,
         UiRoute::Settings => Route::Settings,
+        UiRoute::SettingsShortcuts => Route::SettingsShortcuts,
+        UiRoute::SettingsDictation => Route::SettingsDictation,
+        UiRoute::SettingsFormatting => Route::SettingsFormatting,
+        UiRoute::SettingsAppearance => Route::SettingsAppearance,
+        UiRoute::SettingsPrivacy => Route::SettingsPrivacy,
     }
 }
 fn unmap_route(route: Route) -> UiRoute {
@@ -1471,6 +1799,11 @@ fn unmap_route(route: Route) -> UiRoute {
         Route::Profiles => UiRoute::Profiles,
         Route::Models => UiRoute::Models,
         Route::Settings => UiRoute::Settings,
+        Route::SettingsShortcuts => UiRoute::SettingsShortcuts,
+        Route::SettingsDictation => UiRoute::SettingsDictation,
+        Route::SettingsFormatting => UiRoute::SettingsFormatting,
+        Route::SettingsAppearance => UiRoute::SettingsAppearance,
+        Route::SettingsPrivacy => UiRoute::SettingsPrivacy,
     }
 }
 
@@ -1487,6 +1820,20 @@ fn map_runtime_status(status: UiRuntimeStatus) -> RuntimeStatus {
             RuntimeStatus::NeedsAttention
         }
     }
+}
+
+fn library_runtime_busy(status: UiRuntimeStatus) -> bool {
+    matches!(
+        status,
+        UiRuntimeStatus::Starting
+            | UiRuntimeStatus::Listening
+            | UiRuntimeStatus::Transcribing
+            | UiRuntimeStatus::Refining
+    )
+}
+
+fn normalize_library_query(query: &str) -> String {
+    query.trim().chars().take(1024).collect()
 }
 fn map_readiness(state: UiReadinessState) -> Readiness {
     match state {
@@ -1617,6 +1964,446 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Entirely synthetic shell composition: no native window, global shortcut,
+    /// clipboard operation, audio device or model discovery is started.
+    struct LibraryFixture {
+        app: ProductShellApp,
+        database: phorminx_persistence::Persistence,
+        directory: tempfile::TempDir,
+    }
+
+    impl LibraryFixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let store = SettingsStore::new(directory.path().join("settings.toml")).unwrap();
+            let mut settings = Settings::default();
+            settings.privacy.history_retention = HistoryRetention::Indefinite;
+            settings.formatting.strength = FormattingStrength::Light;
+            settings.recognition.accurate_model = AccurateModelVariant::Custom;
+            settings.recognition.model_path = directory.path().join("synthetic-model.bin");
+            std::fs::write(
+                &settings.recognition.model_path,
+                b"synthetic-not-a-native-model",
+            )
+            .unwrap();
+            store.save(&settings).unwrap();
+            let database_path = directory.path().join("synthetic.sqlite3");
+            let bridge = UiBridge::open(store.clone(), &database_path).unwrap();
+            let readiness = UiReadinessSnapshot::checking(&settings, &store);
+            let snapshot = bridge
+                .snapshot(
+                    UiRuntimeStatus::Ready,
+                    readiness.clone(),
+                    DEFAULT_HISTORY_LIMIT,
+                )
+                .unwrap();
+            let (_, controls) = mpsc::channel();
+            let (events, _) = mpsc::channel();
+            let (_, readiness_rx) = mpsc::channel();
+            let features = SetupFeatures::open(store.clone(), &settings, false);
+            let app = ProductShellApp::new(
+                bridge,
+                readiness,
+                snapshot,
+                UiRoute::History,
+                UiRuntimeStatus::Ready,
+                controls,
+                events,
+                readiness_rx,
+                store,
+                None,
+                HistoryLoader::new(database_path.clone()),
+                None,
+                None,
+                features,
+                true,
+                false,
+            );
+            let database = phorminx_persistence::Persistence::open(database_path).unwrap();
+            Self {
+                app,
+                database,
+                directory,
+            }
+        }
+
+        fn insert(&self, text: &str, time: i64) -> i64 {
+            self.database
+                .history()
+                .insert(&phorminx_persistence::DictationDraft {
+                    created_at_ms: time,
+                    raw_text: text.into(),
+                    normalized_text: None,
+                    cleaned_text: None,
+                    selected_output: text.into(),
+                    language: Some("en".into()),
+                    target_executable: None,
+                    timings: phorminx_persistence::TimingMetadata::default(),
+                    warnings: vec![],
+                })
+                .unwrap()
+                .unwrap()
+        }
+
+        fn update(
+            &self,
+            generation: u64,
+            query: &str,
+            id: i64,
+            excerpt: &str,
+        ) -> LibrarySearchUpdate {
+            LibrarySearchUpdate {
+                generation,
+                query: query.into(),
+                hits: vec![phorminx_persistence::LibrarySearchHit {
+                    history_id: id,
+                    created_at_ms: now_ms(),
+                    start_char: 0,
+                    end_char: excerpt.chars().count(),
+                    passage: excerpt.into(),
+                    score: 1.0,
+                    semantic: false,
+                }],
+                stats: phorminx_persistence::LibraryIndexStats::default(),
+                status: "Synthetic search complete".into(),
+                failed: false,
+                semantic_available: false,
+            }
+        }
+    }
+
+    #[test]
+    fn library_stale_query_cannot_replace_current_hits_or_index_stats() {
+        let mut fixture = LibraryFixture::new();
+        let id = fixture.insert("current phrase", now_ms());
+        fixture
+            .app
+            .search_library("current".into(), LibrarySearchMode::Keyword);
+        let generation = fixture.app.library_generation;
+        fixture.app.apply_library_update(fixture.update(
+            generation,
+            "current",
+            id,
+            "current phrase",
+        ));
+        let expected = fixture.app.library.clone();
+        let mut stale = fixture.update(
+            generation.wrapping_sub(1).max(999),
+            "old",
+            id,
+            "stale phrase",
+        );
+        stale.stats.indexed_passages = 999;
+        fixture.app.apply_library_update(stale);
+        assert_eq!(fixture.app.library, expected);
+        fixture.app.apply_library_update(fixture.update(
+            generation,
+            "different query",
+            id,
+            "wrong phrase",
+        ));
+        assert_eq!(fixture.app.library, expected);
+    }
+
+    #[test]
+    fn rejected_shortcut_save_immediately_publishes_error_without_changing_binding() {
+        let mut fixture = LibraryFixture::new();
+        let original = fixture.app.bridge.settings().interaction.clone();
+        let mut candidate = fixture.app.bridge.settings().clone();
+        // Missing terminal key is rejected in pure validation, before any
+        // RegisterHotKey availability probe or native interaction can occur.
+        candidate.interaction.launcher_shortcut = "Ctrl".into();
+        assert!(!fixture.app.execute(UiCommand::SaveSettings(candidate)));
+        assert_eq!(fixture.app.bridge.settings().interaction, original);
+        assert_eq!(fixture.app.store.load().unwrap().interaction, original);
+        assert_eq!(
+            fixture.app.shell.snapshot().settings.launcher_shortcut,
+            original.launcher_shortcut
+        );
+        let notice = fixture.app.shell.snapshot().notice.as_ref().expect(
+            "validation feedback must appear in the current shell snapshot without another event",
+        );
+        assert_eq!(notice.kind, NoticeKind::Error);
+        assert!(!notice.detail.is_empty());
+    }
+
+    #[test]
+    fn library_background_progress_never_replaces_explicit_query_results() {
+        let mut fixture = LibraryFixture::new();
+        let id = fixture.insert("saved phrase", now_ms());
+        fixture
+            .app
+            .search_library("saved".into(), LibrarySearchMode::Keyword);
+        fixture.app.apply_library_update(fixture.update(
+            fixture.app.library_generation,
+            "saved",
+            id,
+            "saved phrase",
+        ));
+        let expected = fixture.app.library.results.clone();
+        let mut progress = fixture.update(0, "", id, "must never become a result");
+        progress.stats.indexed_passages = 12;
+        progress.stats.pending_documents = 4;
+        progress.stats.total_passages = 10;
+        fixture.app.apply_library_update(progress);
+        assert_eq!(fixture.app.library.results, expected);
+        assert_eq!(fixture.app.library.query, "saved");
+        assert_eq!(fixture.app.library.status, LibrarySearchStatus::Ready);
+        assert_eq!(fixture.app.library.index.indexed_passages, 12);
+        assert_eq!(
+            fixture.app.library.index.total_passages, None,
+            "adaptive totals are not exact while building"
+        );
+    }
+
+    #[test]
+    fn library_long_unicode_query_round_trips_without_permanent_searching() {
+        let mut fixture = LibraryFixture::new();
+        let query = format!("  {}  ", "🦀".repeat(1200));
+        fixture
+            .app
+            .search_library(query, LibrarySearchMode::Keyword);
+        assert_eq!(fixture.app.library.query.chars().count(), 1024);
+        assert_eq!(fixture.app.library.query.len(), 4096);
+        let normalized = fixture.app.library.query.clone();
+        let mut update = fixture.update(fixture.app.library_generation, &normalized, 1, "");
+        update.hits.clear();
+        fixture.app.apply_library_update(update);
+        assert_eq!(fixture.app.library.status, LibrarySearchStatus::Ready);
+    }
+
+    #[test]
+    fn library_clear_invalidates_old_results_and_original_selection() {
+        let mut fixture = LibraryFixture::new();
+        let id = fixture.insert("saved phrase", now_ms());
+        fixture
+            .app
+            .search_library("saved".into(), LibrarySearchMode::Keyword);
+        let stale = fixture.update(fixture.app.library_generation, "saved", id, "saved phrase");
+        fixture.app.apply_library_update(stale.clone());
+        fixture.app.library_selected_history = Some(id);
+        fixture.app.handle_shell_event(ShellEvent::ClearHistory);
+        assert!(fixture.app.library.results.is_empty());
+        assert!(fixture.app.library.query.is_empty());
+        assert!(fixture.app.library_selected_history.is_none());
+        assert!(fixture.app.shell.snapshot().history.is_empty());
+        fixture.app.apply_library_update(stale);
+        assert!(fixture.app.library.results.is_empty());
+    }
+
+    #[test]
+    fn library_old_model_progress_cannot_replace_current_index_readiness() {
+        let mut fixture = LibraryFixture::new();
+        let mut settings = fixture.app.bridge.settings().clone();
+        settings.search.embedding_model = Some("current-embed".into());
+        fixture.app.store.save(&settings).unwrap();
+        fixture.app.bridge.reload_settings().unwrap();
+        fixture.app.readiness.ollama.models = vec![crate::ui_bridge::UiOllamaModel {
+            name: "current-embed".into(),
+            digest: Some("current-digest".into()),
+            size_bytes: Some(123),
+            family: None,
+        }];
+        fixture.app.configure_library();
+        let before = fixture.app.library.clone();
+        let mut stale = fixture.update(0, "", 1, "unused");
+        stale.stats.model_identity = Some(embedding_identity("old-embed", "old-digest"));
+        stale.stats.indexed_passages = 999;
+        stale.semantic_available = true;
+        fixture.app.apply_library_update(stale);
+        assert_eq!(fixture.app.library, before);
+        let mut current = fixture.update(0, "", 1, "unused");
+        current.stats.model_identity = Some(embedding_identity("current-embed", "current-digest"));
+        current.stats.indexed_passages = 3;
+        current.semantic_available = true;
+        fixture.app.apply_library_update(current);
+        assert_eq!(fixture.app.library.index.indexed_passages, 3);
+    }
+
+    #[test]
+    fn library_source_invalidation_drops_exact_text_and_rejects_late_hits() {
+        let mut fixture = LibraryFixture::new();
+        let id = fixture.insert("source before external change", now_ms());
+        fixture.app.refresh();
+        fixture.app.shell.select_history(id);
+        assert!(fixture.app.shell.set_history_detail(
+            id,
+            HistoryVariant::Output,
+            "source before external change".into()
+        ));
+        fixture
+            .app
+            .search_library("source".into(), LibrarySearchMode::Semantic);
+        let stale = fixture.update(
+            fixture.app.library_generation,
+            "source",
+            id,
+            "source before external change",
+        );
+        fixture.app.apply_library_update(stale.clone());
+        fixture
+            .app
+            .request_history_detail(id, HistoryVariant::Output);
+        fixture.database.history().clear().unwrap();
+        fixture.app.invalidate_library_sources();
+        assert_eq!(fixture.app.library.query, "source");
+        assert_eq!(fixture.app.library.mode, LibrarySearchMode::Semantic);
+        assert!(fixture.app.library.results.is_empty());
+        assert!(!fixture.app.history_loader.has_current());
+        assert!(
+            !fixture
+                .app
+                .shell
+                .history_detail_loaded(id, HistoryVariant::Output)
+        );
+        assert!(fixture.app.shell.snapshot().history.is_empty());
+        fixture.app.apply_library_update(stale);
+        assert!(fixture.app.library.results.is_empty());
+    }
+
+    #[test]
+    fn library_shorter_retention_removes_finished_search_excerpts() {
+        let mut fixture = LibraryFixture::new();
+        let old = now_ms() - 3 * 86_400_000;
+        let id = fixture.insert("expired synthetic phrase", old);
+        fixture
+            .app
+            .search_library("expired".into(), LibrarySearchMode::Keyword);
+        let stale = fixture.update(
+            fixture.app.library_generation,
+            "expired",
+            id,
+            "expired synthetic phrase",
+        );
+        fixture.app.apply_library_update(stale.clone());
+        let mut settings = fixture.app.bridge.settings().clone();
+        settings.privacy.history_retention = HistoryRetention::OneDay;
+        assert!(fixture.app.execute(UiCommand::SaveSettings(settings)));
+        assert!(fixture.app.bridge.history_summary(id).unwrap().is_none());
+        assert!(fixture.app.library.results.is_empty());
+        fixture.app.apply_library_update(stale);
+        assert!(fixture.app.library.results.is_empty());
+    }
+
+    #[test]
+    fn library_selected_old_hit_loads_exact_original_outside_recent_hundred() {
+        let mut fixture = LibraryFixture::new();
+        fixture.app.window_visible = true;
+        let text = format!("{} matching old passage", "🦀".repeat(9000));
+        let old = fixture.insert(&text, now_ms() - 1000);
+        for index in 0..105 {
+            fixture.insert(&format!("recent synthetic {index}"), now_ms() + index);
+        }
+        fixture.app.refresh();
+        assert_eq!(
+            fixture.app.shell.snapshot().history.len(),
+            DEFAULT_HISTORY_LIMIT
+        );
+        assert!(
+            !fixture
+                .app
+                .shell
+                .snapshot()
+                .history
+                .iter()
+                .any(|item| item.id == old)
+        );
+        let previous = fixture.app.shell.snapshot().history[0].id;
+        fixture.app.shell.select_history(previous);
+        fixture
+            .app
+            .request_history_detail(previous, HistoryVariant::Output);
+        assert!(fixture.app.history_loader.has_current());
+        fixture
+            .app
+            .search_library("matching".into(), LibrarySearchMode::Keyword);
+        let mut update = fixture.update(
+            fixture.app.library_generation,
+            "matching",
+            old,
+            "matching old passage",
+        );
+        update.hits[0].start_char = 9001;
+        update.hits[0].end_char = text.chars().count();
+        fixture.app.apply_library_update(update);
+        let passage_id = fixture.app.library.results[0].passage_id.clone();
+        fixture
+            .app
+            .handle_shell_event(ShellEvent::SelectLibraryPassage {
+                history_id: old,
+                passage_id,
+            });
+        assert_eq!(
+            fixture.app.shell.history_selection(),
+            Some((old, HistoryVariant::Output))
+        );
+        assert!(
+            fixture
+                .app
+                .shell
+                .snapshot()
+                .history
+                .iter()
+                .any(|item| item.id == old)
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let result = loop {
+            if let Some(result) = fixture.app.history_loader.take_result() {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "synthetic reader did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(result.key.id, old);
+        assert_eq!(result.key.intent, HistoryLoadIntent::Detail);
+        fixture
+            .app
+            .apply_history_result(result, &egui::Context::default());
+        assert_eq!(
+            fixture
+                .app
+                .shell
+                .snapshot()
+                .history
+                .iter()
+                .find(|item| item.id == old)
+                .unwrap()
+                .text_for(HistoryVariant::Output),
+            Some(text.as_str())
+        );
+    }
+
+    #[test]
+    fn library_changed_model_configuration_resubmits_current_query_generation() {
+        let mut fixture = LibraryFixture::new();
+        fixture.app.runtime_status = UiRuntimeStatus::Listening;
+        fixture.app.library_search = Some(
+            LibrarySearchWorker::spawn(fixture.directory.path().join("synthetic.sqlite3")).unwrap(),
+        );
+        fixture.app.configure_library();
+        fixture
+            .app
+            .search_library("a local idea".into(), LibrarySearchMode::Semantic);
+        let old_generation = fixture.app.library_generation;
+        let mut settings = fixture.app.bridge.settings().clone();
+        settings.search.embedding_model = Some("synthetic-embedding-model".into());
+        fixture.app.store.save(&settings).unwrap();
+        fixture.app.bridge.reload_settings().unwrap();
+        fixture.app.configure_library();
+        assert!(fixture.app.library_generation > old_generation);
+        assert_eq!(fixture.app.library.query, "a local idea");
+        assert_eq!(fixture.app.library.status, LibrarySearchStatus::Searching);
+        let current = fixture.app.library_generation;
+        fixture.app.configure_library();
+        assert_eq!(
+            fixture.app.library_generation, current,
+            "same effective configuration must be idempotent"
+        );
+    }
 
     #[test]
     fn automatic_refresh_policy_never_full_loads_vosk() {

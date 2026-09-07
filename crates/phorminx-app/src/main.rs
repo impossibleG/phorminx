@@ -362,7 +362,14 @@ fn run() -> Result<()> {
         Err(error) => return Err(error),
     };
 
-    let hotkey = GlobalHoldHotkey::start().context("failed to install the global hotkey")?;
+    let mut applied_interaction = settings.interaction.clone();
+    let hotkey = GlobalHoldHotkey::start_with_bindings(phorminx_windows::ShortcutBindings::parse(
+        &applied_interaction.launcher_shortcut,
+        applied_interaction.direct_dictation_shortcut.as_deref(),
+    )?)
+    .context("failed to install the global hotkey")?;
+    let mut launcher_open = false;
+    let mut launcher_recording = false;
     let capture = ExtendedCaptureFactory::new(ExtendedCaptureConfig::new(
         settings_store
             .path()
@@ -380,7 +387,10 @@ fn run() -> Result<()> {
     let mut incremental = IncrementalPlanner::default();
     let mut instant_pump = InstantPump::default();
 
-    println!("Ready. Hold Ctrl+Alt+Space to dictate; press Ctrl+C here to exit.");
+    println!(
+        "Ready. Press {} then 1 to dictate; press the shortcut again to stop.",
+        settings.interaction.launcher_shortcut
+    );
     log_state(None, runtime.state(), "ready");
     {
         let mut io = ProductionIo {
@@ -472,6 +482,7 @@ fn run() -> Result<()> {
                 if runtime.is_clean_idle() {
                     active_dictation_activity.take();
                 }
+                hotkey.set_dictation_busy(runtime.state() != RuntimeState::Idle);
                 continue 'event_loop;
             }
             Ok(ShellAction::TestDictation) => {
@@ -500,6 +511,17 @@ fn run() -> Result<()> {
             Err(error) => break Err(error),
         }
 
+        if applied_interaction != settings.interaction {
+            hotkey.set_bindings(phorminx_windows::ShortcutBindings::parse(
+                &settings.interaction.launcher_shortcut,
+                settings.interaction.direct_dictation_shortcut.as_deref(),
+            )?)?;
+            applied_interaction = settings.interaction.clone();
+            if launcher_open {
+                overlay.set(OverlayStatus::Hidden)?;
+                launcher_open = false;
+            }
+        }
         let hotkey_event = hotkey.events().recv_timeout(Duration::from_millis(25));
 
         // Tray Quit has priority over an activation or completed transcription that
@@ -542,6 +564,7 @@ fn run() -> Result<()> {
                 if runtime.is_clean_idle() {
                     active_dictation_activity.take();
                 }
+                hotkey.set_dictation_busy(runtime.state() != RuntimeState::Idle);
                 continue 'event_loop;
             }
             Ok(ShellAction::TestDictation) => {
@@ -570,14 +593,66 @@ fn run() -> Result<()> {
             Err(error) => break Err(error),
         }
 
+        // Normalize launcher actions into the existing, tested dictation path.
+        // The launcher never activates a window, and its captured destination is
+        // carried forward rather than recaptured after selecting an action.
+        let hotkey_event = match hotkey_event {
+            Ok(HoldEvent::LauncherRequested { target }) => {
+                if runtime.state() == RuntimeState::Listening {
+                    hotkey.set_launcher_open(false)?;
+                    launcher_open = false;
+                    launcher_recording = true;
+                    Ok(HoldEvent::Started { target })
+                } else if runtime.state() == RuntimeState::Idle {
+                    launcher_open = true;
+                    // The hook already armed selection atomically. Reopening it
+                    // here would race with a fast selection already in the queue.
+                    overlay.set(launcher_overlay_status(&settings))?;
+                    Err(RecvTimeoutError::Timeout)
+                } else {
+                    hotkey.set_launcher_open(false)?;
+                    Err(RecvTimeoutError::Timeout)
+                }
+            }
+            Ok(HoldEvent::LauncherDictate { target }) => {
+                hotkey.set_launcher_open(false)?;
+                launcher_open = false;
+                overlay.set(OverlayStatus::Hidden)?;
+                if runtime.state() == RuntimeState::Idle {
+                    launcher_recording = true;
+                    Ok(HoldEvent::Started { target })
+                } else {
+                    Err(RecvTimeoutError::Timeout)
+                }
+            }
+            Ok(HoldEvent::LauncherDismissed) => {
+                launcher_open = false;
+                overlay.set(OverlayStatus::Hidden)?;
+                Err(RecvTimeoutError::Timeout)
+            }
+            Ok(HoldEvent::Started { target }) => {
+                if launcher_open {
+                    overlay.set(OverlayStatus::Hidden)?;
+                }
+                launcher_open = false;
+                hotkey.set_launcher_open(false)?;
+                if runtime.state() == RuntimeState::Idle {
+                    launcher_recording = false;
+                }
+                Ok(HoldEvent::Started { target })
+            }
+            event => event,
+        };
         match hotkey_event {
             Ok(HoldEvent::Started {
                 target: activation_target,
             }) => {
-                let release_received_at = (settings.interaction.recording_mode
-                    == RecordingMode::Toggle
-                    && runtime.state() == RuntimeState::Listening)
-                    .then(Instant::now);
+                let release_received_at = activation_stops_recording(
+                    launcher_recording,
+                    settings.interaction.recording_mode,
+                    runtime.state(),
+                )
+                .then(Instant::now);
                 if let (Some(released_at), Some(id)) = (release_received_at, runtime.active_id()) {
                     log_release_received(id, released_at);
                 }
@@ -666,7 +741,8 @@ fn run() -> Result<()> {
                 // This is the user-observable release boundary. Capture it
                 // before stopping/resampling the recording so telemetry
                 // includes all finalization work.
-                if settings.interaction.recording_mode == RecordingMode::Toggle {
+                if !release_stops_recording(launcher_recording, settings.interaction.recording_mode)
+                {
                     continue 'event_loop;
                 }
                 let released_at = Instant::now();
@@ -691,10 +767,17 @@ fn run() -> Result<()> {
                 report_notices(notices);
             }
             Err(RecvTimeoutError::Timeout) => {}
+            Ok(
+                HoldEvent::LauncherRequested { .. }
+                | HoldEvent::LauncherDictate { .. }
+                | HoldEvent::LauncherDismissed,
+            ) => unreachable!("launcher events are normalized above"),
             Err(RecvTimeoutError::Disconnected) => {
                 break Err(anyhow!("the global hotkey thread stopped unexpectedly"));
             }
         }
+
+        hotkey.set_dictation_busy(runtime.state() != RuntimeState::Idle);
 
         match poll_shell_events(
             &tray,
@@ -734,6 +817,7 @@ fn run() -> Result<()> {
                 if runtime.is_clean_idle() {
                     active_dictation_activity.take();
                 }
+                hotkey.set_dictation_busy(runtime.state() != RuntimeState::Idle);
                 continue 'event_loop;
             }
             Ok(ShellAction::TestDictation) => {
@@ -1023,6 +1107,7 @@ fn run() -> Result<()> {
             active_dictation_activity.take();
         }
         let shell_status = runtime_shell_status(runtime.state());
+        hotkey.set_dictation_busy(runtime.state() != RuntimeState::Idle);
         if shell_status != last_shell_status {
             if let Some(shell) = product_shell.as_ref() {
                 let _ = shell.send(ProductShellControl::SetRuntimeStatus(shell_status));
@@ -1311,6 +1396,32 @@ enum ShellAction {
     ReloadAliases,
 }
 
+fn launcher_overlay_status(settings: &Settings) -> OverlayStatus {
+    use phorminx_app::settings::AppearancePreference;
+    let dark = match settings.appearance.theme {
+        AppearancePreference::Dark => true,
+        AppearancePreference::Light => false,
+        AppearancePreference::System => phorminx_windows::system_apps_use_dark_theme(),
+    };
+    if dark {
+        OverlayStatus::LauncherDark
+    } else {
+        OverlayStatus::LauncherLight
+    }
+}
+
+fn activation_stops_recording(
+    from_launcher: bool,
+    direct_mode: RecordingMode,
+    state: RuntimeState,
+) -> bool {
+    (from_launcher || direct_mode == RecordingMode::Toggle) && state == RuntimeState::Listening
+}
+
+fn release_stops_recording(from_launcher: bool, direct_mode: RecordingMode) -> bool {
+    !from_launcher && direct_mode == RecordingMode::Hold
+}
+
 struct ShellPoll<'a> {
     product_shell: Option<&'a ProductShell>,
     settings_window: &'a mut Option<SettingsWindow>,
@@ -1476,6 +1587,11 @@ fn poll_shell_events(
     if let Some(shell) = product_shell {
         loop {
             match shell.events().try_recv() {
+                Ok(ProductShellEvent::ShortcutCapture(capturing)) => {
+                    if capturing {
+                        overlay.set(OverlayStatus::Hidden)?;
+                    }
+                }
                 Ok(ProductShellEvent::TestDictation) => {
                     return Ok(ShellAction::TestDictation);
                 }
@@ -1525,6 +1641,14 @@ fn poll_shell_events(
                 }
                 Ok(ProductShellEvent::RuntimeReloadRequested(mutation)) => match mutation {
                     UiMutation::SettingsSaved => return Ok(ShellAction::Restart),
+                    UiMutation::ShortcutsSaved | UiMutation::SearchSaved => {
+                        let persisted = settings_store
+                            .load()
+                            .context("failed to reload shortcut preferences")?;
+                        settings.interaction = persisted.interaction;
+                        settings.search = persisted.search;
+                        settings.appearance = persisted.appearance;
+                    }
                     UiMutation::LexiconSaved { .. }
                     | UiMutation::LexiconDeleted { .. }
                     | UiMutation::LexiconEnabled { .. } => {
@@ -6596,6 +6720,53 @@ fn elapsed_since_release(released_at: Instant, stage_at: Instant) -> Duration {
 
 #[cfg(test)]
 mod composition_tests {
+    #[test]
+    fn launcher_always_toggles_independently_of_legacy_direct_hold_setting() {
+        use super::*;
+        for mode in [RecordingMode::Hold, RecordingMode::Toggle] {
+            assert!(activation_stops_recording(
+                true,
+                mode,
+                RuntimeState::Listening
+            ));
+            assert!(!activation_stops_recording(true, mode, RuntimeState::Idle));
+            assert!(!activation_stops_recording(
+                true,
+                mode,
+                RuntimeState::Transcribing
+            ));
+            assert!(!release_stops_recording(true, mode));
+        }
+        assert!(release_stops_recording(false, RecordingMode::Hold));
+        assert!(!activation_stops_recording(
+            false,
+            RecordingMode::Hold,
+            RuntimeState::Listening
+        ));
+        assert!(!release_stops_recording(false, RecordingMode::Toggle));
+        assert!(activation_stops_recording(
+            false,
+            RecordingMode::Toggle,
+            RuntimeState::Listening
+        ));
+    }
+
+    #[test]
+    fn launcher_respects_explicit_appearance_preferences() {
+        use super::*;
+        use phorminx_app::settings::AppearancePreference;
+        let mut settings = Settings::default();
+        settings.appearance.theme = AppearancePreference::Dark;
+        assert_eq!(
+            launcher_overlay_status(&settings),
+            OverlayStatus::LauncherDark
+        );
+        settings.appearance.theme = AppearancePreference::Light;
+        assert_eq!(
+            launcher_overlay_status(&settings),
+            OverlayStatus::LauncherLight
+        );
+    }
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::io::{Read, Write};

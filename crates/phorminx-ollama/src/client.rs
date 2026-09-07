@@ -244,6 +244,114 @@ impl OllamaClient {
         ModelCatalog::from_api(response.models).map_err(ClientError::InvalidCatalog)
     }
 
+    /// Embeds bounded text batches on the explicitly configured loopback service.
+    /// No model downloads, redirects, proxies, or silent input truncation are allowed.
+    pub fn embed(
+        &self,
+        model: &ModelName,
+        inputs: &[String],
+        keep_alive: KeepAlive,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, ClientError> {
+        cancel.check()?;
+        if inputs.is_empty()
+            || inputs.len() > 16
+            || inputs
+                .iter()
+                .any(|input| input.trim().is_empty() || input.len() > 8192)
+            || model.as_str().ends_with(":cloud")
+            || model.as_str().ends_with("-cloud")
+        {
+            return Err(ClientError::InvalidEmbeddings);
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": model.as_str(), "input": inputs, "truncate": false,
+            "keep_alive": keep_alive.api_value(),
+        }))
+        .map_err(ClientError::SerializeRequest)?;
+        let response = self
+            .document_agent
+            .post(&self.endpoint.api_url("/api/embed"))
+            .content_type("application/json")
+            .send(body.as_slice())
+            .map_err(map_http_error)?;
+        // Preserve only a classified, content-free context error. Never expose
+        // the server error body, which may repeat private input text.
+        if response.status().as_u16() == 400 {
+            let mut reader = response.into_parts().1.into_reader().take(16 * 1024);
+            let mut bytes = Vec::new();
+            reader
+                .read_to_end(&mut bytes)
+                .map_err(ClientError::ReadResponse)?;
+            cancel.check()?;
+            let context = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .and_then(|e| e.as_str())
+                        .map(str::to_ascii_lowercase)
+                })
+                .is_some_and(|e| {
+                    e.contains("input length exceeds")
+                        || e.contains("context length")
+                        || e.contains("context window")
+                });
+            return Err(if context {
+                ClientError::EmbeddingContextExceeded
+            } else {
+                ClientError::HttpStatus(400)
+            });
+        }
+        let bytes = read_response(response, 2 * 1024 * 1024, cancel)?;
+        #[derive(Deserialize)]
+        struct Response {
+            embeddings: Vec<Vec<f32>>,
+        }
+        let response: Response =
+            serde_json::from_slice(&bytes).map_err(|_| ClientError::InvalidEmbeddings)?;
+        validate_embeddings(&response.embeddings, inputs.len())?;
+        Ok(response.embeddings)
+    }
+
+    /// Checks capability and rejects cloud proxy models before any private input.
+    pub fn validate_local_embedding_model(
+        &self,
+        model: &ModelName,
+        cancel: &CancellationToken,
+    ) -> Result<(), ClientError> {
+        cancel.check()?;
+        let name = model.as_str().to_ascii_lowercase();
+        if name.ends_with(":cloud") || name.ends_with("-cloud") {
+            return Err(ClientError::InvalidEmbeddings);
+        }
+        let body = serde_json::to_vec(&serde_json::json!({"model":model.as_str(),"verbose":false}))
+            .map_err(ClientError::SerializeRequest)?;
+        let response = self
+            .document_agent
+            .post(&self.endpoint.api_url("/api/show"))
+            .content_type("application/json")
+            .send(body.as_slice())
+            .map_err(map_http_error)?;
+        let bytes = read_response(response, MAX_DISCOVERY_RESPONSE_BYTES, cancel)?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| ClientError::InvalidEmbeddings)?;
+        let embeddings = value
+            .get("capabilities")
+            .and_then(|v| v.as_array())
+            .is_some_and(|caps| caps.iter().any(|v| v.as_str() == Some("embedding")));
+        let remote = ["remote_host", "remote_model", "remote_url"]
+            .iter()
+            .any(|key| {
+                value
+                    .get(*key)
+                    .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
+            });
+        if !embeddings || remote {
+            return Err(ClientError::InvalidEmbeddings);
+        }
+        Ok(())
+    }
+
     /// Loads a model with an empty generation request and sets its residency policy.
     pub fn warm_up(
         &self,
@@ -652,6 +760,22 @@ impl OllamaClient {
     }
 }
 
+fn validate_embeddings(vectors: &[Vec<f32>], expected: usize) -> Result<(), ClientError> {
+    let dimension = vectors.first().map_or(0, Vec::len);
+    if vectors.len() != expected
+        || dimension == 0
+        || dimension > 4096
+        || vectors.iter().any(|v| {
+            v.len() != dimension
+                || v.iter().any(|x| !x.is_finite())
+                || v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() <= 0.0
+        })
+    {
+        return Err(ClientError::InvalidEmbeddings);
+    }
+    Ok(())
+}
+
 fn build_agent(timeouts: &ClientTimeouts) -> ureq::Agent {
     ureq::Agent::config_builder()
         .proxy(None)
@@ -809,6 +933,10 @@ pub enum FallbackReason {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
+    #[error("the embedding input exceeds this model's context window")]
+    EmbeddingContextExceeded,
+    #[error("Ollama embedding input or response is invalid")]
+    InvalidEmbeddings,
     #[error("invalid Ollama endpoint: {0}")]
     InvalidEndpoint(String),
     #[error("all Ollama timeouts must be greater than zero")]
@@ -972,6 +1100,145 @@ mod tests {
 
     fn model() -> ModelName {
         ModelName::parse("qwen2.5:3b").unwrap()
+    }
+
+    #[test]
+    fn embedding_request_is_local_bounded_and_never_truncates() {
+        let server = FakeServer::start(vec![FakeResponse::json(r#"{"embeddings":[[3,4],[1,0]]}"#)]);
+        let vectors = client(&server)
+            .embed(
+                &model(),
+                &["first".into(), "ação".into()],
+                KeepAlive::UnloadAfterRequest,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(vectors, vec![vec![3., 4.], vec![1., 0.]]);
+        let request = server
+            .requests
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(request.path, "/api/embed");
+        let json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(json["truncate"], false);
+        assert_eq!(json["keep_alive"], "0s");
+        assert_eq!(json["input"][1], "ação");
+    }
+    #[test]
+    fn embedding_responses_reject_missing_zero_ragged_and_extra_vectors() {
+        for response in [
+            r#"{}"#,
+            r#"{"embeddings":[]}"#,
+            r#"{"embeddings":[[]]}"#,
+            r#"{"embeddings":[[0,0]]}"#,
+            r#"{"embeddings":[[1],[1,2]]}"#,
+            r#"{"embeddings":[[1],[2]]}"#,
+            r#"{"embeddings":[[1e100]]}"#,
+        ] {
+            let server = FakeServer::start(vec![FakeResponse::json(response)]);
+            assert!(
+                client(&server)
+                    .embed(
+                        &model(),
+                        &["sample".into()],
+                        KeepAlive::UnloadAfterRequest,
+                        &CancellationToken::new()
+                    )
+                    .is_err()
+            );
+        }
+        assert!(validate_embeddings(&[vec![f32::NAN]], 1).is_err());
+        assert!(validate_embeddings(&[vec![1.; 4097]], 1).is_err());
+    }
+    #[test]
+    fn embedding_input_and_precancel_reject_without_network() {
+        let client = OllamaClient::default();
+        for inputs in [
+            vec![],
+            vec![" ".into()],
+            vec!["x".repeat(8193)],
+            vec!["x".into(); 17],
+        ] {
+            assert!(matches!(
+                client.embed(
+                    &model(),
+                    &inputs,
+                    KeepAlive::UnloadAfterRequest,
+                    &CancellationToken::new()
+                ),
+                Err(ClientError::InvalidEmbeddings)
+            ));
+        }
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            client.embed(
+                &model(),
+                &["sample".into()],
+                KeepAlive::UnloadAfterRequest,
+                &cancel
+            ),
+            Err(ClientError::Cancelled)
+        ));
+    }
+    #[test]
+    fn embedding_context_errors_are_classified_without_leaking_server_text() {
+        for (message, context) in [
+            (
+                "the input length exceeds the context length private synthetic transcript",
+                true,
+            ),
+            ("model does not support embeddings", false),
+        ] {
+            let response = FakeResponse {
+                status: 400,
+                body: serde_json::to_vec(&serde_json::json!({"error":message})).unwrap(),
+                delay: Duration::ZERO,
+            };
+            let server = FakeServer::start(vec![response]);
+            let error = client(&server)
+                .embed(
+                    &model(),
+                    &["sample".into()],
+                    KeepAlive::UnloadAfterRequest,
+                    &CancellationToken::new(),
+                )
+                .unwrap_err();
+            assert_eq!(
+                matches!(error, ClientError::EmbeddingContextExceeded),
+                context
+            );
+            assert!(!error.to_string().contains("private synthetic"));
+        }
+    }
+    #[test]
+    fn embedding_capability_rejects_cloud_aliases_before_private_input() {
+        for response in [
+            r#"{"capabilities":["completion"]}"#,
+            r#"{"capabilities":["embedding"],"remote_host":"https://example.invalid"}"#,
+            r#"{"capabilities":["embedding"],"remote_model":"hidden-cloud"}"#,
+        ] {
+            let server = FakeServer::start(vec![FakeResponse::json(response)]);
+            assert!(
+                client(&server)
+                    .validate_local_embedding_model(&model(), &CancellationToken::new())
+                    .is_err()
+            );
+        }
+        let server = FakeServer::start(vec![FakeResponse::json(
+            r#"{"capabilities":["embedding"]}"#,
+        )]);
+        client(&server)
+            .validate_local_embedding_model(&model(), &CancellationToken::new())
+            .unwrap();
+        assert_eq!(
+            server
+                .requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .path,
+            "/api/show"
+        );
     }
 
     fn format_response(text: &str) -> FakeResponse {

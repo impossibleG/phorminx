@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use phorminx_windows::atomic_replace_file;
+use phorminx_windows::{
+    DEFAULT_LAUNCHER_SHORTCUT, ShortcutBindings, ShortcutError, atomic_replace_file,
+};
 use serde::{Deserialize, Serialize};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 pub const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 pub const MAX_CUSTOM_INSTRUCTIONS_CHARS: usize = 4_096;
 
@@ -31,6 +33,8 @@ pub struct Settings {
     pub startup: StartupSettings,
     #[serde(default)]
     pub appearance: AppearanceSettings,
+    #[serde(default)]
+    pub search: SearchSettings,
 }
 
 impl Default for Settings {
@@ -43,6 +47,7 @@ impl Default for Settings {
             privacy: PrivacySettings::default(),
             startup: StartupSettings::default(),
             appearance: AppearanceSettings::default(),
+            search: SearchSettings::default(),
         }
     }
 }
@@ -51,7 +56,7 @@ impl Settings {
     pub fn validate_and_normalize(&mut self) -> Result<(), SettingsError> {
         match self.schema_version {
             CURRENT_SCHEMA_VERSION => {}
-            1..=5 => self.schema_version = CURRENT_SCHEMA_VERSION,
+            1..=6 => self.schema_version = CURRENT_SCHEMA_VERSION,
             0 => return Err(SettingsError::MissingOrInvalidVersion),
             version if version > CURRENT_SCHEMA_VERSION => {
                 return Err(SettingsError::FutureVersion {
@@ -60,6 +65,26 @@ impl Settings {
                 });
             }
             version => return Err(SettingsError::UnsupportedOldVersion(version)),
+        }
+
+        let bindings = ShortcutBindings::parse(
+            &self.interaction.launcher_shortcut,
+            self.interaction.direct_dictation_shortcut.as_deref(),
+        )
+        .map_err(SettingsError::InvalidShortcut)?;
+        self.interaction.launcher_shortcut = bindings.launcher.to_string();
+        self.interaction.direct_dictation_shortcut = bindings
+            .direct_dictation
+            .map(|shortcut| shortcut.to_string());
+        if let Some(model) = &self.search.embedding_model {
+            let normalized = model.trim();
+            if normalized.is_empty() {
+                self.search.embedding_model = None;
+            } else if normalized.len() > 256 || normalized.chars().any(char::is_control) {
+                return Err(SettingsError::InvalidEmbeddingModel);
+            } else {
+                self.search.embedding_model = Some(normalized.to_owned());
+            }
         }
 
         if self.recognition.model_path.as_os_str().is_empty() {
@@ -328,10 +353,28 @@ pub enum OllamaLifecycle {
     MemorySaver,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InteractionSettings {
     pub recording_mode: RecordingMode,
+    pub launcher_shortcut: String,
+    pub direct_dictation_shortcut: Option<String>,
+}
+
+impl Default for InteractionSettings {
+    fn default() -> Self {
+        Self {
+            recording_mode: RecordingMode::default(),
+            launcher_shortcut: DEFAULT_LAUNCHER_SHORTCUT.to_owned(),
+            direct_dictation_shortcut: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchSettings {
+    pub embedding_model: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -757,6 +800,10 @@ fn migrate_legacy_accurate_fields(
 
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
+    #[error("{0}")]
+    InvalidShortcut(ShortcutError),
+    #[error("Choose an embedding model name of at most 256 bytes without control characters.")]
+    InvalidEmbeddingModel,
     #[error("Windows did not provide a Local AppData directory")]
     LocalAppDataUnavailable,
     #[error("failed to resolve the current directory: {0}")]
@@ -849,6 +896,56 @@ pub enum SettingsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_six_migrates_with_launcher_defaults_without_changing_direct_recording_mode() {
+        let mut settings: Settings =
+            toml::from_str("schema_version = 6\n[interaction]\nrecording_mode = 'hold'\n").unwrap();
+        settings.validate_and_normalize().unwrap();
+        assert_eq!(settings.schema_version, 7);
+        assert_eq!(settings.interaction.launcher_shortcut, "Ctrl+Alt+Space");
+        assert_eq!(settings.interaction.direct_dictation_shortcut, None);
+        assert_eq!(settings.interaction.recording_mode, RecordingMode::Hold);
+        assert_eq!(settings.search.embedding_model, None);
+    }
+
+    #[test]
+    fn shortcut_and_embedding_preferences_round_trip_and_normalize() {
+        let mut settings = Settings::default();
+        settings.interaction.launcher_shortcut = " control + alt + f8 ".to_owned();
+        settings.interaction.direct_dictation_shortcut = Some("f9".to_owned());
+        settings.search.embedding_model = Some(" local-embedding:latest ".to_owned());
+        settings.validate_and_normalize().unwrap();
+        assert_eq!(settings.interaction.launcher_shortcut, "Ctrl+Alt+F8");
+        assert_eq!(
+            settings.interaction.direct_dictation_shortcut.as_deref(),
+            Some("F9")
+        );
+        assert_eq!(
+            settings.search.embedding_model.as_deref(),
+            Some("local-embedding:latest")
+        );
+        let encoded = toml::to_string(&settings).unwrap();
+        assert_eq!(toml::from_str::<Settings>(&encoded).unwrap(), settings);
+    }
+
+    #[test]
+    fn invalid_shortcuts_and_embedding_models_are_rejected() {
+        let mut settings = Settings::default();
+        settings.interaction.direct_dictation_shortcut = Some("Alt+Ctrl+Space".to_owned());
+        assert!(matches!(
+            settings.validate_and_normalize(),
+            Err(SettingsError::InvalidShortcut(ShortcutError::Duplicate))
+        ));
+        settings.interaction.direct_dictation_shortcut = None;
+        for model in ["a".repeat(257), "model\nname".to_owned()] {
+            settings.search.embedding_model = Some(model);
+            assert!(matches!(
+                settings.validate_and_normalize(),
+                Err(SettingsError::InvalidEmbeddingModel)
+            ));
+        }
+    }
 
     struct TestDirectory(PathBuf);
 

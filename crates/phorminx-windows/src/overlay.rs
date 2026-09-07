@@ -5,24 +5,25 @@ use std::thread::{self, JoinHandle};
 
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_GUI_FONT, DT_CENTER, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW, GetStockObject,
-    HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT,
-    SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TRANSPARENT,
+    BeginPaint, CreateFontIndirectW, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_GUI_FONT,
+    DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect,
+    GetMonitorInfoW, GetStockObject, HGDIOBJ, InvalidateRect, LOGFONTW, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MonitorFromWindow, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor,
+    SetWindowRgn, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetThreadDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-    GetClientRect, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, HTTRANSPARENT,
-    HWND_TOPMOST, IsWindow, KillTimer, MA_NOACTIVATE, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UnregisterClassW, WM_APP,
-    WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
-    WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    CREATESTRUCTW, CreateWindowExW, DI_NORMAL, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    DrawIconEx, GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
+    HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IsWindow, KillTimer, LoadIconW, MA_NOACTIVATE, MSG,
+    PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    UnregisterClassW, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::w;
 
@@ -45,6 +46,8 @@ pub enum OverlayStatus {
     NoSpeech = 7,
     Error = 8,
     Cleaning = 9,
+    LauncherLight = 10,
+    LauncherDark = 11,
 }
 
 impl OverlayStatus {
@@ -60,6 +63,8 @@ impl OverlayStatus {
             7 => Some(Self::NoSpeech),
             8 => Some(Self::Error),
             9 => Some(Self::Cleaning),
+            10 => Some(Self::LauncherLight),
+            11 => Some(Self::LauncherDark),
             _ => None,
         }
     }
@@ -67,6 +72,7 @@ impl OverlayStatus {
     fn label(self) -> &'static str {
         match self {
             Self::Hidden => "",
+            Self::LauncherLight | Self::LauncherDark => "Dictate",
             Self::Loading => "Phorminx is loading...",
             Self::Ready => "Phorminx is ready",
             Self::Listening => "Listening...",
@@ -87,6 +93,8 @@ impl OverlayStatus {
             Self::NoSpeech => Some(2_500),
             Self::Error => Some(5_000),
             Self::Hidden
+            | Self::LauncherLight
+            | Self::LauncherDark
             | Self::Loading
             | Self::Listening
             | Self::Transcribing
@@ -309,7 +317,24 @@ unsafe extern "system" fn window_procedure(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
-        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        WM_NCHITTEST => LRESULT(
+            if unsafe { window_state(hwnd) }.is_some_and(|s| is_launcher(s.status)) {
+                HTCLIENT as isize
+            } else {
+                HTTRANSPARENT as isize
+            },
+        ),
+        WM_LBUTTONUP => {
+            if unsafe { window_state(hwnd) }.is_some_and(|s| is_launcher(s.status)) {
+                let x = (lparam.0 as u16) as i16 as i32;
+                let y = ((lparam.0 >> 16) as u16) as i16 as i32;
+                let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+                if launcher_hit_test(x, y, dpi) {
+                    crate::hotkey::choose_launcher_action();
+                }
+            }
+            LRESULT(0)
+        }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_CLOSE => {
             let _ = unsafe { DestroyWindow(hwnd) };
@@ -355,11 +380,16 @@ unsafe fn update_window(hwnd: HWND, state: &mut WindowState, status: OverlayStat
     let _ = unsafe { GetMonitorInfoW(monitor, &mut monitor_info) };
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     let scale = |value: i32| value * dpi as i32 / 96;
-    let width = scale(300);
-    let height = scale(52);
+    let launcher = is_launcher(status);
+    let width = scale(if launcher { 360 } else { 300 });
+    let height = scale(if launcher { 160 } else { 52 });
     let margin = scale(48);
     let work = monitor_info.rcWork;
-    let x = work.left + (work.right - work.left - width) / 2;
+    let x = if launcher {
+        (work.right - width - scale(24)).max(work.left)
+    } else {
+        work.left + (work.right - work.left - width) / 2
+    };
     let y = work.bottom - height - margin;
     let _ = unsafe {
         SetWindowPos(
@@ -395,6 +425,16 @@ unsafe fn paint_window(hwnd: HWND) {
     let mut paint = PAINTSTRUCT::default();
     let device_context = unsafe { BeginPaint(hwnd, &mut paint) };
     let mut rectangle = RECT::default();
+    let status = unsafe { window_state(hwnd) }
+        .map(|s| s.status)
+        .unwrap_or(OverlayStatus::Hidden);
+    if is_launcher(status) {
+        unsafe { paint_launcher(hwnd, device_context, status) };
+        unsafe {
+            let _ = EndPaint(hwnd, &paint);
+        }
+        return;
+    }
     if unsafe { GetClientRect(hwnd, &mut rectangle) }.is_ok() {
         let background = unsafe { CreateSolidBrush(COLORREF(0x0022_2222)) };
         unsafe {
@@ -434,6 +474,107 @@ fn window(bits: usize) -> HWND {
     HWND(bits as *mut core::ffi::c_void)
 }
 
+fn is_launcher(status: OverlayStatus) -> bool {
+    matches!(
+        status,
+        OverlayStatus::LauncherLight | OverlayStatus::LauncherDark
+    )
+}
+
+fn launcher_hit_test(x: i32, y: i32, dpi: u32) -> bool {
+    let scale = |value: i32| value * dpi as i32 / 96;
+    (scale(16)..scale(344)).contains(&x) && (scale(62)..scale(116)).contains(&y)
+}
+
+unsafe fn paint_launcher(
+    hwnd: HWND,
+    dc: windows::Win32::Graphics::Gdi::HDC,
+    status: OverlayStatus,
+) {
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let scale = |value: i32| value * dpi as i32 / 96;
+    let dark = status == OverlayStatus::LauncherDark;
+    let background = if dark { 0x001A1817 } else { 0x00F0F3F5 };
+    let surface = if dark { 0x002A2724 } else { 0x00E2E7EA };
+    let foreground = if dark { 0x00E5E8EB } else { 0x0023211F };
+    let muted = if dark { 0x00ADB5BE } else { 0x00636970 };
+    let fill = |rectangle: RECT, color: u32| unsafe {
+        let brush = CreateSolidBrush(COLORREF(color));
+        FillRect(dc, &rectangle, brush);
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+    };
+    let rect = |l, t, r, b| RECT {
+        left: scale(l),
+        top: scale(t),
+        right: scale(r),
+        bottom: scale(b),
+    };
+    fill(rect(0, 0, 360, 160), background);
+    fill(rect(16, 62, 344, 116), surface);
+    fill(rect(16, 62, 19, 116), 0x004F79A4);
+    unsafe {
+        SetBkMode(dc, TRANSPARENT);
+    }
+    let mut font_description = LOGFONTW {
+        lfHeight: -scale(14),
+        lfWeight: 400,
+        ..Default::default()
+    };
+    for (index, code) in "Segoe UI".encode_utf16().enumerate() {
+        font_description.lfFaceName[index] = code;
+    }
+    let owned_font = unsafe { CreateFontIndirectW(&font_description) };
+    let font = if owned_font.is_invalid() {
+        unsafe { GetStockObject(DEFAULT_GUI_FONT) }
+    } else {
+        HGDIOBJ(owned_font.0)
+    };
+    let previous = unsafe { SelectObject(dc, font) };
+    let text = |value: &str, mut bounds: RECT, color: u32| unsafe {
+        SetTextColor(dc, COLORREF(color));
+        DrawTextW(
+            dc,
+            &mut value.encode_utf16().collect::<Vec<_>>(),
+            &mut bounds,
+            DT_VCENTER | DT_SINGLELINE,
+        );
+    };
+    if let Ok(module) = unsafe { GetModuleHandleW(None) }
+        && let Ok(icon) = unsafe {
+            LoadIconW(
+                Some(HINSTANCE(module.0)),
+                windows::core::PCWSTR(std::ptr::without_provenance::<u16>(1)),
+            )
+        }
+    {
+        let _ = unsafe {
+            DrawIconEx(
+                dc,
+                scale(18),
+                scale(17),
+                icon,
+                scale(28),
+                scale(28),
+                0,
+                None,
+                DI_NORMAL,
+            )
+        };
+    }
+    text("PHORMINX", rect(58, 16, 230, 47), foreground);
+    text("1", rect(32, 62, 58, 116), foreground);
+    text("Dictate", rect(67, 62, 245, 116), foreground);
+    text("Enter", rect(286, 62, 339, 116), muted);
+    text("Microphone  ·  Local", rect(20, 121, 251, 150), muted);
+    text("Esc to close", rect(264, 121, 344, 150), muted);
+    unsafe {
+        SelectObject(dc, previous);
+        if !owned_font.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(owned_font.0));
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OverlayError {
     #[error("the Phorminx status overlay is already running")]
@@ -463,6 +604,17 @@ mod tests {
             Some(OverlayStatus::Listening)
         );
         assert_eq!(OverlayStatus::from_message(99), None);
+    }
+
+    #[test]
+    fn launcher_hit_region_scales_and_does_not_activate_header_or_footer() {
+        for dpi in [96, 144, 192] {
+            let p = |n| n * dpi as i32 / 96;
+            assert!(launcher_hit_test(p(30), p(80), dpi));
+            assert!(!launcher_hit_test(p(30), p(30), dpi));
+            assert!(!launcher_hit_test(p(30), p(130), dpi));
+            assert_eq!(OverlayStatus::LauncherDark.hide_after_ms(), None);
+        }
     }
 
     #[test]

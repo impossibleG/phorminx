@@ -13,10 +13,15 @@ pub enum Route {
     Profiles,
     Models,
     Settings,
+    SettingsShortcuts,
+    SettingsDictation,
+    SettingsFormatting,
+    SettingsAppearance,
+    SettingsPrivacy,
 }
 
 impl Route {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 12] = [
         Self::Home,
         Self::Setup,
         Self::History,
@@ -24,44 +29,86 @@ impl Route {
         Self::Profiles,
         Self::Models,
         Self::Settings,
+        Self::SettingsShortcuts,
+        Self::SettingsDictation,
+        Self::SettingsFormatting,
+        Self::SettingsAppearance,
+        Self::SettingsPrivacy,
     ];
+
+    pub const PRIMARY: [Self; 4] = [Self::Home, Self::History, Self::Models, Self::Settings];
+
+    pub const fn is_settings(self) -> bool {
+        matches!(
+            self,
+            Self::Settings
+                | Self::SettingsShortcuts
+                | Self::SettingsDictation
+                | Self::SettingsFormatting
+                | Self::SettingsAppearance
+                | Self::SettingsPrivacy
+        )
+    }
+
+    pub const fn primary(self) -> Self {
+        if self.is_settings() {
+            Self::Settings
+        } else if matches!(self, Self::Setup) {
+            Self::Models
+        } else {
+            self
+        }
+    }
 
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
             Self::Home => "Home",
             Self::Setup => "Setup",
-            Self::History => "History",
-            Self::Lexicon => "Lexicon",
+            Self::History => "Library",
+            Self::Lexicon => "Vocabulary",
             Self::Profiles => "Profiles",
             Self::Models => "Models",
             Self::Settings => "Settings",
+            Self::SettingsShortcuts => "Shortcuts",
+            Self::SettingsDictation => "Dictation",
+            Self::SettingsFormatting => "Formatting",
+            Self::SettingsAppearance => "Appearance",
+            Self::SettingsPrivacy => "Privacy",
         }
     }
 
     #[must_use]
     pub const fn title(self) -> &'static str {
         match self {
-            Self::Home => "The instrument at rest",
-            Self::Setup => "Commissioning",
-            Self::History => "Recovered thought",
-            Self::Lexicon => "A deliberate vocabulary",
-            Self::Profiles => "Policy by application",
-            Self::Models => "Local machinery",
-            Self::Settings => "Preferences",
+            Self::Home => "A place for your voice.",
+            Self::Setup => "Models & setup",
+            Self::History => "Your words, kept close.",
+            Self::Lexicon => "Vocabulary",
+            Self::Profiles => "Application profiles",
+            Self::Models => "Models & setup",
+            Self::Settings | Self::SettingsShortcuts => "Shortcuts",
+            Self::SettingsDictation => "Dictation",
+            Self::SettingsFormatting => "Formatting",
+            Self::SettingsAppearance => "Appearance",
+            Self::SettingsPrivacy => "Privacy",
         }
     }
 
     #[must_use]
     pub const fn context(self) -> &'static str {
         match self {
-            Self::Home => "Voice, disciplined.",
-            Self::Setup => "Every local system, proven.",
-            Self::History => "Compare what was spoken with what was kept.",
+            Self::Home => "Speak naturally. Keep your momentum.",
+            Self::Setup => "Local models, installation and care.",
+            Self::History => "Find a phrase. Follow a thought.",
             Self::Lexicon => "Exact names. Exact replacements.",
             Self::Profiles => "Let context govern the instrument.",
-            Self::Models => "Nothing leaves this machine.",
-            Self::Settings => "Infrequent choices, held quietly.",
+            Self::Models => "Local models, installation and care.",
+            Self::Settings | Self::SettingsShortcuts => "One gesture, wherever you work.",
+            Self::SettingsDictation => "How Phorminx listens.",
+            Self::SettingsFormatting => "Keep your voice. Choose the finish.",
+            Self::SettingsAppearance => "A quieter workspace, in your light.",
+            Self::SettingsPrivacy => "What stays on this machine is yours to decide.",
         }
     }
 }
@@ -718,6 +765,9 @@ pub enum RecognitionMode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsSnapshot {
+    pub launcher_shortcut: String,
+    /// Empty disables the optional direct-dictation shortcut.
+    pub direct_dictation_shortcut: String,
     pub appearance: AppearancePreference,
     pub microphone: String,
     pub microphones: Vec<String>,
@@ -740,6 +790,8 @@ pub struct SettingsSnapshot {
 impl Default for SettingsSnapshot {
     fn default() -> Self {
         Self {
+            launcher_shortcut: "Ctrl+Alt+Space".into(),
+            direct_dictation_shortcut: String::new(),
             appearance: AppearancePreference::System,
             microphone: "Windows default".into(),
             microphones: vec!["Windows default".into()],
@@ -812,6 +864,72 @@ impl AccurateBackend {
 }
 
 /// Immutable view-state supplied by the host runtime.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LibrarySearchMode {
+    #[default]
+    Keyword,
+    Semantic,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LibrarySearchStatus {
+    #[default]
+    Idle,
+    Searching,
+    Ready,
+    Unavailable,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LibraryIndexState {
+    #[default]
+    Disabled,
+    MissingModel,
+    Ready,
+    Building,
+    Stale,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LibraryEmbeddingModel {
+    pub name: String,
+    pub detail: String,
+    pub available: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LibraryIndexSnapshot {
+    pub state: LibraryIndexState,
+    pub detail: String,
+    pub indexed_passages: u64,
+    pub total_passages: Option<u64>,
+    pub selected_model: Option<String>,
+    pub models: Vec<LibraryEmbeddingModel>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LibrarySearchHit {
+    pub history_id: i64,
+    pub passage_id: String,
+    pub time: String,
+    pub application: String,
+    pub excerpt: String,
+    pub rank: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LibrarySnapshot {
+    pub query: String,
+    pub mode: LibrarySearchMode,
+    pub status: LibrarySearchStatus,
+    pub detail: Option<String>,
+    pub results: Vec<LibrarySearchHit>,
+    pub index: LibraryIndexSnapshot,
+}
+
+/// Immutable view-state supplied by the host runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShellSnapshot {
     pub route: Route,
@@ -821,6 +939,7 @@ pub struct ShellSnapshot {
     pub history_enabled: bool,
     pub interrupted: Vec<(String, String)>,
     pub history: Vec<HistoryItem>,
+    pub library: LibrarySnapshot,
     pub lexicon: Vec<LexiconEntry>,
     pub profiles: Vec<ApplicationProfile>,
     pub whisper: ModelSystem,
@@ -996,6 +1115,7 @@ impl ShellSnapshot {
             history_enabled: true,
             interrupted: Vec::new(),
             history,
+            library: LibrarySnapshot::default(),
             lexicon,
             profiles,
             whisper: ModelSystem {
@@ -1128,9 +1248,27 @@ impl Default for ShellSnapshot {
 pub enum ShellEvent {
     Navigate(Route),
     TestDictation,
+    ShortcutCapture(bool),
+    SearchLibrary {
+        query: String,
+        mode: LibrarySearchMode,
+    },
+    SelectLibraryPassage {
+        history_id: i64,
+        passage_id: String,
+    },
+    ClearLibrarySearch,
+    SelectEmbeddingModel(String),
+    RebuildLibraryIndex,
     SelectHistory(i64),
-    SelectHistoryVariant { id: i64, variant: HistoryVariant },
-    CopyHistory { id: i64, variant: HistoryVariant },
+    SelectHistoryVariant {
+        id: i64,
+        variant: HistoryVariant,
+    },
+    CopyHistory {
+        id: i64,
+        variant: HistoryVariant,
+    },
     ClearHistory,
     DiscardInterrupted(String),
     CopyInterrupted(String),

@@ -449,12 +449,26 @@ impl<'connection> HistoryRepository<'connection> {
 
     /// Applies the active bounded retention policy and returns removed rows.
     pub fn purge_expired(&self, now_ms: i64) -> Result<usize> {
-        match self.retention()? {
-            RetentionPolicy::Disabled => self.clear(),
-            RetentionPolicy::Indefinite => Ok(0),
+        // Background search can now prune concurrently with a settings change.
+        // Read the policy and delete under one snapshot: never act on a policy
+        // read before another connection enabled history or extended retention.
+        let transaction = self.connection.unchecked_transaction()?;
+        let value: String = transaction.query_row(
+            "SELECT value FROM persistence_settings WHERE key='history_retention'",
+            [],
+            |row| row.get(0),
+        )?;
+        let removed = match RetentionPolicy::from_db(&value)? {
+            RetentionPolicy::Disabled => {
+                let removed = transaction.execute("DELETE FROM dictation_history", [])?;
+                transaction.execute("DELETE FROM interrupted_dictation", [])?;
+                transaction.execute("DELETE FROM recovery_tombstones", [])?;
+                transaction.execute("UPDATE persistence_settings SET value=CAST(value AS INTEGER)+1 WHERE key='recovery_epoch'",[])?;
+                removed
+            }
+            RetentionPolicy::Indefinite => 0,
             policy => {
                 let cutoff = now_ms.saturating_sub(policy.max_age_ms().unwrap_or_default());
-                let transaction = self.connection.unchecked_transaction()?;
                 let removed = transaction.execute(
                     "DELETE FROM dictation_history WHERE created_at_ms < ?1",
                     [cutoff],
@@ -463,10 +477,11 @@ impl<'connection> HistoryRepository<'connection> {
                     "DELETE FROM interrupted_dictation WHERE updated_at_ms < ?1",
                     [cutoff],
                 )?;
-                transaction.commit()?;
-                Ok(removed)
+                removed
             }
-        }
+        };
+        transaction.commit()?;
+        Ok(removed)
     }
 
     /// Immediately deletes all persisted dictations.

@@ -9,6 +9,7 @@ pub mod components;
 mod gallery;
 pub mod model;
 mod pages;
+mod studio;
 pub mod theme;
 
 pub use app::PhorminxUi;
@@ -18,11 +19,12 @@ pub use model::{
     BenchmarkCandidateView, BenchmarkEvidenceView, BenchmarkUnavailableView,
     CalibrationCaptureState, CalibrationPromptView, FormattingStrength, GalleryScenario,
     HistoryItem, HistoryLoadedText, HistoryVariant, HistoryVariantAvailability, InlineNotice,
-    LexiconCasePolicy, LexiconDraft, LexiconEntry, ModelSystem, NoticeKind, OllamaLifecycle,
-    OllamaModelChoice, OllamaOperationState, OllamaSetupSnapshot, OllamaSetupState,
-    PerformancePreference, PerformanceRecommendationView, PerformanceRollbackState,
-    PerformanceRunState, PerformanceSetupSnapshot, ProfileDraft, ProfileInsertion, Readiness,
-    RecognitionMode, RecordingMode, Route, RuntimeStatus, SettingsSnapshot, SetupAction,
-    SetupCapability, SetupRecommendation, SetupSnapshot, SetupStage, ShellEvent, ShellSnapshot,
-    SystemReadiness,
+    LexiconCasePolicy, LexiconDraft, LexiconEntry, LibraryEmbeddingModel, LibraryIndexSnapshot,
+    LibraryIndexState, LibrarySearchHit, LibrarySearchMode, LibrarySearchStatus, LibrarySnapshot,
+    ModelSystem, NoticeKind, OllamaLifecycle, OllamaModelChoice, OllamaOperationState,
+    OllamaSetupSnapshot, OllamaSetupState, PerformancePreference, PerformanceRecommendationView,
+    PerformanceRollbackState, PerformanceRunState, PerformanceSetupSnapshot, ProfileDraft,
+    ProfileInsertion, Readiness, RecognitionMode, RecordingMode, Route, RuntimeStatus,
+    SettingsSnapshot, SetupAction, SetupCapability, SetupRecommendation, SetupSnapshot, SetupStage,
+    ShellEvent, ShellSnapshot, SystemReadiness,
 };

@@ -56,6 +56,10 @@ impl PhorminxUi {
     }
 
     pub fn apply_snapshot(&mut self, snapshot: ShellSnapshot) {
+        if self.route != snapshot.route && self.pages.shortcut_capture.is_some() {
+            self.pages.shortcut_capture = None;
+            self.outbox.push(ShellEvent::ShortcutCapture(false));
+        }
         if self.route == Route::Setup && snapshot.route != Route::Setup {
             self.pages.clear_setup_confirmations();
         }
@@ -82,6 +86,9 @@ impl PhorminxUi {
 
     pub fn navigate(&mut self, route: Route) {
         if self.route != route {
+            if self.pages.shortcut_capture.take().is_some() {
+                self.outbox.push(ShellEvent::ShortcutCapture(false));
+            }
             if self.route == Route::Setup {
                 self.pages.clear_setup_confirmations();
             }
@@ -135,6 +142,28 @@ impl PhorminxUi {
                 .first_available_variant()
                 .unwrap_or(crate::model::HistoryVariant::Output);
             self.pages.history_page = 0;
+            self.pages.history_passage_start = None;
+        }
+    }
+
+    /// Selects a host-authorized search hit and opens the page containing its
+    /// Unicode character offset, including when exact text arrives later.
+    pub fn select_history_passage(&mut self, id: i64, start_char: usize) {
+        self.select_history(id);
+        if self.pages.history_id != Some(id) {
+            return;
+        }
+        self.pages.library_detail = true;
+        self.pages.history_passage_start = Some((id, start_char));
+        if let Some(text) = self
+            .snapshot
+            .history
+            .iter()
+            .find(|item| item.id == id)
+            .and_then(|item| item.text_for(self.pages.history_variant))
+        {
+            self.pages.history_page = passage_page(text, start_char);
+            self.pages.history_passage_start = None;
         }
     }
 
@@ -172,8 +201,13 @@ impl PhorminxUi {
         if !item.has_variant(variant) {
             return false;
         }
+        self.pages.history_page = self
+            .pages
+            .history_passage_start
+            .take()
+            .filter(|(selected, _)| *selected == id)
+            .map_or(0, |(_, start)| passage_page(&text, start));
         item.loaded = Some(HistoryLoadedText { variant, text });
-        self.pages.history_page = 0;
         true
     }
 
@@ -182,6 +216,7 @@ impl PhorminxUi {
             item.loaded = None;
         }
         self.pages.history_page = 0;
+        self.pages.history_passage_start = None;
     }
 
     #[must_use]
@@ -195,36 +230,54 @@ impl PhorminxUi {
             self.theme_applied = true;
         }
         let tokens = ui.tokens();
-        ui.set_min_size(Vec2::new(900.0, 620.0));
+        let compact = ui.available_width() < 760.0;
+        if !ui.input(|input| input.focused) && self.pages.shortcut_capture.take().is_some() {
+            self.outbox.push(ShellEvent::ShortcutCapture(false));
+        }
         egui::Frame::new()
             .fill(tokens.background)
             .inner_margin(Margin::ZERO)
             .show(ui, |ui| {
                 self.brand_header(ui);
                 hairline(ui);
+                if compact {
+                    ui.horizontal_wrapped(|ui| {
+                        for route in NAV_ROUTES {
+                            if ui
+                                .selectable_label(self.route.primary() == route, route.label())
+                                .clicked()
+                            {
+                                self.navigate(route);
+                            }
+                        }
+                    });
+                    hairline(ui);
+                }
                 ui.horizontal_top(|ui| {
-                    self.navigation(ui);
-                    let (separator, _) = ui.allocate_exact_size(
-                        Vec2::new(1.0, ui.available_height()),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter().line_segment(
-                        [separator.left_top(), separator.left_bottom()],
-                        Stroke::new(1.0, tokens.edge),
-                    );
+                    if !compact {
+                        self.navigation(ui);
+                        let (separator, _) = ui.allocate_exact_size(
+                            Vec2::new(1.0, ui.available_height()),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().line_segment(
+                            [separator.left_top(), separator.left_bottom()],
+                            Stroke::new(1.0, tokens.edge),
+                        );
+                    }
                     ScrollArea::vertical()
                         .id_salt("phorminx-route")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             egui::Frame::new()
-                                .inner_margin(Margin::same(32))
+                                .inner_margin(Margin::same(if compact { 16 } else { 32 }))
                                 .show(ui, |ui| {
                                     // This frame is created inside the shell's horizontal
                                     // navigation row, so explicitly restore a vertical page
                                     // flow for route content.
                                     ui.vertical(|ui| {
-                                        ui.set_width(ui.available_width());
+                                        ui.set_width(ui.available_width().min(1120.0));
                                         if let Some(notice) = &self.snapshot.notice {
                                             let (acted, dismissed) = inline_notice(ui, notice);
                                             if acted {
@@ -284,11 +337,11 @@ impl PhorminxUi {
             .fill(tokens.surface)
             .inner_margin(Margin::symmetric(16, 20))
             .show(ui, |ui| {
-                ui.set_min_width(180.0);
-                ui.set_max_width(180.0);
+                ui.set_min_width(164.0);
+                ui.set_max_width(164.0);
                 ui.set_min_height(ui.available_height());
                 ui.vertical(|ui| {
-                    if let Some(index) = Route::ALL.iter().position(|route| {
+                    if let Some(index) = NAV_ROUTES.iter().position(|route| {
                         ui.memory(|memory| memory.has_focus(nav_id(ui, route.label())))
                     }) {
                         let delta = ui.input_mut(|input| {
@@ -308,7 +361,18 @@ impl PhorminxUi {
                             self.navigate(target);
                         }
                     }
-                    for route in Route::ALL {
+                    for route in Route::PRIMARY {
+                        if nav_item(ui, route.label(), route == self.route.primary()).clicked() {
+                            self.navigate(route);
+                        }
+                    }
+                    ui.add_space(Space::XL);
+                    ui.label(
+                        RichText::new("PERSONAL")
+                            .size(10.0)
+                            .color(tokens.secondary_text),
+                    );
+                    for route in [Route::Lexicon, Route::Profiles] {
                         if nav_item(ui, route.label(), route == self.route).clicked() {
                             self.navigate(route);
                         }
@@ -327,9 +391,30 @@ impl PhorminxUi {
     }
 }
 
+const NAV_ROUTES: [Route; 6] = [
+    Route::Home,
+    Route::History,
+    Route::Models,
+    Route::Settings,
+    Route::Lexicon,
+    Route::Profiles,
+];
+
+fn passage_page(text: &str, start_char: usize) -> usize {
+    // A scalar crossing a nominal byte boundary belongs to the following
+    // page: HistoryLoadedText rounds both neighboring edges down together.
+    let byte = text
+        .char_indices()
+        .nth(start_char)
+        .map_or(text.len().saturating_sub(1), |(byte, character)| {
+            byte + character.len_utf8() - 1
+        });
+    byte / crate::model::HISTORY_DETAIL_PAGE_BYTES
+}
+
 fn adjacent_route(index: usize, delta: isize) -> Route {
-    let last = Route::ALL.len().saturating_sub(1);
-    Route::ALL[(index as isize + delta).clamp(0, last as isize) as usize]
+    let last = NAV_ROUTES.len().saturating_sub(1);
+    NAV_ROUTES[(index as isize + delta).clamp(0, last as isize) as usize]
 }
 
 impl eframe::App for PhorminxUi {
@@ -405,10 +490,10 @@ mod tests {
     #[test]
     fn sidebar_arrow_navigation_clamps_at_both_ends() {
         assert_eq!(adjacent_route(0, -1), Route::Home);
-        assert_eq!(adjacent_route(0, 1), Route::Setup);
-        let last = Route::ALL.len() - 1;
-        assert_eq!(adjacent_route(last, 1), Route::Settings);
-        assert_eq!(adjacent_route(last, -1), Route::Models);
+        assert_eq!(adjacent_route(0, 1), Route::History);
+        let last = NAV_ROUTES.len() - 1;
+        assert_eq!(adjacent_route(last, 1), Route::Profiles);
+        assert_eq!(adjacent_route(last, -1), Route::Lexicon);
     }
 
     #[test]
@@ -580,6 +665,83 @@ mod tests {
             let mut app = PhorminxUi::new(ShellSnapshot::gallery(GalleryScenario::Populated));
             app.show(ui);
         });
+    }
+
+    #[test]
+    fn async_search_passage_selects_unicode_page_and_clears_pending_jump() {
+        let mut snapshot = ShellSnapshot::gallery(GalleryScenario::Populated);
+        snapshot.route = Route::History;
+        for item in &mut snapshot.history {
+            item.loaded = None;
+        }
+        let id = snapshot.history[0].id;
+        let mut app = PhorminxUi::new(snapshot);
+        app.select_history_passage(id, 9000);
+        let text = "🦀".repeat(12000);
+        assert!(app.set_history_detail(id, HistoryVariant::Output, text));
+        assert_eq!(app.pages.history_page, 2);
+        assert!(app.pages.library_detail);
+        assert!(app.pages.history_passage_start.is_none());
+        assert_eq!(
+            passage_page(&format!("{}🦀tail", "a".repeat(16383)), 16383),
+            1
+        );
+        app.select_history_passage(id, usize::MAX);
+        assert_eq!(app.pages.history_page, 2);
+        app.navigate(Route::Home);
+        assert!(app.pages.history_passage_start.is_none());
+    }
+
+    #[test]
+    fn navigation_releases_shortcut_capture_once() {
+        let mut app = PhorminxUi {
+            route: Route::SettingsShortcuts,
+            ..Default::default()
+        };
+        app.pages.shortcut_capture = Some(crate::studio::ShortcutTarget::Launcher);
+        app.navigate(Route::SettingsAppearance);
+        app.navigate(Route::SettingsPrivacy);
+        assert_eq!(
+            app.take_events()
+                .iter()
+                .filter(|event| matches!(event, ShellEvent::ShortcutCapture(false)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn all_workspace_routes_paint_in_all_themes_at_narrow_and_wide_sizes() {
+        for width in [480.0, 760.0, 1180.0] {
+            for mode in [
+                ThemeMode::AuthoredLight,
+                ThemeMode::AuthoredDark,
+                ThemeMode::HighContrast,
+                ThemeMode::HighContrastLight,
+            ] {
+                for route in Route::ALL {
+                    let context = egui::Context::default();
+                    let mut snapshot = ShellSnapshot::gallery(GalleryScenario::Populated);
+                    snapshot.route = route;
+                    let mut app = PhorminxUi::new(snapshot);
+                    app.set_theme(mode);
+                    let input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 820.0),
+                        )),
+                        ..Default::default()
+                    };
+                    let mut output = context.run_ui(input, |ui| app.show(ui));
+                    assert!(!output.shapes.is_empty(), "{route:?} at {width}");
+                    output.textures_delta.clear();
+                    assert!(
+                        app.take_events().is_empty(),
+                        "Paint must not trigger actions for {route:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

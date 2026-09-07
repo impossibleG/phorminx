@@ -1,6 +1,5 @@
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_SUCCESS, GetLastError, HANDLE, HWND, LPARAM, SetLastError, WPARAM,
@@ -26,12 +25,6 @@ pub struct TargetSnapshot {
     thread_id: u32,
     focus: usize,
 }
-
-static TARGET_VALID: AtomicBool = AtomicBool::new(false);
-static TARGET_FOREGROUND: AtomicUsize = AtomicUsize::new(0);
-static TARGET_PROCESS_ID: AtomicU32 = AtomicU32::new(0);
-static TARGET_THREAD_ID: AtomicU32 = AtomicU32::new(0);
-static TARGET_FOCUS: AtomicUsize = AtomicUsize::new(0);
 
 impl TargetSnapshot {
     pub(crate) fn capture() -> Option<Self> {
@@ -136,32 +129,6 @@ fn basename_from_image_path(image_path: &str) -> Option<String> {
         return None;
     }
     Some(basename.to_owned())
-}
-
-pub(crate) fn capture_activation_target() {
-    TARGET_VALID.store(false, Ordering::Release);
-    let Some(target) = TargetSnapshot::capture() else {
-        return;
-    };
-
-    TARGET_FOREGROUND.store(target.foreground, Ordering::Relaxed);
-    TARGET_PROCESS_ID.store(target.process_id, Ordering::Relaxed);
-    TARGET_THREAD_ID.store(target.thread_id, Ordering::Relaxed);
-    TARGET_FOCUS.store(target.focus, Ordering::Relaxed);
-    TARGET_VALID.store(true, Ordering::Release);
-}
-
-pub(crate) fn activation_target() -> Option<TargetSnapshot> {
-    if !TARGET_VALID.load(Ordering::Acquire) {
-        return None;
-    }
-
-    Some(TargetSnapshot {
-        foreground: TARGET_FOREGROUND.load(Ordering::Relaxed),
-        process_id: TARGET_PROCESS_ID.load(Ordering::Relaxed),
-        thread_id: TARGET_THREAD_ID.load(Ordering::Relaxed),
-        focus: TARGET_FOCUS.load(Ordering::Relaxed),
-    })
 }
 
 unsafe fn capture_target() -> Option<TargetSnapshot> {

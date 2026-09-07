@@ -5,6 +5,10 @@
 
 mod history;
 mod lexicon;
+mod library;
+pub use library::{
+    EmbeddedPassage, LibraryIndexStats, LibraryPassage, LibraryRepository, LibrarySearchHit,
+};
 mod migration;
 mod profile;
 mod recovery;
@@ -67,7 +71,19 @@ pub struct Persistence {
     connection: Connection,
 }
 
+/// Cross-thread cancellation of an isolated background connection. Never share
+/// this handle with the production recording/history-write connection.
+pub struct PersistenceInterrupt(rusqlite::InterruptHandle);
+impl PersistenceInterrupt {
+    pub fn interrupt(&self) {
+        self.0.interrupt();
+    }
+}
+
 impl Persistence {
+    pub fn interrupt_handle(&self) -> PersistenceInterrupt {
+        PersistenceInterrupt(self.connection.get_interrupt_handle())
+    }
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_busy_timeout(path, Duration::from_secs(5))
     }
@@ -101,6 +117,10 @@ impl Persistence {
         HistoryRepository::new(&self.connection)
     }
 
+    pub fn library(&self) -> LibraryRepository<'_> {
+        LibraryRepository::new(&self.connection)
+    }
+
     pub fn recovery(&self) -> RecoveryRepository<'_> {
         RecoveryRepository::new(&self.connection)
     }
@@ -119,6 +139,16 @@ impl Persistence {
 }
 
 fn register_read_guards(connection: &Connection) -> Result<()> {
+    connection.create_scalar_function(
+        "phorminx_find",
+        2,
+        FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
+        |context| {
+            let text = context.get_raw(0).as_str()?;
+            let query = context.get_raw(1).as_str()?;
+            Ok(library::unicode_match_offset(text, query) as i64)
+        },
+    )?;
     connection.create_scalar_function(
         "phorminx_is_valid_text",
         1,

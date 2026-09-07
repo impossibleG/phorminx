@@ -38,6 +38,11 @@ pub enum UiRoute {
     Profiles,
     Models,
     Settings,
+    SettingsShortcuts,
+    SettingsDictation,
+    SettingsFormatting,
+    SettingsAppearance,
+    SettingsPrivacy,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -617,6 +622,7 @@ pub struct UiProfileDraft {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Synchronous, low-frequency intent; never queued on the audio path.
 pub enum UiCommand {
     SaveSettings(Settings),
     ClearHistory,
@@ -636,12 +642,28 @@ pub enum UiEffect {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UiMutation {
     SettingsSaved,
-    HistoryCleared { removed: usize },
-    LexiconSaved { id: i64 },
-    LexiconDeleted { deleted: bool },
-    LexiconEnabled { updated: bool },
-    ProfileSaved { executable: String },
-    ProfileDeleted { deleted: bool },
+    /// Input-only changes are applied without reloading recognition models.
+    ShortcutsSaved,
+    /// Search, appearance and startup changes do not alter the speech pipeline.
+    SearchSaved,
+    HistoryCleared {
+        removed: usize,
+    },
+    LexiconSaved {
+        id: i64,
+    },
+    LexiconDeleted {
+        deleted: bool,
+    },
+    LexiconEnabled {
+        updated: bool,
+    },
+    ProfileSaved {
+        executable: String,
+    },
+    ProfileDeleted {
+        deleted: bool,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -681,6 +703,16 @@ impl UiBridge {
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Bounded metadata for an explicitly selected search hit outside the recent
+    /// history page. Full text still uses the asynchronous history reader.
+    pub fn history_summary(&self, id: i64) -> Result<Option<UiHistoryItem>, UiBridgeError> {
+        self.persistence
+            .history()
+            .summary(id)
+            .map(|summary| summary.map(history_item))
+            .map_err(UiBridgeError::persistence)
     }
 
     /// Refreshes the in-memory settings after a trusted background host action
@@ -904,6 +936,31 @@ impl UiBridge {
         candidate
             .validate_and_normalize()
             .map_err(UiBridgeError::settings)?;
+        if candidate.interaction.launcher_shortcut != self.settings.interaction.launcher_shortcut
+            || candidate.interaction.direct_dictation_shortcut
+                != self.settings.interaction.direct_dictation_shortcut
+        {
+            phorminx_windows::ShortcutBindings::parse(
+                &candidate.interaction.launcher_shortcut,
+                candidate.interaction.direct_dictation_shortcut.as_deref(),
+            ).map_err(|_| UiBridgeError::validation("shortcut", "Choose a supported, distinct shortcut."))?
+                .check_available().map_err(|_| UiBridgeError::validation("shortcut", "Windows reports that a selected shortcut is unavailable. Choose another combination."))?;
+        }
+        // Preferences unrelated to recognition must remain editable even when a
+        // model is unavailable. Do not hash/load native assets just to rebind a
+        // shortcut, switch the theme or select a search model.
+        if candidate != self.settings
+            && candidate.recognition == self.settings.recognition
+            && candidate.formatting == self.settings.formatting
+            && candidate.privacy == self.settings.privacy
+        {
+            let mutation = if candidate.interaction != self.settings.interaction {
+                UiMutation::ShortcutsSaved
+            } else {
+                UiMutation::SearchSaved
+            };
+            return self.commit_settings(candidate, now_ms, mutation);
+        }
         match candidate.recognition.mode {
             crate::settings::RecognitionMode::Accurate => {
                 let resolved_model = self
@@ -1037,6 +1094,15 @@ impl UiBridge {
             .ensure_runtime_supported()
             .map_err(UiBridgeError::settings)?;
 
+        self.commit_settings(candidate, now_ms, UiMutation::SettingsSaved)
+    }
+
+    fn commit_settings(
+        &mut self,
+        candidate: Settings,
+        now_ms: i64,
+        mutation: UiMutation,
+    ) -> Result<UiCommandOutcome, UiBridgeError> {
         let old_settings = self.settings.clone();
         self.store
             .save(&candidate)
@@ -1061,10 +1127,7 @@ impl UiBridge {
         if launch_changed {
             effects.push(UiEffect::ApplyLaunchAtLogin(launch_value));
         }
-        Ok(UiCommandOutcome {
-            mutation: UiMutation::SettingsSaved,
-            effects,
-        })
+        Ok(UiCommandOutcome { mutation, effects })
     }
 }
 
@@ -1584,6 +1647,73 @@ mod tests {
         assert_eq!(
             result.effects,
             [UiEffect::ReloadRuntime, UiEffect::ApplyLaunchAtLogin(true)]
+        );
+    }
+
+    #[test]
+    fn preferences_save_without_model_readiness_or_speech_reload() {
+        let mut test = TestBridge::new();
+        // The model can disappear after startup. An unrelated preference must
+        // remain editable without probing or repairing that asset first.
+        fs::remove_file(&test.bridge.settings().recognition.model_path).unwrap();
+        let readiness = UiReadinessSnapshot::checking(test.bridge.settings(), &test.bridge.store);
+        let mut candidate = test.bridge.settings().clone();
+        candidate.interaction.launcher_shortcut = "Ctrl+Shift+F9".into();
+        let result = test
+            .bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+            .unwrap();
+        assert_eq!(result.mutation, UiMutation::ShortcutsSaved);
+        assert_eq!(
+            test.bridge
+                .store
+                .load()
+                .unwrap()
+                .interaction
+                .launcher_shortcut,
+            "Ctrl+Shift+F9"
+        );
+
+        let mut candidate = test.bridge.settings().clone();
+        candidate.search.embedding_model = Some("local-embedding:latest".into());
+        candidate.appearance.theme = crate::settings::AppearancePreference::Dark;
+        let result = test
+            .bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 11)
+            .unwrap();
+        assert_eq!(result.mutation, UiMutation::SearchSaved);
+        assert_eq!(
+            test.bridge
+                .store
+                .load()
+                .unwrap()
+                .search
+                .embedding_model
+                .as_deref(),
+            Some("local-embedding:latest")
+        );
+    }
+
+    #[test]
+    fn combined_shortcut_and_recognition_change_still_requires_recognition_validation() {
+        let mut test = TestBridge::new();
+        let readiness = test.readiness();
+        let mut candidate = test.bridge.settings().clone();
+        candidate.interaction.launcher_shortcut = "Ctrl+Shift+F9".into();
+        candidate.recognition.model_path = test.root.join("missing-model.bin");
+        assert!(
+            test.bridge
+                .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+                .is_err()
+        );
+        assert_eq!(
+            test.bridge
+                .store
+                .load()
+                .unwrap()
+                .interaction
+                .launcher_shortcut,
+            "Ctrl+Alt+Space"
         );
     }
 

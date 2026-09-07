@@ -20,6 +20,7 @@ pub(crate) struct PageState {
     pub history_id: Option<i64>,
     pub history_variant: HistoryVariant,
     pub history_page: usize,
+    pub history_passage_start: Option<(i64, usize)>,
     pub confirm_clear_history: bool,
     pub confirm_discard_interrupted: Option<String>,
     pub lexicon_id: Option<i64>,
@@ -30,6 +31,11 @@ pub(crate) struct PageState {
     pub confirm_profile_delete: Option<String>,
     pub settings: SettingsSnapshot,
     pub settings_dirty: bool,
+    pub shortcut_capture: Option<crate::studio::ShortcutTarget>,
+    pub library_query: String,
+    pub library_mode: crate::model::LibrarySearchMode,
+    pub selected_passage: Option<String>,
+    pub library_detail: bool,
     pub confirm_model_download: Option<AccurateModel>,
     pub confirm_setup_action: Option<String>,
     pub ollama_search: String,
@@ -50,6 +56,7 @@ impl PageState {
                 .and_then(super::model::HistoryItem::first_available_variant)
                 .unwrap_or(HistoryVariant::Output),
             history_page: 0,
+            history_passage_start: None,
             confirm_clear_history: false,
             confirm_discard_interrupted: None,
             lexicon_id: snapshot.lexicon.first().map(|item| item.id),
@@ -63,6 +70,11 @@ impl PageState {
             confirm_profile_delete: None,
             settings: snapshot.settings.clone(),
             settings_dirty: false,
+            shortcut_capture: None,
+            library_query: snapshot.library.query.clone(),
+            library_mode: snapshot.library.mode,
+            selected_passage: None,
+            library_detail: false,
             confirm_model_download: None,
             confirm_setup_action: None,
             ollama_search: String::new(),
@@ -76,6 +88,12 @@ impl PageState {
     }
 
     pub fn reconcile(&mut self, snapshot: &ShellSnapshot) {
+        if self
+            .history_passage_start
+            .is_some_and(|(id, _)| !snapshot.history.iter().any(|item| item.id == id))
+        {
+            self.history_passage_start = None;
+        }
         if self
             .confirm_setup_action
             .as_ref()
@@ -183,7 +201,12 @@ pub(crate) fn show(
         Route::Lexicon => lexicon(ui, snapshot, state, outbox),
         Route::Profiles => profiles(ui, snapshot, state, outbox),
         Route::Models => models(ui, snapshot, state, outbox),
-        Route::Settings => settings(ui, snapshot, state, outbox),
+        Route::Settings
+        | Route::SettingsShortcuts
+        | Route::SettingsDictation
+        | Route::SettingsFormatting
+        | Route::SettingsAppearance
+        | Route::SettingsPrivacy => settings(ui, route, snapshot, state, outbox),
     }
 }
 
@@ -195,6 +218,7 @@ fn setup(
 ) {
     let tokens = ui.tokens();
     page_header(ui, Route::Setup.title(), Route::Setup.context(), None);
+    crate::studio::models_navigation(ui, Route::Setup, outbox);
     ui.add_space(Space::LG);
     metadata(ui, "Commissioning state");
     ui.add_space(Space::XS);
@@ -883,7 +907,14 @@ fn home(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
         home_local_systems(ui, snapshot);
     }
     ui.add_space(Space::XXL);
-    metadata(ui, "Recently held");
+    ui.horizontal(|ui| {
+        metadata(ui, "RECENT DICTATIONS");
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if action(ui, "Open library", ActionTone::Quiet).clicked() {
+                outbox.push(ShellEvent::Navigate(Route::History));
+            }
+        });
+    });
     ui.add_space(Space::SM);
     if !snapshot.history_enabled {
         ui.label(
@@ -891,7 +922,9 @@ fn home(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
                 .color(tokens.secondary_text),
         );
     } else if snapshot.history.is_empty() {
-        ui.label(RichText::new("No dictations held yet.").color(tokens.secondary_text));
+        ui.label(
+            RichText::new("Your first dictation will appear here.").color(tokens.secondary_text),
+        );
     } else {
         for item in snapshot.history.iter().take(3) {
             ui.horizontal(|ui| {
@@ -920,28 +953,91 @@ fn home(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
 
 fn home_instrument_state(ui: &mut Ui, snapshot: &ShellSnapshot, outbox: &mut Vec<ShellEvent>) {
     let tokens = ui.tokens();
-    metadata(ui, "Instrument state");
-    ui.add_space(Space::SM);
-    ui.label(
-        RichText::new(snapshot.status.label())
-            .size(56.0)
-            .color(tokens.text),
-    );
-    ui.add_space(Space::XS);
-    components::shortcut_chord(ui, &snapshot.shortcut);
-    ui.add_space(Space::XL);
-    if action(ui, "Test dictation", ActionTone::Primary).clicked() {
-        outbox.push(ShellEvent::TestDictation);
-    }
+    egui::Frame::new()
+        .fill(tokens.surface)
+        .inner_margin(egui::Margin::same(24))
+        .show(ui, |ui| {
+            metadata(ui, "DICTATION");
+            ui.add_space(Space::MD);
+            ui.label(
+                RichText::new(snapshot.status.label())
+                    .size(38.0)
+                    .color(tokens.text),
+            );
+            ui.label(
+                RichText::new(match snapshot.status {
+                    crate::model::RuntimeStatus::Listening => "Listening until you stop.",
+                    crate::model::RuntimeStatus::Transcribing => "Finishing your words.",
+                    crate::model::RuntimeStatus::Refining => "Applying your chosen finish.",
+                    crate::model::RuntimeStatus::NeedsAttention => {
+                        "Check the notice above before continuing."
+                    }
+                    _ => "Ready when the thought arrives.",
+                })
+                .color(tokens.secondary_text),
+            );
+            ui.add_space(Space::LG);
+            ui.horizontal_wrapped(|ui| {
+                components::shortcut_chord(ui, &snapshot.shortcut);
+                ui.label(
+                    RichText::new("Open from anywhere")
+                        .size(12.0)
+                        .color(tokens.secondary_text),
+                );
+            });
+            ui.add_space(Space::LG);
+            let label = if snapshot.status == crate::model::RuntimeStatus::Listening {
+                "Stop dictation"
+            } else {
+                "Start dictation"
+            };
+            ui.add_enabled_ui(
+                !matches!(
+                    snapshot.status,
+                    crate::model::RuntimeStatus::Transcribing
+                        | crate::model::RuntimeStatus::Refining
+                ),
+                |ui| {
+                    if action(ui, label, ActionTone::Primary).clicked() {
+                        outbox.push(ShellEvent::TestDictation);
+                    }
+                },
+            );
+        });
 }
 
 fn home_local_systems(ui: &mut Ui, snapshot: &ShellSnapshot) {
-    metadata(ui, "Local systems");
-    ui.add_space(Space::SM);
-    for system in &snapshot.systems {
-        readiness_row(ui, &system.name, &system.detail, system.state);
-        hairline(ui);
-    }
+    let tokens = ui.tokens();
+    egui::Frame::new()
+        .inner_margin(egui::Margin::same(24))
+        .show(ui, |ui| {
+            metadata(ui, "YOUR DEFAULTS");
+            ui.add_space(Space::MD);
+            ui.label(
+                RichText::new(match snapshot.settings.recognition_mode {
+                    RecognitionMode::Instant => "Instant recognition",
+                    RecognitionMode::Accurate => "Accurate recognition",
+                })
+                .size(23.0),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{} · {} formatting",
+                    snapshot.settings.language,
+                    formatting_label(snapshot.settings.formatting)
+                ))
+                .color(tokens.secondary_text),
+            );
+            ui.add_space(Space::LG);
+            metadata(ui, "MICROPHONE");
+            ui.label(&snapshot.settings.microphone);
+            ui.add_space(Space::LG);
+            egui::CollapsingHeader::new("Local system status").show(ui, |ui| {
+                for system in &snapshot.systems {
+                    readiness_row(ui, &system.name, &system.detail, system.state);
+                }
+            });
+        });
 }
 
 fn history(
@@ -952,16 +1048,19 @@ fn history(
 ) {
     let tokens = ui.tokens();
     page_header(ui, Route::History.title(), Route::History.context(), None);
+    if crate::studio::library_search(ui, snapshot, state, outbox) {
+        return;
+    }
     if !snapshot.interrupted.is_empty() {
-        metadata(ui, "Interrupted dictations");
-        ui.label("Saved text from an interrupted session. The most recent speech may be missing. Nothing is inserted automatically.");
+        metadata(ui, "Saved text awaiting delivery");
+        ui.label("Text kept after a delivery failure. Review or copy it here.");
         ScrollArea::vertical()
             .id_salt("interrupted-dictations")
             .max_height(180.0)
             .show(ui, |ui| {
                 for (session, timestamp) in &snapshot.interrupted {
                     ui.horizontal(|ui| {
-                        ui.label(format!("Interrupted dictation · {timestamp}"));
+                        ui.label(format!("Saved text · {timestamp}"));
                         if action(ui, "Copy text", ActionTone::Secondary).clicked() {
                             outbox.push(ShellEvent::CopyInterrupted(session.clone()));
                         }
@@ -992,7 +1091,6 @@ fn history(
             });
         hairline(ui);
     }
-    ui.label("With History on, interrupted text is encrypted for your Windows account and follows history retention. History off saves no recovery text.");
     if !snapshot.history.is_empty() || !snapshot.interrupted.is_empty() {
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width(), 44.0),
@@ -1001,7 +1099,7 @@ fn history(
                 let label = if state.confirm_clear_history {
                     "Delete every retained dictation"
                 } else {
-                    "Clear history"
+                    "Clear library"
                 };
                 if action(ui, label, ActionTone::Destructive).clicked() {
                     if state.confirm_clear_history {
@@ -1024,7 +1122,7 @@ fn history(
     if snapshot.history.is_empty() {
         empty_state(
             ui,
-            "Nothing held",
+            "Your library starts here.",
             if snapshot.history_enabled {
                 "Completed dictations will gather here."
             } else {
@@ -1035,12 +1133,14 @@ fn history(
         return;
     }
 
-    ui.columns(2, |columns| {
-        columns[0].set_width(300.0);
+    let narrow = ui.available_width() < 700.0;
+    ui.columns(if narrow { 1 } else { 2 }, |columns| {
+        let detail_column = columns.len() - 1;
         metadata(&mut columns[0], "Chronology");
         columns[0].add_space(Space::XS);
         ScrollArea::vertical()
             .id_salt("history-list")
+            .max_height(if narrow { 220.0 } else { 560.0 })
             .show(&mut columns[0], |ui| {
                 for item in &snapshot.history {
                     let selected = state.history_id == Some(item.id);
@@ -1079,7 +1179,7 @@ fn history(
                 }
             });
 
-        columns[1].add_space(Space::XXS);
+        columns[detail_column].add_space(if narrow { Space::LG } else { Space::XXS });
         if let Some(item) = state
             .history_id
             .and_then(|id| snapshot.history.iter().find(|entry| entry.id == id))
@@ -1088,7 +1188,7 @@ fn history(
                 .into_iter()
                 .filter(|variant| item.has_variant(*variant));
             if let Some(variant) = segmented(
-                &mut columns[1],
+                &mut columns[detail_column],
                 available,
                 &mut state.history_variant,
                 HistoryVariant::label,
@@ -1099,12 +1199,12 @@ fn history(
                     variant,
                 });
             }
-            columns[1].add_space(Space::LG);
+            columns[detail_column].add_space(Space::LG);
             let loaded = item.loaded_for(state.history_variant);
             let page_count = loaded.map_or(1, super::model::HistoryLoadedText::page_count);
             state.history_page = state.history_page.min(page_count.saturating_sub(1));
             if page_count > 1 {
-                columns[1].horizontal(|ui| {
+                columns[detail_column].horizontal_wrapped(|ui| {
                     if action(ui, "Previous page", ActionTone::Quiet).clicked() {
                         state.history_page = state.history_page.saturating_sub(1);
                     }
@@ -1117,7 +1217,7 @@ fn history(
                             state.history_page.saturating_add(1).min(page_count - 1);
                     }
                 });
-                columns[1].add_space(Space::SM);
+                columns[detail_column].add_space(Space::SM);
             }
             let text = loaded
                 .map(|loaded| loaded.page(state.history_page))
@@ -1128,16 +1228,16 @@ fn history(
                         "This retained transcript is unavailable."
                     }
                 });
-            columns[1].label(
+            columns[detail_column].label(
                 RichText::new(text)
                     .size(21.0)
                     .line_height(Some(29.0))
                     .color(tokens.text),
             );
-            columns[1].add_space(Space::XL);
-            hairline(&mut columns[1]);
-            columns[1].add_space(Space::MD);
-            columns[1].horizontal(|ui| {
+            columns[detail_column].add_space(Space::XL);
+            hairline(&mut columns[detail_column]);
+            columns[detail_column].add_space(Space::MD);
+            columns[detail_column].horizontal_wrapped(|ui| {
                 if item.has_variant(HistoryVariant::Output)
                     && action(ui, "Copy output", ActionTone::Primary).clicked()
                 {
@@ -1155,9 +1255,9 @@ fn history(
                     });
                 }
             });
-            columns[1].add_space(Space::XL);
-            metadata(&mut columns[1], "Provenance");
-            columns[1].label(
+            columns[detail_column].add_space(Space::XL);
+            metadata(&mut columns[detail_column], "Details");
+            columns[detail_column].label(
                 RichText::new(format!(
                     "{} · {} · {}",
                     item.application, item.language, item.latency
@@ -1166,7 +1266,7 @@ fn history(
                 .color(tokens.secondary_text),
             );
             if let Some(warning) = &item.warning {
-                columns[1].label(RichText::new(warning).color(tokens.accent_focus));
+                columns[detail_column].label(RichText::new(warning).color(tokens.accent_focus));
             }
         }
     });
@@ -1582,6 +1682,7 @@ fn models(
     ) {
         outbox.push(ShellEvent::VerifyModels);
     }
+    crate::studio::models_navigation(ui, Route::Models, outbox);
     let tokens = ui.tokens();
     model_system(ui, "01", &snapshot.whisper, true, state, outbox);
     ui.add_space(Space::LG);
@@ -1609,6 +1710,9 @@ fn models(
     hairline(ui);
     ui.add_space(Space::XL);
     model_system(ui, "03", &snapshot.ollama, false, state, outbox);
+    ui.add_space(Space::LG);
+    hairline(ui);
+    crate::studio::library_index(ui, snapshot, outbox);
 }
 
 fn model_system(
@@ -1668,6 +1772,7 @@ fn model_system(
 
 fn settings(
     ui: &mut Ui,
+    route: Route,
     snapshot: &ShellSnapshot,
     state: &mut PageState,
     outbox: &mut Vec<ShellEvent>,
@@ -1683,14 +1788,20 @@ fn settings(
         });
     if page_header(
         ui,
-        Route::Settings.title(),
-        Route::Settings.context(),
+        route.title(),
+        route.context(),
         state.settings_dirty.then_some("Save changes"),
     ) {
         outbox.push(ShellEvent::SaveSettings(state.settings.clone()));
     }
+    crate::studio::settings_navigation(ui, route, outbox);
+    if matches!(route, Route::Settings | Route::SettingsShortcuts) {
+        crate::studio::shortcuts(ui, state, outbox);
+        return;
+    }
     ScrollArea::vertical().id_salt("settings").show(ui, |ui| {
         let original = state.settings.clone();
+        if route == Route::SettingsAppearance {
         setting_section(ui, "01", "Appearance", |ui| {
             setting_row(
                 ui,
@@ -1715,6 +1826,8 @@ fn settings(
                 },
             );
         });
+        }
+        if route == Route::SettingsDictation {
         setting_section(ui, "02", "Input", |ui| {
             setting_row(ui, "Microphone", "The source Phorminx listens to.", |ui| {
                 ComboBox::from_id_salt("microphone")
@@ -1731,8 +1844,8 @@ fn settings(
             });
             setting_row(
                 ui,
-                "Recording mode",
-                "Hold or toggle the global shortcut.",
+                "Direct shortcut behavior",
+                "Applies only to the optional direct-dictation shortcut.",
                 |ui| {
                     ui.selectable_value(
                         &mut state.settings.recording_mode,
@@ -1835,6 +1948,8 @@ fn settings(
                 },
             );
         });
+        }
+        if route == Route::SettingsFormatting {
         setting_section(ui, "04", "Formatting", |ui| {
             setting_row(ui, "Strength", "How much phrasing may change.", |ui| {
                 ComboBox::from_id_salt("formatting")
@@ -1920,6 +2035,8 @@ fn settings(
                 },
             );
         });
+        }
+        if route == Route::SettingsPrivacy {
         setting_section(ui, "05", "Privacy", |ui| {
             setting_row(ui, "History", "Retain completed local dictations.", |ui| {
                 ComboBox::from_id_salt("history-retention")
@@ -1935,6 +2052,9 @@ fn settings(
                     });
             });
         });
+        crate::studio::library_index(ui, snapshot, outbox);
+        }
+        if route == Route::SettingsAppearance {
         setting_section(ui, "06", "Startup", |ui| {
             setting_row(
                 ui,
@@ -1945,6 +2065,9 @@ fn settings(
                 },
             );
         });
+        }
+        if route == Route::SettingsDictation {
+        egui::CollapsingHeader::new("Model paths & diagnostics").show(ui, |ui| {
         setting_section(ui, "07", "Advanced", |ui| {
             setting_row(
                 ui,
@@ -1999,6 +2122,8 @@ fn settings(
                 },
             );
         });
+        });
+        }
         state.settings_dirty |= original != state.settings;
     });
 }
@@ -2019,6 +2144,17 @@ fn setting_section(ui: &mut Ui, index: &str, title: &str, content: impl FnOnce(&
 
 fn setting_row(ui: &mut Ui, title: &str, detail: &str, control: impl FnOnce(&mut Ui)) {
     let tokens = ui.tokens();
+    if ui.available_width() < 680.0 {
+        ui.label(RichText::new(title).strong());
+        ui.label(
+            RichText::new(detail)
+                .size(12.0)
+                .color(tokens.secondary_text),
+        );
+        ui.horizontal_wrapped(control);
+        ui.add_space(Space::SM);
+        return;
+    }
     ui.horizontal(|ui| {
         ui.set_min_height(52.0);
         ui.vertical(|ui| {

@@ -43,6 +43,33 @@ pub fn system_appearance() -> SystemAppearance {
     }
 }
 
+/// Effective Windows application color preference; read only when opening the
+/// native palette, not on its paint or keyboard callback path.
+#[must_use]
+pub fn system_apps_use_dark_theme() -> bool {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+    use windows::core::w;
+    let contrast = system_appearance();
+    if contrast.high_contrast {
+        return contrast.contrast_theme_is_dark;
+    }
+    let mut light = 1_u32;
+    let mut bytes = size_of::<u32>() as u32;
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&raw mut light).cast()),
+            Some(&mut bytes),
+        )
+    };
+    result == ERROR_SUCCESS && light == 0
+}
+
 fn colorref_is_dark(color: u32) -> bool {
     let red = color & 0xff;
     let green = (color >> 8) & 0xff;

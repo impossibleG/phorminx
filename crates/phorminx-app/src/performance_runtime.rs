@@ -1098,6 +1098,19 @@ impl std::fmt::Debug for WorkloadCoordinator {
 }
 
 impl WorkloadCoordinator {
+    /// Advisory read-only gate for optional background work. Never reserves
+    /// resources or denies foreground dictation; fail closed if unavailable.
+    pub fn is_busy(&self) -> bool {
+        self.state.try_lock().map_or(true, |state| {
+            state.benchmark
+                || state.calibration
+                || state.dictation != 0
+                || state.whisper != 0
+                || state.ollama != 0
+                || state.ollama_model_mutations != 0
+        })
+    }
+
     pub fn try_begin(
         &self,
         kind: RuntimeActivityKind,

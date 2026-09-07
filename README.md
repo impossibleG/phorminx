@@ -1,6 +1,6 @@
 # Phorminx
 
-Phorminx is a privacy-first Windows dictation utility. Hold a shortcut, speak naturally, and insert a faithful, clean transcript into the application that had focus.
+Phorminx is a privacy-first Windows dictation utility. Open the P launcher, choose Dictate, speak naturally, and press the shortcut again to insert the transcript into the original application. An optional direct shortcut supports toggle or hold-to-record.
 
 The product is local-first:
 
@@ -9,6 +9,8 @@ The product is local-first:
   bundle and language-matched unpacked model are explicitly configured.
 - Deterministic rules handle safe normalization and explicit aliases.
 - Ollama optionally cleans and formats transcripts.
+- Library finds retained dictations by exact words or meaning using an optional
+  local embedding model. Indexing runs in the background and yields to dictation.
 - Longer dictations are transcribed while you speak. Committed audio is erased
   from a fixed rolling memory buffer; only uncommitted audio and boundary
   context remain. Recording duration does not determine audio memory usage.
@@ -25,6 +27,18 @@ The product is local-first:
 Start with [docs/BLUEPRINT.md](docs/BLUEPRINT.md), [docs/ROADMAP.md](docs/ROADMAP.md), [docs/PHASE-2-4-STATUS.md](docs/PHASE-2-4-STATUS.md), the Phase 0 benchmark results, and the [Phase 1 walking-skeleton guide](docs/PHASE-1.md).
 
 ## Status
+
+The current local-workspace release adds a refined unified UI, configurable
+shortcuts, the P action launcher, and local semantic search. See the
+approved scope and
+[validation and manual test guide](docs/LOCAL-WORKSPACE-VALIDATION.md).
+
+The default `Ctrl+Alt+Space` shortcut now opens the launcher; press `1` or `Enter`
+to start, and the shortcut again to stop. Configure bindings under Settings >
+Shortcuts, and the light/dark preference under Settings > Appearance. Optional
+semantic search is configured under Models and used from Library. Choose an
+installed dedicated embedding model; normal chat models may not support it.
+Exact-word search needs no AI model. No remote AI provider is enabled.
 
 The Phase 1 walking skeleton and the implementation work for Phases 2–4 are complete. Phorminx now has native settings and first-run setup, microphone selection and hotplug fallback, verified Whisper model downloads, Raw/Light/Balanced/Strong/Custom formatting, local Ollama discovery and model selection, private history with retention, an exact personal lexicon, per-application profiles, launch-at-login, sleep/resume recovery, and private-alpha release tooling.
 
@@ -62,7 +76,7 @@ extraction. Ready requires an actual native model and recognizer probe. The
 release-to-insert timer begins at the physical hold-release or toggle-stop event,
 and history keeps content-free stage timings for performance analysis.
 
-Whisper models belong in `models/` and personal recordings in `test-data/`; neither directory is committed to Git. The Phase 1 executable keeps the selected model resident and uses `Ctrl+Alt+Space` as its temporary hold-to-talk shortcut.
+Whisper models belong in `models/` and development audio fixtures in `test-data/`; neither directory is committed to Git. Speech models can remain resident according to the selected runtime policy.
 
 ## Name
 

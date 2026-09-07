@@ -2,6 +2,7 @@
 
 mod history_loader;
 pub mod incremental;
+mod library_search;
 pub mod model;
 pub mod ollama_onboarding;
 pub mod performance;

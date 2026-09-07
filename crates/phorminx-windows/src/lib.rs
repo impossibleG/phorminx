@@ -29,6 +29,8 @@ mod settings_window;
 #[cfg(windows)]
 mod setup_lock;
 #[cfg(windows)]
+mod shortcut;
+#[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]
 mod startup;
@@ -38,7 +40,7 @@ mod target;
 mod tray;
 
 #[cfg(windows)]
-pub use appearance::{SystemAppearance, system_appearance};
+pub use appearance::{SystemAppearance, system_appearance, system_apps_use_dark_theme};
 #[cfg(windows)]
 pub use asset_dialog::choose_zip_archive;
 #[cfg(windows)]
@@ -48,7 +50,7 @@ pub use file::{AtomicReplaceError, atomic_activate_directory, atomic_replace_fil
 #[cfg(windows)]
 pub use history_window::{HistoryItem, HistoryWindow, HistoryWindowError, HistoryWindowEvent};
 #[cfg(windows)]
-pub use hotkey::{GlobalHoldHotkey, HoldEvent, HotkeyError};
+pub use hotkey::{GlobalHoldHotkey, HoldEvent, HotkeyError, set_global_shortcut_capture};
 #[cfg(windows)]
 pub use insertion::{ClipboardOnlyReason, InsertionOutcome, copy_and_maybe_paste};
 #[cfg(windows)]
@@ -86,6 +88,10 @@ pub use settings_window::{
 };
 #[cfg(windows)]
 pub use setup_lock::{SetupOperationLock, SetupOperationLockError};
+#[cfg(windows)]
+pub use shortcut::{
+    DEFAULT_LAUNCHER_SHORTCUT, Shortcut, ShortcutAvailabilityError, ShortcutBindings, ShortcutError,
+};
 #[cfg(windows)]
 pub use single_instance::{SingleInstance, SingleInstanceError, activate_existing_window};
 #[cfg(windows)]

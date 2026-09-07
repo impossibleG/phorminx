@@ -5,8 +5,7 @@ use std::time::{Duration, Instant};
 use arboard::{Clipboard, SetExtWindows};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-    KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
-    VK_SPACE, VK_V,
+    KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_V,
 };
 
 use crate::TargetSnapshot;
@@ -167,8 +166,14 @@ impl InputInjector for SystemInputInjector {
 fn wait_for_modifier_release(timeout: Duration) -> bool {
     let started = Instant::now();
     while started.elapsed() < timeout {
-        if ![VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_SPACE]
+        if ![VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
             .into_iter()
+            .chain(
+                crate::hotkey::activation_keys()
+                    .into_iter()
+                    .filter(|key| *key != 0)
+                    .map(VIRTUAL_KEY),
+            )
             .any(key_is_down)
         {
             return true;
