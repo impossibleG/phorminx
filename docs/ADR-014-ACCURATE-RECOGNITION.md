@@ -54,13 +54,17 @@ model default unless an explicit benchmark command asks for an override.
    whisper.cpp's abort callback, so final work does not wait for obsolete
    partial inference. The tombstone clears only when the final command dequeues.
    Aborted work is never accepted into the stable accumulator.
-7. Whisper partials expose segment timestamps. Only segments ending before the
-   overlap guard become stable. Later chunks append segments by their absolute
-   audio interval and use a bounded prior-text prompt for decoder context. A
-   segment that crosses the stability guard or already-accepted frontier freezes
-   admission at the earliest unresolved instant; the final tail resumes there,
-   so a later timestamp can never jump across and permanently lose audio. Text
-   overlap remains a compatibility fallback, not the primary boundary proof.
+7. Whisper partials expose segment timestamps and use retained audio for
+   context, not recycled transcript prompts. Native regression testing found
+   that prompting tiny audio windows with prior output caused large repeated
+   passages and slowed decoding. Uncertain timestamp admission is retried;
+   it must not permanently disable transcription. A bounded independent decode
+   handles persistent alignment uncertainty, including successful no-word
+   results. Confirmed full-window text owns the full represented interval only
+   after additional right context; capture still retains two seconds for the
+   next boundary. Repair starts near the current ownership frontier, not an
+   obsolete window start. Text reconciliation can still introduce small seam
+   differences, which are measured against native baseline recognition.
 8. Formatting, history, and insertion remain downstream of exactly one accepted
    final result. Ollama warm-up cannot block STT readiness or the transcription
    command loop.
@@ -68,12 +72,12 @@ model default unless an explicit benchmark command asks for an override.
    partial audio/compute/abort, final tail audio/compute, full fallback reason
    and compute, formatting, insertion, and release-to-insert. Never log audio or
    transcript text.
-10. Recover from pathological repeated incremental output with one clean
-    full-clip pass before persistence/insertion. The high-specificity guard
-    requires four consecutive repetitions of a phrase at least five words long,
-    so intentional short repetition such as `red green blue` three times remains
-    valid. A repeated full-clip result fails closed; recognized speech is never
-    silently rewritten.
+10. Preserve repeated speech in every successful recognition result. A
+    text-only phrase-repetition heuristic cannot distinguish intentional
+    emphasis from a decoder loop. It produces only a content-free diagnostic
+    warning; it cannot reject delivery, trigger retranscription, or delete
+    words. This applies equally to the shared Instant/Accurate delivery path,
+    Accurate retained-tail assembly, and bounded sequential finalization.
 11. The Models page and both settings surfaces expose all four pinned variants
     and Auto/Vulkan/CPU. Downloads use the selected manifest and switch the
     authoritative model path only after size and SHA-256 verification.
@@ -93,6 +97,7 @@ model default unless an explicit benchmark command asks for an override.
   reproducible.
 - Vulkan packaging adds SDK/build complexity and must be proven on physical AMD
   hardware before claiming acceleration.
-- Very long intentional verbatim repetition can still meet the conservative
-  loop threshold; it receives a full-clip recovery pass before any visible
-  failure.
+- Long intentional repetition follows normal formatting and insertion, without
+  requiring retrieval from History. Removing the text-only veto also means a
+  genuine decoder repetition may be delivered; that must be addressed with
+  recognition-quality evidence, not by guessing the speaker's intent from text.

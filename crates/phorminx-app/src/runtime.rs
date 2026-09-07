@@ -1141,6 +1141,39 @@ mod tests {
     }
 
     #[test]
+    fn completed_long_repeated_speech_inserts_once_into_original_target() {
+        let repeated = "please keep all of these words ".repeat(100);
+        for backend in ["vosk", "whisper.cpp"] {
+            let mut runtime = AppRuntime::<u64, FakeRecording>::new_with_formatting(
+                0.003,
+                "en".to_owned(),
+                RuntimeFormatting::Raw,
+            )
+            .unwrap();
+            let mut io = FakeIo::default();
+            let id = advance_to_transcribing(&mut runtime, &mut io, 77);
+            let mut recognized = transcript(&repeated);
+            recognized.backend = backend;
+            let notices = runtime
+                .transcription_completed(id, Ok(recognized.clone()), &mut io)
+                .unwrap();
+            assert_eq!(
+                io.inserted_texts.as_slice(),
+                std::slice::from_ref(&repeated)
+            );
+            assert_eq!(io.pasted_targets, [77]);
+            assert!(notices.iter().any(
+                |notice| matches!(notice, RuntimeNotice::Inserted { id: found, .. } if *found == id)
+            ));
+            runtime
+                .transcription_completed(id, Ok(recognized), &mut io)
+                .unwrap();
+            assert_eq!(io.insertions, 1);
+            assert!(runtime.is_clean_idle());
+        }
+    }
+
+    #[test]
     fn cleanup_has_an_explicit_sticky_state_before_insertion() {
         let mut runtime = AppRuntime::<u64, FakeRecording>::new_with_formatting(
             0.003,

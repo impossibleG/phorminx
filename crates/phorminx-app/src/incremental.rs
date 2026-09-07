@@ -14,6 +14,9 @@ pub const MAX_CHUNK_DURATION: Duration = Duration::from_secs(3);
 pub const CHUNK_OVERLAP: Duration = Duration::from_millis(500);
 pub const SILENCE_PROBE_DURATION: Duration = CHUNK_OVERLAP;
 pub const PROBE_INTERVAL: Duration = Duration::from_millis(200);
+/// Includes twelve seconds of recognition, retained boundary context, and the
+/// next scheduling step. Failed repairs must never grow a decode indefinitely.
+pub const MAX_REPAIR_WINDOW_DURATION: Duration = Duration::from_secs(17);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BoundaryKind {
@@ -62,7 +65,6 @@ struct Session {
     /// unresolved timestamp boundary. This is worker feedback, not a new
     /// scheduling frontier, so capture remains authoritative.
     repair_from: Option<Duration>,
-    degraded: bool,
 }
 
 impl IncrementalPlanner {
@@ -75,7 +77,6 @@ impl IncrementalPlanner {
             next_probe_at: MIN_CHUNK_DURATION,
             last_boundary: None,
             repair_from: None,
-            degraded: false,
         });
     }
 
@@ -86,7 +87,6 @@ impl IncrementalPlanner {
     pub fn needs_probe(&self, id: DictationId, captured: Duration) -> bool {
         self.session.as_ref().is_some_and(|session| {
             session.id == id
-                && !session.degraded
                 && session.in_flight.is_none()
                 && captured >= session.next_probe_at
                 && captured.saturating_sub(session.stable_end) >= MIN_CHUNK_DURATION
@@ -101,7 +101,6 @@ impl IncrementalPlanner {
     ) -> Option<ChunkPlan> {
         let session = self.session.as_mut()?;
         if session.id != id
-            || session.degraded
             || session.in_flight.is_some()
             || captured < session.next_probe_at
             || captured.saturating_sub(session.stable_end) < MIN_CHUNK_DURATION
@@ -124,6 +123,15 @@ impl IncrementalPlanner {
         let start = session.repair_from.map_or(ordinary_start, |repair_from| {
             repair_from.min(ordinary_start)
         });
+        let bounded_end = end.min(start.saturating_add(MAX_REPAIR_WINDOW_DURATION));
+        // The silence probe only describes the actual newest audio. A repair
+        // cap cutting earlier must retain forced-boundary right context.
+        let boundary = if bounded_end < end {
+            BoundaryKind::Forced
+        } else {
+            boundary
+        };
+        let end = bounded_end;
         let plan = ChunkPlan {
             id,
             sequence: session.next_sequence,
@@ -160,14 +168,20 @@ impl IncrementalPlanner {
             session.repair_from = repair_from;
             session.next_probe_at = plan.stable_end.saturating_add(MIN_CHUNK_DURATION);
         } else {
-            session.degraded = true;
+            // A failed decode does not consume its sequence or its audio.
+            // Retry the same contiguous window on the next capture probe.
+            session.next_sequence = plan.sequence;
+            session.next_probe_at = plan.range.end.saturating_add(PROBE_INTERVAL);
         }
     }
 
-    pub fn degrade(&mut self, id: DictationId) {
-        if let Some(session) = self.session.as_mut().filter(|session| session.id == id) {
-            session.degraded = true;
-            session.in_flight = None;
+    /// Retry unsubmitted work without resetting already committed progress.
+    pub fn retry(&mut self, id: DictationId) {
+        if let Some(session) = self.session.as_mut().filter(|session| session.id == id)
+            && let Some(plan) = session.in_flight.take()
+        {
+            session.next_sequence = plan.sequence;
+            session.next_probe_at = plan.range.end.saturating_add(PROBE_INTERVAL);
         }
     }
 
@@ -418,6 +432,57 @@ mod tests {
     }
 
     #[test]
+    fn repeated_unresolved_repairs_have_bounded_input_and_continue_retrying() {
+        let mut planner = IncrementalPlanner::default();
+        planner.start(id(81));
+        let mut previous_end = Duration::ZERO;
+        for second in (3..=600).step_by(3) {
+            let plan = planner
+                .observe(id(81), Duration::from_secs(second), false)
+                .unwrap();
+            assert!(plan.range.duration() <= MAX_REPAIR_WINDOW_DURATION);
+            assert_eq!(plan.range.start, Duration::ZERO);
+            assert!(plan.range.end >= previous_end);
+            previous_end = plan.range.end;
+            planner.partial_completed(id(81), plan.sequence, true, Some(Duration::ZERO));
+        }
+        assert!(planner.needs_probe(id(81), Duration::from_secs(601)));
+        let capped = planner
+            .observe(id(81), Duration::from_secs(603), false)
+            .unwrap();
+        for second in [606, 609] {
+            planner.partial_completed(id(81), capped.sequence, false, None);
+            let retry = planner
+                .observe(id(81), Duration::from_secs(second), false)
+                .unwrap();
+            assert_eq!(retry, capped);
+        }
+        planner.partial_completed(id(81), capped.sequence, true, Some(Duration::from_secs(10)));
+        let advancing = planner
+            .observe(id(81), Duration::from_secs(612), false)
+            .unwrap();
+        assert!(advancing.range.start > capped.range.start);
+        assert!(advancing.range.end > capped.range.end);
+    }
+
+    #[test]
+    fn bounded_repair_does_not_apply_newest_silence_to_an_earlier_cut() {
+        let mut planner = IncrementalPlanner::default();
+        planner.start(id(82));
+        for second in [3, 6, 9, 12, 15, 18] {
+            let plan = planner
+                .observe(id(82), Duration::from_secs(second), false)
+                .unwrap();
+            planner.partial_completed(id(82), plan.sequence, true, Some(Duration::ZERO));
+        }
+        let capped = planner
+            .observe(id(82), Duration::from_millis(18_600), true)
+            .unwrap();
+        assert_eq!(capped.range.end, MAX_REPAIR_WINDOW_DURATION);
+        assert_eq!(capped.boundary, BoundaryKind::Forced);
+    }
+
+    #[test]
     fn silence_is_preferred_and_only_one_chunk_can_be_in_flight() {
         let mut planner = IncrementalPlanner::default();
         planner.start(id(1));
@@ -531,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_degrades_session_and_stale_completions_are_ignored() {
+    fn failure_retries_the_same_audio_and_stale_completions_are_ignored() {
         let mut planner = IncrementalPlanner::default();
         planner.start(id(2));
         let plan = planner
@@ -540,10 +605,53 @@ mod tests {
         planner.partial_completed(id(99), plan.sequence, true, None);
         assert_eq!(planner.active_id(), Some(id(2)));
         planner.partial_completed(id(2), plan.sequence, false, None);
-        assert!(!planner.needs_probe(id(2), Duration::from_secs(20)));
+        assert!(planner.needs_probe(id(2), Duration::from_secs(20)));
+        let retry = planner
+            .observe(id(2), Duration::from_secs(20), false)
+            .unwrap();
+        assert_eq!(retry.sequence, plan.sequence);
+        assert_eq!(retry.range, plan.range);
         planner.finish(id(99));
         assert_eq!(planner.active_id(), Some(id(2)));
         planner.finish(id(2));
+        assert_eq!(planner.active_id(), None);
+    }
+
+    #[test]
+    fn scheduling_retry_preserves_nonzero_sequence_frontier_and_repair_overlap() {
+        let mut planner = IncrementalPlanner::default();
+        planner.start(id(72));
+        let first = planner
+            .observe(id(72), Duration::from_secs(3), false)
+            .unwrap();
+        planner.partial_completed(id(72), first.sequence, true, Some(Duration::from_secs(1)));
+        let pending = planner
+            .observe(id(72), Duration::from_secs(6), false)
+            .unwrap();
+        assert_eq!(pending.sequence, 1);
+        assert_eq!(pending.range.start, Duration::from_secs(1));
+
+        // A failed snapshot or submission never reached the decoder. Retrying
+        // must retain the worker's existing sequence and owned text boundary.
+        planner.retry(id(99));
+        assert!(!planner.needs_probe(id(72), Duration::from_secs(7)));
+        planner.retry(id(72));
+        assert!(!planner.needs_probe(id(72), Duration::from_millis(6_199)));
+        let retried = planner
+            .observe(id(72), Duration::from_millis(6_200), false)
+            .unwrap();
+        assert_eq!(retried, pending);
+        planner.partial_completed(id(72), 0, true, None);
+        assert!(!planner.needs_probe(id(72), Duration::from_secs(7)));
+        planner.partial_completed(id(72), retried.sequence, true, None);
+        let next = planner
+            .observe(id(72), Duration::from_secs(9), false)
+            .unwrap();
+        assert_eq!(next.sequence, 2);
+        assert_eq!(next.range.start, Duration::from_millis(5_500));
+        assert_eq!(next.stable_end, Duration::from_secs(9));
+        planner.finish(id(72));
+        planner.retry(id(72));
         assert_eq!(planner.active_id(), None);
     }
 

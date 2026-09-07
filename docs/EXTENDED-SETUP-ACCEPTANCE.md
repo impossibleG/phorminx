@@ -4,12 +4,16 @@ This document is the release-blocking evidence checklist for ADR-015 and
 ADR-016. A checked implementation test is not a substitute for the physical
 hardware gates at the end.
 
-## Rolling-capture evidence snapshot (2026-09-06)
+## Original rolling-capture evidence snapshot (2026-09-06)
 
 The current change replaces full-recording scratch audio with a 45-second
 in-memory backlog window. This snapshot distinguishes implemented regression
 coverage from physical qualification; unchecked items below are not claims of
 completed testing.
+
+The counts and installers below describe the original rolling-capture release,
+not qualification of subsequent continuity fixes. The follow-up regression
+report records the newer evidence separately.
 
 - [x] Ring wraparound, exact retained ranges, reclaimed-slot zeroization, and a
   three-hour synthetic capture through the real capture engine create no audio
@@ -19,7 +23,10 @@ completed testing.
 - [x] Accurate tests exercise timestamps across silence and speech, uncertain
   seams, repair overlap, repeated words, and release after a long owned prefix.
 - [x] Instant tests exercise endpoint ownership, word-aware forced rollover,
-  replay boundaries, energetic empty tails, and retained-tail failure recovery.
+  replay boundaries, and retained-tail failure recovery. The original
+  energetic-empty rejection policy was incorrect: a successful native empty
+  result is ordinary no-word coverage, not a decoder failure. Follow-up tests
+  must cover leading/trailing ambient noise and long pauses.
 - [x] Independent adversarial reviews produced regression fixes for both
   recognition modes. Native Vosk runtime smoke verifies the installed ABI and
   PCM input path; scripted hours-long recognition tests remain synthetic.
@@ -60,6 +67,14 @@ establish crash durability.
 
 ## Extended Dictation
 
+- Successful complete text follows normal formatting and original-target
+  insertion. Intentional repeated phrases cannot cause rejection or force
+  retrieval from History; speculative repetition detection is diagnostic only.
+- A successful independent recognition result with no words is not a native
+  error. Audio energy alone cannot prove that words were spoken. Empty decoded
+  intervals advance bounded audio coverage without changing already owned text;
+  retained boundary overlap still applies to Accurate. Actual native errors,
+  missing audio, and invalid ownership remain distinct retry/failure cases.
 - Generated lifecycle traces permit one owner, terminal outcome, insertion,
   and history row, and reject every stale generation.
 - Random callback sizes, channel layouts, sample formats, and 8–192 kHz input
@@ -73,10 +88,14 @@ establish crash durability.
   obsolete speculative work.
 - Release/cancel/finalize/sleep/device-loss/shutdown races produce no deadlock,
   stale insertion, use-after-free, or duplicate persistence.
-- Production capture creates no audio spool file. Recognition lag stops capture
-  before uncommitted audio can be overwritten, preserves recoverable text, and
-  allows the next recording to start. Legacy spool corruption, quota, and
-  cleanup tests qualify only the dormant compatibility facility.
+- Production capture creates no audio spool file. Ordinary empty recognition
+  results and temporary timestamp uncertainty must not be treated as terminal
+  failures. Sustained genuine recognition failure or insufficient throughput
+  can still exhaust the bounded backlog: capture must not silently overwrite
+  uncommitted audio. This remaining resource-failure path is not an arbitrary
+  recording-duration limit. A completed memory-only fault must permit the next
+  recording; legacy spool corruption, quota, and cleanup tests qualify only the
+  dormant compatibility facility.
 - Long synthetic captures demonstrate bounded retained audio and decoder
   context. Text growth is reported separately; process handles/threads require
   a native soak. Terminal cleanup covers success, cancel, and failure.

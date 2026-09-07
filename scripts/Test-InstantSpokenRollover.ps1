@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string] $AssetsRoot = (Join-Path $env:LOCALAPPDATA 'Phorminx'),
-    [string] $Voice = 'Microsoft David Desktop'
+    [string] $Voice = 'Microsoft David Desktop',
+    [string] $TestFilter = 'native_spoken_audio'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,7 +33,7 @@ try {
     $env:PHORMINX_SPOKEN_ROLLOVER_WAV = $fixture
     Push-Location (Split-Path $PSScriptRoot -Parent)
     try {
-        cargo test -p phorminx-app --bin phorminx-app native_spoken_audio -- --ignored --nocapture --test-threads=1
+        cargo test -p phorminx-app --bin phorminx-app $TestFilter -- --ignored --nocapture --test-threads=1
         if ($LASTEXITCODE -ne 0) { throw 'Native spoken rollover regression failed.' }
     } finally {
         Pop-Location

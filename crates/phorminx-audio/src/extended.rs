@@ -739,6 +739,14 @@ impl ExtendedCapturedAudio {
             .finalizer_permit
             .take()
             .expect("captured audio owns a finalizer permit");
+        if matches!(inner.storage, FinalizedStorage::Memory(_)) {
+            // The bounded rolling buffer only needs zeroization and a drop.
+            // No I/O is pending: spawning a cleanup worker would introduce a
+            // possible spawn failure/timeout after transcription succeeded.
+            drop(inner);
+            drop(finalizer_permit);
+            return Ok(());
+        }
         run_cleanup_with_timeout(move || cleanup_finalized(inner), finalizer_permit, timeout)
     }
 }
@@ -762,6 +770,11 @@ fn cleanup_finalized(inner: EngineFinalized<FileStorage>) -> Result<(), CaptureE
 }
 
 fn spawn_abandoned_cleanup(inner: EngineFinalized<FileStorage>, finalizer_permit: FinalizerPermit) {
+    if matches!(inner.storage, FinalizedStorage::Memory(_)) {
+        drop(inner);
+        drop(finalizer_permit);
+        return;
+    }
     let _ = thread::Builder::new()
         .name("phorminx-audio-abandoned-cleanup".to_owned())
         .spawn(move || {
@@ -868,6 +881,7 @@ fn start_extended_prepared(
     let worker = thread::Builder::new()
         .name("phorminx-audio-pump".to_owned())
         .spawn(move || {
+            let disk_storage_enabled = config.spill_uncommitted_to_disk;
             let result = run_pump(
                 consumer,
                 source_rate,
@@ -890,16 +904,7 @@ fn start_extended_prepared(
                     }));
                 }
                 Err(fault) => {
-                    if !fault_requires_finalizer_quarantine(fault) {
-                        // The rolling buffer deliberately stops before it can
-                        // overwrite uncommitted audio. No disk-backed storage
-                        // exists on this production path, so there is nothing
-                        // to quarantine after the pump exits. Releasing the
-                        // permit lets the next dictation start normally.
-                        drop(finalizer_permit);
-                    } else {
-                        finalizer_permit.block();
-                    }
+                    release_failed_pump_permit(finalizer_permit, fault, disk_storage_enabled);
                     let _ = finalized_tx.try_send(Err(fault));
                 }
             }
@@ -940,8 +945,21 @@ fn start_extended_prepared(
     })
 }
 
-const fn fault_requires_finalizer_quarantine(fault: ExtendedCaptureFault) -> bool {
-    !matches!(fault, ExtendedCaptureFault::UncommittedAudioBacklog)
+fn release_failed_pump_permit(
+    permit: FinalizerPermit,
+    fault: ExtendedCaptureFault,
+    disk_storage_enabled: bool,
+) {
+    // Called only after the pump has returned and dropped its storage. A
+    // completed memory-only failure leaves no pending cleanup to quarantine:
+    // keeping this permit blocked would disable every subsequent dictation
+    // until the app restarted. A genuinely running finalizer still owns its
+    // permit and cannot reach this path until it returns.
+    if disk_storage_enabled && !matches!(fault, ExtendedCaptureFault::UncommittedAudioBacklog) {
+        permit.block();
+    } else {
+        drop(permit);
+    }
 }
 
 fn build_extended_stream(
@@ -2263,13 +2281,66 @@ mod tests {
     }
 
     #[test]
-    fn recognition_backlog_releases_the_next_recording_permit() {
-        assert!(!fault_requires_finalizer_quarantine(
-            ExtendedCaptureFault::UncommittedAudioBacklog
+    fn completed_memory_only_pump_failures_allow_the_next_recording() {
+        let active = Arc::new(AtomicBool::new(false));
+        for _ in 0..10 {
+            for fault in [
+                ExtendedCaptureFault::CallbackOverflow,
+                ExtendedCaptureFault::Resampling,
+                ExtendedCaptureFault::WorkerUnavailable,
+                ExtendedCaptureFault::StreamFailed,
+                ExtendedCaptureFault::UncommittedAudioBacklog,
+            ] {
+                let permit = FinalizerPermit::acquire(&active).unwrap();
+                thread::spawn(move || release_failed_pump_permit(permit, fault, false))
+                    .join()
+                    .unwrap();
+                let next_recording = FinalizerPermit::acquire(&active)
+                    .expect("an exited memory-only pump must not poison future starts");
+                drop(next_recording);
+            }
+        }
+    }
+
+    #[test]
+    fn uncertain_legacy_disk_cleanup_remains_quarantined() {
+        let active = Arc::new(AtomicBool::new(false));
+        let permit = FinalizerPermit::acquire(&active).unwrap();
+        release_failed_pump_permit(permit, ExtendedCaptureFault::SpoolIntegrity, true);
+        assert!(matches!(
+            FinalizerPermit::acquire(&active),
+            Err(CaptureError::Extended(ExtendedCaptureFault::FinalizerBusy))
         ));
-        assert!(fault_requires_finalizer_quarantine(
-            ExtendedCaptureFault::SpoolIntegrity
-        ));
+    }
+
+    fn finalized_memory_capture(active: &Arc<AtomicBool>) -> ExtendedCapturedAudio {
+        ExtendedCapturedAudio {
+            inner: Some(EngineFinalized {
+                storage: FinalizedStorage::Memory(Zeroizing::new(vec![0.25; 16_000 * 45])),
+                retained_from: 0,
+                total_samples: 16_000 * 45,
+                backend_warning_count: 0,
+                fault: None,
+            }),
+            finalizer_permit: Some(FinalizerPermit::acquire(active).unwrap()),
+        }
+    }
+
+    #[test]
+    fn memory_cleanup_cannot_timeout_or_delay_the_next_recording() {
+        let active = Arc::new(AtomicBool::new(false));
+        let audio = finalized_memory_capture(&active);
+        audio.cleanup_with_timeout(Duration::ZERO).unwrap();
+        let next_recording = FinalizerPermit::acquire(&active).unwrap();
+        drop(next_recording);
+    }
+
+    #[test]
+    fn abandoned_memory_capture_releases_its_permit_synchronously() {
+        let active = Arc::new(AtomicBool::new(false));
+        drop(finalized_memory_capture(&active));
+        let next_recording = FinalizerPermit::acquire(&active).unwrap();
+        drop(next_recording);
     }
 
     #[test]

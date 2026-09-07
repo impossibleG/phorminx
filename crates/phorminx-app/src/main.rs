@@ -795,7 +795,7 @@ fn run() -> Result<()> {
                                 frontier.saturating_sub(ACCURATE_REPAIR_OVERLAP_SAMPLES),
                             )
                         {
-                            incremental.degrade(id);
+                            incremental.retry(id);
                             eprintln!(
                                 "dictation_id={} state=Listening event=rolling_audio_reclaim_failed error={error}",
                                 id.0
@@ -2382,7 +2382,6 @@ fn show_status(overlay: &StatusOverlay, status: OverlayStatus) {
 struct FinalAudioStats {
     total_samples: u64,
     peak_retained_samples: u64,
-    rms: f32,
     auto_stopped: bool,
 }
 
@@ -2572,7 +2571,6 @@ impl AppIo for ProductionIo<'_> {
                     stats: FinalAudioStats {
                         total_samples: clip.samples.len() as u64,
                         peak_retained_samples: progress.peak_resident_samples,
-                        rms,
                         auto_stopped,
                     },
                     clip,
@@ -2597,7 +2595,6 @@ impl AppIo for ProductionIo<'_> {
             stats: FinalAudioStats {
                 total_samples: progress.canonical_samples,
                 peak_retained_samples: progress.peak_resident_samples,
-                rms,
                 auto_stopped,
             },
         };
@@ -2814,7 +2811,7 @@ fn poll_incremental_transcription(
         planner.start(id);
     }
     let Some(recording) = runtime.active_recording() else {
-        planner.degrade(id);
+        planner.retry(id);
         let _ = worker.cancel_incremental(id);
         return;
     };
@@ -2835,8 +2832,7 @@ fn poll_incremental_transcription(
     let range = match sample_range_for_duration(plan.range.start, plan.range.end) {
         Ok(range) => range,
         Err(error) => {
-            planner.degrade(id);
-            let _ = worker.cancel_incremental(id);
+            planner.retry(id);
             eprintln!(
                 "dictation_id={} state=Listening event=incremental_fallback reason=invalid_range error={error}",
                 id.0
@@ -2847,8 +2843,7 @@ fn poll_incremental_transcription(
     let clip = match recording.snapshot(range).and_then(audio_span_to_clip) {
         Ok(clip) => clip,
         Err(error) => {
-            planner.degrade(id);
-            let _ = worker.cancel_incremental(id);
+            planner.retry(id);
             eprintln!(
                 "dictation_id={} state=Listening event=incremental_fallback reason=snapshot_failed error={error}",
                 id.0
@@ -2872,8 +2867,7 @@ fn poll_incremental_transcription(
             audio_duration.as_millis()
         ),
         Err(error) => {
-            planner.degrade(id);
-            let _ = worker.cancel_incremental(id);
+            planner.retry(id);
             eprintln!(
                 "dictation_id={} state=Listening event=incremental_fallback reason=submit_failed error={error}",
                 id.0
@@ -3302,72 +3296,10 @@ struct InstantSession {
     continuity_prefix: Vec<f32>,
     checkpoint_count: u64,
     ownership: InstantTranscriptOwnership,
-    evidence: InstantAudioEvidence,
     /// Audio not yet transferred to `ownership`, retained so a replacement
     /// decoder can re-read the lexical boundary at a forced rollover.
     uncommitted_audio: Vec<f32>,
-    minimum_rms: f32,
     ownership_acknowledger: Option<OwnershipAcknowledger>,
-}
-
-#[derive(Default)]
-struct InstantAudioEvidence {
-    peak_window_mean_square: f64,
-    window_square_sum: f64,
-    window_samples: u64,
-}
-
-impl InstantAudioEvidence {
-    fn observe(&mut self, samples: &[f32]) {
-        let mut cursor = 0;
-        while cursor < samples.len() {
-            let needed = usize::try_from(
-                INSTANT_EVIDENCE_WINDOW_SAMPLES.saturating_sub(self.window_samples),
-            )
-            .unwrap_or(0);
-            let take = needed.min(samples.len() - cursor);
-            let energy = samples[cursor..cursor + take]
-                .iter()
-                .map(|sample| f64::from(*sample) * f64::from(*sample))
-                .sum::<f64>();
-            self.window_square_sum += energy;
-            self.window_samples = self.window_samples.saturating_add(take as u64);
-            cursor += take;
-            if self.window_samples == INSTANT_EVIDENCE_WINDOW_SAMPLES {
-                self.peak_window_mean_square = self
-                    .peak_window_mean_square
-                    .max(self.window_square_sum / self.window_samples as f64);
-                self.window_square_sum = 0.0;
-                self.window_samples = 0;
-            }
-        }
-    }
-
-    fn peak_window_rms(&self) -> f64 {
-        let partial = if self.window_samples == 0 {
-            0.0
-        } else {
-            self.window_square_sum / self.window_samples as f64
-        };
-        self.peak_window_mean_square.max(partial).sqrt()
-    }
-
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    #[cfg(test)]
-    fn observe_constant(&mut self, amplitude: f32, samples: u64) {
-        let block = vec![amplitude; INSTANT_EVIDENCE_WINDOW_SAMPLES as usize];
-        let mut remaining = samples;
-        while remaining >= INSTANT_EVIDENCE_WINDOW_SAMPLES {
-            self.observe(&block);
-            remaining -= INSTANT_EVIDENCE_WINDOW_SAMPLES;
-        }
-        if remaining != 0 {
-            self.observe(&block[..remaining as usize]);
-        }
-    }
 }
 
 #[derive(Default)]
@@ -3404,9 +3336,14 @@ fn append_owned_text(destination: &mut String, text: &str) {
 #[cfg(test)]
 mod spoken_rollover_tests;
 
+#[cfg(test)]
+mod accurate_stream_tests;
+
+#[cfg(test)]
+mod accurate_ownership_tests;
+
 const INSTANT_ROLLOVER_TARGET_SAMPLES: u64 = WHISPER_SAMPLE_RATE as u64 * 30;
 const INSTANT_ROLLOVER_OVERLAP_SAMPLES: u64 = WHISPER_SAMPLE_RATE as u64 * 2;
-const INSTANT_EVIDENCE_WINDOW_SAMPLES: u64 = WHISPER_SAMPLE_RATE as u64 / 50;
 const VOSK_FEED_BATCH_SAMPLES: usize = 4_096;
 
 enum InstantAudioCommand {
@@ -3740,13 +3677,6 @@ impl TranscriptionWorker {
                             let result = match recognition {
                                 Ok(transcript) => {
                                     worker_recovery.checkpoint(&mut checkpoint_clock, id.0, &transcript.text, true);
-                                    if has_pathological_repetition(&transcript.text) {
-                                        eprintln!(
-                                            "dictation_id={} state=Transcribing event=transcription_rejected reason=repetition_loop",
-                                            id.0
-                                        );
-                                        Err("Whisper produced a repeated output loop".to_owned())
-                                    } else {
                                     // Whisper cannot be preempted safely today,
                                     // so cancellation is checked again before
                                     // any cleanup event or potentially long
@@ -3824,7 +3754,6 @@ impl TranscriptionWorker {
                                         continue;
                                     }
                                     Ok(processed)
-                                    }
                                 }
                                 Err(error) => Err(error.to_string()),
                             };
@@ -3853,7 +3782,7 @@ impl TranscriptionWorker {
                                     &result_tx,
                                 );
                             } else {
-                                if let LoadedRecognizer::Instant { model, minimum_rms } = &recognizer
+                                if let LoadedRecognizer::Instant { model, .. } = &recognizer
                                     && let Ok(recognizer) = model.session(16_000)
                                 {
                                     instant_sessions.insert(
@@ -3868,9 +3797,7 @@ impl TranscriptionWorker {
                                             continuity_prefix: Vec::new(),
                                             checkpoint_count: 0,
                                             ownership: InstantTranscriptOwnership::default(),
-                                            evidence: InstantAudioEvidence::default(),
                                             uncommitted_audio: Vec::new(),
-                                            minimum_rms: *minimum_rms,
                                             ownership_acknowledger: None,
                                         },
                                     );
@@ -4333,7 +4260,7 @@ fn drain_instant_audio(
     sessions: &mut HashMap<DictationId, InstantSession>,
     results: &Sender<WorkerEvent>,
 ) {
-    let LoadedRecognizer::Instant { model, minimum_rms } = recognizer else {
+    let LoadedRecognizer::Instant { model, .. } = recognizer else {
         while receiver.try_recv().is_ok() {}
         return;
     };
@@ -4361,9 +4288,7 @@ fn drain_instant_audio(
                                 continuity_prefix: Vec::new(),
                                 checkpoint_count: 0,
                                 ownership: InstantTranscriptOwnership::default(),
-                                evidence: InstantAudioEvidence::default(),
                                 uncommitted_audio: Vec::new(),
-                                minimum_rms: *minimum_rms,
                                 ownership_acknowledger: Some(ownership_acknowledger),
                             },
                         );
@@ -4418,17 +4343,15 @@ fn drain_instant_audio(
                             .continuity_prefix
                             .extend_from_slice(&samples[..samples.len().min(remaining)]);
                         session.accepted_through = absolute_accepted;
-                        session.evidence.observe(&samples);
                         session.uncommitted_audio.extend_from_slice(&samples);
                         if let Some(endpoint) = outcome.endpoint {
                             let start =
                                 session.decoder_origin.saturating_add(endpoint.start_sample);
                             let end = session.decoder_origin.saturating_add(endpoint.end_sample);
-                            let safe = !instant_segment_is_unrecognized(
-                                &endpoint.text,
-                                &session.evidence,
-                                session.minimum_rms,
-                            ) && start == session.ownership.committed_through
+                            // An empty successful native result is an ordinary
+                            // endpoint (silence, room noise, or no decoded words).
+                            // Audio energy is not evidence of a decoder failure.
+                            let safe = start == session.ownership.committed_through
                                 && commit_instant_text(session, id, end, &endpoint.text, results)
                                     .is_ok();
                             if !safe {
@@ -4480,16 +4403,6 @@ fn instant_rollover_due(accepted_through: u64, committed_through: u64) -> bool {
     accepted_through.saturating_sub(committed_through) >= INSTANT_ROLLOVER_TARGET_SAMPLES
 }
 
-fn instant_segment_is_unrecognized(
-    text: &str,
-    evidence: &InstantAudioEvidence,
-    minimum_rms: f32,
-) -> bool {
-    let threshold = f64::from(minimum_rms);
-    text.trim().is_empty()
-        && evidence.peak_window_rms() >= threshold - threshold.abs().max(1.0) * 1e-9
-}
-
 fn commit_instant_text(
     session: &mut InstantSession,
     id: DictationId,
@@ -4507,11 +4420,9 @@ fn commit_instant_text(
         through,
         text,
         results,
-    )? {
-        if let Some(acknowledger) = &session.ownership_acknowledger {
-            acknowledger.acknowledge(through);
-        }
-        session.evidence.reset();
+    )? && let Some(acknowledger) = &session.ownership_acknowledger
+    {
+        acknowledger.acknowledge(through);
     }
     Ok(())
 }
@@ -4560,10 +4471,21 @@ fn plan_instant_rollover(
         .iter()
         .take_while(|word| decoder_origin.saturating_add(word.end_sample) <= stable_cutoff)
         .collect::<Vec<_>>();
-    let Some(last_stable) = stable_words.last() else {
+    let committed_through = if let Some(last_stable) = stable_words.last() {
+        decoder_origin.saturating_add(last_stable.end_sample)
+    } else if terminal.text.trim().is_empty() {
+        // A successful empty FinalResult also owns decoded coverage. Preserve
+        // the ordinary overlap, but do not turn long ambient audio into an
+        // artificial native decoder error merely because it has no words.
+        stable_cutoff
+    } else if let Some(first_word) = terminal.words.first() {
+        // Speech can begin only near the rollover deadline. Preserve the
+        // complete first word, including one crossing the overlap boundary,
+        // while acknowledging the leading interval with no decoded words.
+        stable_cutoff.min(decoder_origin.saturating_add(first_word.start_sample))
+    } else {
         return Err(phorminx_vosk::VoskError::DecoderFailed);
     };
-    let committed_through = decoder_origin.saturating_add(last_stable.end_sample);
     if committed_through <= prior_committed || committed_through > stable_cutoff {
         return Err(phorminx_vosk::VoskError::SampleAccountingOverflow);
     }
@@ -4632,18 +4554,11 @@ fn force_instant_rollover(
         session.accepted_through = session
             .decoder_origin
             .saturating_add(outcome.accepted_through);
-        session.evidence.observe(batch);
         session.uncommitted_audio.extend_from_slice(batch);
         if let Some(endpoint) = outcome.endpoint {
             let start = session.decoder_origin.saturating_add(endpoint.start_sample);
             let end = session.decoder_origin.saturating_add(endpoint.end_sample);
-            if start != session.ownership.committed_through
-                || instant_segment_is_unrecognized(
-                    &endpoint.text,
-                    &session.evidence,
-                    session.minimum_rms,
-                )
-            {
+            if start != session.ownership.committed_through {
                 return Err(phorminx_vosk::VoskError::DecoderFailed);
             }
             commit_instant_text(session, id, end, &endpoint.text, results)
@@ -4698,7 +4613,6 @@ fn transcribe_instant_final(
         )
         .map_err(|_| phorminx_vosk::VoskError::DecoderFailed)?;
         for batch in native_tail.chunks(VOSK_FEED_BATCH_SAMPLES) {
-            session.evidence.observe(batch);
             let started = Instant::now();
             let outcome = session.recognizer.accept_f32(batch)?;
             session.inference_time += started.elapsed();
@@ -4708,13 +4622,11 @@ fn transcribe_instant_final(
             if let Some(endpoint) = outcome.endpoint {
                 let start = session.decoder_origin.saturating_add(endpoint.start_sample);
                 let end = session.decoder_origin.saturating_add(endpoint.end_sample);
-                if instant_segment_is_unrecognized(&endpoint.text, &session.evidence, minimum_rms)
-                    || start != session.ownership.committed_through
+                if start != session.ownership.committed_through
                     || session.ownership.commit(end, &endpoint.text).is_err()
                 {
                     return transcribe_instant_full_clip(model, clip, minimum_rms);
                 }
-                session.evidence.reset();
             }
         }
     }
@@ -4723,20 +4635,12 @@ fn transcribe_instant_final(
     session.inference_time += started.elapsed();
     let start = session.decoder_origin.saturating_add(terminal.start_sample);
     let end = session.decoder_origin.saturating_add(terminal.end_sample);
-    if instant_segment_is_unrecognized(&terminal.text, &session.evidence, minimum_rms)
-        || start != session.ownership.committed_through
+    if start != session.ownership.committed_through
         || session.ownership.commit(end, &terminal.text).is_err()
     {
         return transcribe_instant_full_clip(model, clip, minimum_rms);
     }
     let text = session.ownership.text;
-    if text.trim().is_empty() && clip.rms() >= minimum_rms {
-        eprintln!(
-            "dictation_id={} state=Transcribing event=instant_recovery path=full_clip reason=empty_high_energy",
-            id.0
-        );
-        return transcribe_instant_full_clip(model, clip, minimum_rms);
-    }
     Ok(Transcript {
         text,
         backend: "vosk",
@@ -4749,27 +4653,18 @@ fn transcribe_instant_final(
 fn transcribe_instant_full_clip(
     model: &VoskModel,
     clip: &AudioClip,
-    minimum_rms: f32,
+    _minimum_rms: f32,
 ) -> Result<Transcript, phorminx_vosk::VoskError> {
     let mut recognizer = model.session(clip.sample_rate)?;
     let started = Instant::now();
     let mut text = String::new();
-    let mut evidence = InstantAudioEvidence::default();
     for batch in clip.samples.chunks(VOSK_FEED_BATCH_SAMPLES) {
-        evidence.observe(batch);
         let outcome = recognizer.accept_f32(batch)?;
         if let Some(endpoint) = outcome.endpoint {
-            if instant_segment_is_unrecognized(&endpoint.text, &evidence, minimum_rms) {
-                return Err(phorminx_vosk::VoskError::DecoderFailed);
-            }
             append_owned_text(&mut text, &endpoint.text);
-            evidence.reset();
         }
     }
     let terminal = recognizer.finish()?;
-    if instant_segment_is_unrecognized(&terminal.text, &evidence, minimum_rms) {
-        return Err(phorminx_vosk::VoskError::DecoderFailed);
-    }
     append_owned_text(&mut text, &terminal.text);
     Ok(Transcript {
         text,
@@ -4848,6 +4743,26 @@ fn transcribe_extended_instant(
     minimum_rms: f32,
 ) -> Result<Transcript, String> {
     let retained_from = audio.retained_from();
+    transcribe_extended_instant_with_source(
+        model,
+        session,
+        retained_from,
+        stats,
+        id,
+        minimum_rms,
+        |range| audio.snapshot(range).map_err(|error| error.to_string()),
+    )
+}
+
+fn transcribe_extended_instant_with_source(
+    model: &VoskModel,
+    session: Option<InstantSession>,
+    retained_from: u64,
+    stats: FinalAudioStats,
+    id: DictationId,
+    minimum_rms: f32,
+    mut snapshot: impl FnMut(SampleRange) -> Result<phorminx_session::AudioSpan, String>,
+) -> Result<Transcript, String> {
     if retained_from > stats.total_samples {
         return Err("Instant retained-audio frontier exceeds captured audio".to_owned());
     }
@@ -4855,7 +4770,15 @@ fn transcribe_extended_instant(
         if retained_from != 0 {
             return Err("Instant committed text is unavailable for retained audio".to_owned());
         }
-        return transcribe_instant_sequential(model, audio, stats, 0, String::new(), minimum_rms);
+        return transcribe_instant_sequential(
+            model,
+            retained_from,
+            stats,
+            0,
+            String::new(),
+            minimum_rms,
+            &mut snapshot,
+        );
     };
     if session.ownership.committed_through < retained_from
         || session.ownership.committed_through > session.accepted_through
@@ -4871,11 +4794,12 @@ fn transcribe_extended_instant(
         let start = session.ownership.committed_through;
         return transcribe_instant_sequential(
             model,
-            audio,
+            retained_from,
             stats,
             start,
             session.ownership.text,
             minimum_rms,
+            &mut snapshot,
         );
     }
 
@@ -4885,9 +4809,8 @@ fn transcribe_extended_instant(
         if session.accepted_through < stats.total_samples {
             let range = SampleRange::new(session.accepted_through, stats.total_samples)
                 .map_err(|error| error.to_string())?;
-            let tail = audio.snapshot(range).map_err(|error| error.to_string())?;
+            let tail = snapshot(range)?;
             for batch in tail.samples().chunks(VOSK_FEED_BATCH_SAMPLES) {
-                session.evidence.observe(batch);
                 let started = Instant::now();
                 let outcome = session
                     .recognizer
@@ -4900,15 +4823,6 @@ fn transcribe_extended_instant(
                 if let Some(endpoint) = outcome.endpoint {
                     let start = session.decoder_origin.saturating_add(endpoint.start_sample);
                     let end = session.decoder_origin.saturating_add(endpoint.end_sample);
-                    if instant_segment_is_unrecognized(
-                        &endpoint.text,
-                        &session.evidence,
-                        minimum_rms,
-                    ) {
-                        return Err(
-                            "Instant final endpoint was empty for energetic audio".to_owned()
-                        );
-                    }
                     if start != session.ownership.committed_through {
                         return Err("Instant final endpoint is non-contiguous".to_owned());
                     }
@@ -4916,7 +4830,6 @@ fn transcribe_extended_instant(
                         .ownership
                         .commit(end, &endpoint.text)
                         .map_err(str::to_owned)?;
-                    session.evidence.reset();
                 }
             }
             if session.accepted_through != stats.total_samples {
@@ -4931,9 +4844,6 @@ fn transcribe_extended_instant(
         session.inference_time = session.inference_time.saturating_add(started.elapsed());
         let start = session.decoder_origin.saturating_add(terminal.start_sample);
         let end = session.decoder_origin.saturating_add(terminal.end_sample);
-        if instant_segment_is_unrecognized(&terminal.text, &session.evidence, minimum_rms) {
-            return Err("Instant terminal result was empty for energetic audio".to_owned());
-        }
         if start != session.ownership.committed_through || end != stats.total_samples {
             return Err("Instant terminal segment is non-contiguous".to_owned());
         }
@@ -4941,9 +4851,6 @@ fn transcribe_extended_instant(
             .ownership
             .commit(end, &terminal.text)
             .map_err(str::to_owned)?;
-        if session.ownership.text.trim().is_empty() && stats.rms >= minimum_rms {
-            return Err("Instant streamed result was empty for energetic audio".to_owned());
-        }
         Ok(Transcript {
             text: session.ownership.text,
             backend: "vosk",
@@ -4961,11 +4868,12 @@ fn transcribe_extended_instant(
             );
             transcribe_instant_sequential(
                 model,
-                audio,
+                retained_from,
                 stats,
                 recovery_start,
                 recovery_prefix,
                 minimum_rms,
+                &mut snapshot,
             )
         }
     }
@@ -4973,47 +4881,37 @@ fn transcribe_extended_instant(
 
 fn transcribe_instant_sequential(
     model: &VoskModel,
-    audio: &mut ExtendedCapturedAudio,
+    retained_from: u64,
     stats: FinalAudioStats,
     start_sample: u64,
     mut text: String,
-    minimum_rms: f32,
+    _minimum_rms: f32,
+    mut snapshot: impl FnMut(SampleRange) -> Result<phorminx_session::AudioSpan, String>,
 ) -> Result<Transcript, String> {
     const RECOVERY_CHUNK_SAMPLES: u64 = 16_000 * 30;
-    if start_sample < audio.retained_from() || start_sample > stats.total_samples {
+    if start_sample < retained_from || start_sample > stats.total_samples {
         return Err("Instant recovery requested unavailable audio".to_owned());
     }
     let mut recognizer = model.session(16_000).map_err(|error| error.to_string())?;
     let started = Instant::now();
-    let mut evidence = InstantAudioEvidence::default();
     for_each_bounded_range_from(
         start_sample,
         stats.total_samples,
         RECOVERY_CHUNK_SAMPLES,
         |range| {
-            let span = audio.snapshot(range).map_err(|error| error.to_string())?;
+            let span = snapshot(range)?;
             for batch in span.samples().chunks(VOSK_FEED_BATCH_SAMPLES) {
-                evidence.observe(batch);
                 let outcome = recognizer
                     .accept_f32(batch)
                     .map_err(|error| error.to_string())?;
                 if let Some(endpoint) = outcome.endpoint {
-                    if instant_segment_is_unrecognized(&endpoint.text, &evidence, minimum_rms) {
-                        return Err(
-                            "Instant recovery endpoint was empty for energetic audio".to_owned()
-                        );
-                    }
                     append_owned_text(&mut text, &endpoint.text);
-                    evidence.reset();
                 }
             }
             Ok(())
         },
     )?;
     let terminal = recognizer.finish().map_err(|error| error.to_string())?;
-    if instant_segment_is_unrecognized(&terminal.text, &evidence, minimum_rms) {
-        return Err("Instant recovery terminal was empty for energetic audio".to_owned());
-    }
     append_owned_text(&mut text, &terminal.text);
     Ok(Transcript {
         text,
@@ -5085,23 +4983,24 @@ fn process_partial_transcription(
     let accumulator = sessions.entry(plan.id).or_default();
     let accepted_before = accumulator.accepted_through;
     let mut compute_time = Duration::ZERO;
-    let succeeded = if accumulator.degraded.is_some() {
-        false
-    } else if plan.sequence != accumulator.next_sequence {
+    let succeeded = if plan.sequence != accumulator.next_sequence {
         accumulator.degraded = Some("sequence_gap");
         false
     } else if (plan.sequence == 0) != plan.start_overlap.is_none() {
         accumulator.degraded = Some("boundary_mismatch");
         false
     } else {
+        accumulator.degraded = None;
         let options = TranscriptionOptions {
             language: Some(language),
             thread_count: None,
             audio_context: None,
         };
-        let prompt = bounded_decoder_prompt(&accumulator.text);
         let (recognition, measured) = WallComputeClock.measure(|| {
-            recognizer.transcribe_detailed(&clip, &options, prompt.as_deref(), Some(abort))
+            // Each overlapping audio window already carries acoustic context.
+            // Refeeding the accumulated transcript makes Whisper repeat old
+            // paragraphs and can substantially delay otherwise healthy calls.
+            recognizer.transcribe_detailed(&clip, &options, None, Some(abort))
         });
         compute_time = measured;
         accumulator.partial_compute_time = accumulator
@@ -5118,6 +5017,23 @@ fn process_partial_transcription(
                     &detailed.segments,
                     silence_threshold,
                 );
+                if accumulator.degraded == Some("timestamp_repair_exhausted") {
+                    let (repaired, repair_time) = WallComputeClock.measure(|| {
+                        repair_accurate_chunk(recognizer, accumulator, plan, &clip, &options, abort)
+                    });
+                    compute_time = compute_time.saturating_add(repair_time);
+                    accumulator.partial_compute_time =
+                        accumulator.partial_compute_time.saturating_add(repair_time);
+                    if let Err(error) = repaired {
+                        eprintln!(
+                            "dictation_id={} state=Listening event=accurate_chunk_retry_failed error={error}",
+                            plan.id.0
+                        );
+                    }
+                    // The next partial retries unresolved audio. A timestamp
+                    // disagreement is not a terminal decoder failure.
+                    accumulator.degraded = None;
+                }
                 accumulator.timestamp_stable = true;
                 accumulator.stable_end = plan.stable_end;
                 // Text was admitted by absolute timestamp and ends no later
@@ -5126,7 +5042,7 @@ fn process_partial_transcription(
                 accumulator.last_boundary = Some(BoundaryKind::Silence);
                 accumulator.next_sequence = accumulator.next_sequence.saturating_add(1);
                 accumulator.model_load_time = transcript.model_load_time;
-                accumulator.degraded.is_none()
+                true
             }
             Err(WhisperError::Aborted) => false,
             Err(_) => {
@@ -5154,6 +5070,65 @@ fn process_partial_transcription(
         compute_time,
         audio_duration,
     }
+}
+
+fn accurate_repair_window(
+    clip_start: u64,
+    sample_count: usize,
+    accepted_through: u64,
+) -> Option<SampleRange> {
+    let clip_end = clip_start.checked_add(u64::try_from(sample_count).ok()?)?;
+    let start = clip_start.max(accepted_through.saturating_sub(ACCURATE_REPAIR_OVERLAP_SAMPLES));
+    let end = start
+        .checked_add(MAX_ACCURATE_LIVE_REPAIR_SAMPLES)?
+        .min(clip_end);
+    if end <= accepted_through {
+        return None;
+    }
+    SampleRange::new(start, end).ok()
+}
+
+fn repair_accurate_chunk(
+    recognizer: &WhisperRecognizer,
+    accumulator: &mut PartialAccumulator,
+    plan: phorminx_app::incremental::ChunkPlan,
+    clip: &AudioClip,
+    options: &TranscriptionOptions<'_>,
+    abort: &Arc<AtomicBool>,
+) -> Result<(), WhisperError> {
+    // Whisper segment timestamps are approximate. Once repeated timestamp
+    // alignment stops making progress, recognize a bounded independent chunk
+    // using the same transcript acceptance policy as a final decode. Preserve
+    // every returned word and retain the decoded right edge for continuation.
+    let clip_start = canonical_sample(plan.range.start);
+    let Some(range) = accurate_repair_window(
+        clip_start,
+        clip.samples.len(),
+        canonical_sample(accumulator.accepted_through),
+    ) else {
+        return Ok(());
+    };
+    let offset = (range.start() - clip_start) as usize;
+    let length = range.len() as usize;
+    let end = range.end();
+    let repair_clip = AudioClip {
+        samples: clip.samples[offset..offset + length].to_vec(),
+        sample_rate: clip.sample_rate,
+    };
+    let result = recognizer.transcribe_detailed(&repair_clip, options, None, Some(abort))?;
+    let text = strip_known_non_speech_annotations(&result.transcript.text);
+    // A successful empty decode is a no-words result, not a decoder error.
+    // RMS alone cannot establish that speech exists in ambient noise.
+    if !text.trim().is_empty() {
+        accumulator.text = merge_confirmed_hypothesis(&accumulator.text, &text);
+    }
+    // All returned text is owned through the chunk end. Capture reclamation
+    // independently retains two seconds before this frontier, so the next
+    // normal decode can reconcile a word straddling the physical cut.
+    accumulator.accepted_through = accumulator.accepted_through.max(canonical_duration(end));
+    accumulator.unresolved_from = Some(accumulator.accepted_through);
+    accumulator.provisional = None;
+    Ok(())
 }
 
 fn append_timestamp_stable_segments(
@@ -5205,7 +5180,7 @@ fn append_timestamp_stable_segments(
         .then(|| {
             current_hypothesis.map(|text| AccurateHypothesis {
                 text,
-                commit_through: guarded_end,
+                commit_through: plan.range.end,
                 range: plan.range,
             })
         })
@@ -5316,9 +5291,9 @@ fn append_timestamp_stable_segments(
         && guarded_end_sample.saturating_sub(canonical_sample(unresolved_from))
             > MAX_ACCURATE_LIVE_REPAIR_SAMPLES
     {
-        // Stop scheduling increasingly large partial decodes. The committed
-        // prefix remains owned, no audio is reclaimed past the uncertainty,
-        // and release recovery reads only the retained unresolved tail.
+        // Request a bounded independent decode when timestamp alignment has
+        // stalled. This marker is handled in the same worker call and must
+        // never permanently disable the live transcription planner.
         accumulator.degraded = Some("timestamp_repair_exhausted");
     }
 }
@@ -5331,6 +5306,11 @@ fn hypothesis_is_confirmed(
     const MAX_HYPOTHESIS_WORDS: usize = 256;
     previous.range.start < current_range.end
         && current_range.start < previous.range.end
+        && current_range.end
+            >= previous
+                .range
+                .end
+                .saturating_add(canonical_duration(ACCURATE_REPAIR_OVERLAP_SAMPLES))
         && longest_word_overlap(&previous.text, current_text, MAX_HYPOTHESIS_WORDS) >= 2
 }
 
@@ -5482,24 +5462,9 @@ fn append_with_spacing(output: &mut String, value: &str) {
     output.push_str(value);
 }
 
-fn bounded_decoder_prompt(text: &str) -> Option<String> {
-    const MAX_PROMPT_CHARS: usize = 512;
-    if text.trim().is_empty() {
-        return None;
-    }
-    let mut start = text.len();
-    for (count, (index, _)) in text.char_indices().rev().enumerate() {
-        if count == MAX_PROMPT_CHARS {
-            break;
-        }
-        start = index;
-    }
-    Some(text[start..].to_owned())
-}
-
-/// Detects high-confidence decoder loops without retaining or logging content.
-/// Short intentional repetition is valid speech, so only a long phrase
-/// repeated at least four consecutive times is classified as pathological.
+/// Flags repeated phrases for diagnostics without retaining or logging content.
+/// Text alone cannot distinguish intentional repetition from a decoder loop;
+/// this must never reject a transcript or trigger a replacement transcription.
 fn has_pathological_repetition(text: &str) -> bool {
     const MIN_SPAN_WORDS: usize = 5;
     const REPEATS: usize = 4;
@@ -5600,9 +5565,6 @@ where
                 full_duration,
             )
             .map_err(|reason| format!("extended Accurate seam could not be proven: {reason}"))?;
-            if has_pathological_repetition(&transcript.text) {
-                return Err("Whisper produced a repeated output loop".to_owned());
-            }
             eprintln!(
                 "dictation_id={} state=Transcribing event=extended_final_tail tail_audio_ms={}",
                 id.0,
@@ -5694,9 +5656,6 @@ where
         }
         cursor = end.saturating_sub(OVERLAP);
     }
-    if has_pathological_repetition(&output) {
-        return Err("Whisper produced a repeated output loop".to_owned());
-    }
     Ok(Transcript {
         text: output,
         backend: backend.unwrap_or("whisper.cpp"),
@@ -5764,16 +5723,7 @@ where
                     accumulator.partial_compute_time.as_millis(),
                     tail_compute_time.as_millis()
                 );
-                if has_pathological_repetition(&transcript.text) {
-                    fallback = Some(TailAttemptError {
-                        reason: "incremental_repetition_loop",
-                        compute_time: transcript
-                            .inference_time
-                            .saturating_sub(accumulator.partial_compute_time),
-                    });
-                } else {
-                    return Ok(transcript);
-                }
+                return Ok(transcript);
             }
             Err(error) => fallback = Some(error),
         }
@@ -5805,9 +5755,6 @@ where
             error.compute_time.as_millis(),
             fallback_compute_time.as_millis()
         );
-    }
-    if has_pathological_repetition(&transcript.text) {
-        return Err("Whisper produced a repeated output loop".to_owned());
     }
     Ok(transcript)
 }
@@ -6282,6 +6229,9 @@ fn process_transcript(
     );
     let formatting_started = Instant::now();
     let mut warnings = Vec::new();
+    if has_pathological_repetition(&raw_text) {
+        warnings.push("recognition_repeated_phrase".to_owned());
+    }
     let mut terminal = TerminalMetadata::default();
     let _ollama_compute = formatting
         .uses_ollama()
@@ -6855,7 +6805,7 @@ mod composition_tests {
     }
 
     #[test]
-    fn repetition_guard_rejects_decoder_loops_but_not_normal_emphasis() {
+    fn repetition_diagnostic_flags_long_phrases_but_not_short_emphasis() {
         assert!(has_pathological_repetition(
             "the same decoder phrase repeats forever the same decoder phrase repeats forever the same decoder phrase repeats forever the same decoder phrase repeats forever"
         ));
@@ -7442,7 +7392,6 @@ mod composition_tests {
             let clip_samples = canonical_sample(plan.range.duration()) as usize;
             maximum_decode_samples = maximum_decode_samples.max(clip_samples);
             let clip = AudioClip::new(vec![0.1; clip_samples], 16_000).unwrap();
-            let guarded_end = plan.stable_end - Duration::from_secs(2);
             let hypothesis = (plan.range.start.as_secs()..plan.range.end.as_secs())
                 .map(|second| format!("word{second} alpha{second} beta{second} omega{second}"))
                 .collect::<Vec<_>>()
@@ -7461,7 +7410,7 @@ mod composition_tests {
             let expected = if sequence == 0 {
                 Duration::ZERO
             } else {
-                guarded_end.saturating_sub(Duration::from_secs(3))
+                plan.range.end.saturating_sub(Duration::from_secs(3))
             };
             assert_eq!(accumulator.accepted_through, expected);
             assert_eq!(accumulator.unresolved_from, Some(expected));
@@ -7473,14 +7422,14 @@ mod composition_tests {
 
         assert_eq!(
             accumulator.accepted_through,
-            Duration::from_secs(3 * 60 * 60 - 5)
+            Duration::from_secs(3 * 60 * 60 - 3)
         );
         assert_eq!(
             accumulator
                 .provisional
                 .as_ref()
                 .map(|hypothesis| hypothesis.commit_through),
-            Some(Duration::from_secs(3 * 60 * 60 - 2))
+            Some(Duration::from_secs(3 * 60 * 60))
         );
         // The production worker records this after each successful partial;
         // this fixture drives the lower-level accumulator directly.
@@ -7488,7 +7437,7 @@ mod composition_tests {
         accumulator.timestamp_stable = true;
         accumulator.last_boundary = Some(BoundaryKind::Forced);
         let release_plan = final_tail_plan(&accumulator, Duration::from_secs(3 * 60 * 60)).unwrap();
-        assert_eq!(release_plan.start, Duration::from_secs(3 * 60 * 60 - 7));
+        assert_eq!(release_plan.start, Duration::from_secs(3 * 60 * 60 - 5));
         assert_eq!(release_plan.expectation, MergeExpectation::LexicalOverlap);
         assert!(
             Duration::from_secs(3 * 60 * 60).saturating_sub(release_plan.start)
@@ -7868,14 +7817,10 @@ mod composition_tests {
     }
 
     #[test]
-    fn incremental_decoder_loop_recovers_with_one_clean_full_clip_pass() {
-        let recognizer = SequencedRecognizer::new([
-            SequencedOutcome::Text(
-                "the same decoder phrase repeats forever the same decoder phrase repeats forever the same decoder phrase repeats forever the same decoder phrase repeats forever",
-            ),
-            SequencedOutcome::Text("clean full transcript"),
-        ]);
-        let clock = ScriptedClock::new([Duration::from_millis(200), Duration::from_millis(300)]);
+    fn incremental_repeated_speech_is_delivered_without_retranscription() {
+        let repeated = "please keep all of these words please keep all of these words please keep all of these words please keep all of these words";
+        let recognizer = SequencedRecognizer::new([SequencedOutcome::Text(repeated)]);
+        let clock = ScriptedClock::new([Duration::from_millis(200)]);
         let full_clip = AudioClip::new(vec![0.1; 160_000], 16_000).unwrap();
 
         let result = transcribe_final_with_clock(
@@ -7889,9 +7834,75 @@ mod composition_tests {
         )
         .unwrap();
 
-        assert_eq!(result.text, "clean full transcript");
-        assert_eq!(recognizer.clip_lengths.borrow().len(), 2);
-        assert_eq!(recognizer.clip_lengths.borrow()[1], full_clip.samples.len());
+        assert_eq!(result.text, format!("stable introduction {repeated}"));
+        assert_eq!(recognizer.clip_lengths.borrow().len(), 1);
+        assert_repeated_speech_delivery(result);
+    }
+
+    #[test]
+    fn full_accurate_repeated_speech_reaches_normal_delivery() {
+        let repeated = "please keep all of these words please keep all of these words please keep all of these words please keep all of these words";
+        let recognizer = SequencedRecognizer::new([SequencedOutcome::Text(repeated)]);
+        let clock = ScriptedClock::new([Duration::from_millis(200)]);
+        let full_clip = AudioClip::new(vec![0.1; 160_000], 16_000).unwrap();
+        let result = transcribe_final_with_clock(
+            &recognizer,
+            None,
+            &full_clip,
+            "en",
+            recommended_audio_context(full_clip.duration()),
+            DictationId(82),
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(result.text, repeated);
+        assert_repeated_speech_delivery(result);
+    }
+
+    #[test]
+    fn vosk_repeated_speech_reaches_normal_delivery() {
+        let mut recognized = transcript(
+            "please keep all of these words please keep all of these words please keep all of these words please keep all of these words",
+        );
+        recognized.backend = "vosk";
+        assert_repeated_speech_delivery(recognized);
+    }
+
+    fn assert_repeated_speech_delivery(recognized: Transcript) {
+        let original = recognized.text.clone();
+        for profile in [
+            FormatProfile::Raw,
+            FormatProfile::Light,
+            FormatProfile::Balanced,
+        ] {
+            let processed = process_transcript(
+                recognized.clone(),
+                "en",
+                &WorkerFormatting {
+                    profile: profile.clone(),
+                    model: None,
+                    model_identity: None,
+                    keep_alive: KeepAlive::UnloadAfterRequest,
+                },
+                None,
+                &[],
+                None,
+                &CancellationToken::new(),
+            );
+            assert_eq!(processed.raw_text, original);
+            let expected = if matches!(profile, FormatProfile::Raw) {
+                original.clone()
+            } else {
+                normalize_transcript(&original)
+            };
+            assert_eq!(processed.transcript.text, expected);
+            assert!(
+                processed
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == "recognition_repeated_phrase")
+            );
+        }
     }
 
     #[test]
@@ -8173,7 +8184,6 @@ mod composition_tests {
             FinalAudioStats {
                 total_samples: 16_000 * 130,
                 peak_retained_samples: 16_000 * 120,
-                rms: 0.2,
                 auto_stopped: false,
             },
             0,
@@ -8205,7 +8215,6 @@ mod composition_tests {
             FinalAudioStats {
                 total_samples: 16_000 * 130,
                 peak_retained_samples: 16_000 * 120,
-                rms: 0.2,
                 auto_stopped: false,
             },
             0,
@@ -8235,6 +8244,64 @@ mod composition_tests {
     }
 
     #[test]
+    fn extended_accurate_repeated_speech_reaches_delivery_from_both_final_paths() {
+        const REPEATED: &str = "please keep all of these words please keep all of these words please keep all of these words please keep all of these words";
+        for retained in [false, true] {
+            let recognizer = if retained {
+                SequencedRecognizer::new([SequencedOutcome::Text("closing words")])
+            } else {
+                SequencedRecognizer::new([
+                    SequencedOutcome::Text(concat!(
+                        "please keep all of these words please keep all of these words please keep all of these words please keep all of these words",
+                        " shared two"
+                    )),
+                    SequencedOutcome::Text("shared two three four"),
+                    SequencedOutcome::Text("three four five six"),
+                    SequencedOutcome::Text("five six seven eight"),
+                    SequencedOutcome::Text("seven eight closing words"),
+                ])
+            };
+            let accumulator = retained.then(|| PartialAccumulator {
+                text: REPEATED.to_owned(),
+                stable_end: Duration::from_secs(120),
+                accepted_through: Duration::from_secs(120),
+                timestamp_stable: true,
+                last_boundary: Some(BoundaryKind::Silence),
+                next_sequence: 40,
+                ..PartialAccumulator::default()
+            });
+            let recognized = transcribe_extended_accurate_with_source(
+                &recognizer,
+                accumulator,
+                FinalAudioStats {
+                    total_samples: 16_000 * 130,
+                    peak_retained_samples: 16_000 * 45,
+                    auto_stopped: false,
+                },
+                if retained { 16_000 * 118 } else { 0 },
+                "en",
+                DictationId(93),
+                |range| {
+                    AudioClip::new(vec![0.2; range.len() as usize], 16_000)
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .unwrap();
+            let expected = if retained {
+                format!("{REPEATED} closing words")
+            } else {
+                format!("{REPEATED} shared two three four five six seven eight closing words")
+            };
+            assert_eq!(recognized.text, expected);
+            assert_eq!(
+                recognizer.clip_lengths.borrow().len(),
+                if retained { 1 } else { 5 }
+            );
+            assert_repeated_speech_delivery(recognized);
+        }
+    }
+
+    #[test]
     fn extended_accurate_reads_only_the_unresolved_tail_after_120_seconds() {
         let recognizer = CountingRecognizer::returning("tail text");
         let accumulator = PartialAccumulator {
@@ -8253,7 +8320,6 @@ mod composition_tests {
             FinalAudioStats {
                 total_samples: 16_000 * 130,
                 peak_retained_samples: 16_000 * 120,
-                rms: 0.2,
                 auto_stopped: false,
             },
             16_000 * 118,
@@ -8294,7 +8360,6 @@ mod composition_tests {
             FinalAudioStats {
                 total_samples: 16_000 * 130,
                 peak_retained_samples: 16_000 * 45,
-                rms: 0.2,
                 auto_stopped: false,
             },
             16_000 * 118,
@@ -8333,7 +8398,6 @@ mod composition_tests {
             FinalAudioStats {
                 total_samples: 16_000 * 183,
                 peak_retained_samples: 16_000 * 45,
-                rms: 0.2,
                 auto_stopped: false,
             },
             16_000 * 178,
@@ -8370,7 +8434,6 @@ mod composition_tests {
             FinalAudioStats {
                 total_samples: total,
                 peak_retained_samples: 16_000 * 45,
-                rms: 0.2,
                 auto_stopped: false,
             },
             accepted - ACCURATE_REPAIR_OVERLAP_SAMPLES,
@@ -8615,25 +8678,6 @@ mod composition_tests {
             recovery,
             [SampleRange::new(capture.retained_from, capture.total).unwrap()]
         );
-    }
-
-    #[test]
-    fn instant_empty_result_uses_the_effective_configured_speech_threshold() {
-        let mut evidence = InstantAudioEvidence::default();
-        evidence.observe_constant(0.0, 16_000 * 29);
-        evidence.observe_constant(0.003, INSTANT_EVIDENCE_WINDOW_SAMPLES);
-        assert!(instant_segment_is_unrecognized("", &evidence, 0.003));
-        assert!(!instant_segment_is_unrecognized("", &evidence, 0.004));
-        assert!(!instant_segment_is_unrecognized(
-            "recognized",
-            &evidence,
-            0.003
-        ));
-
-        evidence.reset();
-        evidence.observe_constant(0.02, 16_000);
-        assert!(instant_segment_is_unrecognized("", &evidence, 0.015));
-        assert!(!instant_segment_is_unrecognized("", &evidence, 0.025));
     }
 
     #[test]

@@ -153,8 +153,8 @@ impl WhisperRecognizer {
     }
 
     /// Runs Whisper with segment timestamps, bounded decoder context, and an
-    /// optional cooperative abort flag. The prompt is decoder context only; it
-    /// is never emitted or logged by this layer.
+    /// optional cooperative abort flag. A supplied prompt influences decoding
+    /// and may be reproduced by the model; pass None for independent windows.
     pub fn transcribe_detailed(
         &self,
         clip: &AudioClip,

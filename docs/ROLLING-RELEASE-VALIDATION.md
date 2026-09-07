@@ -1,5 +1,11 @@
 # Rolling dictation release validation — 2026-09-06
 
+Historical baseline for revision `2fb4037`. Later recording and delivery
+regression fixes, current validation, and replacement artifact hashes are
+tracked in [continuous dictation regressions](CONTINUOUS-DICTATION-REGRESSIONS.md).
+The artifact hashes below describe that earlier build, not a later installer
+written to the same output directory.
+
 The integrated revision uses bounded rolling audio, timestamp-aware Whisper
 repair, Vosk whole-word rollover/replay, and encrypted interrupted-text recovery.
 
