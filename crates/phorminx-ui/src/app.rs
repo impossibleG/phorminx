@@ -58,6 +58,7 @@ impl PhorminxUi {
     pub fn apply_snapshot(&mut self, snapshot: ShellSnapshot) {
         if self.route != snapshot.route && self.pages.shortcut_capture.is_some() {
             self.pages.shortcut_capture = None;
+            self.pages.shortcut_capture_error = None;
             self.outbox.push(ShellEvent::ShortcutCapture(false));
         }
         if self.route == Route::Setup && snapshot.route != Route::Setup {
@@ -87,6 +88,7 @@ impl PhorminxUi {
     pub fn navigate(&mut self, route: Route) {
         if self.route != route {
             if self.pages.shortcut_capture.take().is_some() {
+                self.pages.shortcut_capture_error = None;
                 self.outbox.push(ShellEvent::ShortcutCapture(false));
             }
             if self.route == Route::Setup {
@@ -232,6 +234,7 @@ impl PhorminxUi {
         let tokens = ui.tokens();
         let compact = ui.available_width() < 760.0;
         if !ui.input(|input| input.focused) && self.pages.shortcut_capture.take().is_some() {
+            self.pages.shortcut_capture_error = None;
             self.outbox.push(ShellEvent::ShortcutCapture(false));
         }
         egui::Frame::new()

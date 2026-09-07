@@ -110,19 +110,29 @@ pub(crate) fn shortcuts(ui: &mut Ui, state: &mut PageState, outbox: &mut Vec<She
             {
                 if key == egui::Key::Escape {
                     state.shortcut_capture = None;
+                    state.shortcut_capture_error = None;
                     outbox.push(ShellEvent::ShortcutCapture(false));
                     break;
                 }
-                if let Some(chord) = captured_chord(key, modifiers) {
-                    match target {
-                        ShortcutTarget::Launcher => state.settings.launcher_shortcut = chord,
-                        ShortcutTarget::Direct => state.settings.direct_dictation_shortcut = chord,
+                let chord = match captured_chord(key, modifiers) {
+                    Ok(chord) => chord,
+                    Err(message) => {
+                        state.shortcut_capture_error = Some(message);
+                        continue;
                     }
-                    state.shortcut_capture = None;
-                    outbox.push(ShellEvent::ShortcutCapture(false));
-                    break;
+                };
+                match target {
+                    ShortcutTarget::Launcher => state.settings.launcher_shortcut = chord,
+                    ShortcutTarget::Direct => state.settings.direct_dictation_shortcut = chord,
                 }
+                state.shortcut_capture = None;
+                state.shortcut_capture_error = None;
+                outbox.push(ShellEvent::ShortcutCapture(false));
+                break;
             }
+        }
+        if let Some(message) = state.shortcut_capture_error {
+            ui.label(RichText::new(message).color(tokens.accent_focus));
         }
     }
     state.settings_dirty |= original != state.settings;
@@ -160,6 +170,7 @@ fn shortcut_editor(
         .clicked()
         {
             state.shortcut_capture = if capturing { None } else { Some(target) };
+            state.shortcut_capture_error = None;
             ui.memory_mut(|memory| {
                 memory.surrender_focus(ui.id().with(format!("shortcut-{target:?}")))
             });
@@ -167,6 +178,7 @@ fn shortcut_editor(
         }
         if target == ShortcutTarget::Direct && action(ui, "Disable", ActionTone::Quiet).clicked() {
             state.settings.direct_dictation_shortcut.clear();
+            state.shortcut_capture_error = None;
             if state.shortcut_capture.take().is_some() {
                 outbox.push(ShellEvent::ShortcutCapture(false));
             }
@@ -174,7 +186,15 @@ fn shortcut_editor(
     });
 }
 
-fn captured_chord(key: egui::Key, modifiers: egui::Modifiers) -> Option<String> {
+fn captured_chord(key: egui::Key, modifiers: egui::Modifiers) -> Result<String, &'static str> {
+    // Keep the capture policy aligned with the native Shortcut::parse policy.
+    // `command` mirrors Ctrl on Windows, so it must not be rejected. `mac_cmd`
+    // covers macOS Command input only; egui-winit does not expose Win here.
+    if modifiers.mac_cmd || modifiers.alt && !modifiers.ctrl {
+        return Err(
+            "Windows-key and Alt-without-Ctrl shortcuts are not supported. Use Ctrl (optionally Alt/Shift), or a function key.",
+        );
+    }
     let name = format!("{key:?}");
     let key_name = if name.len() == 1 && name.as_bytes()[0].is_ascii_uppercase() {
         name
@@ -188,11 +208,20 @@ fn captured_chord(key: egui::Key, modifiers: egui::Modifiers) -> Option<String> 
     {
         name
     } else {
-        return None;
+        return Err("Choose a letter, number, Space, Enter, or a function key.");
     };
     let function_key = key_name.starts_with('F') && key_name.len() > 1;
-    if !modifiers.ctrl && !modifiers.alt && !modifiers.shift && !function_key {
-        return None;
+    if !modifiers.ctrl && !function_key {
+        return Err(
+            "Letters, numbers, Space, and Enter need Ctrl so ordinary typing stays available.",
+        );
+    }
+    if key == egui::Key::F12
+        || key == egui::Key::F4 && modifiers.ctrl && !modifiers.alt && !modifiers.shift
+    {
+        return Err(
+            "This shortcut is reserved by Windows or closes applications. Choose another combination.",
+        );
     }
     let mut parts = Vec::new();
     if modifiers.ctrl {
@@ -205,7 +234,7 @@ fn captured_chord(key: egui::Key, modifiers: egui::Modifiers) -> Option<String> 
         parts.push("Shift".to_owned());
     }
     parts.push(key_name);
-    Some(parts.join("+"))
+    Ok(parts.join("+"))
 }
 
 /// Returns true when the ranked results replace the ordinary chronology.
@@ -437,7 +466,7 @@ mod tests {
 
     #[test]
     fn capture_requires_explicit_chord_or_function_key() {
-        assert_eq!(captured_chord(egui::Key::A, egui::Modifiers::NONE), None);
+        assert!(captured_chord(egui::Key::A, egui::Modifiers::NONE).is_err());
         assert_eq!(
             captured_chord(
                 egui::Key::Space,
@@ -447,16 +476,102 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            Some("Ctrl+Alt+Space".into())
+            Ok("Ctrl+Alt+Space".into())
         );
         assert_eq!(
             captured_chord(egui::Key::F8, egui::Modifiers::NONE),
-            Some("F8".into())
+            Ok("F8".into())
+        );
+        assert!(captured_chord(egui::Key::Escape, egui::Modifiers::CTRL).is_err());
+    }
+
+    #[test]
+    fn capture_rejects_combinations_the_native_parser_cannot_save() {
+        for (key, modifiers) in [
+            (egui::Key::Space, egui::Modifiers::ALT),
+            (egui::Key::F8, egui::Modifiers::ALT),
+            (egui::Key::A, egui::Modifiers::SHIFT),
+            (egui::Key::F12, egui::Modifiers::NONE),
+            (egui::Key::F12, egui::Modifiers::CTRL),
+            (egui::Key::F4, egui::Modifiers::CTRL),
+            (
+                egui::Key::F8,
+                egui::Modifiers {
+                    mac_cmd: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                egui::Key::A,
+                egui::Modifiers {
+                    mac_cmd: true,
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            assert!(
+                captured_chord(key, modifiers).is_err(),
+                "{key:?} {modifiers:?}"
+            );
+        }
+        assert_eq!(
+            captured_chord(egui::Key::F8, egui::Modifiers::SHIFT),
+            Ok("Shift+F8".into())
         );
         assert_eq!(
-            captured_chord(egui::Key::Escape, egui::Modifiers::CTRL),
-            None
+            captured_chord(
+                egui::Key::A,
+                egui::Modifiers {
+                    ctrl: true,
+                    command: true,
+                    ..Default::default()
+                }
+            ),
+            Ok("Ctrl+A".into())
         );
+    }
+
+    #[test]
+    fn rejected_capture_preserves_draft_and_allows_retry_or_cancel() {
+        for next_key in [egui::Key::F8, egui::Key::Escape] {
+            let mut state = PageState::from_snapshot(&ShellSnapshot::default());
+            let original = state.settings.clone();
+            state.shortcut_capture = Some(ShortcutTarget::Launcher);
+            let mut events = Vec::new();
+            let context = egui::Context::default();
+            for key in [egui::Key::F12, next_key] {
+                let input = egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                };
+                let mut output = context.run_ui(input, |ui| shortcuts(ui, &mut state, &mut events));
+                output.textures_delta.clear();
+                if key == egui::Key::F12 {
+                    assert_eq!(state.settings, original);
+                    assert!(!state.settings_dirty);
+                    assert_eq!(state.shortcut_capture, Some(ShortcutTarget::Launcher));
+                    assert!(state.shortcut_capture_error.unwrap().contains("reserved"));
+                    assert!(events.is_empty());
+                }
+            }
+            assert!(state.shortcut_capture.is_none());
+            assert!(state.shortcut_capture_error.is_none());
+            assert_eq!(events, vec![ShellEvent::ShortcutCapture(false)]);
+            if next_key == egui::Key::F8 {
+                assert_eq!(state.settings.launcher_shortcut, "F8");
+                assert!(state.settings_dirty);
+            } else {
+                assert_eq!(state.settings, original);
+                assert!(!state.settings_dirty);
+            }
+        }
     }
 
     #[test]

@@ -1358,6 +1358,27 @@ impl UiBridgeError {
 
     fn settings(error: SettingsError) -> Self {
         let (field, message) = match error {
+            SettingsError::InvalidShortcut(error) => {
+                use phorminx_windows::ShortcutError;
+                let message = match error {
+                    ShortcutError::Invalid => {
+                        "Choose a Ctrl combination or a function key. Ctrl can be combined with Alt and Shift."
+                    }
+                    ShortcutError::NeedsModifier => {
+                        "Letters, numbers, Space, and Enter need Ctrl so ordinary typing stays available."
+                    }
+                    ShortcutError::UnsupportedModifier => {
+                        "Windows-key and Alt-without-Ctrl shortcuts are not supported. Use Ctrl (optionally Alt/Shift), or a function key."
+                    }
+                    ShortcutError::Reserved => {
+                        "This shortcut is reserved by Windows or closes applications. Choose another combination."
+                    }
+                    ShortcutError::Duplicate => {
+                        "The launcher and direct dictation shortcuts must be different."
+                    }
+                };
+                return Self::validation("shortcut", message);
+            }
             SettingsError::EmptyModelPath => (Some("model_path"), "Select a Whisper model."),
             SettingsError::InvalidMinimumRms(_) => {
                 (Some("minimum_rms"), "Use a speech level between 0 and 1.")
@@ -1420,6 +1441,45 @@ mod tests {
     use super::*;
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn shortcut_validation_reports_the_reason_without_changing_settings() {
+        use phorminx_windows::ShortcutError;
+        let mut test = TestBridge::new();
+        let original = test.bridge.settings().clone();
+        let readiness = test.readiness();
+        for (launcher, direct, expected) in [
+            ("Ctrl", None, ShortcutError::Invalid),
+            ("Shift+A", None, ShortcutError::NeedsModifier),
+            ("Alt+Space", None, ShortcutError::UnsupportedModifier),
+            ("Win+F8", None, ShortcutError::UnsupportedModifier),
+            ("Ctrl+F12", None, ShortcutError::Reserved),
+            ("Ctrl+F4", None, ShortcutError::Reserved),
+            (
+                "Ctrl+Alt+Space",
+                Some(" alt + control + space "),
+                ShortcutError::Duplicate,
+            ),
+            (
+                "Ctrl+Alt+Space",
+                Some("Alt+Space"),
+                ShortcutError::UnsupportedModifier,
+            ),
+        ] {
+            let mut candidate = original.clone();
+            candidate.interaction.launcher_shortcut = launcher.into();
+            candidate.interaction.direct_dictation_shortcut = direct.map(str::to_owned);
+            let error = test
+                .bridge
+                .execute(UiCommand::SaveSettings(candidate), &readiness, 0)
+                .unwrap_err();
+            assert_eq!(error.code, "validation");
+            assert_eq!(error.field, Some("shortcut"));
+            assert_eq!(error.message, expected.to_string());
+            assert_eq!(test.bridge.settings(), &original);
+            assert_eq!(test.bridge.store.load().unwrap(), original);
+        }
+    }
 
     #[test]
     fn resident_and_layout_readiness_never_invoke_the_full_vosk_loader() {

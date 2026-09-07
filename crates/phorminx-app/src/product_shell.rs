@@ -2125,7 +2125,12 @@ mod tests {
             "validation feedback must appear in the current shell snapshot without another event",
         );
         assert_eq!(notice.kind, NoticeKind::Error);
-        assert!(!notice.detail.is_empty());
+        assert!(
+            notice
+                .detail
+                .contains("Choose a Ctrl combination or a function key.")
+        );
+        assert!(!notice.detail.contains("Settings could not be saved."));
     }
 
     #[test]
