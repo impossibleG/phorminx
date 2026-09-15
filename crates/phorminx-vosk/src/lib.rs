@@ -150,6 +150,7 @@ struct Api {
     accept_waveform: AcceptWaveform,
     result: ResultFn,
     final_result: ResultFn,
+    partial_result: ResultFn,
     set_words: SetWords,
 }
 
@@ -173,6 +174,7 @@ impl Api {
         let accept_waveform = symbol!("vosk_recognizer_accept_waveform", AcceptWaveform);
         let result = symbol!("vosk_recognizer_result", ResultFn);
         let final_result = symbol!("vosk_recognizer_final_result", ResultFn);
+        let partial_result = symbol!("vosk_recognizer_partial_result", ResultFn);
         let set_words = symbol!("vosk_recognizer_set_words", SetWords);
         let set_log_level = symbol!("vosk_set_log_level", SetLogLevel);
         // SAFETY: public Vosk API; suppress native path/content-adjacent logs so
@@ -187,6 +189,7 @@ impl Api {
             accept_waveform,
             result,
             final_result,
+            partial_result,
             set_words,
         })
     }
@@ -333,6 +336,17 @@ pub struct AcceptOutcome {
 }
 
 impl VoskSession {
+    /// Provisional display text only. It conveys no audio ownership and may be
+    /// revised; callers must never persist/send it as a finalized transcript.
+    pub fn partial_text(&self) -> Result<String, VoskError> {
+        // SAFETY: this session owns a live recognizer; Vosk owns the returned
+        // NUL-terminated buffer until the next call. Copy/parse before returning.
+        let pointer = unsafe { (self.model.api.partial_result)(self.raw) };
+        if pointer.is_null() {
+            return Err(VoskError::NullResult);
+        }
+        parse_partial(unsafe { CStr::from_ptr(pointer) }.to_bytes())
+    }
     /// Accepts native-rate mono f32 samples. Conversion happens on the decoder
     /// worker, never in the audio callback.
     pub fn accept_f32(&mut self, samples: &[f32]) -> Result<AcceptOutcome, VoskError> {
@@ -483,6 +497,16 @@ fn parse_result(
     Ok((document.text.trim().to_owned(), words))
 }
 
+fn parse_partial(json: &[u8]) -> Result<String, VoskError> {
+    #[derive(Deserialize)]
+    struct PartialDocument {
+        partial: String,
+    }
+    let document =
+        serde_json::from_slice::<PartialDocument>(json).map_err(VoskError::InvalidJson)?;
+    Ok(document.partial.trim().to_owned())
+}
+
 fn timestamp_sample(seconds: f64, sample_rate: u32) -> Option<u64> {
     let sample = seconds * f64::from(sample_rate);
     (sample.is_finite() && sample >= 0.0 && sample <= u64::MAX as f64)
@@ -507,6 +531,17 @@ fn pcm16_bytes(samples: &[f32]) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn partial_text_is_separate_from_finalized_text_and_rejects_malformed_json() {
+        assert_eq!(
+            parse_partial(br#"{"partial":"  provisional words  ","text":"not final"}"#).unwrap(),
+            "provisional words"
+        );
+        assert_eq!(parse_partial(br#"{"partial":""}"#).unwrap(), "");
+        assert!(parse_partial(br#"{"text":"not a partial"}"#).is_err());
+        assert!(parse_partial(br#"{"partial":7}"#).is_err());
+    }
 
     #[test]
     fn parses_text_without_exposing_other_result_fields() {

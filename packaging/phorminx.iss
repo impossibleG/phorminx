@@ -1,5 +1,5 @@
 #define AppPublisher "Phorminx"
-#define AppURL "https://github.com/autoantohaki/phorminx"
+#define AppURL "https://github.com/impossibleG/phorminx"
 
 #ifndef AppVersion
   #define AppVersion "0.1.0"

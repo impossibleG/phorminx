@@ -14,3 +14,26 @@ test-data/
 *.db
 *.db-shm
 *.db-wal
+
+# Private runtime data and credentials (never publication inputs).
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+*.pfx
+*.p12
+id_ed25519
+id_rsa
+/settings.toml
+*.sqlite
+*.sqlite3
+*.log
+*.dmp
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.pcm

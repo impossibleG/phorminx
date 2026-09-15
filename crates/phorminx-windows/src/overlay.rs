@@ -1,15 +1,15 @@
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontIndirectW, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_GUI_FONT,
-    DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect,
-    GetMonitorInfoW, GetStockObject, HGDIOBJ, InvalidateRect, LOGFONTW, MONITOR_DEFAULTTONEAREST,
-    MONITORINFO, MonitorFromWindow, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor,
-    SetWindowRgn, TRANSPARENT,
+    DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW,
+    EndPaint, FillRect, GetMonitorInfoW, GetStockObject, HGDIOBJ, InvalidateRect, LOGFONTW,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, SelectObject, SetBkMode,
+    SetTextColor, SetWindowRgn, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -31,6 +31,7 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 const CLASS_NAME: windows::core::PCWSTR = w!("PhorminxStatusOverlay");
 const WM_STATUS: u32 = WM_APP + 10;
+const WM_LAUNCHER_ACTIONS: u32 = WM_APP + 11;
 const INITIAL_TIMER_ID: usize = 1;
 
 #[repr(usize)]
@@ -106,6 +107,7 @@ impl OverlayStatus {
 pub struct StatusOverlay {
     window_bits: usize,
     thread: Option<JoinHandle<()>>,
+    launcher_actions: Arc<Mutex<Vec<(u8, String)>>>,
 }
 
 impl StatusOverlay {
@@ -118,9 +120,11 @@ impl StatusOverlay {
         }
 
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let launcher_actions = Arc::new(Mutex::new(Vec::new()));
+        let thread_actions = launcher_actions.clone();
         let thread = thread::Builder::new()
             .name("phorminx-overlay".to_owned())
-            .spawn(move || run_overlay(ready_tx))
+            .spawn(move || run_overlay(ready_tx, thread_actions))
             .map_err(|error| {
                 ACTIVE.store(false, Ordering::Release);
                 OverlayError::Spawn(error)
@@ -141,6 +145,7 @@ impl StatusOverlay {
         Ok(Self {
             window_bits,
             thread: Some(thread),
+            launcher_actions,
         })
     }
 
@@ -150,6 +155,24 @@ impl StatusOverlay {
                 Some(window(self.window_bits)),
                 WM_STATUS,
                 WPARAM(status as usize),
+                LPARAM(0),
+            )
+        }
+        .map_err(OverlayError::PostStatus)
+    }
+
+    /// Only public action names and assigned keys cross into this overlay thread.
+    /// Credentials, endpoints, prompts, and transcript text are never supplied.
+    pub fn set_launcher_actions(&self, actions: Vec<(u8, String)>) -> Result<(), OverlayError> {
+        *self
+            .launcher_actions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = clean_launcher_actions(actions);
+        unsafe {
+            PostMessageW(
+                Some(window(self.window_bits)),
+                WM_LAUNCHER_ACTIONS,
+                WPARAM(0),
                 LPARAM(0),
             )
         }
@@ -193,10 +216,18 @@ struct WindowState {
     status: OverlayStatus,
     timer_id: usize,
     next_timer_id: usize,
+    launcher_actions: Arc<Mutex<Vec<(u8, String)>>>,
+    /// Snapshot used for both painting and hit testing. A changed configuration
+    /// never maps an old visible row to a new action before the redraw message.
+    launcher_rows: Vec<(u8, String)>,
+    launcher_row_height: i32,
 }
 
-fn run_overlay(ready_tx: mpsc::SyncSender<Result<usize, String>>) {
-    let result = unsafe { create_and_run(&ready_tx) };
+fn run_overlay(
+    ready_tx: mpsc::SyncSender<Result<usize, String>>,
+    actions: Arc<Mutex<Vec<(u8, String)>>>,
+) {
+    let result = unsafe { create_and_run(&ready_tx, actions) };
     if let Err(error) = result {
         let _ = ready_tx.try_send(Err(error.to_string()));
     }
@@ -205,6 +236,7 @@ fn run_overlay(ready_tx: mpsc::SyncSender<Result<usize, String>>) {
 
 unsafe fn create_and_run(
     ready_tx: &mpsc::SyncSender<Result<usize, String>>,
+    actions: Arc<Mutex<Vec<(u8, String)>>>,
 ) -> windows::core::Result<()> {
     let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let module = unsafe { GetModuleHandleW(None)? };
@@ -223,6 +255,9 @@ unsafe fn create_and_run(
         status: OverlayStatus::Hidden,
         timer_id: 0,
         next_timer_id: INITIAL_TIMER_ID,
+        launcher_actions: actions,
+        launcher_rows: launcher_rows(&[]),
+        launcher_row_height: 54,
     });
     let state_pointer = (&mut *state as *mut WindowState).cast();
     let hwnd = match unsafe {
@@ -299,6 +334,14 @@ unsafe extern "system" fn window_procedure(
             }
             LRESULT(0)
         }
+        WM_LAUNCHER_ACTIONS => {
+            if let Some(state) = unsafe { window_state(hwnd) }
+                && is_launcher(state.status)
+            {
+                unsafe { update_window(hwnd, state, state.status) };
+            }
+            LRESULT(0)
+        }
         WM_TIMER => {
             if let Some(state) = unsafe { window_state(hwnd) }
                 && wparam.0 == state.timer_id
@@ -318,19 +361,25 @@ unsafe extern "system" fn window_procedure(
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_NCHITTEST => LRESULT(
-            if unsafe { window_state(hwnd) }.is_some_and(|s| is_launcher(s.status)) {
+            if let Some(state) = unsafe { window_state(hwnd) }
+                && is_launcher(state.status)
+            {
                 HTCLIENT as isize
             } else {
                 HTTRANSPARENT as isize
             },
         ),
         WM_LBUTTONUP => {
-            if unsafe { window_state(hwnd) }.is_some_and(|s| is_launcher(s.status)) {
+            if let Some(state) = unsafe { window_state(hwnd) }
+                && is_launcher(state.status)
+            {
                 let x = (lparam.0 as u16) as i16 as i32;
                 let y = ((lparam.0 >> 16) as u16) as i16 as i32;
                 let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
-                if launcher_hit_test(x, y, dpi) {
-                    crate::hotkey::choose_launcher_action();
+                if let Some(choice) =
+                    launcher_hit_test(x, y, dpi, &state.launcher_rows, state.launcher_row_height)
+                {
+                    crate::hotkey::choose_launcher_action(choice);
                 }
             }
             LRESULT(0)
@@ -381,16 +430,33 @@ unsafe fn update_window(hwnd: HWND, state: &mut WindowState, status: OverlayStat
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     let scale = |value: i32| value * dpi as i32 / 96;
     let launcher = is_launcher(status);
+    if launcher {
+        state.launcher_rows = launcher_rows(
+            &state
+                .launcher_actions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+    }
     let width = scale(if launcher { 360 } else { 300 });
-    let height = scale(if launcher { 160 } else { 52 });
     let margin = scale(48);
     let work = monitor_info.rcWork;
+    if launcher {
+        let available =
+            ((work.bottom - work.top - margin - scale(12)).max(scale(180))) * 96 / dpi as i32;
+        state.launcher_row_height = launcher_row_height(state.launcher_rows.len(), available);
+    }
+    let height = scale(if launcher {
+        launcher_height(state.launcher_rows.len(), state.launcher_row_height)
+    } else {
+        52
+    });
     let x = if launcher {
         (work.right - width - scale(24)).max(work.left)
     } else {
         work.left + (work.right - work.left - width) / 2
     };
-    let y = work.bottom - height - margin;
+    let y = (work.bottom - height - margin).max(work.top);
     let _ = unsafe {
         SetWindowPos(
             hwnd,
@@ -481,9 +547,52 @@ fn is_launcher(status: OverlayStatus) -> bool {
     )
 }
 
-fn launcher_hit_test(x: i32, y: i32, dpi: u32) -> bool {
+fn clean_launcher_actions(actions: Vec<(u8, String)>) -> Vec<(u8, String)> {
+    let mut result = Vec::new();
+    for (slot, name) in actions {
+        if !(3..=9).contains(&slot) || result.iter().any(|(existing, _)| *existing == slot) {
+            continue;
+        }
+        let name: String = name.chars().filter(|c| !c.is_control()).take(80).collect();
+        if !name.trim().is_empty() {
+            result.push((slot, name.trim().to_owned()));
+        }
+    }
+    result.sort_by_key(|(slot, _)| *slot);
+    result
+}
+
+fn launcher_rows(actions: &[(u8, String)]) -> Vec<(u8, String)> {
+    let mut rows = vec![(1, "Dictate".into()), (2, "Start meeting".into())];
+    rows.extend_from_slice(actions);
+    rows
+}
+
+fn launcher_row_height(row_count: usize, available_height: i32) -> i32 {
+    ((available_height - 104) / row_count.max(1) as i32 - 6).clamp(22, 54)
+}
+
+fn launcher_height(row_count: usize, row_height: i32) -> i32 {
+    104 + row_count as i32 * (row_height + 6)
+}
+
+fn launcher_hit_test(
+    x: i32,
+    y: i32,
+    dpi: u32,
+    rows: &[(u8, String)],
+    row_height: i32,
+) -> Option<u8> {
     let scale = |value: i32| value * dpi as i32 / 96;
-    (scale(16)..scale(344)).contains(&x) && (scale(62)..scale(116)).contains(&y)
+    if !(scale(16)..scale(344)).contains(&x) {
+        return None;
+    }
+    rows.iter().enumerate().find_map(|(index, (choice, _))| {
+        let top = 62 + index as i32 * (row_height + 6);
+        (scale(top)..scale(top + row_height))
+            .contains(&y)
+            .then_some(*choice)
+    })
 }
 
 unsafe fn paint_launcher(
@@ -491,6 +600,9 @@ unsafe fn paint_launcher(
     dc: windows::Win32::Graphics::Gdi::HDC,
     status: OverlayStatus,
 ) {
+    let (rows, row_height) = unsafe { window_state(hwnd) }
+        .map(|s| (s.launcher_rows.clone(), s.launcher_row_height))
+        .unwrap_or_else(|| (launcher_rows(&[]), 54));
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     let scale = |value: i32| value * dpi as i32 / 96;
     let dark = status == OverlayStatus::LauncherDark;
@@ -509,9 +621,13 @@ unsafe fn paint_launcher(
         right: scale(r),
         bottom: scale(b),
     };
-    fill(rect(0, 0, 360, 160), background);
-    fill(rect(16, 62, 344, 116), surface);
-    fill(rect(16, 62, 19, 116), 0x004F79A4);
+    let height = launcher_height(rows.len(), row_height);
+    fill(rect(0, 0, 360, height), background);
+    for index in 0..rows.len() {
+        let top = 62 + index as i32 * (row_height + 6);
+        fill(rect(16, top, 344, top + row_height), surface);
+    }
+    fill(rect(16, 62, 19, 62 + row_height), 0x004F79A4);
     unsafe {
         SetBkMode(dc, TRANSPARENT);
     }
@@ -536,7 +652,7 @@ unsafe fn paint_launcher(
             dc,
             &mut value.encode_utf16().collect::<Vec<_>>(),
             &mut bounds,
-            DT_VCENTER | DT_SINGLELINE,
+            DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
     };
     if let Ok(module) = unsafe { GetModuleHandleW(None) }
@@ -562,11 +678,37 @@ unsafe fn paint_launcher(
         };
     }
     text("PHORMINX", rect(58, 16, 230, 47), foreground);
-    text("1", rect(32, 62, 58, 116), foreground);
-    text("Dictate", rect(67, 62, 245, 116), foreground);
-    text("Enter", rect(286, 62, 339, 116), muted);
-    text("Microphone  ·  Local", rect(20, 121, 251, 150), muted);
-    text("Esc to close", rect(264, 121, 344, 150), muted);
+    for (index, (slot, label)) in rows.iter().enumerate() {
+        let top = 62 + index as i32 * (row_height + 6);
+        text(
+            &slot.to_string(),
+            rect(32, top, 58, top + row_height),
+            foreground,
+        );
+        text(
+            label,
+            rect(
+                67,
+                top,
+                if *slot == 1 { 275 } else { 332 },
+                top + row_height,
+            ),
+            foreground,
+        );
+        if *slot == 1 {
+            text("Enter", rect(286, top, 339, top + row_height), muted);
+        }
+    }
+    text(
+        "Choose your next action",
+        rect(20, height - 39, 251, height - 10),
+        muted,
+    );
+    text(
+        "Esc to close",
+        rect(264, height - 39, 344, height - 10),
+        muted,
+    );
     unsafe {
         SelectObject(dc, previous);
         if !owned_font.is_invalid() {
@@ -608,12 +750,56 @@ mod tests {
 
     #[test]
     fn launcher_hit_region_scales_and_does_not_activate_header_or_footer() {
+        let rows = launcher_rows(&[(7, "Notes".into())]);
         for dpi in [96, 144, 192] {
             let p = |n| n * dpi as i32 / 96;
-            assert!(launcher_hit_test(p(30), p(80), dpi));
-            assert!(!launcher_hit_test(p(30), p(30), dpi));
-            assert!(!launcher_hit_test(p(30), p(130), dpi));
+            assert_eq!(launcher_hit_test(p(30), p(80), dpi, &rows, 54), Some(1));
+            assert_eq!(launcher_hit_test(p(30), p(140), dpi, &rows, 54), Some(2));
+            assert_eq!(launcher_hit_test(p(30), p(200), dpi, &rows, 54), Some(7));
+            assert_eq!(launcher_hit_test(p(30), p(30), dpi, &rows, 54), None);
+            assert_eq!(launcher_hit_test(p(30), p(119), dpi, &rows, 54), None);
+            assert_eq!(launcher_hit_test(p(30), p(250), dpi, &rows, 54), None);
             assert_eq!(OverlayStatus::LauncherDark.hide_after_ms(), None);
+        }
+    }
+
+    #[test]
+    fn action_names_are_bounded_slots_sorted_unique_and_empty_defaults_stay_small() {
+        let actions = clean_launcher_actions(vec![
+            (9, "Z".repeat(400)),
+            (7, "  Notes & tasks\n\0  ".into()),
+            (7, "Duplicate".into()),
+            (1, "Invalid".into()),
+            (10, "Invalid".into()),
+            (5, " \n ".into()),
+        ]);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0], (7, "Notes & tasks".into()));
+        assert_eq!(actions[1].1.chars().count(), 80);
+        assert_eq!(
+            launcher_rows(&[]),
+            vec![(1, "Dictate".into()), (2, "Start meeting".into())]
+        );
+        assert_eq!(launcher_height(2, 54), 224);
+    }
+
+    #[test]
+    fn all_nine_rows_fit_compact_layout_and_hits_follow_visible_slots() {
+        let actions: Vec<_> = (3..=9)
+            .map(|slot| (slot, format!("Action {slot}")))
+            .collect();
+        let rows = launcher_rows(&actions);
+        for available in [400, 500, 640, 900] {
+            let height = launcher_row_height(rows.len(), available);
+            assert!(launcher_height(rows.len(), height) <= available);
+            for dpi in [96, 120, 144, 192, 288] {
+                for (index, (slot, _)) in rows.iter().enumerate() {
+                    let top = 62 + index as i32 * (height + 6);
+                    let x = 30 * dpi as i32 / 96;
+                    let y = (top + height / 2) * dpi as i32 / 96;
+                    assert_eq!(launcher_hit_test(x, y, dpi, &rows, height), Some(*slot));
+                }
+            }
         }
     }
 

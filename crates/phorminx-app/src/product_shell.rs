@@ -48,6 +48,9 @@ use winit::platform::windows::EventLoopBuilderExtWindows;
 
 #[derive(Clone, Debug)]
 pub enum ProductShellControl {
+    FocusActions,
+    StartMeeting,
+    TriggerAction(phorminx_assistant::ActionConfig),
     Focus(UiRoute),
     SetRuntimeStatus(UiRuntimeStatus),
     Refresh,
@@ -315,6 +318,7 @@ struct ProductShellApp {
     notice: Option<InlineNotice>,
     download_active: bool,
     quitting: bool,
+    quit_pending: bool,
     history_loader: HistoryLoader,
     library_search: Option<LibrarySearchWorker>,
     library: LibrarySnapshot,
@@ -323,6 +327,31 @@ struct ProductShellApp {
     setup_center: Option<SetupCenter>,
     setup_features: SetupFeatures,
     window_visible: bool,
+    meeting_workspace: Option<crate::meeting_workspace::MeetingWorkspace>,
+    meeting_snapshot: phorminx_ui::workspace::WorkspaceSnapshot,
+    companion_open: bool,
+    companion_hide_requested: bool,
+    root_companion: bool,
+    main_window_geometry: Option<MainWindowGeometry>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MainWindowGeometry {
+    position: Option<egui::Pos2>,
+    size: Vec2,
+    maximized: bool,
+}
+
+const COMPANION_SIZE: Vec2 = Vec2::new(430.0, 680.0);
+const COMPANION_MIN_SIZE: Vec2 = Vec2::new(360.0, 420.0);
+
+fn companion_viewport() -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_title("Phorminx · Companion")
+        .with_inner_size(COMPANION_SIZE)
+        .with_min_inner_size(COMPANION_MIN_SIZE)
+        .with_decorations(false)
+        .with_always_on_top()
 }
 
 impl Drop for ProductShellApp {
@@ -373,6 +402,7 @@ impl ProductShellApp {
             notice: None,
             download_active: false,
             quitting: false,
+            quit_pending: false,
             history_loader,
             library_search,
             library: LibrarySnapshot::default(),
@@ -381,6 +411,12 @@ impl ProductShellApp {
             setup_center,
             setup_features,
             window_visible: initially_visible,
+            meeting_workspace: None,
+            meeting_snapshot: Default::default(),
+            companion_open: false,
+            companion_hide_requested: false,
+            root_companion: false,
+            main_window_geometry: None,
         };
         app.configure_library();
         app.refresh();
@@ -392,6 +428,107 @@ impl ProductShellApp {
             app.ensure_history_detail();
         }
         app
+    }
+
+    /// eframe 0.36 runs only `logic` when a hidden root has no visible child.
+    /// In that state a child created in `ui` would never bootstrap. Present the
+    /// existing native root as the companion instead; no main-window flash and
+    /// no unsupported UI calls inside egui's logic-only pass are needed.
+    fn open_companion(&mut self, ctx: &egui::Context) {
+        self.companion_hide_requested = false;
+        self.companion_open = true;
+        let child_id = egui::ViewportId::from_hash_of("phorminx-meeting-companion");
+        let needs_bootstrap = ctx.input(|i| {
+            let child_visible = i
+                .raw
+                .viewports
+                .get(&child_id)
+                .is_some_and(|v| v.visible() != Some(false));
+            (!self.window_visible || i.viewport().visible() == Some(false)) && !child_visible
+        });
+        if needs_bootstrap && !self.root_companion {
+            self.main_window_geometry = Some(ctx.input(|i| {
+                let viewport = i.viewport();
+                MainWindowGeometry {
+                    position: viewport.outer_rect.map(|rect| rect.min),
+                    size: viewport
+                        .inner_rect
+                        .map_or(Vec2::new(1120.0, 760.0), |rect| rect.size())
+                        .max(Vec2::new(900.0, 620.0)),
+                    maximized: viewport.maximized.unwrap_or(false),
+                }
+            }));
+            self.root_companion = true;
+            self.window_visible = true;
+            ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+            ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
+            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(COMPANION_MIN_SIZE));
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(COMPANION_SIZE));
+            ctx.send_viewport_cmd(ViewportCommand::Title("Phorminx · Companion".into()));
+            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        }
+        let viewport = if self.root_companion {
+            egui::ViewportId::ROOT
+        } else {
+            egui::ViewportId::from_hash_of("phorminx-meeting-companion")
+        };
+        ctx.send_viewport_cmd_to(viewport, ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd_to(viewport, ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd_to(viewport, ViewportCommand::Focus);
+    }
+
+    /// Leave companion_open intact: opening the full app migrates an active root
+    /// companion to the ordinary child viewport on the next rendered frame.
+    fn restore_main_window(&mut self, ctx: &egui::Context) {
+        if !self.root_companion {
+            return;
+        }
+        self.root_companion = false;
+        let geometry = self
+            .main_window_geometry
+            .take()
+            .unwrap_or(MainWindowGeometry {
+                position: None,
+                size: Vec2::new(1120.0, 760.0),
+                maximized: false,
+            });
+        ctx.send_viewport_cmd(ViewportCommand::Title("Phorminx".into()));
+        ctx.send_viewport_cmd(ViewportCommand::Decorations(true));
+        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(Vec2::new(900.0, 620.0)));
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(geometry.size));
+        if let Some(position) = geometry.position {
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(position));
+        }
+        ctx.send_viewport_cmd(ViewportCommand::Maximized(geometry.maximized));
+    }
+
+    fn close_root_companion(&mut self, ctx: &egui::Context) {
+        if self.root_companion {
+            // Hide before resizing so closing the compact window cannot flash
+            // the full control panel. Recording deliberately remains untouched.
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            self.companion_open = false;
+            self.restore_main_window(ctx);
+            self.window_visible = false;
+        }
+    }
+
+    /// Presentation-only hide: never dispatch Stop, CancelActionCapture, or any
+    /// other workspace command. Root bootstrap restores main chrome while hidden.
+    fn apply_companion_hide(&mut self, ctx: &egui::Context) {
+        if !std::mem::take(&mut self.companion_hide_requested) {
+            return;
+        }
+        if self.root_companion {
+            self.close_root_companion(ctx);
+        } else {
+            self.companion_open = false;
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::from_hash_of("phorminx-meeting-companion"),
+                ViewportCommand::Visible(false),
+            );
+        }
     }
 
     fn refresh(&mut self) {
@@ -419,6 +556,14 @@ impl ProductShellApp {
                 let mut mapped =
                     map_snapshot_with_setup(snapshot, self.route, self.notice.clone(), Some(setup));
                 mapped.library = self.library.clone();
+                mapped.workspace = self.meeting_snapshot.clone();
+                mapped.workspace.available_models = self
+                    .readiness
+                    .ollama
+                    .models
+                    .iter()
+                    .map(|model| model.name.clone())
+                    .collect();
                 self.shell.apply_snapshot(mapped);
             }
             Err(error) => self.set_error(error.to_string()),
@@ -432,6 +577,15 @@ impl ProductShellApp {
             detail: message,
             action: None,
         });
+    }
+
+    fn ensure_meeting_workspace(&mut self) {
+        if self.meeting_workspace.is_none() {
+            match crate::meeting_workspace::MeetingWorkspace::start(self.store.clone()) {
+                Ok(worker) => self.meeting_workspace = Some(worker),
+                Err(message) => self.set_error(message),
+            }
+        }
     }
 
     fn configure_library(&mut self) {
@@ -778,6 +932,40 @@ impl ProductShellApp {
 
     fn handle_shell_event(&mut self, event: ShellEvent) {
         match event {
+            ShellEvent::Workspace(event) => {
+                if matches!(event, phorminx_ui::workspace::WorkspaceEvent::HideCompanion) {
+                    self.companion_hide_requested = true;
+                    return;
+                }
+                if matches!(event, phorminx_ui::workspace::WorkspaceEvent::OpenCompanion) {
+                    self.companion_open = true;
+                    return;
+                }
+                if matches!(
+                    event,
+                    phorminx_ui::workspace::WorkspaceEvent::TriggerAction(_)
+                ) {
+                    self.companion_open = true;
+                }
+                if matches!(
+                    event,
+                    phorminx_ui::workspace::WorkspaceEvent::DeleteSelected {
+                        dictations: true,
+                        ..
+                    }
+                ) {
+                    self.clear_library_search();
+                    self.history_loader.invalidate();
+                    self.shell.clear_history_detail();
+                }
+                self.ensure_meeting_workspace();
+                if let Some(worker) = &self.meeting_workspace
+                    && let Err(message) = worker.send(event)
+                {
+                    self.set_error(message);
+                    self.refresh();
+                }
+            }
             ShellEvent::SearchLibrary { query, mode } => {
                 self.search_library(query, mode);
                 self.refresh();
@@ -840,6 +1028,9 @@ impl ProductShellApp {
                     self.setup_features.activate(self.bridge.settings());
                 }
                 self.route = destination;
+                if matches!(self.route, UiRoute::Meetings | UiRoute::Actions) {
+                    self.ensure_meeting_workspace();
+                }
                 if self.route != UiRoute::History {
                     self.history_loader.invalidate();
                     self.shell.clear_history_detail();
@@ -1169,6 +1360,44 @@ fn resolve_theme(
 
 impl eframe::App for ProductShellApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_companion_hide(ctx);
+        if matches!(self.route, UiRoute::Meetings | UiRoute::Actions) {
+            self.ensure_meeting_workspace();
+        }
+        if let Some(snapshot) = self
+            .meeting_workspace
+            .as_ref()
+            .and_then(|worker| worker.snapshot_after(self.meeting_snapshot.revision))
+        {
+            let deletion_changed =
+                snapshot.deletion_revision != self.meeting_snapshot.deletion_revision;
+            self.meeting_snapshot = snapshot;
+            if deletion_changed {
+                if self.meeting_snapshot.deletion_failed {
+                    self.set_error(self.meeting_snapshot.deletion_notice.clone());
+                } else {
+                    self.clear_library_search();
+                    self.history_loader.invalidate();
+                    self.shell.clear_history_detail();
+                    self.notice = Some(InlineNotice {
+                        kind: NoticeKind::Information,
+                        title: "Selected data deleted".into(),
+                        detail: self.meeting_snapshot.deletion_notice.clone(),
+                        action: None,
+                    });
+                }
+                self.refresh();
+            }
+            let mut workspace = self.meeting_snapshot.clone();
+            workspace.available_models = self
+                .readiness
+                .ollama
+                .models
+                .iter()
+                .map(|model| model.name.clone())
+                .collect();
+            self.shell.apply_workspace_snapshot(workspace);
+        }
         self.shell.set_theme(resolve_theme(
             self.bridge.settings().appearance.theme,
             ctx.system_theme(),
@@ -1176,7 +1405,39 @@ impl eframe::App for ProductShellApp {
         ));
         while let Ok(control) = self.controls.try_recv() {
             match control {
+                ProductShellControl::StartMeeting | ProductShellControl::TriggerAction(_) => {
+                    self.ensure_meeting_workspace();
+                    self.open_companion(ctx);
+                    if let Some(worker) = &self.meeting_workspace {
+                        let result = match control {
+                            ProductShellControl::TriggerAction(action) => {
+                                worker.trigger_saved_action(action)
+                            }
+                            _ => worker.send(phorminx_ui::workspace::WorkspaceEvent::StartMeeting),
+                        };
+                        if let Err(message) = result {
+                            self.set_error(message);
+                        }
+                    }
+                }
+                ProductShellControl::FocusActions => {
+                    self.restore_main_window(ctx);
+                    if self.route == UiRoute::Setup {
+                        self.setup_features.deactivate();
+                    }
+                    self.history_loader.invalidate();
+                    self.shell.clear_history_detail();
+                    self.window_visible = true;
+                    self.route = UiRoute::Actions;
+                    self.ensure_meeting_workspace();
+                    self.refresh();
+                    self.shell.show_workspace_actions();
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
                 ProductShellControl::Focus(route) => {
+                    self.restore_main_window(ctx);
                     if self.route == UiRoute::Setup && route != UiRoute::Setup {
                         self.setup_features.deactivate();
                     } else if should_activate_setup_features(self.route, route, self.window_visible)
@@ -1249,10 +1510,8 @@ impl eframe::App for ProductShellApp {
                         worker.handle().set_paused(true);
                     }
                     self.setup_features.deactivate();
-                    self.window_visible = false;
                     self.history_loader.invalidate();
-                    self.quitting = true;
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    self.quit_pending = true;
                 }
             }
         }
@@ -1327,7 +1586,46 @@ impl eframe::App for ProductShellApp {
         if feature_poll.changed {
             self.refresh();
         }
-        if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
+        if self.quit_pending && !self.quitting {
+            let ready = self
+                .meeting_workspace
+                .as_ref()
+                .is_none_or(|worker| worker.is_finished() || self.meeting_snapshot.shutdown_ready);
+            if ready {
+                self.quitting = true;
+                self.window_visible = false;
+                if self.root_companion {
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                }
+                self.restore_main_window(ctx);
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            } else {
+                if let Some(worker) = &self.meeting_workspace {
+                    let _ = worker.request_shutdown();
+                }
+                if !self.window_visible || self.route != UiRoute::Meetings {
+                    self.window_visible = true;
+                    self.route = UiRoute::Meetings;
+                    self.refresh();
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                }
+                let mut workspace = self.meeting_snapshot.clone();
+                workspace.notice = if workspace.shutdown_error.is_empty() {
+                    "Finishing recording and saving session text before quitting…".into()
+                } else {
+                    workspace.shutdown_error.clone()
+                };
+                self.shell.apply_workspace_snapshot(workspace);
+            }
+        }
+        if ctx.input(|input| input.viewport().close_requested())
+            && self.quit_pending
+            && !self.quitting
+        {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        } else if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
+            self.close_root_companion(ctx);
             let _ = phorminx_windows::set_global_shortcut_capture(false);
             let _ = self.events.send(ProductShellEvent::ShortcutCapture(false));
             self.clear_library_search();
@@ -1371,10 +1669,41 @@ impl eframe::App for ProductShellApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.shell.show(ui);
+        if self.root_companion {
+            self.shell.show_meeting_companion(ui);
+        } else {
+            self.shell.show(ui);
+        }
+        if self.companion_open && !self.root_companion && !self.quitting {
+            let ctx = ui.ctx().clone();
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("phorminx-meeting-companion"),
+                companion_viewport(),
+                |ui, _| {
+                    if ui.input(|i| i.viewport().close_requested()) {
+                        self.companion_open = false;
+                    }
+                    self.shell.show_meeting_companion(ui);
+                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+                },
+            );
+        }
         for event in self.shell.take_events() {
+            if matches!(event, ShellEvent::Navigate(_)) && self.companion_open {
+                self.restore_main_window(ui.ctx());
+                self.window_visible = true;
+                ui.ctx()
+                    .send_viewport_cmd_to(egui::ViewportId::ROOT, ViewportCommand::Visible(true));
+                ui.ctx().send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    ViewportCommand::Minimized(false),
+                );
+                ui.ctx()
+                    .send_viewport_cmd_to(egui::ViewportId::ROOT, ViewportCommand::Focus);
+            }
             self.handle_shell_event(event);
         }
+        self.apply_companion_hide(ui.ctx());
     }
 }
 
@@ -1457,6 +1786,7 @@ fn map_snapshot(
         .unwrap_or("Not selected")
         .to_owned();
     ShellSnapshot {
+        workspace: Default::default(),
         route: map_route(route),
         status: map_runtime_status(snapshot.runtime_status),
         shortcut: settings.interaction.launcher_shortcut.clone(),
@@ -1777,6 +2107,8 @@ fn optional(value: String) -> Option<String> {
 fn map_route(route: UiRoute) -> Route {
     match route {
         UiRoute::Home => Route::Home,
+        UiRoute::Meetings => Route::Meetings,
+        UiRoute::Actions => Route::Actions,
         UiRoute::Setup => Route::Setup,
         UiRoute::History => Route::History,
         UiRoute::Lexicon => Route::Lexicon,
@@ -1793,6 +2125,8 @@ fn map_route(route: UiRoute) -> Route {
 fn unmap_route(route: Route) -> UiRoute {
     match route {
         Route::Home => UiRoute::Home,
+        Route::Meetings => UiRoute::Meetings,
+        Route::Actions => UiRoute::Actions,
         Route::Setup => UiRoute::Setup,
         Route::History => UiRoute::History,
         Route::Lexicon => UiRoute::Lexicon,
@@ -1964,6 +2298,167 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn companion_input(size: Vec2, minimized: bool) -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        let root = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+        root.inner_rect = Some(egui::Rect::from_min_size(egui::pos2(80.0, 100.0), size));
+        root.outer_rect = Some(egui::Rect::from_min_size(egui::pos2(80.0, 72.0), size));
+        root.minimized = Some(minimized);
+        root.occluded = Some(false);
+        input
+    }
+
+    #[test]
+    fn hidden_root_companion_bootstraps_using_only_native_commands_and_preserves_main_geometry() {
+        let mut fixture = LibraryFixture::new();
+        fixture.app.window_visible = false;
+        let ctx = egui::Context::default();
+        let original = Vec2::new(1400.0, 900.0);
+        let output = ctx.run_logic(&companion_input(original, false), |ctx| {
+            fixture.app.open_companion(ctx)
+        });
+        let commands = &output.viewport_commands[&egui::ViewportId::ROOT];
+        assert!(commands.contains(&ViewportCommand::Visible(true)));
+        assert!(commands.contains(&ViewportCommand::InnerSize(COMPANION_SIZE)));
+        assert!(commands.contains(&ViewportCommand::Decorations(false)));
+        assert!(commands.contains(&ViewportCommand::WindowLevel(
+            egui::WindowLevel::AlwaysOnTop
+        )));
+        assert!(
+            fixture.app.root_companion && fixture.app.companion_open && fixture.app.window_visible
+        );
+        assert_eq!(fixture.app.main_window_geometry.unwrap().size, original);
+        let _ = ctx.run_logic(&companion_input(COMPANION_SIZE, false), |ctx| {
+            fixture.app.open_companion(ctx)
+        });
+        assert_eq!(fixture.app.main_window_geometry.unwrap().size, original);
+        let restored = ctx.run_logic(&companion_input(COMPANION_SIZE, false), |ctx| {
+            fixture.app.restore_main_window(ctx)
+        });
+        let commands = &restored.viewport_commands[&egui::ViewportId::ROOT];
+        assert!(commands.contains(&ViewportCommand::InnerSize(original)));
+        assert!(commands.contains(&ViewportCommand::OuterPosition(egui::pos2(80.0, 72.0))));
+        assert!(commands.contains(&ViewportCommand::WindowLevel(egui::WindowLevel::Normal)));
+        assert!(commands.contains(&ViewportCommand::Decorations(true)));
+        assert!(!fixture.app.root_companion);
+        assert!(
+            fixture.app.companion_open,
+            "Main focus must migrate the companion, not close it"
+        );
+        assert!(fixture.app.main_window_geometry.is_none());
+    }
+
+    #[test]
+    fn minimized_main_bootstraps_companion_and_visible_main_keeps_separate_child() {
+        let mut fixture = LibraryFixture::new();
+        fixture.app.window_visible = true;
+        let ctx = egui::Context::default();
+        let output = ctx.run_logic(&companion_input(Vec2::new(1120.0, 760.0), false), |ctx| {
+            fixture.app.open_companion(ctx)
+        });
+        assert!(!fixture.app.root_companion);
+        let child = egui::ViewportId::from_hash_of("phorminx-meeting-companion");
+        assert!(output.viewport_commands[&child].contains(&ViewportCommand::Focus));
+        let output = ctx.run_logic(&companion_input(Vec2::new(1120.0, 760.0), true), |ctx| {
+            fixture.app.open_companion(ctx)
+        });
+        assert!(fixture.app.root_companion);
+        assert!(
+            output.viewport_commands[&egui::ViewportId::ROOT]
+                .contains(&ViewportCommand::Minimized(false))
+        );
+    }
+
+    #[test]
+    fn companion_close_hides_before_geometry_restore_without_changing_capture_and_can_reopen() {
+        let mut fixture = LibraryFixture::new();
+        fixture.app.meeting_snapshot.capture = phorminx_ui::workspace::CaptureState::Listening;
+        let ctx = egui::Context::default();
+        let input = companion_input(Vec2::new(1200.0, 800.0), false);
+        let _ = ctx.run_logic(&input, |ctx| fixture.app.open_companion(ctx));
+        let closed = ctx.run_logic(&input, |ctx| fixture.app.close_root_companion(ctx));
+        let commands = &closed.viewport_commands[&egui::ViewportId::ROOT];
+        assert_eq!(commands.first(), Some(&ViewportCommand::Visible(false)));
+        assert!(
+            !fixture.app.window_visible
+                && !fixture.app.root_companion
+                && !fixture.app.companion_open
+        );
+        assert_eq!(
+            fixture.app.meeting_snapshot.capture,
+            phorminx_ui::workspace::CaptureState::Listening
+        );
+        assert!(commands.contains(&ViewportCommand::InnerSize(Vec2::new(1200.0, 800.0))));
+        assert!(commands.contains(&ViewportCommand::Decorations(true)));
+        let _ = ctx.run_logic(&input, |ctx| fixture.app.open_companion(ctx));
+        assert!(fixture.app.root_companion && fixture.app.companion_open);
+        assert_eq!(
+            fixture.app.main_window_geometry.unwrap().size,
+            Vec2::new(1200.0, 800.0)
+        );
+    }
+
+    #[test]
+    fn companion_child_chrome_matches_borderless_root_bootstrap() {
+        let builder = companion_viewport();
+        assert_eq!(builder.inner_size, Some(COMPANION_SIZE));
+        assert_eq!(builder.min_inner_size, Some(COMPANION_MIN_SIZE));
+        assert_eq!(builder.decorations, Some(false));
+        assert_eq!(builder.window_level, Some(egui::WindowLevel::AlwaysOnTop));
+    }
+
+    #[test]
+    fn hide_companion_is_host_only_and_preserves_capture_for_root_and_child() {
+        for root_bootstrap in [true, false] {
+            let mut fixture = LibraryFixture::new();
+            fixture.app.window_visible = !root_bootstrap;
+            fixture.app.meeting_snapshot.capture = phorminx_ui::workspace::CaptureState::Listening;
+            let ctx = egui::Context::default();
+            let mut input = companion_input(Vec2::new(1400.0, 900.0), false);
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .maximized = Some(true);
+            let _ = ctx.run_logic(&input, |ctx| fixture.app.open_companion(ctx));
+            fixture.app.handle_shell_event(ShellEvent::Workspace(
+                phorminx_ui::workspace::WorkspaceEvent::HideCompanion,
+            ));
+            assert!(
+                fixture.app.meeting_workspace.is_none(),
+                "Hiding must not create a worker or send capture commands"
+            );
+            let hidden = ctx.run_logic(&input, |ctx| fixture.app.apply_companion_hide(ctx));
+            assert_eq!(
+                fixture.app.meeting_snapshot.capture,
+                phorminx_ui::workspace::CaptureState::Listening
+            );
+            assert!(!fixture.app.companion_open);
+            assert!(!fixture.app.root_companion);
+            assert_eq!(fixture.app.window_visible, !root_bootstrap);
+            if root_bootstrap {
+                let commands = &hidden.viewport_commands[&egui::ViewportId::ROOT];
+                assert_eq!(commands.first(), Some(&ViewportCommand::Visible(false)));
+                assert!(commands.contains(&ViewportCommand::Decorations(true)));
+                assert!(commands.contains(&ViewportCommand::InnerSize(Vec2::new(1400.0, 900.0))));
+                assert!(commands.contains(&ViewportCommand::Maximized(true)));
+            } else {
+                let child = egui::ViewportId::from_hash_of("phorminx-meeting-companion");
+                assert_eq!(
+                    hidden.viewport_commands[&child],
+                    vec![ViewportCommand::Visible(false)]
+                );
+                assert!(
+                    !hidden
+                        .viewport_commands
+                        .contains_key(&egui::ViewportId::ROOT)
+                );
+            }
+            let no_repeat = ctx.run_logic(&input, |ctx| fixture.app.apply_companion_hide(ctx));
+            assert!(no_repeat.viewport_commands.is_empty());
+        }
+    }
 
     /// Entirely synthetic shell composition: no native window, global shortcut,
     /// clipboard operation, audio device or model discovery is started.

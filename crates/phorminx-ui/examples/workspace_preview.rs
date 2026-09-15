@@ -12,6 +12,17 @@ struct Preview {
 impl Default for Preview {
     fn default() -> Self {
         let mut snapshot = ShellSnapshot::gallery(GalleryScenario::Populated);
+        snapshot.route = Route::Meetings;
+        snapshot.workspace = phorminx_ui::workspace::WorkspaceSnapshot {
+            history_enabled: true,
+            title: "Product review · synthetic preview".into(),
+            transcript: vec![phorminx_ui::workspace::MeetingLine { start_sample:0, end_sample:480000, text:"We should confirm the delivery date before discussing the next milestone.".into() }],
+            messages: vec![phorminx_ui::workspace::ChatLine { role:"You".into(),text:"Help me respond to the timing question.".into(),status:"sent".into(), context_text:"Synthetic meeting context".into(), ..Default::default() },phorminx_ui::workspace::ChatLine { role:"Assistant".into(),text:"**Clarify the milestone first.**\n\n- Ask which milestone is essential.\n- Confirm the dependencies before committing to a date.".into(),status:"complete".into(), ..Default::default() }],
+            input_devices: vec!["Example microphone".into()],
+            output_devices: vec!["Example speakers".into()],
+            available_models: vec!["example-local-model".into()],
+            ..Default::default()
+        };
         snapshot.library.index = LibraryIndexSnapshot {
             state: LibraryIndexState::Ready,
             detail: "All saved passages are available on this machine.".into(),

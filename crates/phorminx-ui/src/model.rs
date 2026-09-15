@@ -7,6 +7,8 @@ use std::fmt;
 pub enum Route {
     #[default]
     Home,
+    Meetings,
+    Actions,
     Setup,
     History,
     Lexicon,
@@ -21,8 +23,10 @@ pub enum Route {
 }
 
 impl Route {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::Home,
+        Self::Meetings,
+        Self::Actions,
         Self::Setup,
         Self::History,
         Self::Lexicon,
@@ -36,7 +40,14 @@ impl Route {
         Self::SettingsPrivacy,
     ];
 
-    pub const PRIMARY: [Self; 4] = [Self::Home, Self::History, Self::Models, Self::Settings];
+    pub const PRIMARY: [Self; 6] = [
+        Self::Home,
+        Self::History,
+        Self::Meetings,
+        Self::Actions,
+        Self::Models,
+        Self::Settings,
+    ];
 
     pub const fn is_settings(self) -> bool {
         matches!(
@@ -64,6 +75,8 @@ impl Route {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Home => "Home",
+            Self::Meetings => "Meetings",
+            Self::Actions => "Actions",
             Self::Setup => "Setup",
             Self::History => "Library",
             Self::Lexicon => "Vocabulary",
@@ -82,6 +95,8 @@ impl Route {
     pub const fn title(self) -> &'static str {
         match self {
             Self::Home => "A place for your voice.",
+            Self::Meetings => "Conversations, at your pace.",
+            Self::Actions => "Words, delivered.",
             Self::Setup => "Models & setup",
             Self::History => "Your words, kept close.",
             Self::Lexicon => "Vocabulary",
@@ -99,6 +114,8 @@ impl Route {
     pub const fn context(self) -> &'static str {
         match self {
             Self::Home => "Speak naturally. Keep your momentum.",
+            Self::Meetings => "Keep listening. Choose when to ask.",
+            Self::Actions => "An arsenal of destinations. One gesture away.",
             Self::Setup => "Local models, installation and care.",
             Self::History => "Find a phrase. Follow a thought.",
             Self::Lexicon => "Exact names. Exact replacements.",
@@ -932,6 +949,7 @@ pub struct LibrarySnapshot {
 /// Immutable view-state supplied by the host runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShellSnapshot {
+    pub workspace: crate::workspace::WorkspaceSnapshot,
     pub route: Route,
     pub status: RuntimeStatus,
     pub shortcut: String,
@@ -1088,6 +1106,7 @@ impl ShellSnapshot {
 
         let error = scenario == GalleryScenario::Error;
         Self {
+            workspace: Default::default(),
             route: Route::Home,
             status: if error {
                 RuntimeStatus::NeedsAttention
@@ -1246,6 +1265,7 @@ impl Default for ShellSnapshot {
 /// User intent emitted by the shell. The host remains the sole owner of side effects.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShellEvent {
+    Workspace(crate::workspace::WorkspaceEvent),
     Navigate(Route),
     TestDictation,
     ShortcutCapture(bool),

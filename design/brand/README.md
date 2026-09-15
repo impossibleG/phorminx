@@ -1,8 +1,8 @@
 # Phorminx identity assets
 
 This directory contains the production **Rounded P / selected reference**
-family. It is a deterministic geometric redraw of the user-approved 1024 px
-reference recorded in `docs/BRAND-ASSET-LINEAGE.md`.
+family. Versioned vector sources and deterministic exports define the
+production identity.
 
 ## Construction
 
@@ -51,5 +51,5 @@ parses every ICO directory entry and embedded PNG dimension.
 - Do not add a helmet, shield, microphone, waveform, additional slit, external
   leg, gradient, bevel, glow, or drop shadow.
 
-The concept history and exact generation prompts are recorded in
-`docs/BRAND-ASSET-LINEAGE.md`.
+The versioned source geometry and output manifest are the reproducible
+reference for this asset family.

@@ -85,6 +85,11 @@ impl PhorminxUi {
         }
     }
 
+    /// High-frequency transcript deltas do not reload unrelated pages or settings.
+    pub fn apply_workspace_snapshot(&mut self, snapshot: crate::workspace::WorkspaceSnapshot) {
+        self.snapshot.workspace = snapshot;
+    }
+
     pub fn navigate(&mut self, route: Route) {
         if self.route != route {
             if self.pages.shortcut_capture.take().is_some() {
@@ -100,6 +105,28 @@ impl PhorminxUi {
             }
             self.outbox.push(ShellEvent::Navigate(route));
         }
+    }
+
+    /// Open the independent HTTP actions workspace.
+    pub fn show_workspace_actions(&mut self) {
+        self.navigate(Route::Actions);
+        self.request_route_focus();
+    }
+
+    /// Render the compact meeting surface; the host owns its native viewport.
+    pub fn show_meeting_companion(&mut self, ui: &mut Ui) {
+        if !self.theme_applied {
+            theme::apply(ui.ctx(), self.theme);
+            self.theme_applied = true;
+        }
+        ui.push_id("floating-meeting-companion", |ui| {
+            crate::workspace::show_companion(
+                ui,
+                &self.snapshot.workspace,
+                &mut self.pages.workspace,
+                &mut self.outbox,
+            );
+        });
     }
 
     pub fn set_theme(&mut self, theme: ThemeMode) {
@@ -280,7 +307,17 @@ impl PhorminxUi {
                                     // navigation row, so explicitly restore a vertical page
                                     // flow for route content.
                                     ui.vertical(|ui| {
-                                        ui.set_width(ui.available_width().min(1120.0));
+                                        let width = ui.available_width();
+                                        ui.set_width(
+                                            if matches!(
+                                                self.route,
+                                                Route::Meetings | Route::Actions | Route::History
+                                            ) {
+                                                width
+                                            } else {
+                                                width.min(1120.0)
+                                            },
+                                        );
                                         if let Some(notice) = &self.snapshot.notice {
                                             let (acted, dismissed) = inline_notice(ui, notice);
                                             if acted {
@@ -394,8 +431,10 @@ impl PhorminxUi {
     }
 }
 
-const NAV_ROUTES: [Route; 6] = [
+const NAV_ROUTES: [Route; 8] = [
     Route::Home,
+    Route::Meetings,
+    Route::Actions,
     Route::History,
     Route::Models,
     Route::Settings,
@@ -493,7 +532,8 @@ mod tests {
     #[test]
     fn sidebar_arrow_navigation_clamps_at_both_ends() {
         assert_eq!(adjacent_route(0, -1), Route::Home);
-        assert_eq!(adjacent_route(0, 1), Route::History);
+        assert_eq!(adjacent_route(0, 1), Route::Meetings);
+        assert_eq!(adjacent_route(1, 1), Route::Actions);
         let last = NAV_ROUTES.len() - 1;
         assert_eq!(adjacent_route(last, 1), Route::Profiles);
         assert_eq!(adjacent_route(last, -1), Route::Lexicon);
@@ -714,8 +754,21 @@ mod tests {
     }
 
     #[test]
+    fn launcher_actions_route_does_not_start_recording_or_send_requests() {
+        let mut app = PhorminxUi::default();
+        app.show_workspace_actions();
+        assert_eq!(app.route(), Route::Actions);
+        assert_eq!(
+            app.take_events(),
+            vec![ShellEvent::Navigate(Route::Actions)]
+        );
+        egui::__run_test_ui(|ui| app.show(ui));
+        assert!(app.take_events().is_empty());
+    }
+
+    #[test]
     fn all_workspace_routes_paint_in_all_themes_at_narrow_and_wide_sizes() {
-        for width in [480.0, 760.0, 1180.0] {
+        for width in [480.0, 760.0, 1180.0, 1920.0] {
             for mode in [
                 ThemeMode::AuthoredLight,
                 ThemeMode::AuthoredDark,

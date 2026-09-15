@@ -3,6 +3,9 @@
 mod history_loader;
 pub mod incremental;
 mod library_search;
+pub mod meeting_audio;
+pub mod meeting_memory;
+pub mod meeting_workspace;
 pub mod model;
 pub mod ollama_onboarding;
 pub mod performance;

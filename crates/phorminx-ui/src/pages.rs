@@ -17,11 +17,12 @@ use crate::theme::{Space, UiThemeExt};
 
 #[derive(Clone, Debug)]
 pub(crate) struct PageState {
+    pub workspace: crate::workspace::WorkspaceState,
     pub history_id: Option<i64>,
     pub history_variant: HistoryVariant,
     pub history_page: usize,
     pub history_passage_start: Option<(i64, usize)>,
-    pub confirm_clear_history: bool,
+    pub deletion: crate::deletion::DeletionState,
     pub confirm_discard_interrupted: Option<String>,
     pub lexicon_id: Option<i64>,
     pub lexicon_draft: Option<LexiconDraft>,
@@ -52,13 +53,14 @@ impl PageState {
     pub fn from_snapshot(snapshot: &ShellSnapshot) -> Self {
         let first_history = snapshot.history.first();
         Self {
+            workspace: Default::default(),
             history_id: first_history.map(|item| item.id),
             history_variant: first_history
                 .and_then(super::model::HistoryItem::first_available_variant)
                 .unwrap_or(HistoryVariant::Output),
             history_page: 0,
             history_passage_start: None,
-            confirm_clear_history: false,
+            deletion: Default::default(),
             confirm_discard_interrupted: None,
             lexicon_id: snapshot.lexicon.first().map(|item| item.id),
             lexicon_draft: None,
@@ -198,6 +200,12 @@ pub(crate) fn show(
 ) {
     match route {
         Route::Home => home(ui, snapshot, outbox),
+        Route::Meetings => {
+            crate::workspace::show(ui, &snapshot.workspace, &mut state.workspace, outbox)
+        }
+        Route::Actions => {
+            crate::workspace::show_actions(ui, &snapshot.workspace, &mut state.workspace, outbox)
+        }
         Route::Setup => setup(ui, snapshot, state, outbox),
         Route::History => history(ui, snapshot, state, outbox),
         Route::Lexicon => lexicon(ui, snapshot, state, outbox),
@@ -1098,24 +1106,8 @@ fn history(
             Vec2::new(ui.available_width(), 44.0),
             Layout::right_to_left(Align::Center),
             |ui| {
-                let label = if state.confirm_clear_history {
-                    "Delete every retained dictation"
-                } else {
-                    "Clear library"
-                };
-                if action(ui, label, ActionTone::Destructive).clicked() {
-                    if state.confirm_clear_history {
-                        outbox.push(ShellEvent::ClearHistory);
-                        state.confirm_clear_history = false;
-                    } else {
-                        state.confirm_clear_history = true;
-                    }
-                }
-                if state.confirm_clear_history {
-                    ui.label(
-                        RichText::new("This permanently removes all retained transcripts.")
-                            .color(tokens.secondary_text),
-                    );
+                if action(ui, "Choose what to delete", ActionTone::Quiet).clicked() {
+                    outbox.push(ShellEvent::Navigate(Route::SettingsPrivacy));
                 }
             },
         );
@@ -2055,6 +2047,9 @@ fn settings(
             });
         });
         crate::studio::library_index(ui, snapshot, outbox);
+        ui.add_space(crate::theme::Space::LG);
+        ui.label("The retention period above applies to dictation history. Off removes dictation history and pauses saving new meetings/chats; existing meetings and chats stay until explicitly deleted below.");
+        crate::deletion::show(ui,&snapshot.workspace,&mut state.deletion,outbox);
         }
         if route == Route::SettingsAppearance {
         setting_section(ui, "06", "Startup", |ui| {

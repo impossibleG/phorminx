@@ -9,7 +9,14 @@ mod library;
 pub use library::{
     EmbeddedPassage, LibraryIndexStats, LibraryPassage, LibraryRepository, LibrarySearchHit,
 };
+mod meeting;
+mod meeting_memory;
+pub use meeting_memory::{MeetingMemoryPassage, MeetingMemoryRepository, MeetingTitleSource};
 mod migration;
+pub use meeting::{
+    MeetingMessageRecord, MeetingMessageStatus, MeetingQuestionContext, MeetingRecord,
+    MeetingRepository, MeetingSegmentRecord,
+};
 mod profile;
 mod recovery;
 pub use recovery::{RecoveryRecord, RecoveryRepository};
@@ -71,6 +78,14 @@ pub struct Persistence {
     connection: Connection,
 }
 
+/// Explicit deletion intent. Every category defaults to preserved.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeleteSelection {
+    pub dictations: bool,
+    pub meeting_transcripts: bool,
+    pub chats: bool,
+}
+
 /// Cross-thread cancellation of an isolated background connection. Never share
 /// this handle with the production recording/history-write connection.
 pub struct PersistenceInterrupt(rusqlite::InterruptHandle);
@@ -81,6 +96,35 @@ impl PersistenceInterrupt {
 }
 
 impl Persistence {
+    /// Deletes only explicitly selected categories in one transaction. The host
+    /// must first quiesce meeting/chat writers; dictation recovery uses its epoch.
+    pub fn delete_selected(&self, selection: DeleteSelection) -> Result<()> {
+        if selection == DeleteSelection::default() {
+            return Ok(());
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        if selection.dictations {
+            tx.execute("DELETE FROM dictation_history", [])?;
+            tx.execute("DELETE FROM interrupted_dictation", [])?;
+            tx.execute("DELETE FROM recovery_tombstones", [])?;
+            tx.execute("UPDATE persistence_settings SET value=CAST(value AS INTEGER)+1 WHERE key='recovery_epoch'", [])?;
+        }
+        if selection.meeting_transcripts {
+            tx.execute("DELETE FROM meeting_segments", [])?;
+            tx.execute(
+                "UPDATE meeting_sessions SET next_sequence=0,committed_sample=0",
+                [],
+            )?;
+        }
+        if selection.chats {
+            tx.execute("DELETE FROM meeting_messages", [])?;
+        }
+        if selection.meeting_transcripts || selection.chats {
+            tx.execute("DELETE FROM meeting_sessions WHERE NOT EXISTS(SELECT 1 FROM meeting_segments WHERE session_id=meeting_sessions.id) AND NOT EXISTS(SELECT 1 FROM meeting_messages WHERE session_id=meeting_sessions.id)", [])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn interrupt_handle(&self) -> PersistenceInterrupt {
         PersistenceInterrupt(self.connection.get_interrupt_handle())
     }
@@ -119,6 +163,14 @@ impl Persistence {
 
     pub fn library(&self) -> LibraryRepository<'_> {
         LibraryRepository::new(&self.connection)
+    }
+
+    pub fn meetings(&self) -> MeetingRepository<'_> {
+        MeetingRepository::new(&self.connection)
+    }
+
+    pub fn meeting_memory(&self) -> MeetingMemoryRepository<'_> {
+        MeetingMemoryRepository::new(&self.connection)
     }
 
     pub fn recovery(&self) -> RecoveryRepository<'_> {

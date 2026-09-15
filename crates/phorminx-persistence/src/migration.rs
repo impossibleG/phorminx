@@ -132,6 +132,8 @@ pub(crate) fn apply(connection: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS recovery_tombstones (session TEXT PRIMARY KEY);",
     )?;
     transaction.execute_batch(crate::library::SCHEMA)?;
+    transaction.execute_batch(crate::meeting::SCHEMA)?;
+    transaction.execute_batch(crate::meeting_memory::SCHEMA)?;
     if current == TRANSITIONAL_ADDITIVE_VERSION {
         // Pre-release builds briefly labeled the same nullable extension as
         // schema 2. Normalize only that known shape so the previous binary can

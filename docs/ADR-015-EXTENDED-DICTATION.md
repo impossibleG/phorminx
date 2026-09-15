@@ -124,8 +124,7 @@ The native spoken-rollover test additionally exercises 70.355 seconds of
 synthesized English through Vosk, including six deliberately triggered
 rollovers and the final release tail. It detected ordinary wording changes and
 one omitted conjunction at a restart seam despite contiguous audio ownership;
-see `INSTANT-SPOKEN-ROLLOVER-VALIDATION.md` for the measured error bounds.
+the native regression harness is `scripts/Test-InstantSpokenRollover.ps1`.
 These tests do not substitute for continuous English and PT-BR speech corpora,
 physical microphone/device-loss tests, or release-latency measurements. The
-current evidence and remaining gates are recorded in
-`EXTENDED-SETUP-ACCEPTANCE.md`.
+build and verification workflow is described in `DEVELOPMENT.md`.

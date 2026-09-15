@@ -80,6 +80,25 @@ impl ExtendedCaptureFactory {
         device_name: Option<&str>,
     ) -> Result<ExtendedRecording, CaptureError> {
         start_extended_prepared(
+            false,
+            device_name,
+            self.config.clone(),
+            self.bounds,
+            self.spool_root.clone(),
+            FinalizerPermit::acquire(&self.finalizer_active)?,
+        )
+    }
+
+    /// Windows WASAPI render-device loopback. No microphone is opened.
+    pub fn start_output_loopback(
+        &self,
+        device_name: Option<&str>,
+    ) -> Result<ExtendedRecording, CaptureError> {
+        if !cfg!(target_os = "windows") {
+            return Err(CaptureError::LoopbackUnsupported);
+        }
+        start_extended_prepared(
+            true,
             device_name,
             self.config.clone(),
             self.bounds,
@@ -195,6 +214,10 @@ pub struct ExtendedCaptureProgress {
     pub peak_resident_samples: u64,
     pub dropped_native_frames: u64,
     pub backend_warning_count: u64,
+    /// Recoverable backend notifications; not lost frames or terminal faults.
+    pub backend_notice_count: u64,
+    pub backend_notice: Option<&'static str>,
+    pub backend_failure: Option<&'static str>,
     pub storage: ExtendedStorageKind,
     pub sticky_fault: Option<ExtendedCaptureFault>,
     /// Bitwise `f64` mean-square energy for the complete session observed so
@@ -215,6 +238,27 @@ pub struct ExtendedCaptureProgress {
 pub struct OwnershipAcknowledger {
     progress: Arc<SharedProgress>,
     wake: SyncSender<()>,
+}
+
+/// Read-only capture frontier plus an explicit stop signal. Both remain usable
+/// while a recognizer is busy on another thread; neither waits for inference.
+#[derive(Clone)]
+pub struct CaptureObserver {
+    progress: Arc<SharedProgress>,
+    stop: Arc<AtomicBool>,
+}
+
+impl CaptureObserver {
+    pub fn progress(&self) -> ExtendedCaptureProgress {
+        self.progress.snapshot()
+    }
+    pub fn request_stop(&self) {
+        // Stop callback ingestion as well as the pump. The stream may remain
+        // owned by a busy decoder until it can finalize; continuing to enqueue
+        // then would manufacture an overflow after an ordinary explicit Stop.
+        self.progress.ingest_stopped.store(true, Ordering::Release);
+        self.stop.store(true, Ordering::Release);
+    }
 }
 
 impl OwnershipAcknowledger {
@@ -264,7 +308,7 @@ pub enum ExtendedCaptureFault {
     SampleAccountingOverflow,
     #[error("the requested audio snapshot is invalid or exceeds its configured bound")]
     InvalidSnapshot,
-    #[error("the microphone backend failed during capture")]
+    #[error("the audio backend failed during capture")]
     StreamFailed,
     #[error("a prior audio finalizer is still stalled")]
     FinalizerBusy,
@@ -316,6 +360,8 @@ impl ExtendedCaptureFault {
 }
 
 struct SharedProgress {
+    ingest_stopped: AtomicBool,
+    active_callbacks: AtomicU64,
     native_frames: AtomicU64,
     canonical_samples: AtomicU64,
     retained_from: AtomicU64,
@@ -323,6 +369,9 @@ struct SharedProgress {
     peak_resident_samples: AtomicU64,
     dropped_frames: AtomicU64,
     backend_warnings: AtomicU64,
+    backend_notices: AtomicU64,
+    backend_notice_kind: AtomicU8,
+    backend_failure_kind: AtomicU8,
     storage: AtomicU8,
     fault: AtomicU8,
     session_mean_square: AtomicU64,
@@ -334,6 +383,8 @@ struct SharedProgress {
 impl SharedProgress {
     fn new() -> Self {
         Self {
+            ingest_stopped: AtomicBool::new(false),
+            active_callbacks: AtomicU64::new(0),
             native_frames: AtomicU64::new(0),
             canonical_samples: AtomicU64::new(0),
             retained_from: AtomicU64::new(0),
@@ -341,6 +392,9 @@ impl SharedProgress {
             peak_resident_samples: AtomicU64::new(0),
             dropped_frames: AtomicU64::new(0),
             backend_warnings: AtomicU64::new(0),
+            backend_notices: AtomicU64::new(0),
+            backend_notice_kind: AtomicU8::new(0),
+            backend_failure_kind: AtomicU8::new(0),
             storage: AtomicU8::new(0),
             fault: AtomicU8::new(0),
             session_mean_square: AtomicU64::new(0.0_f64.to_bits()),
@@ -364,6 +418,9 @@ impl SharedProgress {
             peak_resident_samples: self.peak_resident_samples.load(Ordering::Acquire),
             dropped_native_frames: self.dropped_frames.load(Ordering::Acquire),
             backend_warning_count: self.backend_warnings.load(Ordering::Acquire),
+            backend_notice_count: self.backend_notices.load(Ordering::Acquire),
+            backend_notice: backend_kind_label(self.backend_notice_kind.load(Ordering::Acquire)),
+            backend_failure: backend_kind_label(self.backend_failure_kind.load(Ordering::Acquire)),
             storage,
             sticky_fault: ExtendedCaptureFault::from_code(self.fault.load(Ordering::Acquire)),
             session_mean_square_bits: self.session_mean_square.load(Ordering::Acquire),
@@ -422,6 +479,13 @@ impl ExtendedRecording {
 
     pub fn progress(&self) -> ExtendedCaptureProgress {
         self.progress.snapshot()
+    }
+
+    pub fn observer(&self) -> CaptureObserver {
+        CaptureObserver {
+            progress: Arc::clone(&self.progress),
+            stop: Arc::clone(&self.stop),
+        }
     }
 
     pub fn ownership_acknowledger(&self) -> OwnershipAcknowledger {
@@ -829,6 +893,7 @@ pub fn start_extended_input(
 }
 
 fn start_extended_prepared(
+    loopback: bool,
     device_name: Option<&str>,
     config: ExtendedCaptureConfig,
     bounds: CaptureBounds,
@@ -837,18 +902,39 @@ fn start_extended_prepared(
 ) -> Result<ExtendedRecording, CaptureError> {
     let host = cpal::default_host();
     let device = match device_name {
-        Some(name) => host
-            .input_devices()
-            .map_err(CaptureError::EnumerateDevices)?
-            .find(|device| device.to_string() == name)
-            .ok_or_else(|| CaptureError::InputDeviceNotFound(name.to_owned()))?,
-        None => host
-            .default_input_device()
-            .ok_or(CaptureError::NoDefaultInputDevice)?,
+        Some(name) => (if loopback {
+            host.output_devices()
+        } else {
+            host.input_devices()
+        })
+        .map_err(CaptureError::EnumerateDevices)?
+        .find(|device| device.to_string() == name)
+        .ok_or_else(|| {
+            if loopback {
+                CaptureError::OutputDeviceNotFound(name.to_owned())
+            } else {
+                CaptureError::InputDeviceNotFound(name.to_owned())
+            }
+        })?,
+        None => (if loopback {
+            host.default_output_device()
+        } else {
+            host.default_input_device()
+        })
+        .ok_or(if loopback {
+            CaptureError::NoDefaultOutputDevice
+        } else {
+            CaptureError::NoDefaultInputDevice
+        })?,
     };
-    let supported = device
-        .default_input_config()
-        .map_err(CaptureError::DefaultConfig)?;
+    // CPAL WASAPI sets AUDCLNT_STREAMFLAGS_LOOPBACK for input streams built on
+    // render endpoints. The render mix format, not a microphone format, is required.
+    let supported = (if loopback {
+        device.default_output_config()
+    } else {
+        device.default_input_config()
+    })
+    .map_err(CaptureError::DefaultConfig)?;
     let sample_format = supported.sample_format();
     let stream_config: StreamConfig = supported.into();
     let channels = usize::from(stream_config.channels);
@@ -872,6 +958,7 @@ fn start_extended_prepared(
         channels,
         producer,
         Arc::clone(&progress),
+        loopback,
     )?;
 
     let worker_progress = Arc::clone(&progress);
@@ -969,10 +1056,13 @@ fn build_extended_stream(
     channels: usize,
     producer: HeapProd<f32>,
     progress: Arc<SharedProgress>,
+    loopback: bool,
 ) -> Result<cpal::Stream, CaptureError> {
     macro_rules! build {
         ($sample:ty) => {
-            build_typed_extended_stream::<$sample>(device, config, channels, producer, progress)
+            build_typed_extended_stream::<$sample>(
+                device, config, channels, producer, progress, loopback,
+            )
         };
     }
     match sample_format {
@@ -998,6 +1088,7 @@ fn build_typed_extended_stream<T>(
     channels: usize,
     mut producer: HeapProd<f32>,
     progress: Arc<SharedProgress>,
+    loopback: bool,
 ) -> Result<cpal::Stream, CaptureError>
 where
     T: cpal::SizedSample + Sample,
@@ -1010,17 +1101,67 @@ where
             move |data: &[T], _| {
                 push_extended_mono_frames(&mut producer, data, channels, &progress);
             },
-            move |_error| {
-                error_progress
-                    .backend_warnings
-                    .fetch_add(1, Ordering::Relaxed);
-                // CPAL's stream error callback means continuity is no longer
-                // trustworthy. A captured prefix must never be returned as success.
-                error_progress.set_fault(ExtendedCaptureFault::StreamFailed);
-            },
+            move |error| handle_backend_notification(&error_progress, error.kind(), loopback),
             None,
         )
         .map_err(CaptureError::BuildStream)
+}
+
+// CPAL's callback also reports non-terminal conditions. In particular, WASAPI
+// loopback can report a discontinuity when playback starts/resumes. Do not turn
+// that notification into an application-initiated Stop. Never hide possible gaps.
+fn handle_backend_notification(progress: &SharedProgress, kind: cpal::ErrorKind, loopback: bool) {
+    if progress.ingest_stopped.load(Ordering::Acquire) {
+        return;
+    }
+    let code = backend_kind_code(kind);
+    if kind == cpal::ErrorKind::RealtimeDenied
+        || (loopback && matches!(kind, cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged))
+    {
+        progress.backend_notice_kind.store(code, Ordering::Release);
+        progress.backend_notices.fetch_add(1, Ordering::Release);
+    } else {
+        progress.backend_failure_kind.store(code, Ordering::Release);
+        progress.backend_warnings.fetch_add(1, Ordering::Relaxed);
+        progress.set_fault(ExtendedCaptureFault::StreamFailed);
+    }
+}
+fn backend_kind_code(kind: cpal::ErrorKind) -> u8 {
+    match kind {
+        cpal::ErrorKind::Xrun => 1,
+        cpal::ErrorKind::RealtimeDenied => 2,
+        cpal::ErrorKind::DeviceChanged => 3,
+        cpal::ErrorKind::DeviceNotAvailable => 4,
+        cpal::ErrorKind::DeviceBusy => 5,
+        cpal::ErrorKind::HostUnavailable => 6,
+        cpal::ErrorKind::PermissionDenied => 7,
+        cpal::ErrorKind::StreamInvalidated => 8,
+        cpal::ErrorKind::UnsupportedConfig => 9,
+        cpal::ErrorKind::ResourceExhausted => 10,
+        cpal::ErrorKind::InvalidInput => 11,
+        cpal::ErrorKind::UnsupportedOperation => 12,
+        cpal::ErrorKind::BackendError => 13,
+        _ => 14,
+    }
+}
+fn backend_kind_label(code: u8) -> Option<&'static str> {
+    Some(match code {
+        0 => return None,
+        1 => "Xrun",
+        2 => "RealtimeDenied",
+        3 => "DeviceChanged",
+        4 => "DeviceNotAvailable",
+        5 => "DeviceBusy",
+        6 => "HostUnavailable",
+        7 => "PermissionDenied",
+        8 => "StreamInvalidated",
+        9 => "UnsupportedConfig",
+        10 => "ResourceExhausted",
+        11 => "InvalidInput",
+        12 => "UnsupportedOperation",
+        13 => "BackendError",
+        _ => "Other",
+    })
 }
 
 /// This is the entire CPAL callback path: arithmetic, SPSC pushes, and atomics only.
@@ -1033,7 +1174,9 @@ fn push_extended_mono_frames<T>(
     T: Sample,
     f32: FromSample<T>,
 {
-    if channels == 0 {
+    progress.active_callbacks.fetch_add(1, Ordering::AcqRel);
+    if channels == 0 || progress.ingest_stopped.load(Ordering::Acquire) {
+        progress.active_callbacks.fetch_sub(1, Ordering::Release);
         return;
     }
     let frames = data.chunks_exact(channels);
@@ -1055,6 +1198,7 @@ fn push_extended_mono_frames<T>(
             .fetch_add(dropped as u64, Ordering::Relaxed);
         progress.set_fault(ExtendedCaptureFault::CallbackOverflow);
     }
+    progress.active_callbacks.fetch_sub(1, Ordering::Release);
 }
 
 fn run_pump(
@@ -1104,7 +1248,10 @@ fn run_pump(
         // applied before another capture batch consumes the final free ring
         // capacity. This makes the worker/capture frontier linearizable at the
         // exact backlog boundary.
-        if stop.load(Ordering::Acquire) && consumer.is_empty() {
+        if stop.load(Ordering::Acquire)
+            && progress.active_callbacks.load(Ordering::Acquire) == 0
+            && consumer.is_empty()
+        {
             break;
         }
         if let Ok(command) = commands.try_recv() {
@@ -2014,6 +2161,119 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[test]
+    fn loopback_startup_and_resume_glitches_are_not_terminal() {
+        let progress = SharedProgress::new();
+        handle_backend_notification(&progress, cpal::ErrorKind::Xrun, true);
+        let first = progress.snapshot();
+        assert_eq!(first.sticky_fault, None);
+        assert_eq!(first.backend_warning_count, 0);
+        assert_eq!(first.backend_notice, Some("Xrun"));
+        assert_eq!(first.backend_notice_count, 1);
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(64).split();
+        push_extended_mono_frames(&mut producer, &[0.25_f32; 16], 1, &progress);
+        handle_backend_notification(&progress, cpal::ErrorKind::Xrun, true);
+        push_extended_mono_frames(&mut producer, &[0.5_f32; 16], 1, &progress);
+        assert_eq!(consumer.pop_iter().count(), 32);
+        assert_eq!(progress.snapshot().native_frames_observed, 32);
+        assert_eq!(progress.snapshot().sticky_fault, None);
+        assert_eq!(progress.snapshot().backend_notice_count, 2);
+        let (mut engine, _) = test_engine(WHISPER_SAMPLE_RATE, 120.0, SpoolQuota::default());
+        engine.ingest_native(&[0.25_f32; 1600]).unwrap();
+        assert!(
+            engine
+                .finalize(progress.snapshot().backend_warning_count)
+                .is_ok()
+        );
+    }
+    #[test]
+    fn recoverable_notices_do_not_weaken_actual_failure_checks() {
+        for kind in [
+            cpal::ErrorKind::DeviceNotAvailable,
+            cpal::ErrorKind::StreamInvalidated,
+            cpal::ErrorKind::PermissionDenied,
+            cpal::ErrorKind::BackendError,
+            cpal::ErrorKind::Other,
+        ] {
+            let progress = SharedProgress::new();
+            handle_backend_notification(&progress, kind, true);
+            assert_eq!(
+                progress.snapshot().sticky_fault,
+                Some(ExtendedCaptureFault::StreamFailed)
+            );
+            assert!(progress.snapshot().backend_failure.is_some());
+            assert_eq!(progress.snapshot().backend_notice_count, 0);
+        }
+        let strict = SharedProgress::new();
+        handle_backend_notification(&strict, cpal::ErrorKind::Xrun, false);
+        assert_eq!(
+            strict.snapshot().sticky_fault,
+            Some(ExtendedCaptureFault::StreamFailed)
+        );
+    }
+    #[test]
+    fn scheduling_notice_and_loopback_route_change_allow_capture() {
+        for (kind, loopback) in [
+            (cpal::ErrorKind::RealtimeDenied, false),
+            (cpal::ErrorKind::RealtimeDenied, true),
+            (cpal::ErrorKind::DeviceChanged, true),
+        ] {
+            let progress = SharedProgress::new();
+            handle_backend_notification(&progress, kind, loopback);
+            assert_eq!(progress.snapshot().sticky_fault, None);
+            assert_eq!(progress.snapshot().backend_warning_count, 0);
+            assert_eq!(progress.snapshot().backend_notice_count, 1);
+        }
+        let stopped = SharedProgress::new();
+        stopped.ingest_stopped.store(true, Ordering::Release);
+        handle_backend_notification(&stopped, cpal::ErrorKind::DeviceNotAvailable, true);
+        assert_eq!(stopped.snapshot().sticky_fault, None);
+    }
+
+    #[test]
+    fn observer_stop_prevents_overflow_while_decoder_still_owns_stream() {
+        let progress = Arc::new(SharedProgress::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let observer = CaptureObserver {
+            progress: Arc::clone(&progress),
+            stop: Arc::clone(&stop),
+        };
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(4).split();
+        push_extended_mono_frames(&mut producer, &[0.25_f32; 2], 1, &progress);
+        observer.request_stop();
+        for _ in 0..100 {
+            push_extended_mono_frames(&mut producer, &[0.5_f32; 32], 1, &progress);
+        }
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(consumer.pop_iter().collect::<Vec<_>>(), vec![0.25; 2]);
+        assert_eq!(observer.progress().native_frames_observed, 2);
+        assert_eq!(observer.progress().dropped_native_frames, 0);
+        assert_eq!(observer.progress().sticky_fault, None);
+        assert_eq!(progress.active_callbacks.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn observer_frontier_updates_without_any_decoder_or_ui_poll() {
+        let progress = Arc::new(SharedProgress::new());
+        let observer = CaptureObserver {
+            progress: Arc::clone(&progress),
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let second = observer.clone();
+        progress.canonical_samples.store(123_456, Ordering::Release);
+        assert_eq!(second.progress().canonical_samples, 123_456);
+        observer.request_stop();
+        assert!(second.stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn invalid_channel_callback_releases_its_inflight_counter() {
+        let progress = SharedProgress::new();
+        let (mut producer, _) = HeapRb::<f32>::new(4).split();
+        push_extended_mono_frames(&mut producer, &[0.25_f32; 2], 0, &progress);
+        assert_eq!(progress.active_callbacks.load(Ordering::Acquire), 0);
+    }
 
     #[derive(Default)]
     struct MemoryState {

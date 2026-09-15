@@ -29,6 +29,8 @@ pub enum HoldEvent {
     Ended,
     LauncherRequested { target: Option<TargetSnapshot> },
     LauncherDictate { target: Option<TargetSnapshot> },
+    LauncherMeetings,
+    LauncherAction(u8),
     LauncherDismissed,
 }
 enum Command {
@@ -142,10 +144,10 @@ impl Drop for GlobalHoldHotkey {
         let _ = self.stop();
     }
 }
-pub(crate) fn choose_launcher_action() {
+pub(crate) fn choose_launcher_action(choice: u8) {
     let id = HOOK_THREAD_ID.load(Ordering::Acquire);
     if id != 0 {
-        let _ = unsafe { PostThreadMessageW(id, WM_CHOOSE, WPARAM(0), LPARAM(0)) };
+        let _ = unsafe { PostThreadMessageW(id, WM_CHOOSE, WPARAM(choice as usize), LPARAM(0)) };
     }
 }
 
@@ -189,6 +191,14 @@ impl HookState {
             KeyAction::Choose => HoldEvent::LauncherDictate {
                 target: self.launcher_target.take(),
             },
+            KeyAction::Meetings => {
+                self.launcher_target = None;
+                HoldEvent::LauncherMeetings
+            }
+            KeyAction::Action(slot) => {
+                self.launcher_target = None;
+                HoldEvent::LauncherAction(slot)
+            }
             KeyAction::Dismiss => {
                 self.launcher_target = None;
                 HoldEvent::LauncherDismissed
@@ -258,7 +268,7 @@ unsafe fn install_and_run(
                         Command::Launcher(open) => {
                             state.keyboard.launcher_open = open;
                             if !open {
-                                state.keyboard.pending_choice = false;
+                                state.keyboard.pending_choice = None;
                             }
                         }
                     }
@@ -268,7 +278,13 @@ unsafe fn install_and_run(
                 let target_current = state
                     .launcher_target
                     .is_none_or(|target| target.is_current());
-                if let Some(action) = state.keyboard.click_choice(target_current) {
+                let choice = match message.wParam.0 {
+                    1 => KeyAction::Choose,
+                    2 => KeyAction::Meetings,
+                    3..=9 => KeyAction::Action(message.wParam.0 as u8),
+                    _ => return,
+                };
+                if let Some(action) = state.keyboard.click_choice(target_current, choice) {
                     state.dispatch(action);
                 }
             }
@@ -322,6 +338,8 @@ enum KeyAction {
     DirectEnd,
     Launcher,
     Choose,
+    Meetings,
+    Action(u8),
     Dismiss,
 }
 struct KeyboardState {
@@ -330,7 +348,7 @@ struct KeyboardState {
     consumed: [bool; 256],
     direct_held: Option<Shortcut>,
     launcher_open: bool,
-    pending_choice: bool,
+    pending_choice: Option<KeyAction>,
     busy: bool,
     suspended: bool,
 }
@@ -342,24 +360,24 @@ impl KeyboardState {
             consumed: [false; 256],
             direct_held: None,
             launcher_open: false,
-            pending_choice: false,
+            pending_choice: None,
             busy: false,
             suspended: false,
         }
     }
     fn close_launcher(&mut self) {
         self.launcher_open = false;
-        self.pending_choice = false;
+        self.pending_choice = None;
     }
-    fn click_choice(&mut self, target_current: bool) -> Option<KeyAction> {
+    fn click_choice(&mut self, target_current: bool, choice: KeyAction) -> Option<KeyAction> {
         if !self.launcher_open || self.suspended {
             self.close_launcher();
             return None;
         }
         self.close_launcher();
-        self.busy = target_current;
+        self.busy = target_current && choice == KeyAction::Choose;
         Some(if target_current {
-            KeyAction::Choose
+            choice
         } else {
             KeyAction::Dismiss
         })
@@ -384,10 +402,12 @@ impl KeyboardState {
         if !pressed {
             self.consumed[index] = false;
         }
-        if self.pending_choice && self.modifiers() == 0 {
+        if let Some(choice) = self.pending_choice
+            && self.modifiers() == 0
+        {
             self.close_launcher();
-            self.busy = true;
-            return (consumed, Some(KeyAction::Choose));
+            self.busy = choice == KeyAction::Choose;
+            return (consumed, Some(choice));
         }
         if !pressed
             && self.direct_held.is_some_and(|held| {
@@ -401,22 +421,22 @@ impl KeyboardState {
             return (consumed, None);
         }
         let modifiers = self.modifiers();
-        if self.launcher_open && matches!(key, 0x31 | 0x61 | 0x0d | 0x1b) {
+        if self.launcher_open && matches!(key, 0x31..=0x39 | 0x61..=0x69 | 0x0d | 0x1b) {
+            let choice = match key {
+                0x1b => KeyAction::Dismiss,
+                0x32 | 0x62 => KeyAction::Meetings,
+                0x33..=0x39 => KeyAction::Action((key - 0x30) as u8),
+                0x63..=0x69 => KeyAction::Action((key - 0x60) as u8),
+                _ => KeyAction::Choose,
+            };
             self.consumed[index] = true;
             if modifiers != 0 && key != 0x1b {
-                self.pending_choice = true;
+                self.pending_choice = Some(choice);
                 return (true, None);
             }
             self.close_launcher();
-            self.busy = key != 0x1b;
-            return (
-                true,
-                Some(if key == 0x1b {
-                    KeyAction::Dismiss
-                } else {
-                    KeyAction::Choose
-                }),
-            );
+            self.busy = choice == KeyAction::Choose;
+            return (true, Some(choice));
         }
         if key == u32::from(self.bindings.launcher.key)
             && modifiers == self.bindings.launcher.modifiers
@@ -463,6 +483,65 @@ pub enum HotkeyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn all_action_digits_and_numpad_digits_preserve_slot_and_suppress_repeat_release() {
+        for slot in 3..=9 {
+            for base in [0x30, 0x60] {
+                let key = base + u32::from(slot);
+                let mut state = KeyboardState::new(ShortcutBindings::default());
+                state.launcher_open = true;
+                assert_eq!(
+                    state.input(key, true),
+                    (true, Some(KeyAction::Action(slot)))
+                );
+                assert_eq!(state.input(key, true), (true, None));
+                assert_eq!(state.input(key, false), (true, None));
+                assert!(!state.launcher_open);
+                assert_eq!(state.input(key, true), (false, None));
+            }
+        }
+    }
+
+    #[test]
+    fn numbered_actions_wait_for_all_modifiers_and_escape_cancels_pending_action() {
+        for slot in 3..=9 {
+            let mut state = KeyboardState::new(ShortcutBindings::default());
+            state.launcher_open = true;
+            state.input(0x11, true);
+            state.input(0x12, true);
+            let key = 0x30 + u32::from(slot);
+            assert_eq!(state.input(key, true), (true, None));
+            assert_eq!(state.input(key, false), (true, None));
+            assert_eq!(state.input(0x11, false), (false, None));
+            assert_eq!(
+                state.input(0x12, false),
+                (false, Some(KeyAction::Action(slot)))
+            );
+            state.launcher_open = true;
+            state.input(0x11, true);
+            state.input(key, true);
+            assert_eq!(state.input(0x1b, true), (true, Some(KeyAction::Dismiss)));
+            assert_eq!(state.input(0x11, false), (false, None));
+        }
+    }
+
+    #[test]
+    fn numbered_mouse_actions_keep_slot_and_reject_stale_target() {
+        for slot in 3..=9 {
+            let mut state = KeyboardState::new(ShortcutBindings::default());
+            state.launcher_open = true;
+            assert_eq!(
+                state.click_choice(true, KeyAction::Action(slot)),
+                Some(KeyAction::Action(slot))
+            );
+            assert_eq!(state.click_choice(true, KeyAction::Action(slot)), None);
+            state.launcher_open = true;
+            assert_eq!(
+                state.click_choice(false, KeyAction::Action(slot)),
+                Some(KeyAction::Dismiss)
+            );
+        }
+    }
     #[test]
     fn suppresses_trigger_repeat_release_not_typing() {
         let mut s = KeyboardState::new(ShortcutBindings::default());
@@ -570,7 +649,7 @@ mod tests {
         s.launcher_open = true;
         s.input(0x11, true);
         assert_eq!(s.input(0x31, true), (true, None));
-        assert!(s.pending_choice);
+        assert!(s.pending_choice.is_some());
         s.close_launcher();
         assert_eq!(s.input(0x11, false), (false, None));
         assert_eq!(s.input(0x31, false), (true, None));
@@ -602,14 +681,68 @@ mod tests {
     fn click_choice_rejects_moved_target_and_suspended_capture() {
         let mut s = KeyboardState::new(ShortcutBindings::default());
         s.launcher_open = true;
-        assert_eq!(s.click_choice(false), Some(KeyAction::Dismiss));
+        assert_eq!(
+            s.click_choice(false, KeyAction::Choose),
+            Some(KeyAction::Dismiss)
+        );
         assert!(!s.busy);
         s.launcher_open = true;
         s.suspended = true;
-        assert_eq!(s.click_choice(true), None);
+        assert_eq!(s.click_choice(true, KeyAction::Choose), None);
         s.suspended = false;
         s.launcher_open = true;
-        assert_eq!(s.click_choice(true), Some(KeyAction::Choose));
-        assert_eq!(s.click_choice(true), None);
+        assert_eq!(
+            s.click_choice(true, KeyAction::Choose),
+            Some(KeyAction::Choose)
+        );
+        assert_eq!(s.click_choice(true, KeyAction::Choose), None);
+    }
+
+    #[test]
+    fn workspace_choices_consume_repeat_release_without_starting_dictation() {
+        for (key, choice) in [
+            (0x32, KeyAction::Meetings),
+            (0x62, KeyAction::Meetings),
+            (0x33, KeyAction::Action(3)),
+            (0x63, KeyAction::Action(3)),
+        ] {
+            let mut state = KeyboardState::new(ShortcutBindings::default());
+            state.launcher_open = true;
+            assert_eq!(state.input(key, true), (true, Some(choice)));
+            assert_eq!(state.input(key, true), (true, None));
+            assert_eq!(state.input(key, false), (true, None));
+            assert!(!state.busy);
+            assert!(!state.launcher_open);
+            assert_eq!(state.input(key, true), (false, None));
+        }
+    }
+
+    #[test]
+    fn pending_workspace_choice_retains_identity_until_modifiers_release() {
+        for (key, choice) in [(0x32, KeyAction::Meetings), (0x33, KeyAction::Action(3))] {
+            let mut state = KeyboardState::new(ShortcutBindings::default());
+            state.launcher_open = true;
+            state.input(0x11, true);
+            assert_eq!(state.input(key, true), (true, None));
+            assert_eq!(state.input(key, false), (true, None));
+            assert_eq!(state.input(0x11, false), (false, Some(choice)));
+            assert!(!state.busy);
+        }
+    }
+
+    #[test]
+    fn workspace_mouse_choices_keep_focus_and_capture_safety_guards() {
+        for choice in [KeyAction::Meetings, KeyAction::Action(3)] {
+            let mut state = KeyboardState::new(ShortcutBindings::default());
+            state.launcher_open = true;
+            assert_eq!(state.click_choice(false, choice), Some(KeyAction::Dismiss));
+            state.launcher_open = true;
+            assert_eq!(state.click_choice(true, choice), Some(choice));
+            assert!(!state.busy);
+            assert_eq!(state.click_choice(true, choice), None);
+            state.launcher_open = true;
+            state.suspended = true;
+            assert_eq!(state.click_choice(true, choice), None);
+        }
     }
 }

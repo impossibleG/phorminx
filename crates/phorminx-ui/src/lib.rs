@@ -6,11 +6,14 @@
 
 mod app;
 pub mod components;
+mod deletion;
 mod gallery;
+mod markdown;
 pub mod model;
 mod pages;
 mod studio;
 pub mod theme;
+pub mod workspace;
 
 pub use app::PhorminxUi;
 pub use gallery::ComponentGallery;

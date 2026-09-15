@@ -14,6 +14,7 @@ vulkan = ["phorminx-whisper/vulkan"]
 
 [dependencies]
 anyhow.workspace = true
+phorminx-assistant = { path = "../phorminx-assistant" }
 clap.workspace = true
 ctrlc.workspace = true
 eframe.workspace = true

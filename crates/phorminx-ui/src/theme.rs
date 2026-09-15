@@ -86,13 +86,13 @@ impl ThemeTokens {
     pub const fn for_mode(mode: ThemeMode) -> Self {
         match mode {
             ThemeMode::AuthoredDark => Self {
-                background: Colors::ABYSS,
-                surface: Colors::IRON,
-                raised: Colors::TEMPERED,
+                background: Color32::from_rgb(14, 17, 19),
+                surface: Color32::from_rgb(23, 27, 30),
+                raised: Color32::from_rgb(34, 40, 44),
                 edge: Colors::EDGE,
                 text: Colors::LIMESTONE,
                 secondary_text: Colors::ASH,
-                accent: Colors::BRONZE,
+                accent: Color32::from_rgb(198, 151, 103),
                 accent_focus: Colors::BRONZE_LIGHT,
                 on_accent: Colors::ABYSS,
                 destructive: Colors::OXBLOOD,
@@ -100,10 +100,10 @@ impl ThemeTokens {
                 verified: Colors::MOSS,
             },
             ThemeMode::AuthoredLight => Self {
-                background: Color32::from_rgb(246, 243, 236),
-                surface: Color32::from_rgb(237, 233, 224),
-                raised: Color32::from_rgb(225, 220, 209),
-                edge: Color32::from_rgb(111, 108, 101),
+                background: Color32::from_rgb(245, 243, 237),
+                surface: Color32::from_rgb(234, 231, 223),
+                raised: Color32::from_rgb(222, 219, 210),
+                edge: Color32::from_rgb(209, 207, 198),
                 text: Color32::from_rgb(23, 26, 28),
                 secondary_text: Color32::from_rgb(78, 82, 84),
                 accent: Color32::from_rgb(126, 78, 33),
@@ -234,6 +234,7 @@ pub fn style(mode: ThemeMode) -> egui::Style {
 }
 
 pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
+    install_strong_font(ctx);
     ctx.data_mut(|data| data.insert_temp(theme_mode_id(), mode));
     let egui_theme = if mode.is_light() {
         egui::Theme::Light
@@ -242,6 +243,50 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
     };
     ctx.set_theme(egui_theme);
     ctx.set_style_of(egui_theme, style(mode));
+}
+
+/// Use the platform's licensed bold face without redistributing OS assets.
+/// This runs once per context, never in the Markdown/audio repaint path.
+/// Other platforms retain the default-font stronger-color fallback.
+fn install_strong_font(ctx: &egui::Context) {
+    let initialized = egui::Id::new("phorminx-strong-font-initialized");
+    if ctx.data(|data| data.get_temp::<bool>(initialized).unwrap_or(false)) {
+        return;
+    }
+    ctx.data_mut(|data| data.insert_temp(initialized, true));
+    #[cfg(windows)]
+    {
+        let windows_directory = std::env::var_os("WINDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+        if let Ok(bytes) = std::fs::read(windows_directory.join("Fonts").join("segoeuib.ttf")) {
+            let mut fonts = egui::FontDefinitions::default();
+            if let Ok(regular) = std::fs::read(windows_directory.join("Fonts").join("segoeui.ttf"))
+            {
+                fonts.font_data.insert(
+                    "PhorminxRegular".into(),
+                    egui::FontData::from_owned(regular).into(),
+                );
+                fonts
+                    .families
+                    .entry(FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "PhorminxRegular".into());
+            }
+            fonts.font_data.insert(
+                "PhorminxStrong".into(),
+                egui::FontData::from_owned(bytes).into(),
+            );
+            let mut names = vec!["PhorminxStrong".into()];
+            if let Some(fallback) = fonts.families.get(&FontFamily::Proportional) {
+                names.extend(fallback.clone());
+            }
+            fonts
+                .families
+                .insert(FontFamily::Name("PhorminxStrong".into()), names);
+            ctx.set_fonts(fonts);
+        }
+    }
 }
 
 #[cfg(test)]

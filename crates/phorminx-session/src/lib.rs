@@ -6,7 +6,12 @@
 
 mod audio;
 mod ledger;
+mod meeting;
 mod spool;
+
+pub use meeting::{
+    AiRunTracker, MeetingBoundaryError, MeetingCutoffs, MeetingSegment, MeetingSubmission,
+};
 
 pub use audio::{AudioSpan, AudioSpanError, CANONICAL_SAMPLE_RATE, SampleRange};
 pub use ledger::{

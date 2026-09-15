@@ -32,6 +32,8 @@ pub const MAX_HISTORY_LIMIT: usize = 500;
 pub enum UiRoute {
     #[default]
     Home,
+    Meetings,
+    Actions,
     Setup,
     History,
     Lexicon,
@@ -1434,13 +1436,10 @@ impl UiBridgeError {
 mod tests {
     use std::cell::Cell;
     use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use phorminx_persistence::{DictationDraft, HISTORY_PREVIEW_MAX_CHARS, TimingMetadata};
 
     use super::*;
-
-    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn shortcut_validation_reports_the_reason_without_changing_settings() {
@@ -1534,16 +1533,17 @@ mod tests {
     struct TestBridge {
         root: PathBuf,
         bridge: UiBridge,
+        // Drop the SQLite handle before the directory guard on Windows.
+        _directory: tempfile::TempDir,
     }
 
     impl TestBridge {
         fn new() -> Self {
-            let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "phorminx-ui-bridge-{}-{sequence}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&root).unwrap();
+            let directory = tempfile::Builder::new()
+                .prefix("phorminx-ui-bridge-")
+                .tempdir()
+                .unwrap();
+            let root = directory.path().to_path_buf();
             let model = root.join("model.bin");
             fs::write(&model, b"model").unwrap();
             let store = SettingsStore::new(root.join("settings.toml")).unwrap();
@@ -1552,17 +1552,15 @@ mod tests {
             settings.recognition.accurate_model = AccurateModelVariant::Custom;
             store.save(&settings).unwrap();
             let bridge = UiBridge::open(store, root.join("phorminx.sqlite3")).unwrap();
-            Self { root, bridge }
+            Self {
+                root,
+                bridge,
+                _directory: directory,
+            }
         }
 
         fn readiness(&self) -> UiReadinessSnapshot {
             ready(&self.bridge)
-        }
-    }
-
-    impl Drop for TestBridge {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
         }
     }
 

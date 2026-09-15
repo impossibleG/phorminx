@@ -3,9 +3,9 @@
 mod extended;
 
 pub use extended::{
-    DeferredCapturedAudio, ExtendedCaptureConfig, ExtendedCaptureFactory, ExtendedCaptureFault,
-    ExtendedCaptureProgress, ExtendedCapturedAudio, ExtendedRecording, ExtendedStorageKind,
-    OwnershipAcknowledger, start_extended_default, start_extended_input,
+    CaptureObserver, DeferredCapturedAudio, ExtendedCaptureConfig, ExtendedCaptureFactory,
+    ExtendedCaptureFault, ExtendedCaptureProgress, ExtendedCapturedAudio, ExtendedRecording,
+    ExtendedStorageKind, OwnershipAcknowledger, start_extended_default, start_extended_input,
 };
 
 use std::collections::TryReserveError;
@@ -52,6 +52,25 @@ pub fn input_devices() -> Result<Vec<InputDevice>, CaptureError> {
         .collect();
 
     Ok(devices)
+}
+
+/// Render endpoints available for system-audio loopback capture.
+pub fn output_devices() -> Result<Vec<InputDevice>, CaptureError> {
+    let host = cpal::default_host();
+    let default_name = host
+        .default_output_device()
+        .map(|device| device.to_string());
+    Ok(host
+        .output_devices()
+        .map_err(CaptureError::EnumerateDevices)?
+        .map(|device| {
+            let name = device.to_string();
+            InputDevice {
+                is_default: default_name.as_deref() == Some(name.as_str()),
+                name,
+            }
+        })
+        .collect())
 }
 
 /// An in-progress recording from the default microphone.
@@ -552,6 +571,12 @@ pub fn read_wav(path: &Path) -> Result<AudioClip, CaptureError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
+    #[error("system-audio capture is currently supported on Windows only")]
+    LoopbackUnsupported,
+    #[error("no default audio output is configured")]
+    NoDefaultOutputDevice,
+    #[error("the selected audio output is no longer available: {0}")]
+    OutputDeviceNotFound(String),
     #[error("no default microphone is configured")]
     NoDefaultInputDevice,
     #[error("the selected microphone is no longer available: {0}")]

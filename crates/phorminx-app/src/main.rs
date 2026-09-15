@@ -369,6 +369,7 @@ fn run() -> Result<()> {
     )?)
     .context("failed to install the global hotkey")?;
     let mut launcher_open = false;
+    let mut launcher_action_configs: Vec<phorminx_assistant::ActionConfig> = Vec::new();
     let mut launcher_recording = false;
     let capture = ExtendedCaptureFactory::new(ExtendedCaptureConfig::new(
         settings_store
@@ -605,6 +606,22 @@ fn run() -> Result<()> {
                     Ok(HoldEvent::Started { target })
                 } else if runtime.state() == RuntimeState::Idle {
                     launcher_open = true;
+                    launcher_action_configs = settings_store
+                        .path()
+                        .parent()
+                        .and_then(|dir| {
+                            phorminx_assistant::ConfigStore::new(dir.join("assistant.json"))
+                                .load()
+                                .ok()
+                        })
+                        .map(|config| config.actions)
+                        .unwrap_or_default();
+                    overlay.set_launcher_actions(
+                        launcher_action_configs
+                            .iter()
+                            .filter_map(|a| a.launcher_slot.map(|slot| (slot, a.name.clone())))
+                            .collect(),
+                    )?;
                     // The hook already armed selection atomically. Reopening it
                     // here would race with a fast selection already in the queue.
                     overlay.set(launcher_overlay_status(&settings))?;
@@ -628,6 +645,25 @@ fn run() -> Result<()> {
             Ok(HoldEvent::LauncherDismissed) => {
                 launcher_open = false;
                 overlay.set(OverlayStatus::Hidden)?;
+                Err(RecvTimeoutError::Timeout)
+            }
+            Ok(action @ (HoldEvent::LauncherMeetings | HoldEvent::LauncherAction(_))) => {
+                hotkey.set_launcher_open(false)?;
+                launcher_open = false;
+                overlay.set(OverlayStatus::Hidden)?;
+                if let Some(shell) = product_shell.as_ref() {
+                    let control = match action {
+                        HoldEvent::LauncherAction(slot) => launcher_action_configs
+                            .iter()
+                            .find(|a| a.launcher_slot == Some(slot))
+                            .cloned()
+                            .map(ProductShellControl::TriggerAction),
+                        _ => Some(ProductShellControl::StartMeeting),
+                    };
+                    if let Some(control) = control {
+                        shell.send(control).map_err(anyhow::Error::msg)?;
+                    }
+                }
                 Err(RecvTimeoutError::Timeout)
             }
             Ok(HoldEvent::Started { target }) => {
@@ -770,6 +806,8 @@ fn run() -> Result<()> {
             Ok(
                 HoldEvent::LauncherRequested { .. }
                 | HoldEvent::LauncherDictate { .. }
+                | HoldEvent::LauncherMeetings
+                | HoldEvent::LauncherAction(_)
                 | HoldEvent::LauncherDismissed,
             ) => unreachable!("launcher events are normalized above"),
             Err(RecvTimeoutError::Disconnected) => {
