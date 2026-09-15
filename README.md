@@ -1,8 +1,24 @@
-# Phorminx
+<p align="center">
+  <img src="design/brand/png/app/phorminx-app-256.png" alt="Phorminx P logo" width="112" height="112">
+</p>
+
+<h1 align="center">Phorminx</h1>
+
+<p align="center"><strong>Voice, disciplined.</strong></p>
 
 Local-first dictation and meeting assistance for Windows. Turn speech into text,
 keep searchable notes, and use optional AI formatting without requiring a paid
 AI service.
+
+<p align="center">
+  <a href="docs/DEVELOPMENT.md">Build from source</a> ·
+  <a href="#what-it-does">Features</a> ·
+  <a href="#privacy-and-network-access">Privacy</a>
+</p>
+
+![Phorminx Meetings workspace in light mode, showing computer-audio and microphone options](docs/images/meetings.png)
+
+<p align="center"><sub>The Meetings workspace. Screenshots use synthetic demo data.</sub></p>
 
 ## What it does
 
@@ -19,6 +35,16 @@ AI service.
   model-generated JSON, accessible from the launcher.
 - **Desktop controls:** configurable shortcuts, light/dark appearance,
   model management, and setup/repair tools.
+
+### Keep the meeting in view
+
+The floating companion puts the live transcript and assistant beside the
+conversation. Ask a question with the latest transcript context while capture
+continues.
+
+<p align="center">
+  <img src="docs/images/companion.png" alt="Phorminx floating companion in dark mode, with a synthetic live transcript and assistant response" width="344" height="544">
+</p>
 
 ## Getting started
 
