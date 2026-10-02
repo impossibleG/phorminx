@@ -871,6 +871,48 @@ mod tests {
     }
 
     #[test]
+    fn empty_recognizer_result_during_initial_silence_cannot_stop_capture() {
+        let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".to_owned()).unwrap();
+        let mut io = FakeIo {
+            finish_plan: FinishPlan::Quiet,
+            ..FakeIo::default()
+        };
+        runtime.hold_started(Some(1), &mut io).unwrap();
+        let id = runtime.active_id().unwrap();
+        // Model an arbitrarily long silent period. Empty endpoint results and
+        // delayed stale completions have no authority to end live capture.
+        for _ in 0..600 {
+            let notices = runtime
+                .transcription_completed(
+                    id,
+                    Ok(Transcript {
+                        text: String::new(),
+                        backend: "fake",
+                        model_load_time: Duration::ZERO,
+                        inference_time: Duration::ZERO,
+                        audio_duration: Duration::from_secs(1),
+                    }),
+                    &mut io,
+                )
+                .unwrap();
+            assert!(
+                notices
+                    .iter()
+                    .all(|notice| matches!(notice, RuntimeNotice::StaleTranscription { .. }))
+            );
+            assert_eq!(runtime.state(), RuntimeState::Listening);
+            assert!(runtime.active_recording().is_some());
+        }
+        assert_eq!(io.recording_drops.load(Ordering::Relaxed), 0);
+        assert!(!io.statuses.contains(&UiStatus::NoSpeech));
+        // Speech arriving later remains accepted until the explicit stop.
+        io.finish_plan = FinishPlan::SpeechThenSilence;
+        runtime.hold_ended(&mut io).unwrap();
+        assert_eq!(runtime.state(), RuntimeState::Transcribing);
+        assert_eq!(io.submitted.len(), 1);
+    }
+
+    #[test]
     fn prior_speech_is_not_diluted_by_release_after_long_silence() {
         let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".to_owned()).unwrap();
         let mut io = FakeIo::default();

@@ -14,6 +14,88 @@ fn fixture() -> (tempfile::TempDir, Persistence, i64) {
     (dir, db, id)
 }
 
+#[test]
+fn translations_and_dual_metadata_preserve_originals_and_follow_deletion() {
+    let (_dir, db, id) = fixture();
+    let repo = db.meetings();
+    repo.mark_dual_source(id).unwrap();
+    assert_eq!(repo.get(id).unwrap().unwrap().source, "both");
+    assert_eq!(repo.list("", None, 10).unwrap()[0].source, "both");
+    repo.append_segment(id, 0, 0, 16_000, "Original text", 100)
+        .unwrap();
+    assert!(
+        repo.save_source_segment(id, "mic", 0, 15_000, 1000, "Original text")
+            .unwrap()
+    );
+    assert!(
+        !repo
+            .save_source_segment(id, "mic", 0, 15_000, 1000, "Original text")
+            .unwrap()
+    );
+    assert!(
+        repo.save_source_segment(id, "mic", 0, 15_000, 1000, "Changed text")
+            .is_err()
+    );
+    assert_eq!(
+        repo.source_segments(id, "mic", 10).unwrap(),
+        vec![(0, 15_000, 1000, "Original text".into())]
+    );
+    assert!(
+        repo.save_translation(id, 0, "Portuguese", "local", "Texto original")
+            .unwrap()
+    );
+    assert_eq!(
+        repo.segments(id, None, 10).unwrap()[0].text,
+        "Original text"
+    );
+    assert_eq!(
+        repo.translations(id, 0, 10).unwrap(),
+        vec![(0, 16_000, "Portuguese".into(), "Texto original".into())]
+    );
+    // Keep a chat row so category deletion retains the parent session.
+    repo.append_chat_user(id, "Keep this chat", 101).unwrap();
+    db.delete_selected(phorminx_persistence::DeleteSelection {
+        meeting_transcripts: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(repo.translations(id, 0, 10).unwrap().is_empty());
+    assert!(repo.source_segments(id, "mic", 10).unwrap().is_empty());
+    assert!(
+        !repo
+            .save_translation(id, 0, "Portuguese", "local", "late response")
+            .unwrap()
+    );
+    assert!(
+        !repo
+            .save_source_segment(id, "mic", 15_000, 16_000, 1000, "late response")
+            .unwrap()
+    );
+}
+
+#[test]
+fn translations_and_sources_never_create_history_when_disabled() {
+    let (_dir, db, id) = fixture();
+    db.history()
+        .set_retention(RetentionPolicy::Disabled, 200)
+        .unwrap();
+    assert!(
+        !db.meetings()
+            .save_translation(id, 0, "English", "local", "text")
+            .unwrap()
+    );
+    assert!(
+        !db.meetings()
+            .save_source_segment(id, "mic", 0, 1, 0, "text")
+            .unwrap()
+    );
+    assert!(
+        db.meetings()
+            .save_source_segment(id, "both", 0, 1, 0, "text")
+            .is_err()
+    );
+}
+
 fn populate_categories(db: &Persistence, id: i64) {
     db.meetings()
         .append_segment(id, 0, 0, 10, "Transcript fixture", 101)

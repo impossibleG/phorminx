@@ -19,6 +19,8 @@ mod lexicon_window;
 #[cfg(windows)]
 mod ollama;
 #[cfg(windows)]
+mod ollama_start;
+#[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 mod performance;
@@ -67,6 +69,8 @@ pub use ollama::{
     inspect_ollama_installation, ollama_automatic_install_availability,
     ollama_model_disk_free_bytes, open_official_ollama_download,
 };
+#[cfg(windows)]
+pub use ollama_start::{OllamaStartError, start_verified_ollama};
 #[cfg(windows)]
 pub use overlay::{OverlayError, OverlayStatus, StatusOverlay};
 #[cfg(windows)]

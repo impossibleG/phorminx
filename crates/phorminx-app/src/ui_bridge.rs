@@ -626,6 +626,7 @@ pub struct UiProfileDraft {
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Synchronous, low-frequency intent; never queued on the audio path.
 pub enum UiCommand {
+    ActivateVerifiedVosk(crate::vosk_models::ValidatedVosk),
     SaveSettings(Settings),
     ClearHistory,
     SaveLexicon(UiLexiconDraft),
@@ -819,6 +820,14 @@ impl UiBridge {
         now_ms: i64,
     ) -> Result<UiCommandOutcome, UiBridgeError> {
         match command {
+            UiCommand::ActivateVerifiedVosk(proof) => {
+                let mut candidate = self.settings.clone();
+                proof.apply_to(&mut candidate);
+                candidate
+                    .validate_and_normalize()
+                    .map_err(UiBridgeError::settings)?;
+                self.commit_settings(candidate, now_ms, UiMutation::SettingsSaved)
+            }
             UiCommand::SaveSettings(candidate) => self.save_settings(candidate, readiness, now_ms),
             UiCommand::ClearHistory => {
                 let removed = self
@@ -1045,7 +1054,23 @@ impl UiBridge {
                 }
             }
         }
-        if requires_ollama(candidate.formatting.strength) {
+        let retained_ollama_selection = candidate.formatting.ollama_model.is_some()
+            && candidate.formatting.ollama_model == self.settings.formatting.ollama_model
+            && candidate.formatting.ollama_model_identity.is_some()
+            && candidate.formatting.ollama_model_identity
+                == self.settings.formatting.ollama_model_identity;
+        // An unavailable daemon cannot establish that a model is missing.
+        // Existing verified selections remain editable offline; runtime still
+        // verifies the exact digest before using AI formatting.
+        if requires_ollama(candidate.formatting.strength)
+            && !(retained_ollama_selection && !readiness.ollama.daemon_reachable)
+        {
+            if !readiness.ollama.daemon_reachable {
+                return Err(UiBridgeError::validation(
+                    "ollama_model",
+                    "Ollama is not reachable. Start Ollama to verify a newly selected model; existing preferences are unchanged.",
+                ));
+            }
             let selected = candidate
                 .formatting
                 .ollama_model
@@ -1808,6 +1833,44 @@ mod tests {
             .execute(UiCommand::SaveSettings(missing_ollama), &readiness, 10)
             .unwrap_err();
         assert_eq!(error.field, Some("ollama_model"));
+    }
+
+    #[test]
+    fn stopped_ollama_does_not_block_residency_changes_or_replace_saved_identity() {
+        let mut test = TestBridge::new();
+        let readiness = test.readiness();
+        let mut candidate = test.bridge.settings().clone();
+        candidate.formatting.strength = FormattingStrength::Balanced;
+        candidate.formatting.ollama_model = Some("qwen2.5:3b".to_owned());
+        test.bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+            .unwrap();
+        let pin = test
+            .bridge
+            .settings()
+            .formatting
+            .ollama_model_identity
+            .clone();
+        let mut offline = readiness.clone();
+        offline.ollama.daemon_reachable = false;
+        offline.ollama.models.clear();
+        let mut candidate = test.bridge.settings().clone();
+        candidate.formatting.ollama_lifecycle = crate::settings::OllamaLifecycle::MemorySaver;
+        test.bridge
+            .execute(UiCommand::SaveSettings(candidate), &offline, 11)
+            .unwrap();
+        assert_eq!(test.bridge.settings().formatting.ollama_model_identity, pin);
+        let mut new_model = test.bridge.settings().clone();
+        new_model.formatting.ollama_model = Some("different:latest".into());
+        new_model.formatting.ollama_model_identity = None;
+        let error = test
+            .bridge
+            .execute(UiCommand::SaveSettings(new_model), &offline, 12)
+            .unwrap_err();
+        assert_eq!(error.field, Some("ollama_model"));
+        assert!(error.message.contains("not reachable"));
+        assert!(!error.message.contains("not currently installed"));
+        assert_eq!(test.bridge.settings().formatting.ollama_model_identity, pin);
     }
 
     #[test]

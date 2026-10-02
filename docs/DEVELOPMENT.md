@@ -38,6 +38,7 @@ cargo fmt --all -- --check
 cargo test --workspace --all-targets --features phorminx-app/desktop
 cargo clippy --workspace --all-targets --features phorminx-app/desktop -- -D warnings
 .\scripts\Test-ReleaseAssets.ps1
+.\scripts\Test-PhorminxBootstrap.ps1
 python .\scripts\build-brand-assets.py --check
 ```
 
@@ -67,6 +68,19 @@ path-length limits. `-Cpu` produces a CPU-only build; `-OutputDirectory` chooses
 the artifact destination. Choose the intended release version explicitly.
 Signing is optional tooling, not automatic certification: do not describe an
 unsigned build as signed or a local build as a published release.
+
+The build embeds the requested version in both the application and its Windows
+resources. `-SkipBuild` rejects a binary with a different embedded version.
+The installer includes the verified bootstrap script and offers to prepare local
+models after installation. Silent update installations skip that interactive step.
+
+Signed updates additionally require `PHORMINX_UPDATE_PUBLIC_KEY` to be set during
+the application build (base64 raw Ed25519 public key). Keep the private key out
+of this repository and out of the web server. An unset key disables updates.
+Stable update metadata accepts only plain release versions, not alpha builds.
+The server contract, durable-storage prerequisites, and manifest format live in
+the website gateway repository's `server/PHORMINX_API.md`. Configuring a build
+does not deploy a feedback service or publish a release.
 
 Installers, compiled binaries, model weights, databases, and local recordings
 are not source contributions. Check dependency/runtime/model licensing and

@@ -52,6 +52,32 @@ CREATE TABLE IF NOT EXISTS meeting_question_context (
 );
 "#;
 
+pub(crate) const TRANSLATION_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS meeting_source_segments (
+ session_id INTEGER NOT NULL REFERENCES meeting_sessions(id) ON DELETE CASCADE,
+ source TEXT NOT NULL CHECK(source IN ('mic','system')),
+ start_sample INTEGER NOT NULL,
+ end_sample INTEGER NOT NULL,
+ offset_sample INTEGER NOT NULL,
+ text TEXT NOT NULL,
+ PRIMARY KEY(session_id,source,start_sample),
+ CHECK(start_sample>=0 AND end_sample>start_sample AND offset_sample>=0)
+);
+CREATE TABLE IF NOT EXISTS meeting_capture_modes (
+ session_id INTEGER PRIMARY KEY REFERENCES meeting_sessions(id) ON DELETE CASCADE,
+ source TEXT NOT NULL CHECK(source IN ('both'))
+);
+CREATE TABLE IF NOT EXISTS meeting_translations (
+ session_id INTEGER NOT NULL,
+ sequence INTEGER NOT NULL,
+ language TEXT NOT NULL,
+ model TEXT NOT NULL,
+ text TEXT NOT NULL,
+ PRIMARY KEY(session_id,sequence,language),
+ FOREIGN KEY(session_id,sequence) REFERENCES meeting_segments(session_id,sequence) ON DELETE CASCADE
+);
+"#;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MeetingQuestionContext {
     pub text: String,
@@ -127,6 +153,75 @@ pub struct MeetingRepository<'a> {
 }
 
 impl<'a> MeetingRepository<'a> {
+    pub fn save_source_segment(
+        &self,
+        session: i64,
+        source: &str,
+        start: u64,
+        end: u64,
+        offset: u64,
+        text: &str,
+    ) -> Result<bool> {
+        if !matches!(source, "mic" | "system") || end <= start {
+            return Err(invalid("meeting_source", "invalid source ownership"));
+        }
+        bounded("meeting_source_text", text, MAX_SEGMENT_BYTES)?;
+        if HistoryRepository::new(self.connection).retention()? == RetentionPolicy::Disabled {
+            return Ok(false);
+        }
+        if let Some(same) = self.connection.query_row("SELECT end_sample=?4 AND offset_sample=?5 AND text=?6 FROM meeting_source_segments WHERE session_id=?1 AND source=?2 AND start_sample=?3", params![session,source,number(start)?,number(end)?,number(offset)?,text], |r| r.get::<_,bool>(0)).optional()? {
+            return if same { Ok(false) } else { Err(invalid("meeting_source", "conflicting source replay")) };
+        }
+        Ok(self.connection.execute("INSERT INTO meeting_source_segments(session_id,source,start_sample,end_sample,offset_sample,text) SELECT session_id,?2,?3,?4,?5,?6 FROM meeting_capture_modes WHERE session_id=?1", params![session,source,number(start)?,number(end)?,number(offset)?,text])? > 0)
+    }
+    pub fn mark_dual_source(&self, session: i64) -> Result<()> {
+        self.connection.execute("INSERT OR IGNORE INTO meeting_capture_modes(session_id,source) SELECT id,'both' FROM meeting_sessions WHERE id=?1", [session])?;
+        Ok(())
+    }
+    pub fn source_segments(
+        &self,
+        session: i64,
+        source: &str,
+        limit: usize,
+    ) -> Result<Vec<(u64, u64, u64, String)>> {
+        let mut statement = self.connection.prepare("SELECT start_sample,end_sample,offset_sample,substr(text,1,16384) FROM meeting_source_segments WHERE session_id=?1 AND source=?2 ORDER BY start_sample LIMIT ?3")?;
+        Ok(statement
+            .query_map(params![session, source, limit.min(200) as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    /// Additive translation only: original transcript is never updated or replaced.
+    pub fn save_translation(
+        &self,
+        session: i64,
+        sequence: u64,
+        language: &str,
+        model: &str,
+        text: &str,
+    ) -> Result<bool> {
+        bounded("translation_language", language, 80)?;
+        bounded("translation_model", model, 256)?;
+        bounded("translation_text", text, MAX_SEGMENT_BYTES)?;
+        if HistoryRepository::new(self.connection).retention()? == RetentionPolicy::Disabled {
+            return Ok(false);
+        }
+        Ok(self.connection.execute("INSERT INTO meeting_translations(session_id,sequence,language,model,text) SELECT session_id,sequence,?3,?4,?5 FROM meeting_segments WHERE session_id=?1 AND sequence=?2 ON CONFLICT(session_id,sequence,language) DO UPDATE SET model=excluded.model,text=excluded.text", params![session, number(sequence)?, language, model, text])? > 0)
+    }
+    pub fn translations(
+        &self,
+        session: i64,
+        first_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, u64, String, String)>> {
+        let mut statement = self.connection.prepare("SELECT s.start_sample,s.end_sample,t.language,substr(t.text,1,16384) FROM meeting_translations t JOIN meeting_segments s USING(session_id,sequence) WHERE t.session_id=?1 AND t.sequence>=?2 ORDER BY t.sequence LIMIT ?3")?;
+        Ok(statement
+            .query_map(
+                params![session, number(first_sequence)?, limit.min(200) as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
     pub(crate) fn new(connection: &'a Connection) -> Self {
         Self { connection }
     }
@@ -226,7 +321,7 @@ impl<'a> MeetingRepository<'a> {
     }
 
     pub fn get(&self, session_id: i64) -> Result<Option<MeetingRecord>> {
-        Ok(self.connection.query_row("SELECT id,substr(title,1,1024),source,created_at_ms,updated_at_ms,ended_at_ms,next_sequence,committed_sample,assistant_generation FROM meeting_sessions WHERE id=?1", [session_id], meeting_row).optional()?)
+        Ok(self.connection.query_row("SELECT id,substr(title,1,1024),COALESCE((SELECT source FROM meeting_capture_modes WHERE session_id=m.id),source),created_at_ms,updated_at_ms,ended_at_ms,next_sequence,committed_sample,assistant_generation FROM meeting_sessions m WHERE id=?1", [session_id], meeting_row).optional()?)
     }
 
     /// Stable descending-id pagination. Keyword search includes title, transcript,
@@ -238,7 +333,7 @@ impl<'a> MeetingRepository<'a> {
         limit: usize,
     ) -> Result<Vec<MeetingRecord>> {
         bounded("meeting_query", query, 1024)?;
-        let mut statement = self.connection.prepare("SELECT id,substr(title,1,1024),source,created_at_ms,updated_at_ms,ended_at_ms,next_sequence,committed_sample,assistant_generation FROM meeting_sessions m WHERE (?1 IS NULL OR m.id<?1) AND (?2='' OR phorminx_find(m.title,?2)>0 OR EXISTS(SELECT 1 FROM meeting_segments s WHERE s.session_id=m.id AND phorminx_find(s.text,?2)>0) OR EXISTS(SELECT 1 FROM meeting_messages c WHERE c.session_id=m.id AND phorminx_find(c.text,?2)>0)) ORDER BY m.id DESC LIMIT ?3")?;
+        let mut statement = self.connection.prepare("SELECT id,substr(title,1,1024),COALESCE((SELECT source FROM meeting_capture_modes WHERE session_id=m.id),source),created_at_ms,updated_at_ms,ended_at_ms,next_sequence,committed_sample,assistant_generation FROM meeting_sessions m WHERE (?1 IS NULL OR m.id<?1) AND (?2='' OR phorminx_find(m.title,?2)>0 OR EXISTS(SELECT 1 FROM meeting_segments s WHERE s.session_id=m.id AND phorminx_find(s.text,?2)>0) OR EXISTS(SELECT 1 FROM meeting_messages c WHERE c.session_id=m.id AND phorminx_find(c.text,?2)>0)) ORDER BY m.id DESC LIMIT ?3")?;
         Ok(statement
             .query_map(
                 params![before_id, query, limit.min(100) as i64],

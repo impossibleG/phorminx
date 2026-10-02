@@ -653,6 +653,7 @@ fn run() -> Result<()> {
                 overlay.set(OverlayStatus::Hidden)?;
                 if let Some(shell) = product_shell.as_ref() {
                     let control = match action {
+                        HoldEvent::LauncherAction(0) => Some(ProductShellControl::Feedback),
                         HoldEvent::LauncherAction(slot) => launcher_action_configs
                             .iter()
                             .find(|a| a.launcher_slot == Some(slot))
@@ -690,7 +691,7 @@ fn run() -> Result<()> {
                 )
                 .then(Instant::now);
                 if let (Some(released_at), Some(id)) = (release_received_at, runtime.active_id()) {
-                    log_release_received(id, released_at);
+                    log_release_received(id, released_at, "shortcut_toggle");
                 }
                 if runtime.state() == RuntimeState::Idle {
                     dictation_context = match DictationContext::for_target(
@@ -783,7 +784,7 @@ fn run() -> Result<()> {
                 }
                 let released_at = Instant::now();
                 if let Some(id) = runtime.active_id() {
-                    log_release_received(id, released_at);
+                    log_release_received(id, released_at, "shortcut_release");
                 }
                 let notices = {
                     let mut io = ProductionIo {
@@ -2439,10 +2440,47 @@ fn apply_settings_form(
     candidate
         .validate_and_normalize()
         .context("The settings are not valid")?;
+    verify_settings_model_selection(&mut candidate, || {
+        production_ollama_client()
+            .discover(&CancellationToken::new())
+            .context("Local Ollama is unavailable. Start Ollama to verify a newly selected model; your existing settings have not been changed.")
+    })?;
+    candidate
+        .ensure_runtime_supported()
+        .context("This formatting profile is not ready")?;
+    let resolved_model = store.resolve_model_path(&candidate.recognition.model_path);
+    if candidate.recognition.mode == RecognitionMode::Accurate && !resolved_model.is_file() {
+        return Err(anyhow!(
+            "The selected Whisper model does not exist or is not a file."
+        ));
+    }
+    store.save(&candidate).context("Could not write settings")?;
+    if let Err(error) = std::env::current_exe()
+        .context("Could not locate Phorminx for launch-at-login")
+        .and_then(|executable| {
+            set_launch_at_login(&executable, candidate.startup.launch_at_login)
+                .context("Could not update launch-at-login")
+        })
+    {
+        let _ = store.save(settings);
+        return Err(error);
+    }
+    *settings = candidate;
+    Ok(())
+}
+
+/// A saved identity is an explicit model selection, not a health check. Keep it
+/// pinned while editing unrelated preferences offline; the worker independently
+/// verifies the identity before it gives a transcript to Ollama.
+fn verify_settings_model_selection(
+    candidate: &mut Settings,
+    discover: impl FnOnce() -> Result<phorminx_ollama::ModelCatalog>,
+) -> Result<()> {
     if matches!(
         candidate.formatting.strength,
         FormattingStrength::Balanced | FormattingStrength::Strong | FormattingStrength::Custom
-    ) {
+    ) && candidate.formatting.ollama_model_identity.is_none()
+    {
         let selected = candidate
             .formatting
             .ollama_model
@@ -2450,9 +2488,7 @@ fn apply_settings_form(
             .context("Select an installed local Ollama model")?;
         let policy = SelectionPolicy::exact(selected.clone())
             .context("The selected Ollama model name is invalid")?;
-        let catalog = production_ollama_client()
-            .discover(&CancellationToken::new())
-            .context("Could not verify the selected model with local Ollama")?;
+        let catalog = discover()?;
         let installed = catalog
             .select(&policy)
             .context("The selected Ollama model is not installed")?;
@@ -2476,27 +2512,6 @@ fn apply_settings_form(
             candidate.formatting.ollama_model_identity = Some(observed);
         }
     }
-    candidate
-        .ensure_runtime_supported()
-        .context("This formatting profile is not ready")?;
-    let resolved_model = store.resolve_model_path(&candidate.recognition.model_path);
-    if !resolved_model.is_file() {
-        return Err(anyhow!(
-            "The selected Whisper model does not exist or is not a file."
-        ));
-    }
-    store.save(&candidate).context("Could not write settings")?;
-    if let Err(error) = std::env::current_exe()
-        .context("Could not locate Phorminx for launch-at-login")
-        .and_then(|executable| {
-            set_launch_at_login(&executable, candidate.startup.launch_at_login)
-                .context("Could not update launch-at-login")
-        })
-    {
-        let _ = store.save(settings);
-        return Err(error);
-    }
-    *settings = candidate;
     Ok(())
 }
 
@@ -3099,7 +3114,7 @@ fn handle_test_dictation(
     }
     let released_at = (runtime.state() == RuntimeState::Listening).then(Instant::now);
     if let (Some(released_at), Some(id)) = (released_at, runtime.active_id()) {
-        log_release_received(id, released_at);
+        log_release_received(id, released_at, "test_dictation_button");
     }
     let mut io = ProductionIo {
         overlay,
@@ -3225,7 +3240,11 @@ fn log_state(id: Option<DictationId>, state: RuntimeState, event: &'static str) 
     );
 }
 
-fn log_release_received(id: DictationId, released_at: Instant) {
+fn log_release_received(id: DictationId, released_at: Instant, source: &'static str) {
+    eprintln!(
+        "dictation_id={} event=recording_stop_requested source={source}",
+        id.0
+    );
     let _ = released_at;
     eprintln!(
         "uptime_ms={} dictation_id={} state=FinalizingAudio event=release_received release_to_event_ms=0",
@@ -3600,7 +3619,7 @@ impl TranscriptionWorker {
                         None
                     }
                 };
-                let mut formatting = formatting;
+                let formatting = formatting;
                 let mut ollama = formatting.model.as_ref().map(|_| production_ollama_client());
                 let ollama_activity = if formatting.uses_ollama() {
                     production_workload_coordinator()
@@ -3610,6 +3629,10 @@ impl TranscriptionWorker {
                     None
                 };
                 if formatting.uses_ollama() {
+                    // Starting a verified local daemon does not authorize a
+                    // model. The exact saved identity is checked immediately
+                    // below before any transcript can be sent.
+                    phorminx_app::ollama_recovery::recover_local_ollama(&thread_shutting_down);
                     let verified = match (
                         ollama.as_ref(),
                         formatting.model.as_ref(),
@@ -3627,7 +3650,6 @@ impl TranscriptionWorker {
                         _ => false,
                     };
                     if !verified {
-                        formatting.profile = FormatProfile::Light;
                         ollama = None;
                         eprintln!(
                             "dictation_id=0 state=Starting event=ollama_identity_unverified recovery=deterministic"
@@ -3648,6 +3670,8 @@ impl TranscriptionWorker {
                 let mut incremental_sessions: HashMap<DictationId, PartialAccumulator> = HashMap::new();
                 let mut instant_sessions: HashMap<DictationId, InstantSession> = HashMap::new();
                 let mut checkpoint_clock = phorminx_app::text_recovery::CheckpointClock::default();
+                let mut recovery_probe: Option<Receiver<bool>> = None;
+                let mut last_recovery_attempt: Option<Instant> = None;
                 if formatting.uses_ollama()
                     && let (Some(client), Some(model)) = (&ollama, &formatting.model)
                 {
@@ -3677,6 +3701,39 @@ impl TranscriptionWorker {
                 }
 
                 loop {
+                    // A daemon missing at launch or stopped later must not
+                    // disable AI formatting until Phorminx restarts. Recovery
+                    // runs off-thread so it cannot stall live audio draining.
+                    if let Some(probe) = recovery_probe.as_ref() {
+                        match probe.try_recv() {
+                            Ok(verified) => {
+                                if verified {
+                                    ollama = Some(production_ollama_client());
+                                    eprintln!("dictation_id=0 event=ollama_recovery_ready");
+                                }
+                                recovery_probe = None;
+                            }
+                            Err(TryRecvError::Disconnected) => recovery_probe = None,
+                            Err(TryRecvError::Empty) => {}
+                        }
+                    }
+                    if ollama.is_none() && formatting.uses_ollama()
+                        && _ollama_activity.is_some() && recovery_probe.is_none()
+                        && last_recovery_attempt.is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
+                        && let (Some(model), Some(identity)) = (formatting.model.clone(), formatting.model_identity.clone())
+                    {
+                        last_recovery_attempt = Some(Instant::now());
+                        let (tx, rx) = mpsc::channel();
+                        let shutdown = Arc::clone(&thread_shutting_down);
+                        if thread::Builder::new().name("phorminx-ollama-recovery".into()).spawn(move || {
+                            let available = phorminx_app::ollama_recovery::recover_local_ollama(&shutdown);
+                            let verified = available && !shutdown.load(Ordering::Acquire)
+                                && installed_ollama_identity_matches(&production_ollama_client(), &model, &identity, &CancellationToken::new());
+                            let _ = tx.send(verified);
+                        }).is_ok() {
+                            recovery_probe = Some(rx);
+                        }
+                    }
                     drain_instant_audio(
                         &recognizer,
                         &instant_audio_rx,
@@ -3887,6 +3944,16 @@ impl TranscriptionWorker {
                                         app_executable.as_deref(),
                                         &formatting_cancel,
                                     );
+                                    if processed.warnings.iter().any(|warning|
+                                        warning == "ollama_fallback:service_unavailable"
+                                            || warning == "ollama_document:service_lost")
+                                    {
+                                        // Keep the deterministic output of this
+                                        // dictation; a fresh pin is mandatory
+                                        // before a recovered daemon is reused.
+                                        ollama = None;
+                                        last_recovery_attempt = None;
+                                    }
                                     processed.terminal.checkpoint_count = Some(checkpoint_count);
                                     processed.terminal.checkpoint_repair_count = Some(repair_count);
                                     processed.terminal.peak_retained_audio_ms = Some(
@@ -5281,9 +5348,25 @@ fn repair_accurate_chunk(
     let text = strip_known_non_speech_annotations(&result.transcript.text);
     // A successful empty decode is a no-words result, not a decoder error.
     // RMS alone cannot establish that speech exists in ambient noise.
-    if !text.trim().is_empty() {
-        accumulator.text = merge_confirmed_hypothesis(&accumulator.text, &text);
-    }
+    accumulator.text = reconcile_accurate_repair(
+        &accumulator.text,
+        &text,
+        range.start() < canonical_sample(accumulator.accepted_through),
+        || {
+            // If timestamps and text cannot prove an overlapping seam, decode
+            // only audio not yet owned by text. Do not append both renderings
+            // or guess how many repeated words should be deleted.
+            let unowned_offset =
+                canonical_sample(accumulator.accepted_through).saturating_sub(clip_start) as usize;
+            let unowned_end = (end - clip_start) as usize;
+            let unowned = AudioClip {
+                samples: clip.samples[unowned_offset..unowned_end].to_vec(),
+                sample_rate: clip.sample_rate,
+            };
+            let decoded = recognizer.transcribe_detailed(&unowned, options, None, Some(abort))?;
+            Ok::<_, WhisperError>(strip_known_non_speech_annotations(&decoded.transcript.text))
+        },
+    )?;
     // All returned text is owned through the chunk end. Capture reclamation
     // independently retains two seconds before this frontier, so the next
     // normal decode can reconcile a word straddling the physical cut.
@@ -5334,8 +5417,9 @@ fn append_timestamp_stable_segments(
         (accumulator.provisional.take(), current_hypothesis.as_ref())
         && previous.commit_through > accumulator.accepted_through
         && hypothesis_is_confirmed(&previous, current, plan.range)
+        && let Some(merged) = merge_confirmed_hypothesis(&accumulator.text, &previous.text)
     {
-        accumulator.text = merge_confirmed_hypothesis(&accumulator.text, &previous.text);
+        accumulator.text = merged;
         frontier = frontier.max(canonical_sample(previous.commit_through));
     }
     accumulator.provisional = (plan.boundary == BoundaryKind::Forced)
@@ -5405,17 +5489,16 @@ fn append_timestamp_stable_segments(
         }
         if !text.is_empty() {
             if absolute_start < frontier {
-                // Re-segmentation across an already committed boundary is
-                // normal. Prefer a lexical repair; when repetition makes the
-                // overlap ambiguous, conservatively append the new rendering.
-                // This may duplicate words, but it can never delete speech.
-                accumulator.text =
-                    merge_overlapping(&accumulator.text, text, MergeExpectation::LexicalOverlap)
-                        .unwrap_or_else(|_| {
-                            let mut preserved = accumulator.text.clone();
-                            append_with_spacing(&mut preserved, text);
-                            preserved
-                        });
+                // A crossing segment includes already-owned audio. Appending
+                // the entire segment on a failed seam duplicates that audio's
+                // words irreversibly. Keep it uncommitted for bounded repair.
+                match merge_overlapping(&accumulator.text, text, MergeExpectation::LexicalOverlap) {
+                    Ok(merged) => accumulator.text = merged,
+                    Err(_) => {
+                        accumulator.unresolved_from = Some(canonical_duration(frontier));
+                        break;
+                    }
+                }
             } else {
                 append_with_spacing(&mut accumulator.text, text);
             }
@@ -5476,25 +5559,43 @@ fn hypothesis_is_confirmed(
         && longest_word_overlap(&previous.text, current_text, MAX_HYPOTHESIS_WORDS) >= 2
 }
 
-fn merge_confirmed_hypothesis(left: &str, right: &str) -> String {
+fn merge_confirmed_hypothesis(left: &str, right: &str) -> Option<String> {
     const MAX_HYPOTHESIS_WORDS: usize = 256;
     if left.trim().is_empty() {
-        return right.trim().to_owned();
+        return Some(right.trim().to_owned());
     }
-    let left_words = normalized_word_ranges(left);
+    let left_words = normalized_tail_word_ranges(left, MAX_HYPOTHESIS_WORDS);
     let overlaps = matching_word_overlaps(left, right, MAX_HYPOTHESIS_WORDS);
     let overlap = overlaps.last().copied().unwrap_or(0);
     if overlap < 2 || overlap > left_words.len() || overlaps.len() != 1 {
-        // Multiple valid alignments are legitimate repeated dictation. Keep
-        // both renderings rather than guessing which occurrence to delete.
-        let mut preserved = left.to_owned();
-        append_with_spacing(&mut preserved, right.trim());
-        return preserved;
+        // Repeated words do not prove which audio occurrence owns the text.
+        // Keep the audio uncommitted instead of making duplication permanent.
+        return None;
     }
     let replace_from = left_words[left_words.len() - overlap].1.start;
     let mut merged = left[..replace_from].trim_end().to_owned();
     append_with_spacing(&mut merged, right.trim());
-    merged
+    Some(merged)
+}
+
+fn reconcile_accurate_repair<E>(
+    committed: &str,
+    overlapping: &str,
+    has_audio_overlap: bool,
+    decode_unowned: impl FnOnce() -> Result<String, E>,
+) -> Result<String, E> {
+    if has_audio_overlap && !overlapping.trim().is_empty() {
+        if let Some(merged) = merge_confirmed_hypothesis(committed, overlapping) {
+            return Ok(merged);
+        }
+        let unowned = decode_unowned()?;
+        let mut result = committed.to_owned();
+        append_with_spacing(&mut result, unowned.trim());
+        return Ok(result);
+    }
+    let mut result = committed.to_owned();
+    append_with_spacing(&mut result, overlapping.trim());
+    Ok(result)
 }
 
 fn longest_word_overlap(left: &str, right: &str, maximum: usize) -> usize {
@@ -5505,7 +5606,7 @@ fn longest_word_overlap(left: &str, right: &str, maximum: usize) -> usize {
 }
 
 fn matching_word_overlaps(left: &str, right: &str, maximum: usize) -> Vec<usize> {
-    let left = normalized_word_ranges(left);
+    let left = normalized_tail_word_ranges(left, maximum);
     let right = normalized_word_ranges(right);
     let maximum = left.len().min(right.len()).min(maximum);
     (1..=maximum)
@@ -5516,6 +5617,38 @@ fn matching_word_overlaps(left: &str, right: &str, maximum: usize) -> Vec<usize>
                 .eq(right[..count].iter().map(|token| &token.0))
         })
         .collect()
+}
+
+/// Seam repair only compares a bounded suffix. Re-tokenizing an hours-long
+/// transcript on every chunk made the matching work grow with session length.
+/// Retain absolute UTF-8 byte ranges so replacement still preserves punctuation.
+fn normalized_tail_word_ranges(
+    input: &str,
+    maximum: usize,
+) -> Vec<(String, std::ops::Range<usize>)> {
+    if maximum == 0 {
+        return Vec::new();
+    }
+    let mut words = Vec::new();
+    let mut end = None;
+    for (index, character) in input.char_indices().rev() {
+        if character.is_alphanumeric() || character == '_' {
+            end.get_or_insert(index + character.len_utf8());
+        } else if let Some(word_end) = end.take() {
+            let start = index + character.len_utf8();
+            words.push((input[start..word_end].to_lowercase(), start..word_end));
+            if words.len() == maximum {
+                break;
+            }
+        }
+    }
+    if words.len() < maximum
+        && let Some(word_end) = end
+    {
+        words.push((input[..word_end].to_lowercase(), 0..word_end));
+    }
+    words.reverse();
+    words
 }
 
 fn normalized_word_ranges(input: &str) -> Vec<(String, std::ops::Range<usize>)> {
@@ -5720,13 +5853,83 @@ where
             let mut tail_transcript = recognition.map_err(|error| error.to_string())?;
             tail_transcript.inference_time = tail_compute_time;
             suppress_non_speech_annotation(&mut tail_transcript);
-            let transcript = assemble_retained_incremental_transcript(
+            let original_tail = tail_transcript.clone();
+            let assembled = assemble_retained_incremental_transcript(
                 &accumulator,
                 tail_transcript,
                 tail.rms(),
                 full_duration,
-            )
-            .map_err(|reason| format!("extended Accurate seam could not be proven: {reason}"))?;
+            );
+            let transcript = match assembled {
+                Ok(transcript) => transcript,
+                Err("tail_overlap_unresolved") if accumulator.timestamp_stable => {
+                    let owned = canonical_sample(accumulator.accepted_through);
+                    let offset = owned
+                        .checked_sub(start_sample)
+                        .and_then(|offset| usize::try_from(offset).ok())
+                        .filter(|offset| *offset <= tail.samples.len())
+                        .ok_or_else(|| {
+                            "extended Accurate ownership is outside retained audio".to_owned()
+                        })?;
+                    let unowned = AudioClip {
+                        samples: tail.samples[offset..].to_vec(),
+                        sample_rate: tail.sample_rate,
+                    };
+                    let mut recovered = Transcript {
+                        text: accumulator.text.clone(),
+                        backend: "whisper.cpp",
+                        model_load_time: accumulator.model_load_time,
+                        inference_time: accumulator
+                            .partial_compute_time
+                            .saturating_add(tail_compute_time),
+                        audio_duration: full_duration,
+                    };
+                    // Recognition already found words in this tail. A quiet
+                    // unowned suffix is not evidence of silence: using a
+                    // second energy gate here can delete those words merely
+                    // because the louder overlap belongs to the prefix.
+                    if !unowned.samples.is_empty() {
+                        let (decoded, elapsed) =
+                            WallComputeClock.measure(|| recognizer.transcribe(&unowned, &options));
+                        recovered.inference_time = recovered.inference_time.saturating_add(elapsed);
+                        match decoded {
+                            Ok(mut decoded) => {
+                                suppress_non_speech_annotation(&mut decoded);
+                                if decoded.text.trim().is_empty() {
+                                    append_with_spacing(
+                                        &mut recovered.text,
+                                        original_tail.text.trim(),
+                                    );
+                                    eprintln!(
+                                        "dictation_id={} event=accurate_tail_retry_empty recovery=preserve_text",
+                                        id.0
+                                    );
+                                } else {
+                                    append_with_spacing(&mut recovered.text, decoded.text.trim());
+                                }
+                                recovered.backend = decoded.backend;
+                                recovered.model_load_time =
+                                    recovered.model_load_time.max(decoded.model_load_time);
+                            }
+                            Err(_) => {
+                                // A failed optional repair must not turn an
+                                // otherwise deliverable dictation into an error.
+                                append_with_spacing(&mut recovered.text, original_tail.text.trim());
+                                eprintln!(
+                                    "dictation_id={} event=accurate_tail_retry_failed recovery=preserve_text",
+                                    id.0
+                                );
+                            }
+                        }
+                    }
+                    recovered
+                }
+                Err(reason) => {
+                    return Err(format!(
+                        "extended Accurate seam could not be proven: {reason}"
+                    ));
+                }
+            };
             eprintln!(
                 "dictation_id={} state=Transcribing event=extended_final_tail tail_audio_ms={}",
                 id.0,
@@ -6102,10 +6305,12 @@ fn assemble_incremental_transcript_with_policy(
             MergeExpectation::LexicalOverlap,
         )
         .is_err()
+            && (!preserve_committed_on_ambiguous_seam || tail_rms == 0.0)
         {
-            // The retained tail is explicit silence. Keep the already-owned
-            // prefix instead of failing the dictation or appending a Whisper
-            // hallucination.
+            // Only a zero-energy retained tail proves silence. Quiet or
+            // sparse speech can have low whole-window RMS; let its recognized
+            // words reach ownership repair instead of discarding them. Legacy
+            // full-audio sessions can still retry their low-energy ambiguity.
             if !preserve_committed_on_ambiguous_seam {
                 return Err("low_energy_unmatched_tail");
             }
@@ -6124,7 +6329,7 @@ fn assemble_incremental_transcript_with_policy(
     }
     let text = match merge_overlapping(&accumulator.text, &tail_transcript.text, plan.expectation) {
         Ok(text) => text,
-        Err(_) if preserve_committed_on_ambiguous_seam => {
+        Err(_) if preserve_committed_on_ambiguous_seam && !accumulator.timestamp_stable => {
             // An ambiguous lexical seam is not grounds to reject committed
             // text. Conservatively preserve both sides; possible duplication
             // is preferable to deleting dictated speech.
@@ -7333,16 +7538,13 @@ mod composition_tests {
             ],
             0.1,
         );
-        assert_eq!(accumulator.text, "accepted prefix straddles frontier");
-        assert_eq!(accumulator.accepted_through, Duration::from_millis(2_500));
-        assert_eq!(
-            accumulator.unresolved_from,
-            Some(Duration::from_millis(2_500))
-        );
+        assert_eq!(accumulator.text, "accepted prefix");
+        assert_eq!(accumulator.accepted_through, Duration::from_secs(2));
+        assert_eq!(accumulator.unresolved_from, Some(Duration::from_secs(2)));
     }
 
     #[test]
-    fn segment_straddling_accepted_frontier_preserves_its_suffix() {
+    fn unprovable_straddling_segment_retains_audio_instead_of_duplicating_text() {
         use phorminx_app::incremental::{ChunkPlan, TimeRange};
         use phorminx_whisper::TimedSegment;
 
@@ -7371,12 +7573,9 @@ mod composition_tests {
             }],
             0.1,
         );
-        assert_eq!(accumulator.text, "accepted changed boundary");
-        assert_eq!(accumulator.accepted_through, Duration::from_millis(2_500));
-        assert_eq!(
-            accumulator.unresolved_from,
-            Some(Duration::from_millis(2_500))
-        );
+        assert_eq!(accumulator.text, "accepted");
+        assert_eq!(accumulator.accepted_through, Duration::from_secs(2));
+        assert_eq!(accumulator.unresolved_from, Some(Duration::from_secs(2)));
     }
 
     #[test]
@@ -7788,6 +7987,80 @@ mod composition_tests {
             replace_bounded("said ai chair", "ai", "AI"),
             "said AI chair"
         );
+    }
+
+    #[test]
+    fn bounded_seam_tokenizer_matches_full_tokenizer_for_unicode_and_punctuation() {
+        for text in [
+            "",
+            "alpha",
+            "go go go",
+            "Olá, não! Café_42 — 東京 🙂",
+            "  tiny ... words!! ",
+        ] {
+            let all = normalized_word_ranges(text);
+            for maximum in 0..=10 {
+                assert_eq!(
+                    normalized_tail_word_ranges(text, maximum),
+                    all[all.len().saturating_sub(maximum)..]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_repair_decodes_only_unowned_audio_and_preserves_spoken_repetitions() {
+        let result = reconcile_accurate_repair("go go", "go go now", true, || {
+            Ok::<_, ()>("go now".to_owned())
+        })
+        .unwrap();
+        assert_eq!(result, "go go go now");
+        assert_eq!(merge_confirmed_hypothesis("go go", "go go now"), None);
+        assert!(
+            reconcile_accurate_repair("go go", "go go now", true, || Err::<String, _>(
+                "decode failed"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn repair_uses_proven_overlap_but_does_not_deduplicate_disjoint_audio() {
+        let merged = reconcile_accurate_repair(
+            "the release is ready",
+            "is ready today",
+            true,
+            || -> Result<String, ()> { panic!("a proven seam needs no retry") },
+        )
+        .unwrap();
+        assert_eq!(merged, "the release is ready today");
+        let disjoint = reconcile_accurate_repair(
+            "very important",
+            "very important",
+            false,
+            || -> Result<String, ()> { panic!("disjoint audio is not retried") },
+        )
+        .unwrap();
+        assert_eq!(disjoint, "very important very important");
+    }
+
+    #[test]
+    fn retained_model_identity_does_not_query_service_for_unrelated_preferences() {
+        let mut settings = Settings::default();
+        settings.formatting.strength = FormattingStrength::Balanced;
+        settings.formatting.ollama_model = Some("qwen2.5:1.5b".to_owned());
+        settings.formatting.ollama_model_identity =
+            Some(OllamaModelIdentity::new("a".repeat(64), 1_000).unwrap());
+        let identity = settings.formatting.ollama_model_identity.clone();
+        settings.formatting.ollama_lifecycle = OllamaLifecycle::MemorySaver;
+        verify_settings_model_selection(&mut settings, || panic!("must not query stopped daemon"))
+            .unwrap();
+        assert_eq!(settings.formatting.ollama_model_identity, identity);
+        settings.formatting.ollama_model_identity = None;
+        assert!(
+            verify_settings_model_selection(&mut settings, || Err(anyhow!("offline"))).is_err()
+        );
+        assert!(settings.formatting.ollama_model_identity.is_none());
     }
 
     #[test]
@@ -8273,6 +8546,23 @@ mod composition_tests {
     }
 
     #[test]
+    fn zero_energy_retained_tail_does_not_append_unmatched_hallucination() {
+        for tail_text in ["", "invented words"] {
+            assert_eq!(
+                assemble_retained_incremental_transcript(
+                    &partial("Hello.", BoundaryKind::Silence),
+                    transcript(tail_text),
+                    0.0,
+                    Duration::from_secs(10),
+                )
+                .unwrap()
+                .text,
+                "Hello."
+            );
+        }
+    }
+
+    #[test]
     fn cancellation_is_visible_before_queued_final_or_partial_work_starts() {
         let cancellations = CancellationRegistry::default();
         let shutting_down = AtomicBool::new(false);
@@ -8457,7 +8747,13 @@ mod composition_tests {
         const REPEATED: &str = "please keep all of these words please keep all of these words please keep all of these words please keep all of these words";
         for retained in [false, true] {
             let recognizer = if retained {
-                SequencedRecognizer::new([SequencedOutcome::Text("closing words")])
+                // The first overlapping decode has no provable lexical seam.
+                // Retry only the unowned 120..130s interval, whose words must
+                // be appended without deleting intentional earlier repeats.
+                SequencedRecognizer::new([
+                    SequencedOutcome::Text("closing words"),
+                    SequencedOutcome::Text("closing words"),
+                ])
             } else {
                 SequencedRecognizer::new([
                     SequencedOutcome::Text(concat!(
@@ -8504,8 +8800,14 @@ mod composition_tests {
             assert_eq!(recognized.text, expected);
             assert_eq!(
                 recognizer.clip_lengths.borrow().len(),
-                if retained { 1 } else { 5 }
+                if retained { 2 } else { 5 }
             );
+            if retained {
+                assert_eq!(
+                    *recognizer.clip_lengths.borrow(),
+                    vec![16_000 * 12, 16_000 * 10]
+                );
+            }
             assert_repeated_speech_delivery(recognized);
         }
     }
@@ -8545,7 +8847,11 @@ mod composition_tests {
             requested.borrow().as_slice(),
             &[SampleRange::new(16_000 * 118, 16_000 * 130).unwrap()]
         );
-        assert_eq!(recognizer.clip_lengths.borrow().as_slice(), &[16_000 * 12]);
+        assert_eq!(
+            recognizer.clip_lengths.borrow().as_slice(),
+            &[16_000 * 12, 16_000 * 10]
+        );
+        assert_eq!(transcript.text, "stable text tail text");
         assert_eq!(transcript.audio_duration, Duration::from_secs(130));
     }
 
@@ -8587,6 +8893,128 @@ mod composition_tests {
             requested.borrow().as_slice(),
             &[SampleRange::new(16_000 * 118, 16_000 * 130).unwrap()]
         );
+    }
+
+    #[test]
+    fn retained_tail_retries_only_unowned_audio_instead_of_appending_overlap() {
+        for (retry, expected) in [
+            (
+                SequencedOutcome::Text("then continue"),
+                "we repeat repeat then continue",
+            ),
+            (
+                SequencedOutcome::Failure,
+                "we repeat repeat repeat then continue",
+            ),
+        ] {
+            let recognizer =
+                SequencedRecognizer::new([SequencedOutcome::Text("repeat then continue"), retry]);
+            let accumulator = PartialAccumulator {
+                text: "we repeat repeat".to_owned(),
+                stable_end: Duration::from_secs(180),
+                accepted_through: Duration::from_secs(180),
+                timestamp_stable: true,
+                next_sequence: 60,
+                ..PartialAccumulator::default()
+            };
+            let transcript = transcribe_extended_accurate_with_source(
+                &recognizer,
+                Some(accumulator),
+                FinalAudioStats {
+                    total_samples: 16_000 * 183,
+                    peak_retained_samples: 16_000 * 45,
+                    auto_stopped: false,
+                },
+                16_000 * 178,
+                "en",
+                DictationId(940),
+                |range| {
+                    AudioClip::new(vec![0.2; range.len() as usize], 16_000)
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .unwrap();
+            assert_eq!(transcript.text, expected);
+            assert_eq!(
+                *recognizer.clip_lengths.borrow(),
+                vec![16_000 * 5, 16_000 * 3]
+            );
+        }
+    }
+
+    #[test]
+    fn qa_quiet_unowned_tail_is_not_discarded_after_loud_overlap() {
+        let recognizer = SequencedRecognizer::new([
+            SequencedOutcome::Text("repeat then continue"),
+            SequencedOutcome::Text("then continue"),
+        ]);
+        let accumulator = PartialAccumulator {
+            text: "we repeat repeat".to_owned(),
+            stable_end: Duration::from_secs(180),
+            accepted_through: Duration::from_secs(180),
+            timestamp_stable: true,
+            next_sequence: 60,
+            ..PartialAccumulator::default()
+        };
+        let transcript = transcribe_extended_accurate_with_source(
+            &recognizer,
+            Some(accumulator),
+            FinalAudioStats {
+                total_samples: 16_000 * 183,
+                peak_retained_samples: 16_000 * 45,
+                auto_stopped: false,
+            },
+            16_000 * 178,
+            "en",
+            DictationId(941),
+            |range| {
+                let mut samples = vec![0.0005; range.len() as usize];
+                // Already-owned overlap is loud; newly spoken words are quiet.
+                for sample in samples.iter_mut().take(16_000 * 2) {
+                    *sample = 0.2;
+                }
+                AudioClip::new(samples, 16_000).map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
+        assert_eq!(transcript.text, "we repeat repeat then continue");
+    }
+
+    #[test]
+    fn qa_short_speech_in_mostly_silent_tail_is_not_treated_as_silence() {
+        let recognizer = SequencedRecognizer::new([
+            SequencedOutcome::Text("repeat then continue"),
+            SequencedOutcome::Text("then continue"),
+        ]);
+        let accumulator = PartialAccumulator {
+            text: "we repeat repeat".to_owned(),
+            stable_end: Duration::from_secs(180),
+            accepted_through: Duration::from_secs(180),
+            timestamp_stable: true,
+            next_sequence: 60,
+            ..PartialAccumulator::default()
+        };
+        let transcript = transcribe_extended_accurate_with_source(
+            &recognizer,
+            Some(accumulator),
+            FinalAudioStats {
+                total_samples: 16_000 * 183,
+                peak_retained_samples: 16_000 * 45,
+                auto_stopped: false,
+            },
+            16_000 * 178,
+            "en",
+            DictationId(942),
+            |range| {
+                // A brief voiced interval is above the default minimum RMS,
+                // but averaging it with the silent overlap lowers tail RMS.
+                let mut samples = vec![0.0; range.len() as usize];
+                samples[16_000 * 2..16_000 * 2 + 1_600].fill(0.006);
+                AudioClip::new(samples, 16_000).map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+        assert_eq!(transcript.text, "we repeat repeat then continue");
     }
 
     #[test]

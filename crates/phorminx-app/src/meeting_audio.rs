@@ -26,14 +26,107 @@ const INSTANT_BATCH: u64 = RATE / 4;
 const INSTANT_ROLLOVER: u64 = 20 * RATE;
 const MAX_PENDING_CUTOFFS: usize = 32;
 
+#[path = "meeting_dual.rs"]
+mod dual;
+
+/// Both inputs own separate recognition sessions; the coordinator only merges text.
+pub enum MeetingAudioService {
+    Single(SingleAudioService),
+    Dual(Box<Mutex<dual::DualAudioService>>),
+}
+impl MeetingAudioService {
+    pub fn start(
+        settings: RecognitionSettings,
+        source: MeetingAudioSource,
+        device: Option<String>,
+        scratch: PathBuf,
+    ) -> Result<Self, String> {
+        let (output_device, microphone_device) = if source == MeetingAudioSource::Microphone {
+            (None, device)
+        } else {
+            (device, None)
+        };
+        Self::start_with_devices(settings, source, output_device, microphone_device, scratch)
+    }
+
+    pub fn start_with_devices(
+        settings: RecognitionSettings,
+        source: MeetingAudioSource,
+        output_device: Option<String>,
+        microphone_device: Option<String>,
+        scratch: PathBuf,
+    ) -> Result<Self, String> {
+        if source == MeetingAudioSource::Both {
+            Ok(Self::Dual(Box::new(Mutex::new(
+                dual::DualAudioService::start(settings, output_device, microphone_device, scratch)?,
+            ))))
+        } else {
+            let device = if source == MeetingAudioSource::Microphone {
+                microphone_device
+            } else {
+                output_device
+            };
+            SingleAudioService::start(settings, source, device, scratch).map(Self::Single)
+        }
+    }
+    pub fn request_cutoff(&self, id: u64) -> Result<u64, String> {
+        match self {
+            Self::Single(audio) => audio.request_cutoff(id),
+            Self::Dual(audio) => audio
+                .lock()
+                .map_err(|_| "Meeting coordinator unavailable.")?
+                .request_cutoff(id),
+        }
+    }
+    pub fn stop(&self) -> Result<(), String> {
+        match self {
+            Self::Single(audio) => audio.stop(),
+            Self::Dual(audio) => audio
+                .lock()
+                .map_err(|_| "Meeting coordinator unavailable.")?
+                .stop(),
+        }
+    }
+    /// Suppress the selected source in Phorminx's recognition path. This does
+    /// not change another application's microphone or speaker state.
+    pub fn set_mute(&self, microphone: bool, computer_audio: bool) -> Result<(), String> {
+        match self {
+            Self::Single(audio) => audio.set_muted(match audio.source {
+                MeetingAudioSource::Microphone => microphone,
+                MeetingAudioSource::SystemAudio => computer_audio,
+                MeetingAudioSource::Both => unreachable!("dual capture has a coordinator"),
+            }),
+            Self::Dual(audio) => audio
+                .lock()
+                .map_err(|_| "Meeting coordinator unavailable.")?
+                .set_mute(microphone, computer_audio),
+        }
+    }
+    pub fn try_recv(&self) -> Option<MeetingAudioEvent> {
+        match self {
+            Self::Single(audio) => audio.try_recv(),
+            Self::Dual(audio) => audio.lock().ok()?.try_recv(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MeetingAudioSource {
     Microphone,
     SystemAudio,
+    Both,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MeetingAudioEvent {
+    /// Source-local ownership plus its offset on the meeting's monotonic clock.
+    SourceSegment {
+        source: MeetingAudioSource,
+        start_sample: u64,
+        end_sample: u64,
+        offset_sample: u64,
+        text: String,
+    },
     Ready,
     Warning {
         message: String,
@@ -68,19 +161,119 @@ pub enum MeetingAudioEvent {
 #[derive(Default)]
 struct Control {
     observer: Option<CaptureObserver>,
+    started_at: Option<std::time::Instant>,
     cutoffs: VecDeque<(u64, u64)>,
     stop_at: Option<u64>,
     closed: bool,
     partial: Option<(u64, String)>,
+    mute: MuteTimeline,
+}
+
+/// Mute changes are stamped at the capture frontier. The decoder can lag many
+/// seconds behind the device, so a current bool would reveal earlier muted
+/// audio after a quick unmute. The history is pruned as ownership advances.
+#[derive(Clone, Default)]
+struct MuteTimeline {
+    baseline: bool,
+    changes: VecDeque<(u64, bool)>,
+}
+
+impl MuteTimeline {
+    fn set(&mut self, sample: u64, muted: bool) -> Result<(), String> {
+        if self.changes.back().is_some_and(|(last, _)| sample < *last) {
+            return Err("Meeting audio timing changed; retry the mute control.".into());
+        }
+        let previous = self
+            .changes
+            .back()
+            .map_or(self.baseline, |(_, value)| *value);
+        if let Some((last_sample, last_value)) = self.changes.back_mut()
+            && *last_sample == sample
+        {
+            *last_value = muted;
+            if self.changes.len() == 1 && muted == self.baseline {
+                self.changes.pop_back();
+            }
+            return Ok(());
+        }
+        if previous == muted {
+            return Ok(());
+        }
+        if self.changes.len() >= 256 {
+            return Err("Recognition needs to catch up before changing mute again.".into());
+        }
+        self.changes.push_back((sample, muted));
+        Ok(())
+    }
+
+    fn prune(&mut self, committed: u64) {
+        while self
+            .changes
+            .front()
+            .is_some_and(|(sample, _)| *sample <= committed)
+        {
+            self.baseline = self.changes.pop_front().expect("front was present").1;
+        }
+    }
+
+    fn mask(&self, span: AudioSpan) -> Result<AudioSpan, String> {
+        let start = span.range().start();
+        let end = span.range().end();
+        let mut muted = self.baseline;
+        let mut cursor = start;
+        let mut ranges = Vec::new();
+        for &(sample, value) in &self.changes {
+            if sample <= start {
+                muted = value;
+            } else if sample < end {
+                if muted {
+                    ranges.push((cursor, sample));
+                }
+                cursor = sample;
+                muted = value;
+            } else {
+                break;
+            }
+        }
+        if muted {
+            ranges.push((cursor, end));
+        }
+        if ranges.is_empty() {
+            return Ok(span);
+        }
+        let mut samples = span.into_samples();
+        for (from, to) in ranges {
+            samples[(from - start) as usize..(to - start) as usize].fill(0.0);
+        }
+        AudioSpan::new(start, std::mem::take(&mut *samples))
+            .map_err(|_| "Muted meeting audio could not be prepared.".into())
+    }
 }
 
 /// Dropping requests shutdown without blocking the UI on native inference.
-pub struct MeetingAudioService {
+pub struct SingleAudioService {
+    source: MeetingAudioSource,
     control: Arc<Mutex<Control>>,
     events: mpsc::Receiver<MeetingAudioEvent>,
 }
 
-impl MeetingAudioService {
+impl SingleAudioService {
+    fn set_muted(&self, muted: bool) -> Result<(), String> {
+        let mut state = self
+            .control
+            .lock()
+            .map_err(|_| "Meeting control is unavailable.")?;
+        if state.closed || state.stop_at.is_some() {
+            return Err("The meeting is stopping or stopped.".into());
+        }
+        let sample = state
+            .observer
+            .as_ref()
+            .map_or(0, |observer| observer.progress().canonical_samples);
+        state.mute.set(sample, muted)?;
+        state.partial = None;
+        Ok(())
+    }
     /// Paths in `settings` must have been resolved against the settings store.
     /// `scratch_directory` is an empty ownership directory, not an audio archive;
     /// encrypted-spool fallback is explicitly disabled for meeting capture.
@@ -110,7 +303,11 @@ impl MeetingAudioService {
                 }
             })
             .map_err(|_| "Could not start the meeting audio worker.".to_owned())?;
-        Ok(Self { control, events })
+        Ok(Self {
+            source,
+            control,
+            events,
+        })
     }
 
     /// The gate also covers decode-plan selection, preventing a racing decoder
@@ -170,7 +367,7 @@ impl MeetingAudioService {
     }
 }
 
-impl Drop for MeetingAudioService {
+impl Drop for SingleAudioService {
     fn drop(&mut self) {
         let _ = self.stop();
     }
@@ -522,7 +719,8 @@ fn run(
     config.spill_uncommitted_to_disk = false;
     let factory = ExtendedCaptureFactory::new(config)
         .map_err(|_| "Meeting audio storage could not be prepared.")?;
-    let recording = match source { MeetingAudioSource::Microphone => factory.start_input(device.as_deref()), MeetingAudioSource::SystemAudio => factory.start_output_loopback(device.as_deref()) }
+    let started_at = std::time::Instant::now();
+    let recording = match source { MeetingAudioSource::Microphone => factory.start_input(device.as_deref()), MeetingAudioSource::SystemAudio => factory.start_output_loopback(device.as_deref()), MeetingAudioSource::Both => unreachable!("dual capture is coordinated above the single-source worker") }
         .map_err(|_| "The selected meeting audio device could not be opened. Check the device and its availability.".to_owned())?;
     let observer = recording.observer();
     {
@@ -530,6 +728,7 @@ fn run(
             .lock()
             .map_err(|_| "Meeting control is unavailable.")?;
         state.observer = Some(observer.clone());
+        state.started_at = Some(started_at);
         if state.stop_at.is_some() {
             observer.request_stop();
         }
@@ -541,7 +740,7 @@ fn run(
     let mut previous_notice_count = 0;
     let mut partial_published = std::time::Instant::now();
     loop {
-        let (available, boundary, plan, span) = {
+        let (available, boundary, plan, span, mute) = {
             let mut state = control
                 .lock()
                 .map_err(|_| "Meeting control is unavailable.")?;
@@ -610,13 +809,16 @@ fn run(
             } else {
                 None
             };
-            (available, boundary, plan, span)
+            (available, boundary, plan, span, state.mute.clone())
         };
         let current = capture.as_mut().ok_or("Meeting audio is unavailable.")?;
         if let (Some((_, _, force)), Some(span)) = (plan, span)
-            && let Some((end, text)) = decoder.transcribe(&span, force)?
+            && let Some((end, text)) = decoder.transcribe(&mute.mask(span)?, force)?
         {
             commit(sender, current, &mut committed, end, text)?;
+        }
+        if let Ok(mut state) = control.lock() {
+            state.mute.prune(committed);
         }
         if let Some(boundary) = boundary {
             if decoder.next_start(committed) == boundary
@@ -715,6 +917,36 @@ mod tests {
         assert_eq!(plan_range(20, 20, None, true), None);
     }
     #[test]
+    fn mute_timeline_masks_only_owned_source_intervals_even_after_unmute() {
+        let mut mute = MuteTimeline::default();
+        mute.set(4, true).unwrap();
+        mute.set(8, false).unwrap();
+        let span = AudioSpan::new(0, vec![0.5; 12]).unwrap();
+        let masked = mute.mask(span).unwrap();
+        assert_eq!(&masked.samples()[..4], &[0.5; 4]);
+        assert_eq!(&masked.samples()[4..8], &[0.0; 4]);
+        assert_eq!(&masked.samples()[8..], &[0.5; 4]);
+        assert_eq!(masked.range(), SampleRange::new(0, 12).unwrap());
+        mute.prune(6);
+        let delayed = mute.mask(AudioSpan::new(6, vec![0.5; 6]).unwrap()).unwrap();
+        assert_eq!(&delayed.samples()[..2], &[0.0; 2]);
+        assert_eq!(&delayed.samples()[2..], &[0.5; 4]);
+    }
+    #[test]
+    fn mute_repeated_at_same_capture_frontier_coalesces() {
+        let mut mute = MuteTimeline::default();
+        for value in [true, false, true, false] {
+            mute.set(10, value).unwrap();
+        }
+        assert!(mute.changes.len() <= 1);
+        assert_eq!(
+            mute.mask(AudioSpan::new(0, vec![0.5; 20]).unwrap())
+                .unwrap()
+                .samples(),
+            &[0.5; 20]
+        );
+    }
+    #[test]
     fn simulated_hours_of_cutoffs_have_exact_contiguous_coverage() {
         for instant in [true, false] {
             let mut frontier = 0;
@@ -733,7 +965,8 @@ mod tests {
     #[test]
     fn stop_before_ready_is_idempotent_and_rejects_cutoffs() {
         let (_, events) = mpsc::channel();
-        let service = MeetingAudioService {
+        let service = SingleAudioService {
+            source: MeetingAudioSource::SystemAudio,
             control: Arc::new(Mutex::new(Control::default())),
             events,
         };
@@ -747,7 +980,8 @@ mod tests {
     #[test]
     fn provisional_updates_coalesce_and_finalized_events_are_delivered_first() {
         let (sender, events) = mpsc::channel();
-        let service = MeetingAudioService {
+        let service = SingleAudioService {
+            source: MeetingAudioSource::SystemAudio,
             control: Arc::new(Mutex::new(Control::default())),
             events,
         };
@@ -790,7 +1024,7 @@ mod tests {
             mode: RecognitionMode::Accurate,
             ..Default::default()
         };
-        let service = MeetingAudioService::start(
+        let service = SingleAudioService::start(
             settings,
             MeetingAudioSource::SystemAudio,
             None,

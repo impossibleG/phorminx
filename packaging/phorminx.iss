@@ -58,9 +58,11 @@ Name: "startup"; Description: "Launch Phorminx when I sign in"; GroupDescription
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "phorminx-app.exe"; Flags: ignoreversion
+Source: "..\scripts\Initialize-Phorminx.ps1"; DestDir: "{app}\setup"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Phorminx"; Filename: "{app}\phorminx-app.exe"; WorkingDir: "{app}"
+Name: "{group}\Prepare Phorminx"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup\Initialize-Phorminx.ps1"" -FromInstaller"; WorkingDir: "{app}"
 Name: "{autodesktop}\Phorminx"; Filename: "{app}\phorminx-app.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 Name: "{group}\Uninstall Phorminx"; Filename: "{uninstallexe}"
 
@@ -69,4 +71,5 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Phorminx"; ValueData: """{app}\phorminx-app.exe"" --background"; Flags: uninsdeletevalue; Tasks: startup
 
 [Run]
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup\Initialize-Phorminx.ps1"" -FromInstaller"; Description: "Prepare local speech and AI models (downloads several GB; may request Windows approval)"; Flags: postinstall skipifsilent runasoriginaluser
 Filename: "{app}\phorminx-app.exe"; Description: "Launch Phorminx"; Flags: nowait postinstall skipifsilent unchecked

@@ -1,5 +1,6 @@
 //! Application orchestration for Phorminx.
 
+pub mod feedback;
 mod history_loader;
 pub mod incremental;
 mod library_search;
@@ -8,6 +9,7 @@ pub mod meeting_memory;
 pub mod meeting_workspace;
 pub mod model;
 pub mod ollama_onboarding;
+pub mod ollama_recovery;
 pub mod performance;
 pub mod performance_runtime;
 pub mod product_shell;
@@ -18,3 +20,6 @@ pub mod setup_features;
 pub mod setup_host;
 pub mod text_recovery;
 pub mod ui_bridge;
+pub mod update_center;
+pub mod updates;
+pub mod vosk_models;

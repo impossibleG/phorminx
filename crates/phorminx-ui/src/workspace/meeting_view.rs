@@ -1,7 +1,7 @@
 //! Approved picker-family companion and task-focused meeting workspace.
 use super::*;
-use crate::components::{page_header, tensioned_p};
-use egui::{Align, Button, Frame, Layout, Margin, Sense, Stroke, Vec2};
+use crate::components::page_header;
+use egui::{Align, Button, CursorIcon, Frame, Layout, Margin, Sense, Stroke, Vec2};
 
 fn muted(ui: &mut Ui, text: impl Into<String>) {
     ui.label(
@@ -67,8 +67,35 @@ pub(super) fn show(
         return;
     }
     ui.spacing_mut().item_spacing.y = 4.0;
-    muted(ui, "CONVERSATIONS");
-    ui.label(RichText::new("Meetings").size(28.0));
+    let (eyebrow, title, subtitle) = match state.tab {
+        Tab::Live => (
+            "MEETINGS / LIVE ROOM",
+            "The listening room.",
+            "Every voice in its place. Every thought within reach.",
+        ),
+        Tab::Saved => (
+            "MEETINGS / YOUR CONVERSATIONS",
+            "The record.",
+            "Find the moment, not just the date.",
+        ),
+        Tab::Settings => (
+            "MEETINGS / YOUR RULES",
+            "Set the room.",
+            "A few decisions before the conversation begins. None during it.",
+        ),
+        #[cfg(test)]
+        Tab::Actions => unreachable!(),
+    };
+    ui.add_space(Space::MD);
+    ui.label(
+        RichText::new(eyebrow)
+            .size(10.0)
+            .strong()
+            .color(ui.tokens().secondary_text),
+    );
+    ui.add_space(Space::XS);
+    ui.label(RichText::new(title).size(38.0).color(ui.tokens().text));
+    muted(ui, subtitle);
     ui.add_space(Space::LG);
     tabs(
         ui,
@@ -76,7 +103,7 @@ pub(super) fn show(
         &[
             (Tab::Live, "Live session"),
             (Tab::Saved, "Saved sessions"),
-            (Tab::Assistant, "Assistant"),
+            (Tab::Settings, "Meeting settings"),
         ],
     );
     if !s.notice.is_empty() {
@@ -86,7 +113,7 @@ pub(super) fn show(
     match state.tab {
         Tab::Live => live(ui, s, state, out),
         Tab::Saved => saved(ui, s, state, out),
-        Tab::Assistant => assistant(ui, s, state, out),
+        Tab::Settings => settings(ui, s, state, out),
         #[cfg(test)]
         Tab::Actions => unreachable!(),
     }
@@ -94,49 +121,43 @@ pub(super) fn show(
 
 fn live(ui: &mut Ui, s: &WorkspaceSnapshot, state: &mut WorkspaceState, out: &mut Vec<ShellEvent>) {
     if s.capture != CaptureState::Idle {
-        ui.add_space(Space::LG);
         let tokens = ui.tokens();
         Frame::new()
             .fill(tokens.surface)
             .stroke(Stroke::new(1.0, tokens.edge))
-            .corner_radius(8)
-            .inner_margin(24)
+            .inner_margin(Margin::symmetric(20, 14))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                muted(
-                    ui,
-                    format!(
-                        "{} · {}",
-                        capture_label(s.capture),
-                        timestamp(s.captured_samples)
-                    ),
-                );
-                ui.add_space(Space::MD);
-                section(
-                    ui,
-                    if s.title.is_empty() {
-                        "The conversation is in motion."
-                    } else {
-                        &s.title
-                    },
-                );
-                muted(
-                    ui,
-                    "Your transcript and assistant live in the floating companion.",
-                );
-                ui.add_space(Space::LG);
                 ui.horizontal_wrapped(|ui| {
-                    if action(ui, "Open companion", ActionTone::Primary).clicked() {
+                    ui.label(
+                        RichText::new("SESSION IN PROGRESS")
+                            .size(10.0)
+                            .strong()
+                            .color(tokens.verified),
+                    );
+                    ui.separator();
+                    ui.label(
+                        RichText::new(if s.title.is_empty() {
+                            "Live conversation"
+                        } else {
+                            &s.title
+                        })
+                        .size(17.0),
+                    );
+                    muted(ui, timestamp(s.captured_samples));
+                    if action(ui, "Open companion", ActionTone::Secondary).clicked() {
                         emit(out, WorkspaceEvent::OpenCompanion);
                     }
                     if matches!(s.capture, CaptureState::Starting | CaptureState::Listening)
-                        && action(ui, "Stop recording", ActionTone::Quiet).clicked()
+                        && action(ui, "Stop recording", ActionTone::Primary).clicked()
                     {
                         emit(out, WorkspaceEvent::Stop);
                     }
                 });
             });
-        ui.add_space(Space::LG);
+        ui.add_space(Space::MD);
+        muted(ui, "The live transcript and assistant stay in the separate companion window.");
+        ui.add_space(Space::MD);
         muted(
             ui,
             if s.history_enabled {
@@ -147,49 +168,79 @@ fn live(ui: &mut Ui, s: &WorkspaceSnapshot, state: &mut WorkspaceState, out: &mu
         );
         return;
     }
+    ui.add_space(Space::MD);
+    section(ui, "Ready for the conversation.");
+    muted(
+        ui,
+        "Phorminx listens to your microphone and computer audio together.",
+    );
     ui.add_space(Space::LG);
-    section(ui, "What should Phorminx listen to?");
-    muted(ui, "Choose once. Launcher 2 remembers.");
-    ui.add_space(Space::LG);
-    let before = (state.source, device(state));
-    ui.horizontal_wrapped(|ui| {
-        for (source, title, subtitle) in [
-            (
-                CaptureSource::SystemAudio,
-                "Computer audio",
-                "Your meeting, video or call",
-            ),
-            (CaptureSource::Microphone, "Microphone", "Your voice only"),
-        ] {
-            let tokens = ui.tokens();
-            let label = format!("{title}\n{subtitle}");
-            let selected = state.source == source;
-            if ui
-                .add(
-                    Button::new(label)
-                        .fill(if selected {
-                            tokens.raised
-                        } else {
-                            tokens.surface
-                        })
-                        .stroke(Stroke::new(
-                            1.0,
-                            if selected { tokens.accent } else { tokens.edge },
-                        ))
-                        .corner_radius(7)
-                        .min_size(Vec2::new(220.0_f32.min(ui.available_width()), 76.0)),
-                )
-                .clicked()
-            {
-                if state.source != source {
-                    state.device.clear();
+    Frame::new()
+        .fill(ui.tokens().surface)
+        .stroke(Stroke::new(1.0, ui.tokens().edge))
+        .inner_margin(20)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            muted(ui, "01 / CAPTURE");
+            ui.add_space(Space::SM);
+            ui.label(RichText::new("Computer + microphone").size(19.0));
+            muted(
+                ui,
+                format!(
+                    "Computer: {} · Microphone: {}",
+                    s.meeting_device.as_deref().unwrap_or("Windows default"),
+                    s.meeting_microphone_device
+                        .as_deref()
+                        .unwrap_or("Windows default")
+                ),
+            );
+            ui.add_space(Space::MD);
+            ui.horizontal_wrapped(|ui| {
+                if action(ui, "Start listening", ActionTone::Primary).clicked() {
+                    emit(out, WorkspaceEvent::StartMeeting);
+                    emit(out, WorkspaceEvent::OpenCompanion);
                 }
-                state.source = source;
-            }
-        }
-    });
+                if action(ui, "Meeting settings", ActionTone::Quiet).clicked() {
+                    state.tab = Tab::Settings;
+                }
+            });
+        });
     ui.add_space(Space::LG);
-    muted(ui, "Audio device");
+    muted(ui, "Start listening opens the companion. Speech becomes text; audio is not saved.");
+    if s.session_id.is_some() && !s.saved_session {
+        ui.add_space(Space::MD);
+        if action(ui, "Review this conversation", ActionTone::Quiet).clicked() {
+            emit(out, WorkspaceEvent::OpenCompanion);
+        }
+    }
+}
+
+fn settings(
+    ui: &mut Ui,
+    s: &WorkspaceSnapshot,
+    state: &mut WorkspaceState,
+    out: &mut Vec<ShellEvent>,
+) {
+    ui.add_space(Space::MD);
+    ui.label(RichText::new("01 / CAPTURE").size(10.0).strong().color(ui.tokens().secondary_text));
+    section(ui, "Capture");
+    muted(
+        ui,
+        "Phorminx listens to your microphone and computer together. Pause either source from the live room.",
+    );
+    if s.capture != CaptureState::Idle {
+        muted(
+            ui,
+            "Finish the current meeting to change audio, translation, or assistant settings.",
+        );
+        ui.disable();
+    }
+    if state.meeting_devices_pending.is_some() {
+        ui.disable();
+    }
+    ui.add_space(Space::LG);
+    muted(ui, "Computer audio device");
+    let before = (device(state), microphone_device(state));
     egui::ComboBox::from_id_salt("meeting-audio-device")
         .width(ui.available_width().min(590.0))
         .selected_text(if state.device.is_empty() {
@@ -199,11 +250,7 @@ fn live(ui: &mut Ui, s: &WorkspaceSnapshot, state: &mut WorkspaceState, out: &mu
         })
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut state.device, String::new(), "System default");
-            for name in if state.source == CaptureSource::SystemAudio {
-                &s.output_devices
-            } else {
-                &s.input_devices
-            } {
+            for name in &s.output_devices {
                 ui.selectable_value(&mut state.device, name.clone(), name);
             }
         });
@@ -214,54 +261,136 @@ fn live(ui: &mut Ui, s: &WorkspaceSnapshot, state: &mut WorkspaceState, out: &mu
                 .hint_text("Exact device name · optional"),
         );
     });
-    let after = (state.source, device(state));
+    ui.add_space(Space::MD);
+    muted(ui, "Microphone input device");
+    egui::ComboBox::from_id_salt("meeting-microphone-device")
+        .width(ui.available_width().min(590.0))
+        .selected_text(if state.microphone_device.is_empty() {
+            "Windows default microphone"
+        } else {
+            &state.microphone_device
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                &mut state.microphone_device,
+                String::new(),
+                "Windows default microphone",
+            );
+            for name in &s.input_devices {
+                ui.selectable_value(&mut state.microphone_device, name.clone(), name);
+            }
+        });
+    let after = (device(state), microphone_device(state));
     if before != after {
-        state.capture_preferences_pending = Some(after.clone());
-        emit(
-            out,
-            WorkspaceEvent::SaveCapturePreferences {
-                source: after.0,
-                device: after.1,
-            },
-        );
+        state.meeting_devices_dirty = after
+            != (
+                s.meeting_device.clone(),
+                s.meeting_microphone_device.clone(),
+            );
     }
-    ui.add_space(Space::LG);
-    ui.horizontal_wrapped(|ui| {
+    ui.add_space(Space::MD);
+    ui.add_enabled_ui(
+        state.meeting_devices_dirty && state.meeting_devices_pending.is_none(),
+        |ui| {
+            if action(ui, "Save devices", ActionTone::Secondary).clicked() {
+                state.save_meeting_devices(s, out);
+            }
+        },
+    );
+    if state.meeting_devices_pending.is_some() {
+        muted(ui, "Saving audio devices…");
+    } else if !s.meeting_devices_error.is_empty() {
         muted(
             ui,
-            if s.provider.model.is_empty() {
-                "Assistant not configured".to_owned()
-            } else {
-                format!("{} · {}", s.provider.model, s.provider.kind.label())
-            },
+            format!("Devices were not saved · {}", s.meeting_devices_error),
         );
-        if action(ui, "Change assistant", ActionTone::Quiet).clicked() {
-            state.tab = Tab::Assistant;
-        }
-    });
+    } else if state.meeting_devices_dirty {
+        muted(ui, "Device changes are not saved yet.");
+    } else if s.meeting_devices_revision > 0 {
+        muted(ui, "Audio devices saved.");
+    }
+    muted(
+        ui,
+        "Headphones help avoid speaker audio reaching the microphone twice.",
+    );
     ui.add_space(Space::LG);
     hairline(ui);
+    ui.add_space(Space::LG);
+    translation_settings(ui, s, state, out);
+    ui.add_space(Space::LG);
+    hairline(ui);
+    ui.add_space(Space::LG);
+    assistant(ui, s, state, out);
+}
+
+fn translation_settings(
+    ui: &mut Ui,
+    s: &WorkspaceSnapshot,
+    state: &mut WorkspaceState,
+    out: &mut Vec<ShellEvent>,
+) {
+    let current = (s.translation_language.clone(), s.translation_model.clone());
+    if state.translation_seen.as_ref() != Some(&current) {
+        state.translation_language = current.0.clone();
+        state.translation_model = current.1.clone();
+        state.translation_seen = Some(current);
+    }
+    ui.label(RichText::new("02 / TRANSLATION").size(10.0).strong().color(ui.tokens().secondary_text));
+    section(ui, "Translation");
+    muted(
+        ui,
+        "Local AI translates completed phrases. Originals are retained; translation never pauses recording.",
+    );
     ui.add_space(Space::MD);
-    ui.horizontal_wrapped(|ui| {
-        muted(ui, "Opens the floating companion.");
-        if action(ui, "Start listening", ActionTone::Primary).clicked() {
+    muted(ui, "Target language · leave empty to turn off");
+    ui.add(
+        TextEdit::singleline(&mut state.translation_language)
+            .hint_text("For example: Brazilian Portuguese")
+            .desired_width(420.0),
+    );
+    muted(ui, "Local Ollama model");
+    egui::ComboBox::from_id_salt("meeting-translation-model")
+        .selected_text(if state.translation_model.is_empty() {
+            "Choose a translation model"
+        } else {
+            &state.translation_model
+        })
+        .show_ui(ui, |ui| {
+            for model in &s.available_models {
+                ui.selectable_value(&mut state.translation_model, model.clone(), model);
+            }
+        });
+    ui.add(
+        TextEdit::singleline(&mut state.translation_model)
+            .hint_text("Installed model name")
+            .desired_width(420.0),
+    );
+    let language = state.translation_language.trim();
+    let model = state.translation_model.trim();
+    let valid =
+        (language.is_empty() && model.is_empty()) || (!language.is_empty() && !model.is_empty());
+    ui.add_enabled_ui(valid, |ui| {
+        if action(ui, "Save translation", ActionTone::Quiet).clicked() {
             emit(
                 out,
-                WorkspaceEvent::Start {
-                    source: state.source,
-                    device: device(state),
-                    title: String::new(),
-                    note: false,
+                WorkspaceEvent::SaveTranslation {
+                    language: language.into(),
+                    model: model.into(),
                 },
             );
-            emit(out, WorkspaceEvent::OpenCompanion);
         }
     });
-    if s.session_id.is_some() && !s.saved_session {
-        ui.add_space(Space::MD);
-        if action(ui, "Review this conversation", ActionTone::Quiet).clicked() {
-            emit(out, WorkspaceEvent::OpenCompanion);
-        }
+    if !valid {
+        muted(
+            ui,
+            "Choose both a target language and an installed local model, or clear both to turn translation off.",
+        );
+    }
+    if !s.translation_notice.is_empty() {
+        muted(
+            ui,
+            format!("Translation unavailable · {}", s.translation_notice),
+        );
     }
 }
 
@@ -271,11 +400,12 @@ fn saved(
     state: &mut WorkspaceState,
     out: &mut Vec<ShellEvent>,
 ) {
+    ui.add_space(Space::MD);
     ui.horizontal_wrapped(|ui| {
         let response = ui.add(
             TextEdit::singleline(&mut state.query)
-                .hint_text("Find a topic, not just a word…")
-                .desired_width(ui.available_width().min(480.0)),
+                .hint_text("Search a topic, a phrase, or a memory…")
+                .desired_width(ui.available_width().min(610.0)),
         );
         let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if action(ui, "Search", ActionTone::Secondary).clicked() || enter {
@@ -302,13 +432,32 @@ fn saved(
             "Saved conversations appear here. Search by what you remember.",
         );
     }
+    if !s.sessions.is_empty() {
+        ui.label(
+            RichText::new("RECENT SESSIONS")
+                .size(10.0)
+                .strong()
+                .color(ui.tokens().secondary_text),
+        );
+        ui.add_space(Space::SM);
+        hairline(ui);
+    }
     for session in &s.sessions {
         ui.push_id(session.id, |ui| {
-            ui.horizontal_wrapped(|ui| {
+            ui.add_space(Space::MD);
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(Vec2::new(108.0, 48.0), Layout::top_down(Align::Min), |ui| {
+                    ui.label(
+                        RichText::new(format!("SESSION {:03}", session.id))
+                            .size(10.0)
+                            .strong()
+                            .color(ui.tokens().secondary_text),
+                    );
+                });
                 ui.add_enabled_ui(s.capture == CaptureState::Idle, |ui| {
                     if ui
                         .add(
-                            Button::new(RichText::new(&session.title).size(16.0))
+                            Button::new(RichText::new(&session.title).size(20.0))
                                 .frame(false)
                                 .min_size(Vec2::new(0.0, 48.0)),
                         )
@@ -321,9 +470,9 @@ fn saved(
                     }
                 });
                 muted(ui, &session.source);
+                ui.label(RichText::new("↗").size(20.0).color(ui.tokens().accent));
             });
             hairline(ui);
-            ui.add_space(Space::SM);
         });
     }
     if s.capture != CaptureState::Idle {
@@ -411,8 +560,9 @@ fn assistant(
     out: &mut Vec<ShellEvent>,
 ) {
     let before = state.provider.clone();
-    section(ui, "Who answers. How they help.");
-    muted(ui, "Used by the companion when you ask a question.");
+    ui.label(RichText::new("03 / ASSISTANT").size(10.0).strong().color(ui.tokens().secondary_text));
+    section(ui, "Assistant");
+    muted(ui, "Choose the model that follows the discussion. Your questions take priority.");
     ui.add_space(Space::LG);
     muted(ui, "Provider");
     egui::ComboBox::from_id_salt("meeting-provider")
@@ -456,6 +606,35 @@ fn assistant(
     }
     ui.add_space(Space::MD);
     if state.provider.kind == ProviderChoice::Ollama {
+        muted(ui, "Fallback model · optional");
+        egui::ComboBox::from_id_salt("meeting-fallback-model")
+            .width(ui.available_width().min(630.0))
+            .selected_text(if state.provider.fallback_model.is_empty() {
+                "No fallback"
+            } else {
+                &state.provider.fallback_model
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut state.provider.fallback_model,
+                    String::new(),
+                    "No fallback",
+                );
+                for model in &s.available_models {
+                    if *model != state.provider.model {
+                        ui.selectable_value(
+                            &mut state.provider.fallback_model,
+                            model.clone(),
+                            model,
+                        );
+                    }
+                }
+            });
+        muted(
+            ui,
+            "If the local assistant fails before answering, Phorminx can try this installed model once.",
+        );
+        ui.add_space(Space::MD);
         ui.collapsing("Connection settings", |ui| {
             muted(ui, "Local Ollama address");
             ui.add(
@@ -518,6 +697,40 @@ fn assistant(
             state.save_provider(s, out);
         }
     });
+    ui.add_space(Space::LG);
+    hairline(ui);
+    ui.add_space(Space::LG);
+    section(ui, "Automatic commentary");
+    muted(
+        ui,
+        "A local Ollama model can comment when new conversation arrives. Your questions take priority.",
+    );
+    let label = if s.auto_commentary_enabled {
+        "Turn off commentary"
+    } else {
+        "Turn on commentary"
+    };
+    if action(ui, label, ActionTone::Quiet).clicked() {
+        emit(
+            out,
+            WorkspaceEvent::SetAutoCommentary(!s.auto_commentary_enabled),
+        );
+    }
+    ui.horizontal_wrapped(|ui| {
+        muted(ui, "Check for new context every");
+        for interval in [10, 15, 30, 60] {
+            let selected = s.auto_commentary_interval_secs == interval;
+            if ui
+                .selectable_label(selected, format!("{interval}s"))
+                .clicked()
+            {
+                emit(out, WorkspaceEvent::SetAutoCommentaryInterval(interval));
+            }
+        }
+    });
+    if !s.auto_commentary_notice.is_empty() {
+        muted(ui, &s.auto_commentary_notice);
+    }
 }
 
 fn timestamp(samples: u64) -> String {
@@ -539,106 +752,16 @@ pub(super) fn companion(
     out: &mut Vec<ShellEvent>,
 ) {
     let tokens = ui.tokens();
-    let panel_height = ui.available_height();
-    ui.spacing_mut().item_spacing = Vec2::new(8.0, 4.0);
-    ui.spacing_mut().button_padding = Vec2::new(8.0, 5.0);
-    ui.spacing_mut().interact_size = Vec2::new(30.0, 30.0);
+    ui.spacing_mut().item_spacing = Vec2::new(6.0, 3.0);
+    ui.spacing_mut().button_padding = Vec2::new(7.0, 4.0);
+    ui.spacing_mut().interact_size = Vec2::new(27.0, 27.0);
     ui.style_mut()
         .text_styles
         .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
-    Frame::new()
-        .fill(tokens.background)
-        .stroke(Stroke::new(1.0, tokens.edge))
-        .corner_radius(12)
-        .show(ui, |ui| {
+    Frame::new().fill(tokens.background).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.set_min_height((panel_height - 2.0).max(0.0));
-            if !state.companion_picker && s.capture_action.is_none() {
-                let retry = answer_retry_available(s);
-                egui::Panel::bottom(ui.id().with("anchored-composer"))
-                    .exact_size(if retry { 168.0 } else { 124.0 })
-                    .show_separator_line(false)
-                    .frame(Frame::new().inner_margin(Margin::symmetric(16, 12)))
-                    .show(ui, |ui| {
-                        Frame::new()
-                            .inner_margin(12)
-                            .fill(tokens.surface)
-                            .stroke(Stroke::new(1.0, tokens.edge))
-                            .corner_radius(7)
-                            .show(ui, |ui| {
-                                composer(ui, s, state, out);
-                            });
-                    });
-                // Content can scroll/clip above the composer, never cover it.
-                ui.set_clip_rect(ui.clip_rect().intersect(ui.available_rect_before_wrap()));
-            }
-            Frame::new()
-                .inner_margin(Margin::symmetric(18, 14))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let mark = tensioned_p(ui, 28.0);
-                        let mark = ui.interact(
-                            mark.rect,
-                            ui.id().with("companion-picker"),
-                            Sense::click(),
-                        );
-                        mark.widget_info(|| {
-                            egui::WidgetInfo::labeled(
-                                egui::WidgetType::Button,
-                                true,
-                                "Open action picker",
-                            )
-                        });
-                        if mark.on_hover_text("Open action picker").clicked() {
-                            state.companion_picker = !state.companion_picker;
-                        }
-                        ui.add_space(Space::XS);
-                        let width = (ui.available_width() - 85.0).max(70.0);
-                        let response = ui
-                            .allocate_ui_with_layout(
-                                Vec2::new(width, 42.0),
-                                Layout::top_down(Align::Min),
-                                |ui| {
-                                    ui.set_width(width);
-                                    ui.label(RichText::new("PHORMINX").size(11.0));
-                                    muted(
-                                        ui,
-                                        format!(
-                                            "{} · {}",
-                                            capture_label(s.capture),
-                                            timestamp(s.captured_samples)
-                                        ),
-                                    );
-                                },
-                            )
-                            .response;
-                        if ui
-                            .interact(response.rect, ui.id().with("companion-drag"), Sense::drag())
-                            .drag_started()
-                        {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                        }
-                        if ui
-                            .add(Button::new("−").frame(false).min_size(Vec2::splat(30.0)))
-                            .on_hover_text("Hide companion · listening continues")
-                            .clicked()
-                        {
-                            emit(out, WorkspaceEvent::HideCompanion);
-                        }
-                        if matches!(s.capture, CaptureState::Starting | CaptureState::Listening)
-                            && ui
-                                .add(Button::new("■").frame(false).min_size(Vec2::splat(30.0)))
-                                .on_hover_text(if s.capture_action.is_some() {
-                                    "Stop and execute action"
-                                } else {
-                                    "Stop listening"
-                                })
-                                .clicked()
-                        {
-                            emit(out, WorkspaceEvent::Stop);
-                        }
-                    });
-                });
+            ui.set_min_height(ui.available_height());
+            companion_utility_bar(ui, s, state, out);
             hairline(ui);
             if state.companion_picker {
                 picker(ui, s, state, out);
@@ -655,95 +778,500 @@ pub(super) fn companion(
                     });
                 return;
             }
-            Frame::new()
-                .fill(tokens.surface)
-                .inner_margin(Margin::symmetric(20, 14))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        muted(ui, "LIVE TRANSCRIPT");
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let label = if state.transcript_expanded {
-                                "Less"
-                            } else {
-                                "Expand"
-                            };
-                            if ui.add(Button::new(label).frame(false)).clicked() {
-                                state.transcript_expanded = !state.transcript_expanded;
-                            }
-                        });
-                    });
-                    ui.add_space(Space::XS);
-                    let height = if state.transcript_expanded {
-                        (panel_height * 0.22).clamp(38.0, 150.0)
-                    } else {
-                        (panel_height * 0.10).clamp(32.0, 68.0)
-                    };
-                    ScrollArea::vertical()
-                        .id_salt("companion-transcript")
-                        .max_height(height)
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            let skip = if state.transcript_expanded {
-                                s.transcript.len().saturating_sub(12)
-                            } else {
-                                s.transcript.len().saturating_sub(1)
-                            };
-                            for line in s.transcript.iter().skip(skip) {
-                                ui.label(&line.text);
-                                if state.transcript_expanded {
-                                    muted(ui, timestamp(line.end_sample));
-                                }
-                            }
-                            if !s.provisional_text.is_empty() {
-                                ui.label(
-                                    RichText::new(&s.provisional_text)
-                                        .italics()
-                                        .color(tokens.secondary_text),
-                                );
-                            }
-                            if s.transcript.is_empty() && s.provisional_text.is_empty() {
-                                muted(
-                                    ui,
-                                    if s.capture == CaptureState::Idle {
-                                        "Start listening when you’re ready."
-                                    } else {
-                                        "Listening for the conversation…"
-                                    },
-                                );
-                            }
-                        });
-                    ui.add_space(Space::XS);
-                    muted(
-                        ui,
-                        format!(
-                            "{} · {}",
-                            timestamp(s.committed_samples),
-                            if s.meeting_source == CaptureSource::SystemAudio {
-                                "Computer audio"
-                            } else {
-                                "Microphone"
-                            }
-                        ),
-                    );
+            companion_controls(ui, s, state, out);
+            companion_content(ui, s, state, out);
+        });
+}
+
+fn companion_utility_bar(
+    ui: &mut Ui,
+    s: &WorkspaceSnapshot,
+    state: &mut WorkspaceState,
+    out: &mut Vec<ShellEvent>,
+) {
+    let tokens = ui.tokens();
+    let compact = ui.available_width() < 820.0;
+    Frame::new()
+        .fill(tokens.surface)
+        .inner_margin(Margin::symmetric(16, 8))
+        .show(ui, |ui| {
+            if compact {
+                ui.horizontal(|ui| {
+                    companion_session_title(ui, s, (ui.available_width() - 110.0).max(150.0));
+                    companion_status(ui, s);
                 });
-            hairline(ui);
-            // Only the conversation scrolls. Header, transcript and composer stay in place.
-            Frame::new()
-                .inner_margin(Margin::symmetric(20, 16))
-                .show(ui, |ui| {
-                    if !s.notice.is_empty() {
-                        muted(ui, &s.notice);
-                    }
-                    let status_height = if s.ai_busy || s.send_pending {
-                        48.0
+                ui.horizontal(|ui| {
+                    if s.capture != CaptureState::Idle { source_controls(ui, s, out); }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        companion_window_actions(ui, s, state, out);
+                    });
+                });
+            } else {
+                let title_width = (ui.available_width() * 0.34).clamp(240.0, 310.0);
+                ui.horizontal(|ui| {
+                    companion_session_title(ui, s, title_width);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        companion_window_actions(ui, s, state, out);
+                        if s.capture != CaptureState::Idle { source_controls(ui, s, out); }
+                        companion_status(ui, s);
+                    });
+                });
+            }
+        });
+}
+
+fn companion_session_title(ui: &mut Ui, s: &WorkspaceSnapshot, width: f32) {
+    let tokens = ui.tokens();
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, 36.0),
+        Layout::top_down(Align::Min),
+        |ui| {
+            ui.label(RichText::new("MEETING").size(9.0).color(tokens.secondary_text));
+            let title = if s.title.trim().is_empty() { "Live meeting" } else { &s.title };
+            ui.add(egui::Label::new(RichText::new(title).size(14.0).strong()).truncate());
+        },
+    );
+}
+
+fn companion_status(ui: &mut Ui, s: &WorkspaceSnapshot) {
+    let tokens = ui.tokens();
+    let color = if matches!(s.capture, CaptureState::Starting | CaptureState::Listening) {
+        tokens.verified
+    } else {
+        tokens.secondary_text
+    };
+    ui.label(RichText::new(format!(
+        "●  {}   {}",
+        capture_label(s.capture).to_uppercase(),
+        timestamp(s.captured_samples)
+    )).size(10.0).color(color));
+}
+
+fn companion_window_actions(
+    ui: &mut Ui,
+    s: &WorkspaceSnapshot,
+    state: &mut WorkspaceState,
+    out: &mut Vec<ShellEvent>,
+) {
+    let tokens = ui.tokens();
+    let active = matches!(s.capture, CaptureState::Starting | CaptureState::Listening);
+    if ui.add_enabled(active, Button::new(RichText::new("Finish").color(tokens.background)).fill(tokens.text).stroke(Stroke::NONE))
+        .on_hover_text("Finish recording")
+        .clicked()
+    {
+        emit(out, WorkspaceEvent::Stop);
+    }
+    if ui.add(Button::new("Hide").fill(tokens.background).stroke(Stroke::new(1.0, tokens.edge)))
+        .on_hover_text("Hide companion · listening continues")
+        .clicked()
+    {
+        emit(out, WorkspaceEvent::HideCompanion);
+    }
+    let picker = ui.add(Button::new("⋯").fill(tokens.background).stroke(Stroke::new(1.0, tokens.edge)));
+    picker.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Open action picker"));
+    if picker.on_hover_text("Open action picker").clicked() {
+        state.companion_picker = !state.companion_picker;
+    }
+}
+
+fn companion_controls(
+    ui: &mut Ui,
+    s: &WorkspaceSnapshot,
+    state: &mut WorkspaceState,
+    out: &mut Vec<ShellEvent>,
+) {
+    let before_layout = (state.companion_view, state.translation_view);
+    let tokens = ui.tokens();
+    Frame::new()
+        .fill(tokens.background)
+        .inner_margin(Margin::symmetric(16, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let compact = ui.available_width() < 710.0;
+                for (view, label) in [
+                    (CompanionView::Transcript, "Transcript"),
+                    (CompanionView::Split, "Together"),
+                    (CompanionView::Assistant, "Assistant"),
+                ] {
+                    let selected = if compact && state.companion_view == CompanionView::Split {
+                        view == CompanionView::Transcript
                     } else {
-                        8.0
+                        state.companion_view == view
                     };
-                    let height = (ui.available_height() - status_height).max(0.0);
-                    conversation_messages(ui, s, state, out, height);
+                    let response = ui.add_enabled(
+                        !compact || view != CompanionView::Split,
+                        Button::new(RichText::new(label).size(11.0).color(if selected { tokens.text } else { tokens.secondary_text }))
+                            .frame(false)
+                            .min_size(Vec2::new(0.0, 28.0)),
+                    ).on_hover_text(if compact && view == CompanionView::Split { "Widen the window for both panes" } else { "Change room view" });
+                    if response.clicked() { state.companion_view = view; }
+                    if selected {
+                        ui.painter().line_segment(
+                            [response.rect.left_bottom(), response.rect.right_bottom()],
+                            Stroke::new(2.0, tokens.accent),
+                        );
+                    }
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let effective = if compact && state.companion_view == CompanionView::Split {
+                        CompanionView::Transcript
+                    } else { state.companion_view };
+                    if effective != CompanionView::Transcript {
+                        commentary_toggle(ui, s, out);
+                    }
+                    if effective != CompanionView::Assistant {
+                        translation_controls(ui, s, state);
+                    }
+                });
+            });
+        });
+    hairline(ui);
+    if before_layout != (state.companion_view, state.translation_view) {
+        state.save_companion_layout(out);
+    }
+}
+
+fn source_controls(ui: &mut Ui, s: &WorkspaceSnapshot, out: &mut Vec<ShellEvent>) {
+    let tokens = ui.tokens();
+    let mic_label = if s.microphone_muted { "□ Mic paused" } else { "▪ Mic on" };
+    if ui.add(Button::new(mic_label).small().fill(tokens.background).stroke(Stroke::new(1.0, tokens.edge)))
+        .on_hover_text(if s.microphone_muted { "Resume my transcription" } else { "Pause my transcription" })
+        .clicked()
+    {
+        emit(out, WorkspaceEvent::SetMeetingSourceMuted { source: CaptureSource::Microphone, muted: !s.microphone_muted });
+    }
+    let computer_label = if s.computer_audio_muted { "□ Computer paused" } else { "▪ Computer on" };
+    if ui.add(Button::new(computer_label).small().fill(tokens.background).stroke(Stroke::new(1.0, tokens.edge)))
+        .on_hover_text(if s.computer_audio_muted { "Resume computer transcription" } else { "Pause computer transcription" })
+        .clicked()
+    {
+        emit(out, WorkspaceEvent::SetMeetingSourceMuted { source: CaptureSource::SystemAudio, muted: !s.computer_audio_muted });
+    }
+}
+
+fn translation_controls(ui: &mut Ui, s: &WorkspaceSnapshot, state: &mut WorkspaceState) {
+    let tokens = ui.tokens();
+    let target = if s.translation_language.eq_ignore_ascii_case("Brazilian Portuguese")
+        || s.translation_language.eq_ignore_ascii_case("pt-BR")
+    { "Português" } else if s.translation_language.len() <= 13 && !s.translation_language.is_empty() {
+        s.translation_language.as_str()
+    } else { "Translation" };
+    for (view, label) in [
+        (TranslationView::Translation, target),
+        (TranslationView::Both, "Both"),
+        (TranslationView::Original, "Original"),
+    ] {
+        let selected = state.translation_view == view;
+        if ui.add(Button::new(RichText::new(label).size(10.0).color(if selected { tokens.background } else { tokens.secondary_text }))
+            .fill(if selected { tokens.text } else { tokens.surface })
+            .stroke(Stroke::new(1.0, tokens.edge)))
+            .on_hover_text(if view == TranslationView::Translation && !s.translation_language.is_empty() {
+                s.translation_language.as_str()
+            } else { label })
+            .clicked()
+        {
+            state.translation_view = view;
+        }
+    }
+}
+
+fn commentary_toggle(ui: &mut Ui, s: &WorkspaceSnapshot, out: &mut Vec<ShellEvent>) {
+    let tokens = ui.tokens();
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(31.0, 18.0), Sense::click());
+    let fill = if s.auto_commentary_enabled { tokens.verified } else { tokens.edge };
+    ui.painter().rect_filled(rect, 9.0, fill);
+    let center_x = if s.auto_commentary_enabled { rect.right() - 9.0 } else { rect.left() + 9.0 };
+    ui.painter().circle_filled(egui::pos2(center_x, rect.center().y), 6.0, tokens.background);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Toggle commentary"));
+    if response.on_hover_text("Commentary on new conversation; your questions take priority").clicked() {
+        emit(out, WorkspaceEvent::SetAutoCommentary(!s.auto_commentary_enabled));
+    }
+    ui.label(RichText::new("Commentary").size(10.0).color(tokens.secondary_text));
+}
+
+fn companion_content(
+    ui: &mut Ui,
+    s: &WorkspaceSnapshot,
+    state: &mut WorkspaceState,
+    out: &mut Vec<ShellEvent>,
+) {
+    let height = ui.available_height().max(80.0);
+    let width = ui.available_width();
+    let origin = ui.next_widget_position();
+    let mut layout_drag_stopped = false;
+    let effective_view = if width < 710.0 && state.companion_view == CompanionView::Split {
+        CompanionView::Transcript
+    } else {
+        state.companion_view
+    };
+    match effective_view {
+        CompanionView::Transcript => transcript_panel(ui, s, state, out, height),
+        CompanionView::Assistant => assistant_panel(ui, s, state, out, height),
+        CompanionView::Split if width >= 710.0 => {
+            let fraction = if state.split_fraction == 0.0 {
+                0.57
+            } else {
+                state.split_fraction.clamp(0.28, 0.72)
+            };
+            ui.horizontal(|ui| {
+                let left = (width * fraction - 8.0).max(180.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(left, height),
+                    Layout::top_down(Align::Min),
+                    |ui| transcript_panel(ui, s, state, out, height),
+                );
+                let (rect, drag) = ui.allocate_exact_size(Vec2::new(12.0, height), Sense::drag());
+                ui.painter().line_segment(
+                    [rect.center_top(), rect.center_bottom()],
+                    Stroke::new(1.0, ui.tokens().edge),
+                );
+                if drag.dragged()
+                    && let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
+                {
+                    state.split_fraction = ((pointer.x - origin.x) / width).clamp(0.28, 0.72);
+                }
+                if drag.double_clicked() { state.split_fraction = 0.57; layout_drag_stopped = true; }
+                layout_drag_stopped |= drag.drag_stopped();
+                drag.on_hover_cursor(CursorIcon::ResizeHorizontal).on_hover_text("Drag this divider to resize; double-click to balance");
+                ui.allocate_ui_with_layout(
+                    Vec2::new((width - left - 20.0).max(180.0), height),
+                    Layout::top_down(Align::Min),
+                    |ui| assistant_panel(ui, s, state, out, height),
+                );
+            });
+        }
+        CompanionView::Split => unreachable!("wide split handled above"),
+    }
+    if layout_drag_stopped {
+        state.save_companion_layout(out);
+    }
+}
+
+fn transcript_panel(
+    ui: &mut Ui,
+    s: &WorkspaceSnapshot,
+    state: &mut WorkspaceState,
+    _out: &mut Vec<ShellEvent>,
+    height: f32,
+) {
+    let tokens = ui.tokens();
+    Frame::new()
+        .fill(tokens.background)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height(height.max(80.0));
+            let view = state.translation_view;
+            let notice = if view == TranslationView::Original {
+                None
+            } else if !s.translation_notice.is_empty() {
+                Some(s.translation_notice.as_str())
+            } else if s.translation_language.is_empty() {
+                Some("Translation is off · set a language and model in Meeting settings")
+            } else { None };
+            if let Some(notice) = notice {
+                Frame::new().fill(tokens.surface).inner_margin(Margin::symmetric(16, 7)).show(ui, |ui| {
+                    ui.label(RichText::new(notice).size(11.0).color(tokens.secondary_text));
+                });
+                hairline(ui);
+            }
+            ScrollArea::vertical()
+                .id_salt("companion-transcript")
+                .max_height((height - if notice.is_some() { 34.0 } else { 0.0 }).max(24.0))
+                .auto_shrink([false, false])
+                .stick_to_bottom(s.capture != CaptureState::Idle)
+                .show(ui, |ui| {
+                    if view != TranslationView::Translation {
+                        for line in &s.transcript {
+                            phrase_row(ui, s, line, view == TranslationView::Both);
+                        }
+                        if !s.provisional_text.is_empty() {
+                            Frame::new().inner_margin(Margin::symmetric(18, 12)).show(ui, |ui| {
+                                ui.label(RichText::new(&s.provisional_text).italics().color(tokens.secondary_text));
+                            });
+                        }
+                    } else {
+                        for line in &s.translations {
+                            Frame::new().inner_margin(Margin::symmetric(18, 14)).show(ui, |ui| {
+                                muted(ui, format!("{}  /  {}", timestamp(line.start_sample), line.language));
+                                ui.label(RichText::new(&line.text).size(13.0).color(tokens.text));
+                            });
+                            hairline(ui);
+                        }
+                    }
+                    if s.transcript.is_empty()
+                        && s.provisional_text.is_empty()
+                        && view != TranslationView::Translation
+                    {
+                        muted(
+                            ui,
+                            if s.capture == CaptureState::Idle {
+                                "No transcript yet."
+                            } else {
+                                "Listening…"
+                            },
+                        );
+                    }
+                    if view == TranslationView::Translation && s.translations.is_empty() {
+                        muted(
+                            ui,
+                            if s.translation_language.is_empty() {
+                                "Set a language and local model in Meeting settings."
+                            } else {
+                                "Waiting for translated phrases…"
+                            },
+                        );
+                    }
                 });
         });
+}
+
+fn phrase_row(ui: &mut Ui, s: &WorkspaceSnapshot, line: &MeetingLine, with_translation: bool) {
+    let tokens = ui.tokens();
+    let (time, source, text) = if inline_source_label(&line.text) {
+        let (prefix, content) = line.text.split_once("] ").expect("validated source label");
+        if let Some((time, source)) = prefix.strip_prefix('[').and_then(|p| p.split_once(" · ")) {
+            (time.to_owned(), source, content)
+        } else {
+            (timestamp(line.start_sample), "CONVERSATION", line.text.as_str())
+        }
+    } else {
+        (timestamp(line.start_sample), "CONVERSATION", line.text.as_str())
+    };
+    Frame::new().inner_margin(Margin::symmetric(18, 14)).show(ui, |ui| {
+        if ui.available_width() >= 300.0 {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(85.0);
+                    muted(ui, &time);
+                    ui.label(RichText::new(source.to_uppercase()).size(9.0).strong().color(tokens.secondary_text));
+                });
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(text).size(13.0));
+                    if with_translation { phrase_translation(ui, s, line); }
+                });
+            });
+        } else {
+            muted(ui, format!("{}  /  {}", time, source.to_uppercase()));
+            ui.label(RichText::new(text).size(13.0));
+            if with_translation { phrase_translation(ui, s, line); }
+        }
+    });
+    hairline(ui);
+}
+
+fn inline_source_label(text: &str) -> bool {
+    let Some((prefix, _)) = text.split_once("] ") else {
+        return false;
+    };
+    prefix.starts_with('[')
+        && (prefix.ends_with(" · Computer audio") || prefix.ends_with(" · You / microphone"))
+}
+
+fn phrase_translation(ui: &mut Ui, s: &WorkspaceSnapshot, line: &MeetingLine) {
+    for translation in s.translations.iter().filter(|translation| {
+        translation.start_sample == line.start_sample && translation.end_sample == line.end_sample
+    }) {
+        ui.add_space(Space::XS);
+        hairline(ui);
+        ui.add_space(Space::XS);
+        ui.label(RichText::new(&translation.text).size(13.0).color(ui.tokens().accent));
+    }
+}
+
+fn assistant_panel(
+    ui: &mut Ui,
+    s: &WorkspaceSnapshot,
+    state: &mut WorkspaceState,
+    out: &mut Vec<ShellEvent>,
+    height: f32,
+) {
+    Frame::new()
+        .fill(ui.tokens().surface)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height(height.max(80.0));
+            egui::Panel::bottom(ui.id().with("assistant-composer"))
+                .exact_size(if answer_retry_available(s) { 94.0 } else { 58.0 })
+                .show_separator_line(true)
+                .frame(Frame::new().fill(ui.tokens().background).inner_margin(Margin::symmetric(16, 8)))
+                .show(ui, |ui| companion_composer(ui, s, state, out));
+            ui.set_clip_rect(ui.clip_rect().intersect(ui.available_rect_before_wrap()));
+            if !s.notice.is_empty() {
+                muted(ui, &s.notice);
+            }
+            if !s.auto_commentary_notice.is_empty() {
+                muted(ui, &s.auto_commentary_notice);
+            }
+            conversation_messages(ui, s, state, out, ui.available_height(), true);
+        });
+}
+
+fn companion_composer(
+    ui: &mut Ui,
+    s: &WorkspaceSnapshot,
+    state: &mut WorkspaceState,
+    out: &mut Vec<ShellEvent>,
+) {
+    let tokens = ui.tokens();
+    let edit_id = ui.make_persistent_id("meeting-chat-composer");
+    let enter = composer_enter(ui, edit_id);
+    let can_send = !s.send_pending && state.chat_pending.is_none() && !state.chat.trim().is_empty();
+    let width = ui.available_width();
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        let input_width = (width - 43.0).max(100.0);
+        if state.chat.contains('\n') || state.chat.len() > 100 {
+            ui.allocate_ui_with_layout(
+                Vec2::new(input_width, 35.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ScrollArea::vertical()
+                        .id_salt("companion-composer-scroll")
+                        .max_height(35.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add_sized(
+                                [ui.available_width(), 35.0],
+                                TextEdit::multiline(&mut state.chat)
+                                    .id(edit_id)
+                                    .frame(Frame::new().fill(tokens.surface).stroke(Stroke::new(1.0, tokens.edge)))
+                                    .hint_text("Ask about this meeting…")
+                                    .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter))
+                                    .desired_rows(1)
+                                    .char_limit(32000),
+                            );
+                        });
+                },
+            );
+        } else {
+            ui.add_sized(
+                [input_width, 35.0],
+                TextEdit::multiline(&mut state.chat)
+                    .id(edit_id)
+                    .frame(Frame::new().fill(tokens.surface).stroke(Stroke::new(1.0, tokens.edge)))
+                    .hint_text("Ask about this meeting…")
+                    .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter))
+                    .desired_rows(1)
+                    .char_limit(32000),
+            );
+        }
+        let response = ui.add_enabled(
+            can_send,
+            Button::new(RichText::new("↗").color(tokens.accent))
+                .fill(tokens.surface)
+                .stroke(Stroke::new(1.0, tokens.edge))
+                .min_size(Vec2::new(35.0, 35.0)),
+        );
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Send message"));
+        clicked = response.on_hover_text("Send message · Enter").clicked();
+    });
+    if (clicked || enter) && can_send {
+        state.send_chat(s, out);
+    }
+    if answer_retry_available(s) && ui.button("Retry answer").clicked() {
+        emit(out, WorkspaceEvent::RetryAnswer);
+    }
 }
 
 fn picker(
@@ -922,5 +1450,16 @@ mod tests {
         assert!(press(egui::Key::Num2, CaptureState::Listening, none, false).is_empty());
         assert!(press(egui::Key::Num7, idle, egui::Modifiers::SHIFT, false).is_empty());
         assert!(press(egui::Key::Num7, idle, none, true).is_empty());
+    }
+    #[test]
+    fn dual_source_labels_already_include_the_original_timestamp() {
+        assert!(inline_source_label(
+            "[12:00.000 · Computer audio] A client question"
+        ));
+        assert!(inline_source_label(
+            "[12:01.120 · You / microphone] My answer"
+        ));
+        assert!(!inline_source_label("[Reminder] Bring the design file"));
+        assert!(!inline_source_label("A plain single-source transcript"));
     }
 }

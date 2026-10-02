@@ -18,12 +18,12 @@ const WINDOWS_RUNTIME_FILES: [&str; 4] = [
     "libstdc++-6.dll",
     "libwinpthread-1.dll",
 ];
-const MODEL_FILES: [&str; 4] = [
-    "am/final.mdl",
-    "conf/model.conf",
-    "graph/HCLr.fst",
-    "graph/Gr.fst",
-];
+const MODEL_FILES: [&str; 2] = ["am/final.mdl", "conf/model.conf"];
+
+fn nonempty_file(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+}
 
 type ModelNew = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type ModelFree = unsafe extern "C" fn(*mut c_void);
@@ -113,6 +113,17 @@ pub fn validate_asset_layout(runtime_bundle: &Path, model: &Path, language: &str
         {
             return AssetLayout::MissingModel { expected };
         }
+    }
+    // Large static-graph models use HCLG; lightweight/dynamic models use the
+    // split HCLr + Gr graph. Both are official Vosk layouts. Neither layout
+    // check replaces the subsequent native model/session readiness probe.
+    if !nonempty_file(&model.join("graph/HCLG.fst"))
+        && !(nonempty_file(&model.join("graph/HCLr.fst"))
+            && nonempty_file(&model.join("graph/Gr.fst")))
+    {
+        return AssetLayout::MissingModel {
+            expected: model.join("graph"),
+        };
     }
     if !model_matches_language(model, &language) {
         return AssetLayout::IncompatibleModelLanguage { language };
@@ -639,6 +650,23 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, [1]).unwrap();
         }
+        fs::create_dir_all(model.join("graph")).unwrap();
+        fs::write(model.join("graph/HCLG.fst"), [1]).unwrap();
+        assert!(matches!(
+            validate_asset_layout(&runtime, &model, "en"),
+            AssetLayout::Present { .. }
+        ));
+        fs::remove_file(model.join("graph/HCLG.fst")).unwrap();
+        fs::write(model.join("graph/HCLr.fst"), [1]).unwrap();
+        assert!(matches!(
+            validate_asset_layout(&runtime, &model, "en"),
+            AssetLayout::MissingModel { .. }
+        ));
+        fs::write(model.join("graph/Gr.fst"), [1]).unwrap();
+        assert!(matches!(
+            validate_asset_layout(&runtime, &model, "en"),
+            AssetLayout::Present { .. }
+        ));
         assert!(matches!(
             inspect(&runtime, &model, "en"),
             Readiness::LoadFailed { .. }

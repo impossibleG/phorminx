@@ -38,6 +38,55 @@ fn fixture() -> Fixture {
 }
 
 #[test]
+fn enabling_translation_shows_both_languages_by_default() {
+    let mut f = fixture();
+    assert_eq!(f.host.view.companion_translation_view, TranslationView::Original);
+    f.host
+        .handle(WorkspaceEvent::SaveTranslation {
+            language: "Brazilian Portuguese".into(),
+            model: "qwen2.5:1.5b".into(),
+        })
+        .unwrap();
+    assert_eq!(f.host.view.companion_translation_view, TranslationView::Both);
+    assert_eq!(f.host.config.companion_translation_view, "both");
+}
+
+#[test]
+#[ignore = "requires a running local Ollama server and an installed translation model"]
+fn native_meeting_segment_reaches_visible_translation_and_saved_session() {
+    let mut f = fixture();
+    let model = std::env::var("PHORMINX_TEST_TRANSLATION_MODEL")
+        .unwrap_or_else(|_| "qwen2.5:1.5b".into());
+    f.host
+        .handle(WorkspaceEvent::SaveTranslation {
+            language: "Brazilian Portuguese".into(),
+            model: model.clone(),
+        })
+        .unwrap();
+    f.host.translation = Some(
+        translation::Worker::start("Brazilian Portuguese".into(), model).unwrap(),
+    );
+    segment(&mut f.host, 0, 16_000, "Good morning, everyone.");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while f.host.view.translations.is_empty() {
+        f.host.poll_translations();
+        assert!(
+            f.host.view.translation_notice.is_empty(),
+            "translation failed: {}",
+            f.host.view.translation_notice
+        );
+        assert!(Instant::now() < deadline, "translation never reached the meeting view");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let translated = &f.host.view.translations[0];
+    assert_eq!((translated.start_sample, translated.end_sample), (0, 16_000));
+    assert!(!translated.text.trim().is_empty());
+    assert_eq!(f.host.view.companion_translation_view, TranslationView::Both);
+    flush(&mut f.host);
+    assert_eq!(f.host.db.meetings().translations(f.id, 0, 100).unwrap().len(), 1);
+}
+
+#[test]
 fn recoverable_audio_warning_does_not_stop_or_reset_the_meeting() {
     let mut f = fixture();
     f.host.view.capture = CaptureState::Listening;
@@ -172,6 +221,168 @@ fn flush(host: &mut Host) {
         }
     }
     panic!("synthetic persistence queue did not drain");
+}
+
+#[test]
+fn automatic_commentary_is_local_and_has_no_saved_fake_user_message() {
+    let mut f = fixture();
+    f.host.config.provider.kind = ProviderKind::OpenAi;
+    assert!(
+        f.host
+            .submit_auto_commentary("private meeting text".into())
+            .is_err()
+    );
+    assert!(f.host.pending.is_none());
+    assert!(f.host.view.messages.is_empty());
+
+    f.host.config.provider.kind = ProviderKind::Ollama;
+    f.host
+        .submit_auto_commentary("The client asked for a timeline.".into())
+        .unwrap();
+    let pending = f.host.pending.as_ref().unwrap();
+    assert_eq!(pending.provider.kind, ProviderKind::Ollama);
+    assert!(
+        pending
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("The client asked for a timeline.")
+    );
+    assert_eq!(f.host.view.messages.len(), 1);
+    assert_eq!(f.host.view.messages[0].role, "Assistant");
+    assert!(
+        !f.host
+            .pending_segments
+            .iter()
+            .any(|write| matches!(&write.kind, WriteKind::User { .. }))
+    );
+}
+
+#[test]
+fn manual_question_takes_queued_automatic_cutoff() {
+    let mut f = fixture();
+    f.host.view.send_pending = true;
+    f.host.auto_commentary_pending_cutoff = true;
+    f.host.send_question("What should I say?".into()).unwrap();
+    assert!(!f.host.auto_commentary_pending_cutoff);
+    assert_eq!(
+        f.host.cutoff_question.as_deref(),
+        Some("What should I say?")
+    );
+    assert!(f.host.pending.is_none());
+}
+
+#[test]
+fn chat_request_from_companion_takes_queued_automatic_cutoff() {
+    let mut f = fixture();
+    f.host.view.send_pending = true;
+    f.host.auto_commentary_pending_cutoff = true;
+    f.host
+        .handle(WorkspaceEvent::SendChatRequest {
+            id: 23,
+            text: "A manual question".into(),
+        })
+        .unwrap();
+    assert_eq!(f.host.cutoff_question.as_deref(), Some("A manual question"));
+    assert_eq!(f.host.cutoff_request, Some(23));
+    assert_eq!(f.host.view.chat_ack_id, 0);
+}
+
+#[test]
+fn disabled_commentary_cutoff_cannot_submit_transcript_as_a_fake_question() {
+    let mut f = fixture();
+    segment(&mut f.host, 0, 10, "A private client detail");
+    f.host.boundaries.request_cutoff(1, 10).unwrap();
+    f.host.auto_commentary_pending_cutoff = true;
+    f.host.view.auto_commentary_enabled = false;
+    f.host
+        .audio_event(MeetingAudioEvent::CutoffReached { id: 1, sample: 10 })
+        .unwrap();
+    assert_eq!(f.host.deferred_cutoff, Some((1, 10)));
+    assert_eq!(f.host.boundaries.submitted_sample(), 0);
+    assert!(f.host.view.messages.is_empty());
+
+    // An older UI may still send this event after the automatic request was
+    // disabled. It must neither consume the portion nor turn it into a chat.
+    f.host.send_cutoff().unwrap();
+    assert_eq!(f.host.boundaries.submitted_sample(), 0);
+    assert!(f.host.view.messages.is_empty());
+
+    f.host
+        .send_question("What should I say next?".into())
+        .unwrap();
+    assert_eq!(f.host.boundaries.submitted_sample(), 10);
+    assert!(!f.host.auto_commentary_pending_cutoff);
+    assert!(
+        f.host
+            .pending
+            .as_ref()
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("A private client detail")
+    );
+    assert_eq!(
+        f.host
+            .view
+            .messages
+            .iter()
+            .filter(|line| line.role == "You")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn unavailable_meeting_device_is_not_saved() {
+    let mut f = fixture();
+    let prior = f.host.config.meeting_device.clone();
+    let revision = f.host.view.meeting_devices_revision;
+    let result = f.host.handle(WorkspaceEvent::SaveMeetingDevices {
+        output_device: Some("Phorminx QA device that does not exist".into()),
+        microphone_device: None,
+    });
+    assert!(result.is_err());
+    assert_eq!(f.host.config.meeting_device, prior);
+    assert_eq!(f.host.view.meeting_devices_revision, revision + 1);
+    assert!(!f.host.view.meeting_devices_error.is_empty());
+    f.host
+        .handle(WorkspaceEvent::SaveMeetingDevices {
+            output_device: None,
+            microphone_device: None,
+        })
+        .unwrap();
+    assert_eq!(f.host.view.meeting_devices_revision, revision + 2);
+    assert!(f.host.view.meeting_devices_error.is_empty());
+}
+
+#[test]
+fn manual_answer_owns_translation_priority_until_terminal_event() {
+    let mut f = fixture();
+    f.host.translation =
+        Some(translation::Worker::start("Portuguese".into(), "fake-local".into()).unwrap());
+    f.host
+        .send_question("What should I answer?".into())
+        .unwrap();
+    assert!(
+        f.host
+            .translation
+            .as_ref()
+            .unwrap()
+            .manual_priority_active()
+    );
+    let generation = f.host.pending.as_ref().unwrap().generation;
+    f.host.job_event(JobEvent::End(generation, Ok(())));
+    assert!(
+        !f.host
+            .translation
+            .as_ref()
+            .unwrap()
+            .manual_priority_active()
+    );
 }
 
 #[test]

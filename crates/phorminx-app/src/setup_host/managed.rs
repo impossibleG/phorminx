@@ -30,7 +30,9 @@ impl Default for AcquisitionLimits {
         Self {
             maximum_entries: 10_000,
             maximum_depth: 24,
-            maximum_expanded_bytes: 1024 * 1024 * 1024,
+            // Curated high-resource English Vosk archives exceed 1 GiB. The
+            // exact archive size/hash stays pinned; expansion remains bounded.
+            maximum_expanded_bytes: 8 * 1024 * 1024 * 1024,
             maximum_expansion_ratio: 100,
         }
     }

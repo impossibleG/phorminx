@@ -2567,6 +2567,7 @@ name = "phorminx-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "ctrlc",
  "eframe",
@@ -2581,7 +2582,9 @@ dependencies = [
  "phorminx-vosk",
  "phorminx-whisper",
  "phorminx-windows",
+ "ring",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

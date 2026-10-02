@@ -1326,6 +1326,8 @@ pub enum ShellEvent {
     DiscardPerformanceRollback,
     ChangeWhisperModel(AccurateModel),
     InstallVerifiedVoskAssets,
+    OpenSoftwareUpdates,
+    OpenVoskModels,
     SelectOllamaModel(String),
     SaveSettings(SettingsSnapshot),
     DismissNotice,

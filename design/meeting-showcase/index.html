@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phorminx · Companion design proof</title>
+  <link rel="icon" href="../brand/png/mark/phorminx-mark-white-64.png">
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./showcase.js" defer></script>
+</head>
+<body>
+  <div class="proof-bar">
+    <span class="proof-name"><i></i> PHORMINX <b>/</b> COMPANION DESIGN PROOF</span>
+    <span class="proof-disclaimer">Visual-only example. No audio, model, or network.</span>
+  </div>
+  <div class="proof-controls" aria-label="Showcase controls">
+    <div class="control-group"><span>VIEW</span><button type="button" data-view="transcript">Transcript</button><button type="button" data-view="together" class="active">Together</button><button type="button" data-view="assistant">Assistant</button></div>
+    <div class="control-group"><span>WINDOW</span><button type="button" data-size="wide" class="active">Wide · 980 × 720</button><button type="button" data-size="compact">Compact · 430 × 680</button></div>
+    <div class="control-group"><span>THEME</span><button type="button" data-theme="light" class="active">Light</button><button type="button" data-theme="dark">Dark</button></div>
+    <span class="scale-note" id="scale-note" aria-live="polite"></span>
+  </div>
+
+  <main class="stage" id="stage">
+    <div class="window-frame wide light" id="window-frame" data-view="together" data-language="both">
+      <div class="native-titlebar" aria-label="Representative Windows title bar"><div><img src="../brand/png/mark/phorminx-mark-white-32.png" width="16" height="16" alt=""><span>Phorminx · Live companion</span></div><span class="window-glyphs" aria-hidden="true"><i>—</i><i>□</i><i>×</i></span></div>
+      <div class="companion" id="companion">
+        <header class="utility-bar">
+          <div class="session-name"><small>MEETING</small><strong>Release scope &amp; Friday delivery</strong></div>
+          <span class="record-state"><i></i><span id="record-status">LISTENING</span><em>12:08</em></span>
+          <div class="sources"><button id="mic" type="button" aria-pressed="true"><i></i><span>Mic</span><em>on</em></button><button id="computer" type="button" aria-pressed="true"><i></i><span>Computer</span><em>on</em></button></div>
+          <div class="window-actions"><button type="button" id="hide">Hide</button><button type="button" id="finish" class="finish">Finish</button></div>
+        </header>
+        <nav class="room-tabs" aria-label="Companion views"><div class="view-choices"><button type="button" data-room-tab="transcript">Transcript</button><button type="button" data-room-tab="together" class="active">Together</button><button type="button" data-room-tab="assistant">Assistant</button></div><div class="nav-tools"><div class="language-tabs" role="group" aria-label="Transcript language"><button type="button" data-language-choice="original">Original</button><button type="button" data-language-choice="both" class="active">Both</button><button type="button" data-language-choice="translation">Português</button></div><div class="commentary-control"><span>Commentary</span><button type="button" id="commentary" class="switch on" role="switch" aria-checked="true" aria-label="Commentary"><i></i></button></div></div></nav>
+
+        <div class="room" id="room">
+          <section class="transcript-pane" aria-label="Transcript">
+            <div class="transcript-scroll" id="transcript-scroll">
+              <article class="phrase"><div class="phrase-source"><time>11:40</time><span>COMPUTER</span></div><div class="phrase-text"><p class="original">Let’s move the launch review to Thursday. That gives design one more day to resolve the last details.</p><p class="translation">Vamos passar a revisão do lançamento para quinta-feira. Isso dá ao design mais um dia para resolver os últimos detalhes.</p></div></article>
+              <article class="phrase"><div class="phrase-source"><time>11:50</time><span class="you">MICROPHONE</span></div><div class="phrase-text"><p class="original">That works for me. I’ll have the revised flow ready before the review.</p><p class="translation">Por mim, tudo bem. Vou deixar o fluxo revisado pronto antes da revisão.</p></div></article>
+              <article class="phrase"><div class="phrase-source"><time>12:00</time><span>COMPUTER</span></div><div class="phrase-text"><p class="original">If we narrow the first release to the core workflow, could we have it ready by Friday?</p><p class="translation">Se reduzirmos a primeira versão ao fluxo principal, conseguiremos entregá-la até sexta-feira?</p></div></article>
+              <div class="listening-tail"><i></i><span>Listening…</span><span class="wave" aria-hidden="true">▂▅▃▆▂▇▅▂</span></div>
+            </div>
+          </section>
+
+          <div class="divider" id="divider" role="separator" aria-label="Resize transcript and assistant" aria-orientation="vertical" tabindex="0" title="Drag to resize; double-click to reset"><span></span></div>
+
+          <section class="assistant-pane" aria-label="Assistant conversation">
+            <div class="conversation-scroll" id="conversation-scroll">
+              <article class="insight" id="insight"><small>COMMENTARY</small><p>The team is narrowing the first release. It may help to agree on which experiences define the core workflow before moving the review.</p></article>
+              <article class="message from-you"><small>YOU <time>12:06</time></small><p>What should I clarify before Friday?</p></article>
+              <article class="message from-phorminx"><small>PHORMINX <time>12:07</time></small><p>Ask for a precise launch scope, the owner of each remaining design decision, and the deadline for final sign-off.</p></article>
+            </div>
+            <form class="composer" id="composer"><label class="sr-only" for="question">Ask about this meeting</label><div class="composer-field"><input id="question" type="text" autocomplete="off" placeholder="Ask about this meeting…"><button type="submit" aria-label="Send question">↗</button></div></form>
+          </section>
+        </div>
+      </div>
+      <div class="hidden-state" id="hidden-state" hidden><p>Companion hidden. Recording continues in a real meeting.</p><button id="show-again" type="button">Show companion</button></div>
+    </div>
+  </main>
+  <footer class="proof-foot">Separate companion window. The main Meetings tabs are unchanged.</footer>
+</body>
+</html>

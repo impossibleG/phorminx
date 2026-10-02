@@ -818,7 +818,7 @@ fn action_copy(key: &ActionKey) -> (&'static str, &'static str) {
         ),
         ActionKey::StartExternalTool { .. } => (
             "Start Ollama manually",
-            "Phorminx will not execute an unverified user-writable binary. Start Ollama yourself, then inspect again.",
+            "Verify the official per-user Ollama executable's Authenticode publisher, start it hidden on loopback, and check that its API responds. No models are downloaded or replaced.",
         ),
         ActionKey::PullOllamaModel { .. } => (
             "Acquire the selected Ollama model",
@@ -1141,10 +1141,12 @@ impl ActionAdapters for ProductionAdapters {
 
     fn start_ollama(&self, cancel: &AtomicBool) -> Result<(), HostActionError> {
         Self::check_cancel(cancel)?;
-        // LocalAppData is user-writable, and `--version` output cannot prove a
-        // publisher identity. Until a pinned Authenticode signer contract is
-        // compiled into the host, Phorminx must not execute this binary.
-        Err(verification_error())
+        if crate::ollama_recovery::recover_local_ollama(cancel) {
+            Ok(())
+        } else {
+            Self::check_cancel(cancel)?;
+            Err(verification_error())
+        }
     }
 
     fn pull_ollama_model(

@@ -72,6 +72,7 @@ function Dismount-ShortBuildDrive {
 }
 
 if (-not $SkipBuild) {
+    $env:PHORMINX_RELEASE_VERSION = $Version
     & (Join-Path $PSScriptRoot "Enter-PhorminxDevShell.ps1") -Vulkan:(-not $Cpu)
     if ($LASTEXITCODE -ne 0) {
         throw "The Phorminx development shell could not be initialized."
@@ -104,6 +105,11 @@ if (-not $SkipBuild) {
 
 if (-not (Test-Path -LiteralPath $sourceExecutable -PathType Leaf)) {
     throw "Release executable not found. Build it first: $sourceExecutable"
+}
+
+$embeddedVersion = (Get-Item -LiteralPath $sourceExecutable).VersionInfo.ProductVersion
+if ($embeddedVersion -ne $Version) {
+    throw "Binary release identity '$embeddedVersion' does not match installer version '$Version'. Rebuild without -SkipBuild."
 }
 
 # Prove that the single-file installer input is not relying on a separately

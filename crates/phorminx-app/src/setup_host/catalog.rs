@@ -120,6 +120,21 @@ impl PinnedCatalog {
             )?,
         )?;
 
+        for model in crate::vosk_models::MODELS.iter().skip(1) {
+            insert_unique(
+                &mut artifacts,
+                archive(
+                    model.id,
+                    model.digest,
+                    model.bytes,
+                    "curated-english",
+                    model.url,
+                    &format!("models/{}", model.directory),
+                    model.directory,
+                    [Language::English],
+                )?,
+            )?;
+        }
         let policy = PlanningPolicy::phorminx(
             artifacts
                 .values()
