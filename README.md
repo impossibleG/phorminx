@@ -62,10 +62,12 @@ Speech models and Vosk runtime assets are separate downloads and are not
 included in this source repository. Configure them in the application's setup
 and model screens. Ollama is optional; dictation can run without AI formatting.
 
-The installer offers **Prepare local speech and AI models** after installation. This runs the
-bundled starter setup with your consent; it is skipped during silent updates.
-If a download fails, use **Prepare Phorminx** in the Start menu to retry. Setup
-does not require a source checkout. It preserves existing settings and text.
+The branded installer opens Phorminx's setup window after installation. Choose
+**Prepare everything** to install the local starter bundle without a terminal,
+or review individual repair steps. Progress and errors appear in Phorminx; a
+safe stop finishes the current step first. Use **Prepare Phorminx** in the Start
+menu to retry. Silent updates skip this onboarding. Setup preserves existing
+settings and saved text.
 
 For an already installed app, an English starter bundle can be downloaded and
 configured automatically. Close Phorminx (including its tray icon), then run
@@ -127,10 +129,13 @@ indexes are not silently replaced.
 
 Launcher **0 · Give feedback** records a draft locally. Only clicking **Send**
 submits its reviewed text to `www.phorminx.net`; optional diagnostics are shown
-separately. Audio and logs are not attached automatically. Software updates are
-opt-in, verify signed metadata and installer hashes, and wait for application
-exit before installing. Builds without a configured release verification key
-cannot enable updates. Neither feature makes an unconfigured server ready.
+separately. Audio and logs are not attached automatically. Release-enabled
+builds check stable GitHub Releases daily by default; automatic download and
+install after exit are on by default, with an onboarding opt-out and a Settings
+control. The app verifies signed metadata and installer hashes and
+waits for exit before installing, never stopping an active recording. Builds
+without a configured release-verification key cannot enable updates. Neither
+feature makes an unconfigured feedback server ready.
 
 Do not include real transcripts, recordings, credentials, or personal settings
 in bug reports or contributions. Use synthetic examples instead.

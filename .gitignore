@@ -1,4 +1,6 @@
 bin/
+!crates/phorminx-app/src/bin/
+!crates/phorminx-app/src/bin/tauri_preview.rs
 obj/
 .vs/
 .idea/
@@ -9,6 +11,7 @@ TestResults/
 target/
 target-vulkan/
 target-ninja/
+crates/phorminx-app/gen/
 models/
 test-data/
 *.db
@@ -37,3 +40,4 @@ id_rsa
 *.flac
 *.ogg
 *.pcm
+convo.txt

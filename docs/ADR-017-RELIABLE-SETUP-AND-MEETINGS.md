@@ -84,7 +84,9 @@ silently provision either, publish unsigned updates, or deploy gateway changes.
 - Voice feedback is a local reviewable draft, with explicit Send and separately
   optional minimal diagnostics. The server acknowledges only durable writes and
   deduplicates retry IDs. No automatic testimonial publication or AI triage.
-- Updates are opt-in and fail closed without a compiled verification key. Signed
+- Updates fail closed without a compiled verification key. The original opt-in
+  default was superseded by an onboarding opt-out and an editable Settings
+  control for signed stable releases. Signed
   metadata, monotonic release sequence, expiry, exact size/hash and constrained
   release URLs precede staging. Installation waits for normal application exit;
   it does not terminate recording or force-close the app. Stable metadata rejects

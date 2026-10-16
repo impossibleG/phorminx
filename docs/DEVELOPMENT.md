@@ -71,16 +71,41 @@ unsigned build as signed or a local build as a published release.
 
 The build embeds the requested version in both the application and its Windows
 resources. `-SkipBuild` rejects a binary with a different embedded version.
-The installer includes the verified bootstrap script and offers to prepare local
-models after installation. Silent update installations skip that interactive step.
+The installer opens the branded Phorminx setup window after installation. The
+user can choose **Prepare everything** to run the verified starter bootstrap
+behind that window, or use individual repair actions. The Start menu's
+**Prepare Phorminx** shortcut reopens setup. No setup PowerShell window is
+shown; silent update installations do not launch the app or install models.
 
-Signed updates additionally require `PHORMINX_UPDATE_PUBLIC_KEY` to be set during
-the application build (base64 raw Ed25519 public key). Keep the private key out
-of this repository and out of the web server. An unset key disables updates.
-Stable update metadata accepts only plain release versions, not alpha builds.
-The server contract, durable-storage prerequisites, and manifest format live in
-the website gateway repository's `server/PHORMINX_API.md`. Configuring a build
-does not deploy a feedback service or publish a release.
+Daily checks use the latest stable GitHub Release and its
+`phorminx-update.json` asset. This asset is a signed envelope, not a trusted
+GitHub assertion. Build with `PHORMINX_UPDATE_PUBLIC_KEY` set to the base64 raw
+Ed25519 public key; an unset key disables checks and installation in that
+development build. Daily checks and automatic download/install are on by
+default; onboarding offers an opt-out, and Settings → Updates keeps that
+choice editable. Installation never interrupts an active recording or meeting
+and runs only after exit.
+
+The offline `phorminx_release` tool creates a signing key outside the source
+repository and signs the exact installer bytes. Build it with
+`cargo build -p phorminx-app --features desktop,vulkan,tauri-shell,release-tools
+--bin phorminx_release` from the Phorminx developer shell.
+Run `phorminx_release keygen <absolute-private-key.pk8> <public-key.txt>` once;
+keep the private key offline, backed up, and never upload it. Build the public
+app with that public-key text in `PHORMINX_UPDATE_PUBLIC_KEY`, then run
+`phorminx_release sign <absolute-private-key.pk8> <version> <increasing-sequence>
+<Phorminx-version-x64-setup.exe> <phorminx-update.json>`. The tool refuses to
+overwrite outputs, checks the installer name and size, signs a five-year-valid
+stable manifest, and verifies its own output. Upload both files to the matching
+`v<version>` stable GitHub Release only after installer QA and Authenticode
+signing. The first public release should be tested on a clean Windows account;
+no release has been published by these instructions.
+
+Ed25519 metadata signing is separate from a Windows Authenticode code-signing
+certificate or signing service. The latter identifies the publisher in Windows
+and is still needed before treating an installer as a polished public release.
+The private Ed25519 key must not be placed on the website/server. The website
+feedback API is independent of update distribution.
 
 Installers, compiled binaries, model weights, databases, and local recordings
 are not source contributions. Check dependency/runtime/model licensing and
