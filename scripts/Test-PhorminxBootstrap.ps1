@@ -38,6 +38,7 @@ try {
     # Status reporting is tested against an isolated destination, never the real
     # LocalAppData profile. Do not execute the installer entry point or dialog.
     & {
+        $RunId = 'synthetic-42'
         function Join-Path {
             param([string] $Path, [string] $ChildPath)
             if ($Path -eq $env:LOCALAPPDATA) {
@@ -45,11 +46,12 @@ try {
             }
             return [IO.Path]::Combine($Path, $ChildPath)
         }
-        Write-SetupStatus 'failed' 'synthetic download interruption'
+        Write-SetupStatus 'failed' 'synthetic download interruption' 2
         $statusPath = [IO.Path]::Combine($testRoot, 'fake-local', 'Phorminx', 'setup-status.json')
         $status = Get-Content -Raw -LiteralPath $statusPath | ConvertFrom-Json
         Assert-True ($status.state -eq 'failed') 'Failure status was not retained for retry.'
         Assert-True ($status.message -eq 'synthetic download interruption') 'Failure status message changed.'
+        Assert-True ($status.run_id -eq $RunId -and $status.step -eq 2 -and $status.total -eq 6) 'App progress receipt is incomplete.'
         Write-SetupStatus 'complete' 'synthetic setup completed'
         $status = Get-Content -Raw -LiteralPath $statusPath | ConvertFrom-Json
         Assert-True ($status.state -eq 'complete') 'Retry completion did not replace failure status.'

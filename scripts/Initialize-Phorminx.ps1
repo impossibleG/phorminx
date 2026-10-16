@@ -9,16 +9,27 @@ request administrator approval. Existing settings and saved text are preserved.
 This does not install Phorminx, build tools, or GPU vendor drivers.
 #>
 [CmdletBinding()]
-param([switch] $Plan, [switch] $FromInstaller)
+param([switch] $Plan, [switch] $FromInstaller, [switch] $FromApp, [int] $HostProcessId, [string] $RunId = '')
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
 
-function Write-SetupStatus([string] $State, [string] $Message) {
+function Write-SetupStatus([string] $State, [string] $Message, [int] $Step = 0) {
     $statusDirectory = Join-Path $env:LOCALAPPDATA 'Phorminx'
     [IO.Directory]::CreateDirectory($statusDirectory) | Out-Null
-    $status = @{ state = $State; message = $Message; updated_at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json
+    $statusRunId = if (Get-Variable -Name RunId -ErrorAction SilentlyContinue) { $RunId } else { '' }
+    $status = @{ state = $State; message = $Message; step = $Step; total = 6; run_id = $statusRunId; updated_at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json
     [IO.File]::WriteAllText((Join-Path $statusDirectory 'setup-status.json'), $status, [Text.UTF8Encoding]::new($false))
+}
+
+function Assert-SetupNotCancelled {
+    if (-not $FromApp) { return }
+    $marker = Join-Path (Join-Path $env:LOCALAPPDATA 'Phorminx') ("setup-cancel-$RunId.flag")
+    if (Test-Path -LiteralPath $marker -PathType Leaf) {
+        Write-SetupStatus 'cancelled' 'Preparation stopped after the current step. Verified downloads are kept for retry.'
+        Remove-Item -LiteralPath $marker -Force
+        exit 2
+    }
 }
 
 trap {
@@ -149,8 +160,14 @@ if ($Plan) {
 }
 if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitProcess -or
     $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Run in 64-bit PowerShell on Windows x64.' }
-if (Get-Process -Name 'phorminx-app' -ErrorAction SilentlyContinue) { throw 'Close Phorminx (including the tray icon), then run this command again.' }
-Write-SetupStatus 'working' 'Preparing local recognition, formatting, and search. No recordings or saved text are uploaded.'
+$appProcesses = @(Get-Process -Name 'phorminx-app' -ErrorAction SilentlyContinue)
+if ($FromApp) {
+    if ($HostProcessId -le 0 -or $RunId -notmatch '^[a-zA-Z0-9-]{1,80}$' -or
+        $appProcesses.Count -ne 1 -or $appProcesses[0].Id -ne $HostProcessId) {
+        throw 'Setup can run only from the single active Phorminx setup window.'
+    }
+} elseif ($appProcesses.Count -gt 0) { throw 'Close Phorminx (including the tray icon), then run this command again.' }
+Write-SetupStatus 'working' 'Preparing local recognition, formatting, and search. No recordings or saved text are uploaded.' 0
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $ProgressPreference = 'SilentlyContinue'
@@ -159,12 +176,18 @@ $cache = Join-Path $data 'setup-downloads'
 [IO.Directory]::CreateDirectory($cache) | Out-Null
 [IO.Directory]::CreateDirectory((Join-Path $data 'models')) | Out-Null
 
+Write-SetupStatus 'working' 'Step 1 of 6 · Installing verified instant recognition.' 1
+Assert-SetupNotCancelled
 $runtime = Get-VerifiedDownload 'https://github.com/alphacep/vosk-api/releases/download/v0.3.45/vosk-win64-0.3.45.zip' (Join-Path $cache 'vosk-runtime.zip') 14882445 'f1dcc9cca460630f81ea8f71794f69c80bed6556d2a4e6237b5785e1d2dff34b'
 $vosk = Get-VerifiedDownload 'https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip' (Join-Path $cache 'vosk-english.zip') 41205931 '30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498'
 Install-VerifiedZip $runtime 'vosk-win64-0.3.45' (Join-Path $data 'runtime\vosk')
 Install-VerifiedZip $vosk 'vosk-model-small-en-us-0.15' (Join-Path $data 'models\vosk-model-small-en-us-0.15')
+Write-SetupStatus 'working' 'Step 2 of 6 · Installing verified accurate recognition.' 2
+Assert-SetupNotCancelled
 $null = Get-VerifiedDownload 'https://huggingface.co/ggerganov/whisper.cpp/resolve/c521a4b02f422512d734391fdf08bb08c0862f68/ggml-base.en.bin?download=true' (Join-Path $data 'models\ggml-base.en.bin') 147964211 'a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002'
 
+Write-SetupStatus 'working' 'Step 3 of 6 · Checking optional Vulkan acceleration.' 3
+Assert-SetupNotCancelled
 if (-not (Test-Path -LiteralPath (Join-Path $env:WINDIR 'System32\vulkan-1.dll'))) {
     $vulkan = Get-VerifiedDownload 'https://sdk.lunarg.com/sdk/download/1.4.357.0/windows/VulkanRT-X64-1.4.357.0-Installer.exe' (Join-Path $cache 'VulkanRuntime.exe') 25720248 '58a9edee599e06dac0485df9ea7767016cc137c776d5d95ae08301fff2def81c'
     Assert-SignedInstaller $vulkan 'O="LunarG, Inc\."'
@@ -174,6 +197,8 @@ if (-not (Test-Path -LiteralPath (Join-Path $env:WINDIR 'System32\vulkan-1.dll')
     if ($install.ExitCode -notin @(0, 3010) -or -not (Test-Path -LiteralPath (Join-Path $env:WINDIR 'System32\vulkan-1.dll'))) { throw 'Vulkan runtime installation failed. Retry after checking the installer or restarting Windows.' }
 }
 
+Write-SetupStatus 'working' 'Step 4 of 6 · Preparing the local language-model service.' 4
+Assert-SetupNotCancelled
 $ollama = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'
 if (-not (Test-Path -LiteralPath $ollama)) {
     $command = Get-Command ollama.exe -ErrorAction SilentlyContinue
@@ -189,6 +214,8 @@ if (-not (Test-Path -LiteralPath $ollama)) {
     if ($install.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $ollama)) { throw 'Ollama installation failed. No starter settings were written.' }
 }
 
+Write-SetupStatus 'working' 'Step 5 of 6 · Installing local formatting and search models.' 5
+Assert-SetupNotCancelled
 $oldHost = $env:OLLAMA_HOST
 try {
     $env:OLLAMA_HOST = '127.0.0.1:11434'
@@ -201,6 +228,7 @@ try {
         }
     }
     foreach ($model in @('qwen2.5:1.5b', 'nomic-embed-text:latest')) {
+        Assert-SetupNotCancelled
         Write-Host "Downloading local model $model ..."
         & $ollama pull $model
         if ($LASTEXITCODE -ne 0) { throw "Ollama could not download $model. Rerun this script to retry." }
@@ -211,6 +239,8 @@ try {
     }
 } finally { $env:OLLAMA_HOST = $oldHost }
 
+Write-SetupStatus 'working' 'Step 6 of 6 · Validating starter settings.' 6
+Assert-SetupNotCancelled
 $settings = Join-Path $data 'settings.toml'
 if (Test-Path -LiteralPath $settings) {
     Write-Host 'Existing settings preserved. If needed, select the downloaded models in Phorminx Settings/Models.'
@@ -233,4 +263,4 @@ if (Test-Path -LiteralPath $settings) {
     Write-Host 'English starter settings created: Instant dictation, balanced formatting, local semantic search.'
 }
 Write-Host 'Downloads and setup complete. Open Phorminx and test dictation. GPU acceleration additionally requires a compatible GPU driver; Accurate mode can fall back to CPU.'
-Write-SetupStatus 'complete' 'Starter assets installed. Existing settings were preserved where present; test recognition on this computer.'
+Write-SetupStatus 'complete' 'Starter assets installed. Existing settings were preserved where present; test recognition on this computer.' 6

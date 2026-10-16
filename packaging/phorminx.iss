@@ -17,6 +17,10 @@
   #define OutputDir "..\artifacts\installer"
 #endif
 
+#ifndef WebView2Bootstrapper
+  #error "WebView2Bootstrapper must be supplied by the verified release build."
+#endif
+
 [Setup]
 AppId={{6C4860D4-9A6C-42C4-BBD6-A41597B6BB16}
 AppName=Phorminx
@@ -36,7 +40,9 @@ OutputDir={#OutputDir}
 OutputBaseFilename=Phorminx-{#AppVersion}-x64-setup
 Compression=lzma2/max
 SolidCompression=yes
-WizardStyle=modern
+WizardStyle=modern dark
+WizardImageFile=..\design\brand\png\installer\phorminx-wizard-600x1149.png
+WizardSmallImageFile=..\design\brand\png\app\phorminx-app-128.png
 CloseApplications=yes
 RestartApplications=no
 SetupLogging=yes
@@ -58,11 +64,12 @@ Name: "startup"; Description: "Launch Phorminx when I sign in"; GroupDescription
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "phorminx-app.exe"; Flags: ignoreversion
+Source: "{#WebView2Bootstrapper}"; DestDir: "{tmp}"; DestName: "MicrosoftEdgeWebView2Setup.exe"; Flags: deleteafterinstall
 Source: "..\scripts\Initialize-Phorminx.ps1"; DestDir: "{app}\setup"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Phorminx"; Filename: "{app}\phorminx-app.exe"; WorkingDir: "{app}"
-Name: "{group}\Prepare Phorminx"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup\Initialize-Phorminx.ps1"" -FromInstaller"; WorkingDir: "{app}"
+Name: "{group}\Prepare Phorminx"; Filename: "{app}\phorminx-app.exe"; Parameters: "--setup"; WorkingDir: "{app}"
 Name: "{autodesktop}\Phorminx"; Filename: "{app}\phorminx-app.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 Name: "{group}\Uninstall Phorminx"; Filename: "{uninstallexe}"
 
@@ -71,5 +78,22 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Phorminx"; ValueData: """{app}\phorminx-app.exe"" --background"; Flags: uninsdeletevalue; Tasks: startup
 
 [Run]
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup\Initialize-Phorminx.ps1"" -FromInstaller"; Description: "Prepare local speech and AI models (downloads several GB; may request Windows approval)"; Flags: postinstall skipifsilent runasoriginaluser
-Filename: "{app}\phorminx-app.exe"; Description: "Launch Phorminx"; Flags: nowait postinstall skipifsilent unchecked
+Filename: "{tmp}\MicrosoftEdgeWebView2Setup.exe"; Parameters: "/silent /install"; StatusMsg: "Preparing the Windows interface..."; Check: not WebView2Installed; Flags: runasoriginaluser
+Filename: "{app}\phorminx-app.exe"; Description: "Open Phorminx to finish setup"; Flags: nowait postinstall skipifsilent runasoriginaluser
+
+[Code]
+function InstalledRuntimeVersion(RootKey: Integer; Subkey: String): Boolean;
+var
+  Version: String;
+begin
+  Result := RegQueryStringValue(RootKey, Subkey, 'pv', Version) and
+    (Version <> '') and (Version <> '0.0.0.0');
+end;
+
+function WebView2Installed: Boolean;
+begin
+  Result := InstalledRuntimeVersion(HKLM,
+      'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}') or
+    InstalledRuntimeVersion(HKCU,
+      'Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}');
+end;

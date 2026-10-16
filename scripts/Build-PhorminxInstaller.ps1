@@ -4,6 +4,7 @@ param(
     [string] $IsccPath,
     [string] $InnoSignToolName,
     [string] $OutputDirectory,
+    [string] $BuildRoot,
     [switch] $SkipBuild,
     [switch] $RequireSignedBinary,
     [switch] $Cpu
@@ -19,8 +20,17 @@ $installerScript = Join-Path $repositoryRoot "packaging\phorminx.iss"
 # that storage through a temporary drive root while native code is compiling.
 # The versioned directory also prevents reuse of old CMake caches that recorded
 # the former long path.
-$releaseTargetDirectory = Join-Path $env:LOCALAPPDATA "PhorminxBuild\short-v2"
+$releaseTargetDirectory = if ([string]::IsNullOrWhiteSpace($BuildRoot)) {
+    Join-Path $env:LOCALAPPDATA "PhorminxBuild\short-v2"
+} else {
+    $candidate = [System.IO.Path]::GetFullPath($BuildRoot)
+    if ([System.IO.Path]::GetPathRoot($candidate).TrimEnd('\') -eq $candidate.TrimEnd('\')) {
+        throw "BuildRoot must be a dedicated build directory, not a drive root."
+    }
+    $candidate
+}
 $sourceExecutable = Join-Path $releaseTargetDirectory "release\phorminx-app.exe"
+$webView2Bootstrapper = Join-Path $releaseTargetDirectory "MicrosoftEdgeWebView2Setup.exe"
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $repositoryRoot "artifacts\installer"
 }
@@ -71,12 +81,15 @@ function Dismount-ShortBuildDrive {
     }
 }
 
+& (Join-Path $PSScriptRoot "Enter-PhorminxDevShell.ps1") -Vulkan:(-not $Cpu)
+if ($LASTEXITCODE -ne 0) {
+    throw "The Phorminx development shell could not be initialized."
+}
+
 if (-not $SkipBuild) {
     $env:PHORMINX_RELEASE_VERSION = $Version
-    & (Join-Path $PSScriptRoot "Enter-PhorminxDevShell.ps1") -Vulkan:(-not $Cpu)
-    if ($LASTEXITCODE -ne 0) {
-        throw "The Phorminx development shell could not be initialized."
-    }
+    # The Tauri context, Windows resource, and updater identity must agree.
+    $env:TAURI_CONFIG = @{ version = $Version } | ConvertTo-Json -Compress
 
     # The per-user installer deliberately ships one executable and cannot
     # elevate to install the Microsoft Visual C++ Redistributable. Pin the
@@ -90,7 +103,7 @@ if (-not $SkipBuild) {
     $env:CMAKE_MSVC_RUNTIME_LIBRARY = "MultiThreaded"
     $env:CMAKE_C_FLAGS_RELEASE = "/MT /O2 /Ob2 /DNDEBUG"
     $env:CMAKE_CXX_FLAGS_RELEASE = "/MT /O2 /Ob2 /DNDEBUG"
-    $features = if ($Cpu) { "desktop" } else { "desktop,vulkan" }
+    $features = if ($Cpu) { "desktop,tauri-shell" } else { "desktop,vulkan,tauri-shell" }
     $shortBuildDrive = Mount-ShortBuildDrive -BackingDirectory $releaseTargetDirectory
     try {
         $env:CARGO_TARGET_DIR = "$shortBuildDrive\"
@@ -113,7 +126,9 @@ if ($embeddedVersion -ne $Version) {
 }
 
 # Prove that the single-file installer input is not relying on a separately
-# installed MSVC/UCRT redistributable. This also protects -SkipBuild from
+# installed Visual C++ redistributable. The UCRT API-set forwarders are part
+# of the operating system on our minimum supported Windows 10 version.
+# This also protects -SkipBuild from
 # accidentally packaging an executable produced outside the release contract.
 $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
 if ($null -eq $dumpbin) {
@@ -132,7 +147,7 @@ if ($dependencyNames.Count -eq 0) {
     throw "The release executable dependency table could not be read."
 }
 $forbiddenRuntimeDependencies = @($dependencyNames | Where-Object {
-    $_ -match '^(?i:api-ms-win-crt-|msvcp|vcruntime|ucrtbase\.dll)'
+    $_ -match '^(?i:msvcp|vcruntime|concrt)'
 })
 if ($forbiddenRuntimeDependencies.Count -gt 0) {
     throw "Release executable depends on an unbundled Microsoft C/C++ runtime: $($forbiddenRuntimeDependencies -join ', ')"
@@ -147,6 +162,19 @@ if (-not $RequireSignedBinary -and $signature.Status -ne [System.Management.Auto
 }
 if ($RequireSignedBinary -and [string]::IsNullOrWhiteSpace($InnoSignToolName)) {
     throw "RequireSignedBinary also requires -InnoSignToolName naming an Inno Setup signing tool configured outside this repository."
+}
+
+# Bundle Microsoft's small Evergreen bootstrapper. The app cannot present its
+# Tauri setup screen on an older Windows host until WebView2 is available.
+if (-not (Test-Path -LiteralPath $webView2Bootstrapper -PathType Leaf)) {
+    New-Item -ItemType Directory -Force -Path $releaseTargetDirectory | Out-Null
+    Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile $webView2Bootstrapper
+}
+$webView2Signature = Get-AuthenticodeSignature -LiteralPath $webView2Bootstrapper
+if ($webView2Signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+    $null -eq $webView2Signature.SignerCertificate -or
+    $webView2Signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+    throw "The WebView2 bootstrapper is not validly signed by Microsoft. Refusing to package it."
 }
 if (-not [string]::IsNullOrWhiteSpace($InnoSignToolName) -and $InnoSignToolName -notmatch '^[A-Za-z0-9_.-]+$') {
     throw "InnoSignToolName may contain only letters, digits, dots, underscores, and hyphens."
@@ -172,11 +200,13 @@ if ([string]::IsNullOrWhiteSpace($IsccPath) -or -not (Test-Path -LiteralPath $Is
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $resolvedOutput = (Resolve-Path -LiteralPath $OutputDirectory).Path
 $resolvedSource = (Resolve-Path -LiteralPath $sourceExecutable).Path
+$resolvedWebView2 = (Resolve-Path -LiteralPath $webView2Bootstrapper).Path
 
 $compilerArguments = @(
     "/DAppVersion=$Version",
     "/DNumericVersion=$numericVersion",
     "/DSourceExe=$resolvedSource",
+    "/DWebView2Bootstrapper=$resolvedWebView2",
     "/DOutputDir=$resolvedOutput",
     $installerScript
 )
