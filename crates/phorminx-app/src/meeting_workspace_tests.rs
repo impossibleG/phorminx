@@ -40,14 +40,20 @@ fn fixture() -> Fixture {
 #[test]
 fn enabling_translation_shows_both_languages_by_default() {
     let mut f = fixture();
-    assert_eq!(f.host.view.companion_translation_view, TranslationView::Original);
+    assert_eq!(
+        f.host.view.companion_translation_view,
+        TranslationView::Original
+    );
     f.host
         .handle(WorkspaceEvent::SaveTranslation {
             language: "Brazilian Portuguese".into(),
             model: "qwen2.5:1.5b".into(),
         })
         .unwrap();
-    assert_eq!(f.host.view.companion_translation_view, TranslationView::Both);
+    assert_eq!(
+        f.host.view.companion_translation_view,
+        TranslationView::Both
+    );
     assert_eq!(f.host.config.companion_translation_view, "both");
 }
 
@@ -55,17 +61,16 @@ fn enabling_translation_shows_both_languages_by_default() {
 #[ignore = "requires a running local Ollama server and an installed translation model"]
 fn native_meeting_segment_reaches_visible_translation_and_saved_session() {
     let mut f = fixture();
-    let model = std::env::var("PHORMINX_TEST_TRANSLATION_MODEL")
-        .unwrap_or_else(|_| "qwen2.5:1.5b".into());
+    let model =
+        std::env::var("PHORMINX_TEST_TRANSLATION_MODEL").unwrap_or_else(|_| "qwen2.5:1.5b".into());
     f.host
         .handle(WorkspaceEvent::SaveTranslation {
             language: "Brazilian Portuguese".into(),
             model: model.clone(),
         })
         .unwrap();
-    f.host.translation = Some(
-        translation::Worker::start("Brazilian Portuguese".into(), model).unwrap(),
-    );
+    f.host.translation =
+        Some(translation::Worker::start("Brazilian Portuguese".into(), model).unwrap());
     segment(&mut f.host, 0, 16_000, "Good morning, everyone.");
     let deadline = Instant::now() + Duration::from_secs(90);
     while f.host.view.translations.is_empty() {
@@ -75,15 +80,110 @@ fn native_meeting_segment_reaches_visible_translation_and_saved_session() {
             "translation failed: {}",
             f.host.view.translation_notice
         );
-        assert!(Instant::now() < deadline, "translation never reached the meeting view");
+        assert!(
+            Instant::now() < deadline,
+            "translation never reached the meeting view"
+        );
         thread::sleep(Duration::from_millis(100));
     }
     let translated = &f.host.view.translations[0];
-    assert_eq!((translated.start_sample, translated.end_sample), (0, 16_000));
+    assert_eq!(
+        (translated.start_sample, translated.end_sample),
+        (0, 16_000)
+    );
     assert!(!translated.text.trim().is_empty());
-    assert_eq!(f.host.view.companion_translation_view, TranslationView::Both);
+    assert_eq!(
+        f.host.view.companion_translation_view,
+        TranslationView::Both
+    );
     flush(&mut f.host);
-    assert_eq!(f.host.db.meetings().translations(f.id, 0, 100).unwrap().len(), 1);
+    assert_eq!(
+        f.host
+            .db
+            .meetings()
+            .translations(f.id, 0, 100)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+#[ignore = "requires a running local Ollama server and an installed chat model"]
+fn native_manual_answer_and_commentary_reach_the_companion() {
+    let mut f = fixture();
+    f.host.config.provider.model =
+        std::env::var("PHORMINX_TEST_CHAT_MODEL").unwrap_or_else(|_| "qwen2.5:1.5b".into());
+    f.host
+        .submit_question(
+            "What is the next step?".into(),
+            None,
+            "The team agreed to review the launch plan on Friday.".into(),
+            None,
+        )
+        .unwrap();
+    complete_native_answer(&mut f.host);
+    assert_eq!(f.host.view.messages.last().unwrap().status, "complete");
+    assert!(!f.host.view.messages.last().unwrap().text.trim().is_empty());
+
+    f.host
+        .submit_auto_commentary("The client asked for a Friday deadline.".into())
+        .unwrap();
+    complete_native_answer(&mut f.host);
+    assert_eq!(f.host.view.messages.last().unwrap().status, "complete");
+    assert!(!f.host.view.messages.last().unwrap().text.trim().is_empty());
+    assert_eq!(f.host.view.messages.last().unwrap().role, "Assistant");
+}
+
+#[test]
+#[ignore = "requires local Ollama and an installed 4B fallback model"]
+fn native_selected_four_billion_parameter_fallback_answers() {
+    let mut f = fixture();
+    f.host.config.provider.model = "phorminx-missing-test-model".into();
+    f.host.config.fallback_model = "gemma3:4b".into();
+    f.host.submit("Briefly say hello.".into(), None).unwrap();
+    complete_native_answer(&mut f.host);
+    assert_eq!(f.host.view.active_answer_model, "gemma3:4b");
+    assert_eq!(f.host.view.messages.last().unwrap().status, "complete");
+}
+
+#[test]
+#[ignore = "requires local Ollama and the configured primary and fallback models"]
+fn native_configured_primary_or_fallback_answers() {
+    let mut f = fixture();
+    f.host.config.provider.model = "gemma3:27b".into();
+    f.host.config.fallback_model = "gemma3:4b".into();
+    f.host
+        .submit_question(
+            "What did the team agree to review on Friday? Answer briefly.".into(),
+            None,
+            "The team agreed to review the launch plan on Friday.".into(),
+            None,
+        )
+        .unwrap();
+    complete_native_answer(&mut f.host);
+    assert!(matches!(
+        f.host.view.active_answer_model.as_str(),
+        "gemma3:27b" | "gemma3:4b"
+    ));
+}
+
+fn complete_native_answer(host: &mut Host) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while host.view.ai_busy {
+        host.start_pending();
+        while let Ok(event) = host.job_rx.try_recv() {
+            host.job_event(event);
+        }
+        assert!(Instant::now() < deadline, "local answer did not finish");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        host.view.messages.last().unwrap().status,
+        "complete",
+        "local answer failed: {}",
+        host.view.notice
+    );
 }
 
 #[test]

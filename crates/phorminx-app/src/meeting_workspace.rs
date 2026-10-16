@@ -1801,6 +1801,16 @@ impl Host {
             .spawn(move || {
                 // Own the lease until the actual network worker exits, including cancellation.
                 let _compute_lease = compute_lease;
+                if pending.provider.kind == ProviderKind::Ollama
+                    && pending.provider.ollama_endpoint == ProviderConfig::default().ollama_endpoint
+                {
+                    // Meeting chat can be the first local-model use after launch.
+                    // Recover the verified local daemon on this worker, never on
+                    // the UI or audio threads. A custom endpoint is not started.
+                    crate::ollama_recovery::recover_local_ollama(
+                        &std::sync::atomic::AtomicBool::new(token.is_cancelled()),
+                    );
+                }
                 let mut emitted = false;
                 let primary = stream_chat(&pending.provider, &pending.messages, &token, |delta| {
                     emitted = true;
@@ -2418,7 +2428,10 @@ fn acquire_chat_compute(
         Ok(None)
     }
 }
-const MAX_FALLBACK_MODEL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+// A user-selected 4B-class model is still a substantially smaller retry for
+// large primaries; the old 2 GiB cap silently rejected common installed 4B
+// models even when explicitly chosen in Meeting settings.
+const MAX_FALLBACK_MODEL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// A fallback is an explicit, installed Ollama model with a small footprint.
 /// This discovery sends only model names to loopback; it never sends a meeting.
@@ -2471,7 +2484,7 @@ fn local_fallback_provider(
         .and_then(|model| model.size);
     if !fallback_size_allowed(selected_size, primary_size) {
         return Err(
-            "The chosen fallback is too large for automatic retry. Choose an installed model under 2 GB.",
+            "The chosen fallback is too large for automatic retry. Choose an installed model under 4 GiB.",
         );
     }
     Ok(fallback)
@@ -2558,7 +2571,8 @@ mod tests {
     fn automatic_fallback_requires_a_smaller_installed_model() {
         assert!(fallback_size_allowed(1_000_000_000, Some(5_000_000_000)));
         assert!(!fallback_size_allowed(0, Some(5_000_000_000)));
-        assert!(!fallback_size_allowed(3_000_000_000, Some(5_000_000_000)));
+        assert!(fallback_size_allowed(3_000_000_000, Some(5_000_000_000)));
+        assert!(!fallback_size_allowed(5_000_000_000, Some(6_000_000_000)));
         assert!(!fallback_size_allowed(1_000_000_000, Some(900_000_000)));
     }
     #[test]

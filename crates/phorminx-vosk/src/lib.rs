@@ -544,6 +544,21 @@ mod tests {
     use std::fs;
 
     #[test]
+    #[ignore = "requires installed local Vosk runtime and English model"]
+    fn native_silent_twenty_second_rollover_finishes_without_a_word() {
+        let runtime = std::env::var("PHORMINX_TEST_VOSK_RUNTIME").unwrap();
+        let model_path = std::env::var("PHORMINX_TEST_VOSK_MODEL").unwrap();
+        let model = VoskModel::load(Path::new(&runtime), Path::new(&model_path), "en").unwrap();
+        let mut session = model.session(16_000).unwrap();
+        let silence = vec![0.0_f32; 4_000];
+        for _ in 0..80 {
+            session.accept_f32(&silence).unwrap();
+        }
+        let final_segment = session.finish().unwrap();
+        assert!(final_segment.text.is_empty());
+    }
+
+    #[test]
     fn partial_text_is_separate_from_finalized_text_and_rejects_malformed_json() {
         assert_eq!(
             parse_partial(br#"{"partial":"  provisional words  ","text":"not final"}"#).unwrap(),

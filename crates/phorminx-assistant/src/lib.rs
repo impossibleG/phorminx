@@ -107,8 +107,11 @@ pub(crate) fn agent(token: &CancellationToken) -> ureq::Agent {
         .max_idle_connections(0)
         .timeout_resolve(Some(Duration::from_secs(10)))
         .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_send_request(Some(Duration::from_secs(15)))
-        .timeout_send_body(Some(Duration::from_secs(15)))
+        // A cold local model can take more than 15 seconds before Ollama
+        // accepts/answers its first chat request. These calls run on workers
+        // and remain cancellable through the registered socket.
+        .timeout_send_request(Some(Duration::from_secs(60)))
+        .timeout_send_body(Some(Duration::from_secs(60)))
         .timeout_recv_response(Some(Duration::from_secs(120)))
         .timeout_recv_body(Some(Duration::from_secs(300)))
         .timeout_global(Some(Duration::from_secs(420)))
