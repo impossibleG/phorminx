@@ -37,6 +37,15 @@ if ($null -eq $gh) {
     throw "GitHub CLI (gh) was not found. Install it and run 'gh auth login'."
 }
 
+# Tag the commit the installer was built from, which must already be pushed.
+$commit = (& git -C $repositoryRoot rev-parse HEAD).Trim()
+if (-not (& git -C $repositoryRoot branch -r --contains $commit)) {
+    throw "Commit $commit is not on any pushed branch. Push it before publishing."
+}
+if (& git -C $repositoryRoot status --porcelain --untracked-files=no) {
+    throw "The working tree has uncommitted changes; the tag would not match the build."
+}
+
 $installer = Join-Path $InstallerDirectory "Phorminx-$Version-x64-setup.exe"
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
     throw "Installer not found: $installer. Build it with Build-PhorminxInstaller.ps1 -Version $Version."
@@ -66,6 +75,7 @@ Copy-Item -LiteralPath $versioned -Destination $fixed
 $arguments = @(
     "release", "create", "v$Version", $versioned, $manifest, $fixed,
     "--repo", $repository,
+    "--target", $commit,
     "--title", "Phorminx $Version",
     "--latest"
 )
