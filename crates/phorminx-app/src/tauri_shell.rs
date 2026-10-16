@@ -816,6 +816,11 @@ fn host_update_action(kind: String, enabled: Option<bool>, app: tauri::AppHandle
         "check" => updates.check_now(),
         "download" => updates.download_now(),
         "install-on-exit" => updates.install_on_exit(idle)?,
+        "restart-now" => {
+            updates.restart_to_update(idle, false)?;
+            state.events.send(ProductShellEvent::QuitRequested)
+                .map_err(|_| "Phorminx could not restart. Close it from the tray to finish updating.")?;
+        }
         "daily-checks" => updates.set_daily_checks(enabled.ok_or("Choose on or off.")?)?,
         "automatic-install" => updates.set_automatic_install(enabled.ok_or("Choose on or off.")?)?,
         _ => return Err("Unknown update action.".into()),
@@ -1233,7 +1238,17 @@ fn control_loop(
         if std::time::Instant::now() >= next_update_tick {
             let host = app.state::<HostState>();
             let idle = update_idle(&app);
-            if let Ok(mut updates) = host.updates.lock() { updates.poll(idle); }
+            if let Ok(mut updates) = host.updates.lock() {
+                updates.poll(idle);
+                let window_visible = app.webview_windows().values().any(|window| window.is_visible().unwrap_or(false));
+                if idle
+                    && !window_visible
+                    && phorminx_windows::user_idle_duration().is_some_and(|away| updates.idle_restart_due(away))
+                    && updates.restart_to_update(idle, true).is_ok()
+                {
+                    let _ = host.events.send(ProductShellEvent::QuitRequested);
+                }
+            }
             next_update_tick = std::time::Instant::now() + Duration::from_secs(5);
         }
         let control = match controls.recv_timeout(Duration::from_millis(200)) {

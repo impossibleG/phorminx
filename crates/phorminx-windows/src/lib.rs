@@ -42,6 +42,8 @@ mod startup;
 mod target;
 #[cfg(windows)]
 mod tray;
+#[cfg(windows)]
+mod user_idle;
 
 #[cfg(windows)]
 pub use appearance::{SystemAppearance, system_appearance, system_apps_use_dark_theme};
@@ -108,6 +110,8 @@ pub use startup::{
 pub use target::TargetSnapshot;
 #[cfg(windows)]
 pub use tray::{SystemTray, TrayError, TrayEvent, TrayStatus};
+#[cfg(windows)]
+pub use user_idle::user_idle_duration;
 
 #[cfg(not(windows))]
 compile_error!("phorminx-windows only supports Windows");

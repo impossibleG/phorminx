@@ -75,31 +75,71 @@ The installer opens the branded Phorminx setup window after installation. The
 user can choose **Prepare everything** to run the verified starter bootstrap
 behind that window, or use individual repair actions. The Start menu's
 **Prepare Phorminx** shortcut reopens setup. No setup PowerShell window is
-shown; silent update installations do not launch the app or install models.
+shown; silent update installations do not open setup or install models.
 
 Daily checks use the latest stable GitHub Release and its
 `phorminx-update.json` asset. This asset is a signed envelope, not a trusted
 GitHub assertion. Build with `PHORMINX_UPDATE_PUBLIC_KEY` set to the base64 raw
 Ed25519 public key; an unset key disables checks and installation in that
-development build. Daily checks and automatic download/install are on by
-default; onboarding offers an opt-out, and Settings → Updates keeps that
-choice editable. Installation never interrupts an active recording or meeting
-and runs only after exit.
+build, so `Build-PhorminxInstaller.ps1` refuses to run without it unless
+`-AllowMissingUpdateKey` is passed for a local QA build. Daily checks and
+automatic download/install are on by default; onboarding offers an opt-out,
+and Settings → Updates keeps that choice editable.
 
-The offline `phorminx_release` tool creates a signing key outside the source
-repository and signs the exact installer bytes. Build it with
-`cargo build -p phorminx-app --features desktop,vulkan,tauri-shell,release-tools
---bin phorminx_release` from the Phorminx developer shell.
-Run `phorminx_release keygen <absolute-private-key.pk8> <public-key.txt>` once;
-keep the private key offline, backed up, and never upload it. Build the public
-app with that public-key text in `PHORMINX_UPDATE_PUBLIC_KEY`, then run
-`phorminx_release sign <absolute-private-key.pk8> <version> <increasing-sequence>
-<Phorminx-version-x64-setup.exe> <phorminx-update.json>`. The tool refuses to
-overwrite outputs, checks the installer name and size, signs a five-year-valid
-stable manifest, and verifies its own output. Upload both files to the matching
-`v<version>` stable GitHub Release only after installer QA and Authenticode
-signing. The first public release should be tested on a clean Windows account;
-no release has been published by these instructions.
+Installation never interrupts an active recording or meeting. Because
+Phorminx lives in the tray and starts with Windows, it rarely exits on its
+own, so a verified update is applied in one of three ways:
+
+- **Restart to update** in Settings → Updates installs now and reopens the app.
+- With automatic updates on, Phorminx restarts itself into the tray after the
+  user has been away for 30 minutes, nothing is recording, and no Phorminx
+  window is open.
+- Otherwise the update installs the next time Phorminx is closed.
+
+The install helper re-hashes the installer before running it silently and
+writes `updates/packages/last-install.json`. Settings and models live in
+Local AppData and are untouched by the installer.
+
+### Release checklist
+
+The offline `phorminx_release` tool signs the exact installer bytes. The
+private key lives outside the repository (for example
+`C:\Users\<you>\PhorminxReleaseKeys\phorminx-release.pk8`) with an offline
+backup; never commit it, upload it, or copy it to the website server. The
+public-key text beside it is safe to share.
+
+1. One time only: from the developer shell, build the tool with
+   `cargo build --release -p phorminx-app --features desktop,vulkan,tauri-shell,release-tools --bin phorminx_release`
+   and run `phorminx_release keygen <absolute-private-key.pk8> <public-key.txt>`.
+2. Bump the version, run the library tests, and merge to `main`.
+3. Build the installer with the key compiled in:
+   ```powershell
+   $env:PHORMINX_UPDATE_PUBLIC_KEY = (Get-Content -Raw <public-key.txt>).Trim()
+   .\scripts\Build-PhorminxInstaller.ps1 -Version 0.2.1
+   ```
+4. Installer QA: install over the previous release and check the tray icon,
+   the setup window, a dictation, and that settings and models survived.
+5. Publish with the next sequence number. It must be higher than every earlier
+   release, because the updater rejects anything at or below the highest
+   sequence it has seen:
+   ```powershell
+   .\scripts\Publish-PhorminxRelease.ps1 -Version 0.2.1 -Sequence 2 `
+       -PrivateKeyPath <absolute-private-key.pk8> -ReleaseTool <phorminx_release.exe>
+   ```
+   This signs `phorminx-update.json`, adds the fixed-name copy
+   `Phorminx-x64-setup.exe` (so
+   `https://github.com/impossibleG/phorminx/releases/latest/download/Phorminx-x64-setup.exe`
+   always serves the newest build), and creates a **draft** `v0.2.1` release.
+   Review the draft on GitHub, then publish it (or re-run with `-Publish`).
+   It must be a full release marked latest, not a pre-release, or both the
+   updater and the website link keep pointing at the previous one.
+6. Verify: on a machine running the previous version, Settings → Updates →
+   Check now offers the new version, downloads it, and **Restart to update**
+   reopens the new version with settings intact.
+7. Record the sequence number used so the next release uses a larger one.
+
+Alpha releases currently ship without Authenticode signing, so Windows
+SmartScreen warns on first run. Do not describe them as signed.
 
 Ed25519 metadata signing is separate from a Windows Authenticode code-signing
 certificate or signing service. The latter identifies the publisher in Windows

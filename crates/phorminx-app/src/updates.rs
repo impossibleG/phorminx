@@ -315,6 +315,12 @@ pub fn stage(release: &Release, directory: &Path) -> Result<PathBuf, UpdateError
     result
 }
 
+/// Marker in the package directory asking the install helper to reopen
+/// Phorminx afterwards. Its text is `background` (tray only) or `window`.
+pub fn relaunch_flag(packages: &Path) -> PathBuf {
+    packages.join("relaunch-after-install")
+}
+
 /// Start a narrowly scoped helper that waits for this process to exit naturally.
 /// It never terminates Phorminx or closes applications; package bytes are hashed
 /// again under a no-write/no-delete file handle immediately before execution.
@@ -346,6 +352,14 @@ pub fn install_after_exit(path: &Path, release: &Release) -> Result<(), UpdateEr
             .to_str()
             .ok_or(UpdateError::Storage)?
             .replace('\'', "''");
+        let flag = relaunch_flag(canonical.parent().ok_or(UpdateError::Storage)?);
+        reject_links(&flag)?;
+        let flag = flag.to_str().ok_or(UpdateError::Storage)?.replace('\'', "''");
+        let exe = std::env::current_exe()
+            .map_err(|_| UpdateError::Storage)?
+            .to_str()
+            .ok_or(UpdateError::Storage)?
+            .replace('\'', "''");
         let powershell = std::env::var_os("SystemRoot")
             .map(PathBuf::from)
             .ok_or(UpdateError::Storage)?
@@ -358,20 +372,35 @@ function Report([string] $status) {{
   [IO.File]::WriteAllText('{receipt}', $receipt)
 }}
 Wait-Process -Id {pid} -ErrorAction SilentlyContinue
-if ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -ge {expires}) {{ Report 'expired'; exit 2 }}
-$file = $null
+$code = & {{
+  if ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -ge {expires}) {{ Report 'expired'; return 2 }}
+  $file = $null
+  try {{
+    $file = [IO.File]::Open('{path}', [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    if ($file.Length -ne {bytes}) {{ Report 'verification_failed'; return 3 }}
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {{ $actual = [BitConverter]::ToString($sha.ComputeHash($file)).Replace('-', '').ToLowerInvariant() }} finally {{ $sha.Dispose() }}
+    if ($actual -ne '{hash}') {{ Report 'verification_failed'; return 4 }}
+    $process = Start-Process -FilePath '{path}' -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCLOSEAPPLICATIONS /NORESTARTAPPLICATIONS' -WindowStyle Hidden -PassThru
+    $process.WaitForExit()
+    if ($process.ExitCode -eq 0) {{ Report 'installed' }} else {{ Report 'installation_failed' }}
+    return $process.ExitCode
+  }} catch {{ Report 'installation_failed'; return 5 }} finally {{ if ($null -ne $file) {{ $file.Dispose() }} }}
+}}
+# A "Restart to update" request leaves a flag; reopen Phorminx whether or not
+# the installer succeeded so the user is never left without the app.
 try {{
-  $file = [IO.File]::Open('{path}', [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-  if ($file.Length -ne {bytes}) {{ Report 'verification_failed'; exit 3 }}
-  $sha = [Security.Cryptography.SHA256]::Create()
-  try {{ $actual = [BitConverter]::ToString($sha.ComputeHash($file)).Replace('-', '').ToLowerInvariant() }} finally {{ $sha.Dispose() }}
-  if ($actual -ne '{hash}') {{ Report 'verification_failed'; exit 4 }}
-  $process = Start-Process -FilePath '{path}' -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCLOSEAPPLICATIONS /NORESTARTAPPLICATIONS' -WindowStyle Hidden -PassThru
-  $process.WaitForExit()
-  if ($process.ExitCode -eq 0) {{ Report 'installed' }} else {{ Report 'installation_failed' }}
-  exit $process.ExitCode
-}} catch {{ Report 'installation_failed'; exit 5 }} finally {{ if ($null -ne $file) {{ $file.Dispose() }} }}
+  if (Test-Path -LiteralPath '{flag}') {{
+    $mode = [IO.File]::ReadAllText('{flag}').Trim()
+    Remove-Item -LiteralPath '{flag}' -Force
+    if ($mode -eq 'background') {{ Start-Process -FilePath '{exe}' -ArgumentList '--background' }}
+    else {{ Start-Process -FilePath '{exe}' }}
+  }}
+}} catch {{ }}
+exit $code
 "#,
+            flag = flag,
+            exe = exe,
             pid = std::process::id(),
             expires = release.expires_at,
             bytes = release.bytes,

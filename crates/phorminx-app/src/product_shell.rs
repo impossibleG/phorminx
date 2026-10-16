@@ -76,6 +76,8 @@ pub enum ProductShellEvent {
     CancelWhisperModelDownload,
     RuntimeReloadRequested(UiMutation),
     ApplyLaunchAtLogin(bool),
+    /// Exit the whole app, e.g. so a scheduled update can install.
+    QuitRequested,
     Hidden,
     Failed(String),
 }

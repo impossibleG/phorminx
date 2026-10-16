@@ -1732,6 +1732,7 @@ fn poll_shell_events(
                         settings.startup.launch_at_login = enabled;
                     }
                 }
+                Ok(ProductShellEvent::QuitRequested) => return Ok(ShellAction::Quit),
                 Ok(ProductShellEvent::Hidden) => {}
                 Ok(ProductShellEvent::Failed(message)) => {
                     eprintln!("product_shell_failed error={message}");

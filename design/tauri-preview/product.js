@@ -92,6 +92,8 @@ function renderUpdates(view) {
   node('update-download').disabled = view.busy || view.scheduled;
   node('update-install').hidden = !view.downloaded;
   node('update-install').disabled = view.busy || view.scheduled;
+  node('update-restart').hidden = !view.downloaded;
+  node('update-restart').disabled = view.busy;
   node('update-notice').textContent = view.configured
     ? view.notice
     : 'This development build has no production release-signing key. Signed updates will be enabled in a public release.';
@@ -569,6 +571,7 @@ node('setup-auto-updates').addEventListener('change', (event) => void updateActi
 node('update-check').addEventListener('click', () => void updateAction('check'));
 node('update-download').addEventListener('click', () => void updateAction('download'));
 node('update-install').addEventListener('click', () => void updateAction('install-on-exit'));
+node('update-restart').addEventListener('click', () => void updateAction('restart-now'));
 node('history-query').addEventListener('input', () => {
   if (historySearchTimer) clearTimeout(historySearchTimer);
   historySearchTimer = setTimeout(() => { void startHistorySearch(); }, 250);

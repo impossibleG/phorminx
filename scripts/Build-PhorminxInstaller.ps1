@@ -7,7 +7,10 @@ param(
     [string] $BuildRoot,
     [switch] $SkipBuild,
     [switch] $RequireSignedBinary,
-    [switch] $Cpu
+    [switch] $Cpu,
+    # Local QA only: build without the release-signing public key, which
+    # disables update checks in the resulting app.
+    [switch] $AllowMissingUpdateKey
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,6 +43,27 @@ if ($Version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
 }
 $numericVersion = ([regex]::Match($Version, '^(\d+)\.(\d+)\.(\d+)')).Groups[1..3].Value -join '.'
 $numericVersion += '.0'
+
+# The updater trusts only manifests signed by this key, and it is compiled in.
+# A release built without it would silently never update again.
+if ([string]::IsNullOrWhiteSpace($env:PHORMINX_UPDATE_PUBLIC_KEY)) {
+    if (-not $AllowMissingUpdateKey) {
+        throw "PHORMINX_UPDATE_PUBLIC_KEY is not set. Set it to the release public-key text, or pass -AllowMissingUpdateKey for a local QA build."
+    }
+    Write-Warning "Building without PHORMINX_UPDATE_PUBLIC_KEY: this app will never check for updates. Do not publish it."
+} else {
+    try {
+        $updateKeyBytes = [Convert]::FromBase64String($env:PHORMINX_UPDATE_PUBLIC_KEY.Trim())
+    } catch {
+        $updateKeyBytes = @()
+    }
+    if ($updateKeyBytes.Length -ne 32) {
+        throw "PHORMINX_UPDATE_PUBLIC_KEY must be the base64 text of a 32-byte Ed25519 public key."
+    }
+    if ($SkipBuild) {
+        Write-Warning "-SkipBuild cannot prove the existing binary was built with PHORMINX_UPDATE_PUBLIC_KEY."
+    }
+}
 
 function Mount-ShortBuildDrive {
     param([Parameter(Mandatory)][string] $BackingDirectory)

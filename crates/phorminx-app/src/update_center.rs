@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 fn daily_checks_by_default() -> bool { true }
 
+const IDLE_RESTART_AFTER: Duration = Duration::from_secs(30 * 60);
+
 #[derive(Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Preferences {
@@ -69,6 +71,9 @@ impl UpdateCenter {
             .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok())
             .and_then(|value|value.get("status").and_then(|s|s.as_str()).map(str::to_owned))
             .map(|status|match status.as_str(){"installed"=>"The last update installer completed.","expired"=>"The last update expired before installation. Check for a fresh signed release.",_=>"The last update did not complete. The installed app was not intentionally removed; check for updates to retry."}.to_owned()).unwrap_or_default();
+        // A relaunch request belongs to the process that wrote it; never let a
+        // stale one reopen Phorminx after an ordinary later exit.
+        let _ = std::fs::remove_file(updates::relaunch_flag(&directory.join("packages")));
         let now = unix_now();
         let due_in = (preferences.last_successful_check.saturating_add(24 * 60 * 60))
             .saturating_sub(now);
@@ -134,6 +139,33 @@ impl UpdateCenter {
         }
         self.schedule();
         if self.scheduled { Ok(()) } else { Err(self.notice.clone()) }
+    }
+    /// Schedule the verified update and ask the install helper to reopen
+    /// Phorminx. The caller must then exit the app.
+    pub fn restart_to_update(&mut self, idle: bool, background: bool) -> Result<(), String> {
+        if !idle { return Err("Finish the active recording or meeting before restarting to update.".into()); }
+        if self.pending.is_some() { return Err("Wait for the current update operation to finish.".into()); }
+        let Some(staged) = self.staged.as_ref() else {
+            return Err("Download and verify an update first.".into());
+        };
+        let flag = updates::relaunch_flag(staged.parent().ok_or("The update package is unavailable.")?);
+        std::fs::write(&flag, if background { "background" } else { "window" })
+            .map_err(|_| "Could not prepare the restart.")?;
+        if !self.scheduled { self.schedule(); }
+        if self.scheduled {
+            Ok(())
+        } else {
+            let _ = std::fs::remove_file(flag);
+            Err(self.notice.clone())
+        }
+    }
+    /// A tray app that starts with Windows rarely exits, so a ready automatic
+    /// update restarts it once the user has been away for a while.
+    pub fn idle_restart_due(&self, user_idle: Duration) -> bool {
+        self.preferences.automatic
+            && self.staged.is_some()
+            && self.pending.is_none()
+            && user_idle >= IDLE_RESTART_AFTER
     }
     fn persist(&self) -> Result<(), String> {
         std::fs::create_dir_all(&self.directory)
@@ -256,7 +288,7 @@ impl UpdateCenter {
                         ResultEvent::Staged(Ok(path)) => {
                             self.staged = Some(path);
                             self.notice =
-                                "Verified update ready. Installation waits until Phorminx exits."
+                                "Verified update ready. Restart Phorminx to finish updating."
                                     .into();
                         }
                     }
@@ -291,7 +323,7 @@ impl UpdateCenter {
             Ok(()) => {
                 self.scheduled = true;
                 self.notice =
-                    "Update scheduled for after Phorminx exits. Recording will not be interrupted."
+                    "Update installs when Phorminx restarts or closes. Recording will not be interrupted."
                         .into();
             }
             Err(error) => {
@@ -442,6 +474,38 @@ mod qa_tests {
             "Older verified release must not remain actionable after receiving a newer floor that cannot be persisted"
         );
         assert!(center.staged.is_none());
+    }
+
+    #[test]
+    fn qa_restart_to_update_requires_idle_and_a_verified_package() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut center = UpdateCenter::new(directory.path().to_owned());
+        assert!(center.restart_to_update(false, false).is_err());
+        assert!(center.restart_to_update(true, false).is_err());
+        assert!(!center.scheduled);
+    }
+
+    #[test]
+    fn qa_idle_restart_waits_for_automatic_consent_package_and_absence() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut center = UpdateCenter::new(directory.path().to_owned());
+        let away = IDLE_RESTART_AFTER;
+        assert!(!center.idle_restart_due(away), "nothing staged");
+        center.staged = Some(directory.path().join("package.exe"));
+        assert!(center.idle_restart_due(away));
+        assert!(!center.idle_restart_due(away - Duration::from_secs(1)), "user still active");
+        center.preferences.automatic = false;
+        assert!(!center.idle_restart_due(away), "automatic install is off");
+    }
+
+    #[test]
+    fn qa_stale_relaunch_request_is_cleared_on_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let packages = directory.path().join("packages");
+        std::fs::create_dir_all(&packages).unwrap();
+        std::fs::write(updates::relaunch_flag(&packages), b"window").unwrap();
+        let _center = UpdateCenter::new(directory.path().to_owned());
+        assert!(!updates::relaunch_flag(&packages).exists());
     }
 
     #[test]

@@ -96,7 +96,7 @@
         <section id="setup" class="page" hidden>
           <div class="page-head"><div><small>CARE</small><h1>Setup &amp; repair</h1></div><button id="setup-start" type="button" class="primary" hidden>Start Phorminx</button></div>
           <div id="bootstrap-card" class="setting-card"><small>RECOMMENDED STARTER</small><h2>Ready in one guided run</h2><p>Prepare instant and accurate recognition, local formatting, and semantic search. Downloads stay on this computer.</p><div class="bootstrap-control"><button id="bootstrap-start" type="button" class="primary">Prepare everything</button><button id="bootstrap-cancel" type="button" hidden>Stop after this step</button><span id="bootstrap-progress" role="status"></span></div><p id="bootstrap-message"></p></div>
-          <div id="setup-updates-card" class="setting-card"><small>NEW FEATURES</small><h2>Keep Phorminx current</h2><label class="check-row"><input id="setup-auto-updates" type="checkbox" checked>Keep getting tested new features automatically</label><p>Phorminx checks signed GitHub Releases daily and installs a verified update only after you close the app. Turn this off here or later in Settings → Updates.</p><p id="setup-update-note" role="status"></p></div>
+          <div id="setup-updates-card" class="setting-card"><small>NEW FEATURES</small><h2>Keep Phorminx current</h2><label class="check-row"><input id="setup-auto-updates" type="checkbox" checked>Keep getting tested new features automatically</label><p>Phorminx checks signed GitHub Releases daily and installs a verified update when Phorminx restarts, or after you have been away for 30 minutes with nothing recording. Turn this off here or later in Settings → Updates.</p><p id="setup-update-note" role="status"></p></div>
           <small id="repair-label">INDIVIDUAL REPAIR</small><div class="setup-intro"><strong id="setup-stage">Inspecting this machine</strong><p id="setup-summary">Reading local capabilities…</p></div><div id="setup-list" class="record-list single-list"></div>
         </section>
         <section id="app-settings" class="page" hidden>
@@ -129,9 +129,9 @@
           <div id="settings-updates" class="settings-panel" hidden>
             <div class="updates-grid">
               <section class="setting-card"><small>INSTALLED</small><h2>Phorminx <span id="update-installed">…</span></h2><p id="update-available">Checking release status…</p><p id="update-last-check"></p></section>
-              <section class="setting-card"><small>DELIVERY</small><h2>Stay current</h2><label class="check-row"><input id="update-daily" type="checkbox">Check GitHub Releases daily</label><label class="check-row"><input id="update-automatic" type="checkbox">Download automatically and install after exit</label><p>Updates never interrupt an active dictation or meeting.</p></section>
+              <section class="setting-card"><small>DELIVERY</small><h2>Stay current</h2><label class="check-row"><input id="update-daily" type="checkbox">Check GitHub Releases daily</label><label class="check-row"><input id="update-automatic" type="checkbox">Download automatically; install on restart or after 30 idle minutes</label><p>Updates never interrupt an active dictation or meeting.</p></section>
             </div>
-            <div class="update-actions"><button id="update-check" type="button">Check now</button><button id="update-download" type="button">Download verified update</button><button id="update-install" type="button" class="primary">Install after closing</button></div>
+            <div class="update-actions"><button id="update-check" type="button">Check now</button><button id="update-download" type="button">Download verified update</button><button id="update-restart" type="button" class="primary">Restart to update</button><button id="update-install" type="button">Install after closing</button></div>
             <p id="update-notice" role="status"></p>
           </div>
         </section>
