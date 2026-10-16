@@ -18,7 +18,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DI_NORMAL, DefWindowProcW, DestroyWindow, DispatchMessageW,
     DrawIconEx, GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
-    HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IsWindow, KillTimer, LoadIconW, MA_NOACTIVATE, MSG,
+    HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IsWindow, KillTimer, MA_NOACTIVATE, MSG,
     PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
     SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
     UnregisterClassW, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEACTIVATE,
@@ -657,12 +657,7 @@ unsafe fn paint_launcher(
         );
     };
     if let Ok(module) = unsafe { GetModuleHandleW(None) }
-        && let Ok(icon) = unsafe {
-            LoadIconW(
-                Some(HINSTANCE(module.0)),
-                windows::core::PCWSTR(std::ptr::without_provenance::<u16>(1)),
-            )
-        }
+        && let Some(icon) = crate::app_icon::load_app_icon(HINSTANCE(module.0))
     {
         let _ = unsafe {
             DrawIconEx(

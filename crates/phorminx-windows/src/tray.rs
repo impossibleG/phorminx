@@ -222,9 +222,8 @@ unsafe fn create_and_run(
         return Err(TrayThreadError::Api(windows::core::Error::from_thread()));
     }
 
-    let resource_name = PCWSTR(ICON_ID as usize as *const u16);
-    let icon = match unsafe { LoadIconW(Some(instance), resource_name) }
-        .or_else(|_| unsafe { LoadIconW(None, IDI_APPLICATION) })
+    let icon = match crate::app_icon::load_app_icon(instance)
+        .map_or_else(|| unsafe { LoadIconW(None, IDI_APPLICATION) }, Ok)
     {
         Ok(icon) => icon,
         Err(error) => {

@@ -1,6 +1,8 @@
 //! Windows shell integration for Phorminx.
 
 #[cfg(windows)]
+mod app_icon;
+#[cfg(windows)]
 mod appearance;
 #[cfg(windows)]
 mod asset_dialog;
