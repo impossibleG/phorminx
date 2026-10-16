@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Feedback · Phorminx</title>
+  <link rel="stylesheet" href="feedback.css">
+  <link rel="stylesheet" href="feedback-light.css">
+  <script src="feedback.js" defer></script>
+</head>
+<body>
+  <header><img class="mark" src="../brand/png/app/phorminx-app-32.png" width="26" height="26" alt=""><strong>PHORMINX</strong><small>FEEDBACK</small></header>
+  <main>
+    <div class="heading"><small>REPORT / LOCAL DRAFT</small><h1>Tell us what happened.</h1><p>Only the report you send goes to phorminx.net. Audio, meetings and history are not attached.</p></div>
+    <div class="composer"><label for="report">YOUR REPORT</label><textarea id="report" rows="11" maxlength="12000" placeholder="Describe what happened…"></textarea><div id="provisional" class="provisional" aria-live="polite"></div><div class="composer-foot"><span id="count">0 / 12,000 bytes</span><span>Review before sending</span></div></div>
+    <label class="diagnostics"><input id="diagnostics" type="checkbox"> Include app version and recognition mode only</label>
+    <div class="actions"><button id="record" type="button">Record report</button><button id="stop" type="button" hidden>Stop recording</button><button id="send" class="primary" type="button">Send report</button></div>
+    <p id="notice" role="status"></p>
+  </main>
+</body>
+</html>

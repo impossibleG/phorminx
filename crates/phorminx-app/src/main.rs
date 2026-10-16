@@ -21,7 +21,9 @@ use phorminx_app::model::{
 use phorminx_app::performance_runtime::{
     RuntimeActivityKind, RuntimeActivityLease, WorkloadCoordinator, production_workload_coordinator,
 };
-use phorminx_app::product_shell::{ProductShell, ProductShellControl, ProductShellEvent};
+#[cfg(not(feature = "tauri-shell"))]
+use phorminx_app::product_shell::ProductShell;
+use phorminx_app::product_shell::{ProductShellControl, ProductShellEvent};
 use phorminx_app::runtime::{
     AppIo, AppRuntime, FinishedAudio, InsertDisposition, ReleaseTiming, RuntimeNotice, UiStatus,
 };
@@ -30,6 +32,8 @@ use phorminx_app::settings::{
     OllamaLifecycle, OllamaModelIdentity, RecognitionMode, RecordingMode, RuntimeFormatting,
     Settings, SettingsStore,
 };
+#[cfg(feature = "tauri-shell")]
+use phorminx_app::tauri_shell::TauriShell as ProductShell;
 use phorminx_app::ui_bridge::{UiMutation, UiRoute, UiRuntimeStatus, UiVoskProbe};
 use phorminx_audio::{
     DeferredCapturedAudio, ExtendedCaptureConfig, ExtendedCaptureFactory, ExtendedCaptureFault,
@@ -100,6 +104,9 @@ struct Cli {
     /// Start ready in the tray without showing the product shell.
     #[arg(long, hide = true)]
     background: bool,
+    /// Open the branded setup experience without starting a recording engine.
+    #[arg(long, conflicts_with = "smoke_test")]
+    setup: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -245,7 +252,7 @@ fn run() -> Result<()> {
             VoskAssetLayout::Present { .. }
         ),
     };
-    if !recognition_ready {
+    if !recognition_ready || cli.setup {
         if cli.smoke_test {
             return Err(anyhow!(
                 "the selected local recognition engine is not ready"
@@ -730,6 +737,7 @@ fn run() -> Result<()> {
                     runtime.configure_next_dictation(
                         dictation_context.language.clone(),
                         dictation_context.runtime_formatting,
+                        settings.recognition.minimum_rms,
                     )?;
                 }
                 if release_received_at.is_none()
@@ -1136,7 +1144,7 @@ fn run() -> Result<()> {
                 &mut incremental,
                 &worker,
                 &dictation_context.language,
-                settings.recognition.minimum_rms,
+                runtime.minimum_rms(),
             ),
             RecognitionMode::Instant => {
                 poll_instant_transcription(&mut runtime, &mut instant_pump, &worker)
@@ -1224,6 +1232,11 @@ fn run() -> Result<()> {
             .shutdown()
             .context("failed to stop the status overlay"),
     );
+    eprintln!(
+        "event=runtime_exit restart_requested={} cleanup_error={}",
+        restart_requested,
+        final_error.is_some()
+    );
     if final_error.is_none() && restart_requested {
         // The replacement process acquires this same mutex during startup. Release
         // our guard before spawning it so a settings restart cannot reject itself.
@@ -1304,7 +1317,7 @@ fn run_setup_mode(
         ProductShell::start(
             settings_store.clone(),
             database_path,
-            UiRoute::Models,
+            UiRoute::Setup,
             UiRuntimeStatus::NeedsAttention,
             setup_shell_vosk_probe(),
             true,
@@ -1687,6 +1700,9 @@ fn poll_shell_events(
                         settings.interaction = persisted.interaction;
                         settings.search = persisted.search;
                         settings.appearance = persisted.appearance;
+                        settings.privacy = persisted.privacy;
+                        settings.startup = persisted.startup;
+                        settings.recognition.minimum_rms = persisted.recognition.minimum_rms;
                     }
                     UiMutation::LexiconSaved { .. }
                     | UiMutation::LexiconDeleted { .. }
@@ -2521,11 +2537,12 @@ fn user_safe_settings_error(error: &anyhow::Error) -> String {
 
 fn restart_with_settings(settings_path: &Path) -> Result<()> {
     let executable = std::env::current_exe().context("failed to locate the Phorminx executable")?;
-    Command::new(executable)
+    let child = Command::new(executable)
         .arg("--config")
         .arg(settings_path)
         .spawn()
         .context("failed to restart Phorminx")?;
+    eprintln!("event=runtime_restart_spawned pid={}", child.id());
     Ok(())
 }
 
@@ -3110,7 +3127,11 @@ fn handle_test_dictation(
             );
         }
         *context = DictationContext::global(settings, context.verified_variant)?;
-        runtime.configure_next_dictation(context.language.clone(), context.runtime_formatting)?;
+        runtime.configure_next_dictation(
+            context.language.clone(),
+            context.runtime_formatting,
+            settings.recognition.minimum_rms,
+        )?;
     }
     let released_at = (runtime.state() == RuntimeState::Listening).then(Instant::now);
     if let (Some(released_at), Some(id)) = (released_at, runtime.active_id()) {

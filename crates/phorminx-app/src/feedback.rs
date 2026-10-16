@@ -118,7 +118,92 @@ pub struct FeedbackPanel {
     response: Option<Receiver<Result<String, String>>>,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackView {
+    pub text: String,
+    pub provisional_text: String,
+    pub notice: String,
+    pub diagnostics: bool,
+    pub recording: bool,
+    pub stopping: bool,
+    pub sending: bool,
+}
+
 impl FeedbackPanel {
+    pub fn snapshot(&self) -> FeedbackView {
+        FeedbackView {
+            text: self.text.clone(),
+            provisional_text: self.partial.clone(),
+            notice: self.notice.clone(),
+            diagnostics: self.diagnostics,
+            recording: self.capture.is_some(),
+            stopping: self.stopping,
+            sending: self.response.is_some(),
+        }
+    }
+
+    pub fn update_draft(&mut self, text: String, diagnostics: bool) -> Result<(), String> {
+        if self.is_busy() {
+            return Err("Finish recording or sending before editing the draft.".into());
+        }
+        if text.len() > MAX_TEXT_BYTES {
+            return Err("Feedback must contain at most 12,000 UTF-8 bytes.".into());
+        }
+        if self.text != text || self.diagnostics != diagnostics {
+            self.pending = None;
+        }
+        self.text = text;
+        self.diagnostics = diagnostics;
+        Ok(())
+    }
+
+    pub fn start_recording(&mut self, settings: &Settings, store: &SettingsStore) {
+        if !self.is_busy() {
+            self.record(settings, store);
+        }
+    }
+
+    pub fn stop_recording(&mut self) {
+        if let Some(capture) = &self.capture {
+            let _ = capture.stop();
+            self.stopping = true;
+        }
+    }
+
+    pub fn close_window(&mut self) {
+        self.stop_recording();
+        self.open = false;
+    }
+
+    pub fn send_report(&mut self, settings: &Settings) -> Result<(), String> {
+        if self.is_busy() {
+            return Err("Finish recording or sending first.".into());
+        }
+        // Reuse the request ID on uncertain retries; an edited draft is a new report.
+        let unchanged = self.pending.as_ref().is_some_and(|request| {
+            request.text == self.text.trim() && request.diagnostics.is_some() == self.diagnostics
+        });
+        if !unchanged {
+            self.pending = Some(FeedbackSubmission::new(
+                &self.text,
+                settings,
+                self.diagnostics,
+            )?);
+        }
+        if let Some(request) = self.pending.clone() {
+            let (tx, rx) = mpsc::sync_channel(1);
+            std::thread::Builder::new()
+                .name("phorminx-feedback".into())
+                .spawn(move || {
+                    let _ = tx.send(submit(&request));
+                })
+                .map_err(|_| "Could not start sending. Your draft is retained.".to_owned())?;
+            self.response = Some(rx);
+            self.notice = "Sending report…".into();
+        }
+        Ok(())
+    }
     pub fn is_busy(&self) -> bool {
         self.capture.is_some() || self.response.is_some()
     }
@@ -249,39 +334,20 @@ impl FeedbackPanel {
             ui.horizontal(|ui| {
                 if self.capture.is_some() {
                     if ui.add_enabled(!self.stopping, egui::Button::new("Stop recording")).clicked() {
-                        if let Some(capture) = &self.capture { let _ = capture.stop(); }
-                        self.stopping = true;
+                        self.stop_recording();
                     }
                 } else if ui.add_enabled(can_record && editing, egui::Button::new("Record report")).clicked() {
-                    self.record(settings, store);
+                    self.start_recording(settings, store);
                 }
                 if ui.add_enabled(editing && !self.text.trim().is_empty() && self.text.trim().len() <= MAX_TEXT_BYTES, egui::Button::new("Send report")).clicked() {
-                    // Reuse the request ID on uncertain retries; an edited draft is a new report.
-                    let unchanged = self.pending.as_ref().is_some_and(|p| p.text == self.text.trim() && p.diagnostics.is_some() == self.diagnostics);
-                    if !unchanged {
-                        match FeedbackSubmission::new(&self.text, settings, self.diagnostics) {
-                            Ok(request) => self.pending = Some(request),
-                            Err(error) => { self.notice = error; return; }
-                        }
-                    }
-                    if let Some(request) = self.pending.clone() {
-                        let (tx, rx) = mpsc::sync_channel(1);
-                        match std::thread::Builder::new().name("phorminx-feedback".into()).spawn(move || { let _ = tx.send(submit(&request)); }) {
-                            Ok(_) => { self.response = Some(rx); self.notice = "Sending report…".into(); }
-                            Err(_) => self.notice = "Could not start sending. Your draft is retained.".into(),
-                        }
-                    }
+                    if let Err(error) = self.send_report(settings) { self.notice = error; }
                 }
             });
             if !self.notice.is_empty() { ui.add_space(8.0); ui.label(&self.notice); }
             ui.weak("Drafts are kept in memory only. Closing Phorminx discards an unsent draft.");
         });
         if !open {
-            if let Some(capture) = &self.capture {
-                let _ = capture.stop();
-                self.stopping = true;
-            }
-            self.open = false;
+            self.close_window();
         }
         if self.capture.is_some() || self.response.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -320,6 +386,22 @@ mod tests {
         assert!(!panel.is_busy());
         assert!(panel.capture.is_none());
         assert!(panel.capture_lease.is_none());
+    }
+    #[test]
+    fn closing_and_reopening_feedback_preserves_an_unsent_local_draft() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(directory.path().join("settings.toml")).unwrap();
+        let settings = Settings::default();
+        let mut panel = FeedbackPanel::default();
+        panel.open(&settings, &store, false);
+        panel.update_draft("synthetic unsent report".into(), false).unwrap();
+        panel.close_window();
+        assert!(!panel.open);
+        assert_eq!(panel.snapshot().text, "synthetic unsent report");
+        assert!(panel.response.is_none());
+        panel.open(&settings, &store, false);
+        assert!(panel.open);
+        assert_eq!(panel.snapshot().text, "synthetic unsent report");
     }
     #[test]
     fn feedback_rejects_empty_and_byte_oversize_before_network() {

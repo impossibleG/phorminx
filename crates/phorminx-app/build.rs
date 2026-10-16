@@ -1,3 +1,12 @@
+#[cfg(feature = "tauri-preview")]
+fn main() {
+    // Tauri embeds its own version and icon resource. Embedding our legacy
+    // winresource a second time makes the Windows linker reject the binary.
+    println!("cargo:rerun-if-env-changed=PHORMINX_RELEASE_VERSION");
+    tauri_build::build();
+}
+
+#[cfg(not(feature = "tauri-preview"))]
 fn main() {
     println!("cargo:rerun-if-env-changed=PHORMINX_RELEASE_VERSION");
     println!("cargo:rerun-if-env-changed=PHORMINX_UPDATE_PUBLIC_KEY");

@@ -182,6 +182,10 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
         self.pending_id
     }
 
+    pub fn minimum_rms(&self) -> f32 {
+        self.minimum_rms
+    }
+
     /// Read-only access used by the event-loop incremental scheduler. The
     /// recording remains owned by the runtime and can still be finalized or
     /// dropped through the existing state-machine paths.
@@ -205,12 +209,14 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
         &mut self,
         language: String,
         formatting: RuntimeFormatting,
+        minimum_rms: f32,
     ) -> Result<(), StateError> {
         if self.machine.state() != RuntimeState::Idle {
             return Err(StateError::Busy(self.machine.state()));
         }
         self.language = language;
         self.formatting = formatting;
+        self.minimum_rms = minimum_rms;
         Ok(())
     }
 
@@ -847,6 +853,15 @@ mod tests {
         assert_eq!(runtime.state(), RuntimeState::Transcribing);
         io.complete_submission(id);
         id
+    }
+
+    #[test]
+    fn speech_level_change_applies_to_the_next_dictation() {
+        let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".to_owned()).unwrap();
+        runtime
+            .configure_next_dictation("en".to_owned(), RuntimeFormatting::Light, 0.005)
+            .unwrap();
+        assert_eq!(runtime.minimum_rms, 0.005);
     }
 
     #[test]

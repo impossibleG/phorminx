@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phorminx · Tauri architecture preview</title>
+  <link rel="stylesheet" href="preview.css">
+  <script src="markdown.js" defer></script>
+  <script src="preview.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar"><img class="mark" src="../brand/png/app/phorminx-app-32.png" width="28" height="28" alt=""><strong>PHORMINX</strong><span class="preview-label">TAURI ARCHITECTURE PREVIEW</span><span id="status" role="status">Connecting to local Rust worker…</span></header>
+    <div class="workspace">
+      <nav class="side" aria-label="Preview routes"><button class="active" type="button" data-route="live">Live session</button><button type="button" data-route="saved">Saved sessions</button><button type="button" data-route="settings">Meeting settings</button><p>The installed Phorminx UI remains unchanged during this migration.</p></nav>
+      <main>
+        <section id="live" class="page">
+          <div class="page-head"><div><small>MEETINGS / LIVE</small><h1>Live session</h1></div><div class="head-actions"><button id="start" type="button" class="primary">Start meeting</button><button id="stop" type="button">Finish</button><button id="companion" type="button">Open companion</button></div></div>
+          <div class="live-grid"><section class="pane"><h2>Transcript</h2><div id="transcript" class="scroll-content" role="log"></div></section><section class="pane"><div class="pane-head"><h2>Assistant</h2><button id="commentary" type="button" aria-pressed="false">Commentary off</button></div><div id="messages" class="scroll-content" role="log"></div><form id="ask"><input id="question" aria-label="Ask about this meeting" placeholder="Ask about this meeting…" autocomplete="off"><button type="submit">Send</button></form></section></div>
+        </section>
+        <section id="saved" class="page" hidden>
+          <div class="page-head"><div><small>MEETINGS / LIBRARY</small><h1>Saved sessions</h1></div><form id="search"><input id="query" aria-label="Search saved sessions" placeholder="Search sessions…"><button type="submit">Search</button></form></div>
+          <div class="saved-grid"><div id="sessions" class="session-list" aria-label="Saved session list"></div><section class="pane saved-detail"><h2 id="saved-title">Select a session</h2><div id="saved-transcript" class="scroll-content"></div></section></div>
+        </section>
+        <section id="settings" class="page" hidden>
+          <div class="page-head"><div><small>MEETINGS / CONFIGURATION</small><h1>Meeting settings</h1></div></div>
+          <div class="settings-grid"><section class="setting-card"><small>AUDIO</small><h2>Computer and microphone</h2><p>Both sources are captured when a meeting starts. Mute either one from the companion.</p><form id="devices-form" class="setting-form"><label for="output-device">Computer device</label><select id="output-device"><option value="">Windows default</option></select><label for="input-device">Microphone</label><select id="input-device"><option value="">Windows default</option></select><button type="submit">Save devices</button></form></section><section class="setting-card"><small>LANGUAGE</small><h2>Live translation</h2><form id="translation-form" class="setting-form"><label for="translation-language">Target language</label><input id="translation-language" placeholder="Off, or a language such as Portuguese (Brazil)"><label for="translation-model">Local model</label><select id="translation-model"><option value="">Choose an installed model</option></select><button type="submit">Save translation</button></form><p id="translation-notice"></p></section></div>
+        </section>
+      </main>
+    </div>
+  </div>
+</body>
+</html>

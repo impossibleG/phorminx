@@ -18,6 +18,11 @@ pub mod settings;
 pub mod setup_center;
 pub mod setup_features;
 pub mod setup_host;
+pub mod tauri_contract;
+#[cfg(feature = "tauri-preview")]
+pub mod tauri_meetings;
+#[cfg(feature = "tauri-shell")]
+pub mod tauri_shell;
 pub mod text_recovery;
 pub mod ui_bridge;
 pub mod update_center;

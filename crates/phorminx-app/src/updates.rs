@@ -7,7 +7,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const UPDATE_ENDPOINT: &str = "https://www.phorminx.net/api/v1/updates/stable/windows-x64";
+// The latest non-prerelease GitHub Release carries a signed envelope as an
+// asset. GitHub is distribution, not the trust root: the embedded key is.
+pub const UPDATE_ENDPOINT: &str =
+    "https://github.com/impossibleG/phorminx/releases/latest/download/phorminx-update.json";
 const MAX_ENVELOPE: usize = 32 * 1024;
 const MAX_PACKAGE: u64 = 512 * 1024 * 1024;
 const MAX_SEQUENCE: u64 = 9_007_199_254_740_991;
@@ -185,7 +188,7 @@ pub fn verify(
         || release.published_at > now.saturating_add(300)
         || release.expires_at <= now
         || release.expires_at <= release.published_at
-        || release.expires_at - release.published_at > 30 * 86400
+        || release.expires_at - release.published_at > 5 * 365 * 86400
         || release.bytes == 0
         || release.bytes > MAX_PACKAGE
         || release.sha256.len() != 64
@@ -207,7 +210,7 @@ pub fn check(highest_sequence: u64) -> Result<VerifiedCheck, UpdateError> {
     let key = configured_key()?;
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
-        .max_redirects(0)
+        .max_redirects(5)
         .https_only(true)
         .build()
         .new_agent();
@@ -487,7 +490,7 @@ mod tests {
                 "platform" => r.platform = "linux".into(),
                 "channel" => r.channel = "preview".into(),
                 "bytes" => r.bytes = MAX_PACKAGE + 1,
-                "expires_at" => r.expires_at = 10000000,
+                "expires_at" => r.expires_at = 6 * 365 * 86400,
                 "published_at" => r.published_at = 1900,
                 "sequence" => r.sequence = 0,
                 _ => r.version = "1.3.0-alpha.1".into(),
