@@ -197,7 +197,7 @@ impl BootstrapCenter {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_app_snapshot(state: State<'_, HostState>) -> Result<AppView, String> {
     let mut bridge = state
         .bridge
@@ -221,14 +221,14 @@ fn host_app_snapshot(state: State<'_, HostState>) -> Result<AppView, String> {
     Ok(AppView::from(&snapshot))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_input_devices() -> Result<Vec<String>, String> {
     input_devices()
         .map(|devices| devices.into_iter().map(|device| device.name).collect())
         .map_err(|_| "Microphone devices could not be listed.".to_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_history_text(
     id: i64,
     variant: Option<String>,
@@ -249,7 +249,7 @@ fn host_history_text(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_library_search(
     query: String,
     semantic: bool,
@@ -267,7 +267,7 @@ fn host_library_search(
     Ok(generation)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_library_update(state: State<'_, HostState>) -> Result<Option<LibrarySearchView>, String> {
     let library = state.library.lock().map_err(|_| "Search is unavailable.")?;
     Ok(library
@@ -276,7 +276,7 @@ fn host_library_update(state: State<'_, HostState>) -> Result<Option<LibrarySear
         .map(Into::into))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_select_route(route: String, state: State<'_, HostState>) -> Result<(), String> {
     let route = match route.as_str() {
         "home" => UiRoute::Home,
@@ -294,7 +294,7 @@ fn host_select_route(route: String, state: State<'_, HostState>) -> Result<(), S
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_preferences(
     theme: String,
     recording_mode: String,
@@ -346,7 +346,7 @@ fn host_save_preferences(
         .map_err(|_| "Settings were saved, but the runtime could not be notified.".to_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_custom_instructions(state: State<'_, HostState>) -> Result<Option<String>, String> {
     Ok(state
         .bridge
@@ -358,7 +358,7 @@ fn host_custom_instructions(state: State<'_, HostState>) -> Result<Option<String
         .clone())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_dictation_settings(
     mode: String,
     backend: String,
@@ -460,7 +460,7 @@ fn host_save_dictation_settings(
     state.execute(UiCommand::SaveSettings(candidate))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_privacy_settings(
     retention: String,
     embedding_model: Option<String>,
@@ -587,7 +587,7 @@ fn dispatch_settings_outcome(
         .map_err(|_| "The change was saved, but the runtime could not be notified.".to_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_lexicon(
     id: Option<i64>,
     canonical: String,
@@ -616,12 +616,12 @@ fn host_save_lexicon(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_delete_lexicon(id: i64, state: State<'_, HostState>) -> Result<(), String> {
     state.execute(UiCommand::DeleteLexicon(id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_profile_detail(
     executable: String,
     state: State<'_, HostState>,
@@ -635,7 +635,7 @@ fn host_profile_detail(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_profile(
     original_executable: Option<String>,
     executable: String,
@@ -672,12 +672,12 @@ fn host_save_profile(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_delete_profile(executable: String, state: State<'_, HostState>) -> Result<(), String> {
     state.execute(UiCommand::DeleteProfile(executable))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_setup_snapshot(
     app: tauri::AppHandle,
     state: State<'_, HostState>,
@@ -719,7 +719,7 @@ fn host_setup_snapshot(
     Ok(view)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_start_setup_action(
     id: String,
     consent_confirmed: bool,
@@ -750,7 +750,7 @@ fn host_start_setup_action(
     center.start(&id).map_err(str::to_owned)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_bootstrap_snapshot(app: tauri::AppHandle, state: State<'_, HostState>) -> Result<BootstrapView, String> {
     let mut bootstrap = state.bootstrap.lock().map_err(|_| "Starter setup is unavailable.")?;
     let completed = bootstrap.poll()?;
@@ -763,7 +763,7 @@ fn host_bootstrap_snapshot(app: tauri::AppHandle, state: State<'_, HostState>) -
     Ok(view)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_start_bootstrap(state: State<'_, HostState>) -> Result<BootstrapView, String> {
     if !state.bootstrap_allowed { return Err("Open Prepare Phorminx from the Start menu to run the full starter.".into()); }
     let readiness = state.readiness.lock().map_err(|_| "Readiness is unavailable.")?.clone();
@@ -775,14 +775,14 @@ fn host_start_bootstrap(state: State<'_, HostState>) -> Result<BootstrapView, St
     Ok(bootstrap.view.clone())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_cancel_bootstrap(state: State<'_, HostState>) -> Result<BootstrapView, String> {
     let mut bootstrap = state.bootstrap.lock().map_err(|_| "Starter setup is unavailable.")?;
     bootstrap.cancel_after_step()?;
     Ok(bootstrap.view.clone())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_cancel_setup_action(id: String, state: State<'_, HostState>) -> Result<(), String> {
     state
         .setup
@@ -811,7 +811,7 @@ fn update_idle(app: &tauri::AppHandle) -> bool {
     runtime_idle && meeting_idle
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_update_snapshot(app: tauri::AppHandle, state: State<'_, HostState>) -> Result<UpdateView, String> {
     let idle = update_idle(&app);
     let mut updates = state.updates.lock().map_err(|_| "Updates are unavailable.")?;
@@ -819,7 +819,7 @@ fn host_update_snapshot(app: tauri::AppHandle, state: State<'_, HostState>) -> R
     Ok(updates.snapshot())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_update_action(kind: String, enabled: Option<bool>, app: tauri::AppHandle, state: State<'_, HostState>) -> Result<UpdateView, String> {
     let idle = update_idle(&app);
     let mut updates = state.updates.lock().map_err(|_| "Updates are unavailable.")?;
@@ -840,7 +840,7 @@ fn host_update_action(kind: String, enabled: Option<bool>, app: tauri::AppHandle
     Ok(updates.snapshot())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_snapshot(state: State<'_, HostState>) -> Result<HostView, String> {
     Ok(HostView {
         route: format!(
@@ -864,7 +864,7 @@ fn host_snapshot(state: State<'_, HostState>) -> Result<HostView, String> {
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_action(kind: String, state: State<'_, HostState>) -> Result<(), String> {
     let event = match kind.as_str() {
         "test-dictation" => ProductShellEvent::TestDictation,
@@ -892,7 +892,7 @@ fn host_action(kind: String, state: State<'_, HostState>) -> Result<(), String> 
         .map_err(|_| "The dictation host is unavailable.".into())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_select_whisper_model(
     manifest_id: String,
     state: State<'_, HostState>,
@@ -905,7 +905,7 @@ fn host_select_whisper_model(
         .map_err(|_| "The model manager is unavailable.".into())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_install_vosk(state: State<'_, HostState>) -> Result<(), String> {
     state
         .events
@@ -913,7 +913,7 @@ fn host_install_vosk(state: State<'_, HostState>) -> Result<(), String> {
         .map_err(|_| "The model manager is unavailable.".into())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn feedback_snapshot(state: State<'_, HostState>) -> Result<FeedbackView, String> {
     let mut feedback = state
         .feedback
@@ -923,7 +923,7 @@ fn feedback_snapshot(state: State<'_, HostState>) -> Result<FeedbackView, String
     Ok(feedback.snapshot())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn feedback_update(
     text: String,
     diagnostics: bool,
@@ -936,7 +936,7 @@ fn feedback_update(
         .update_draft(text, diagnostics)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn feedback_action(kind: String, state: State<'_, HostState>) -> Result<(), String> {
     let mut feedback = state
         .feedback
@@ -1445,7 +1445,7 @@ fn strength_name(strength: FormattingStrength) -> &'static str {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn review_snapshot(state: State<'_, HostState>) -> Result<ReviewWindowView, String> {
     let view = state
         .review
@@ -1463,7 +1463,7 @@ fn review_snapshot(state: State<'_, HostState>) -> Result<ReviewWindowView, Stri
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn review_reformat(
     text: String,
     strength: String,
@@ -1492,7 +1492,7 @@ fn review_reformat(
     Ok(None)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn review_copy(text: String, state: State<'_, HostState>) -> Result<Option<String>, String> {
     if text.trim().is_empty() {
         return Err("There is no text to copy.".into());
@@ -1506,7 +1506,7 @@ fn review_copy(text: String, state: State<'_, HostState>) -> Result<Option<Strin
     Ok(Some(notice))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn review_replace(text: String, state: State<'_, HostState>) -> Result<Option<String>, String> {
     if text.trim().is_empty() {
         return Err("There is no text to insert.".into());
@@ -1518,7 +1518,7 @@ fn review_replace(text: String, state: State<'_, HostState>) -> Result<Option<St
     Ok(None)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn review_close(app: tauri::AppHandle, state: State<'_, HostState>) -> Result<(), String> {
     if let Ok(mut review) = state.review.lock() {
         review.close();

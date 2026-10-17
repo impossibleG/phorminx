@@ -1013,84 +1013,91 @@ impl UiBridge {
         {
             return self.commit_settings(candidate, now_ms, UiMutation::SearchSaved);
         }
-        match candidate.recognition.mode {
-            crate::settings::RecognitionMode::Accurate => {
-                let resolved_model = self
-                    .store
-                    .resolve_model_path(&candidate.recognition.model_path);
-                if !resolved_model.is_file() {
-                    return Err(UiBridgeError::validation(
-                        "model_path",
-                        "Select an existing Whisper model file.",
-                    ));
-                }
-                let verified_variant = identify_pinned_model(&resolved_model).map_err(|_| {
-                    UiBridgeError::validation(
-                        "model_path",
-                        "The Whisper model could not be verified.",
-                    )
-                })?;
-                if candidate.recognition.accurate_model != AccurateModelVariant::Custom {
-                    model_for_variant(candidate.recognition.accurate_model).map_err(|_| {
-                        UiBridgeError::validation(
-                            "model_path",
-                            "The pinned Whisper model is unavailable.",
-                        )
-                    })?;
-                    if verified_variant != Some(candidate.recognition.accurate_model) {
+        // The recognizer in use was verified when it was saved and is verified
+        // again when the runtime loads it. Re-verifying it here would load the
+        // Vosk model or hash the Whisper file on every save, which takes from
+        // half a second to many seconds on a cold disk.
+        if !same_recognizer(&candidate, &self.settings) {
+            match candidate.recognition.mode {
+                crate::settings::RecognitionMode::Accurate => {
+                    let resolved_model = self
+                        .store
+                        .resolve_model_path(&candidate.recognition.model_path);
+                    if !resolved_model.is_file() {
                         return Err(UiBridgeError::validation(
                             "model_path",
-                            "Download and verify the selected pinned Whisper model before switching.",
+                            "Select an existing Whisper model file.",
                         ));
                     }
-                }
-                if verified_variant.is_some_and(|variant| {
-                    !variant.supports_language(&candidate.recognition.language)
-                }) {
-                    return Err(UiBridgeError::validation(
-                        "language",
-                        "Select a multilingual Whisper model for this language.",
-                    ));
-                }
-            }
-            crate::settings::RecognitionMode::Instant => {
-                let runtime = self
-                    .store
-                    .resolve_asset_path(&candidate.recognition.instant_runtime_path);
-                let model = self
-                    .store
-                    .resolve_asset_path(&candidate.recognition.instant_model_path);
-                match phorminx_vosk::inspect(&runtime, &model, &candidate.recognition.language) {
-                    phorminx_vosk::Readiness::Ready { .. } => {}
-                    phorminx_vosk::Readiness::MissingRuntime { .. } => {
-                        return Err(UiBridgeError::validation(
-                            "instant_runtime_path",
-                            "Select a local Vosk runtime bundle containing libvosk.dll.",
-                        ));
+                    let verified_variant =
+                        identify_pinned_model(&resolved_model).map_err(|_| {
+                            UiBridgeError::validation(
+                                "model_path",
+                                "The Whisper model could not be verified.",
+                            )
+                        })?;
+                    if candidate.recognition.accurate_model != AccurateModelVariant::Custom {
+                        model_for_variant(candidate.recognition.accurate_model).map_err(|_| {
+                            UiBridgeError::validation(
+                                "model_path",
+                                "The pinned Whisper model is unavailable.",
+                            )
+                        })?;
+                        if verified_variant != Some(candidate.recognition.accurate_model) {
+                            return Err(UiBridgeError::validation(
+                                "model_path",
+                                "Download and verify the selected pinned Whisper model before switching.",
+                            ));
+                        }
                     }
-                    phorminx_vosk::Readiness::MissingModel { .. } => {
-                        return Err(UiBridgeError::validation(
-                            "instant_model_path",
-                            "Select an unpacked local Vosk model directory.",
-                        ));
-                    }
-                    phorminx_vosk::Readiness::UnsupportedLanguage { .. } => {
+                    if verified_variant.is_some_and(|variant| {
+                        !variant.supports_language(&candidate.recognition.language)
+                    }) {
                         return Err(UiBridgeError::validation(
                             "language",
-                            "Instant mode currently supports en and pt-br.",
+                            "Select a multilingual Whisper model for this language.",
                         ));
                     }
-                    phorminx_vosk::Readiness::IncompatibleModelLanguage { .. } => {
-                        return Err(UiBridgeError::validation(
-                            "instant_model_path",
-                            "Choose a Vosk model whose official directory name matches the selected language.",
-                        ));
-                    }
-                    phorminx_vosk::Readiness::LoadFailed { .. } => {
-                        return Err(UiBridgeError::validation(
-                            "instant_runtime_path",
-                            "The selected Vosk runtime could not be loaded.",
-                        ));
+                }
+                crate::settings::RecognitionMode::Instant => {
+                    let runtime = self
+                        .store
+                        .resolve_asset_path(&candidate.recognition.instant_runtime_path);
+                    let model = self
+                        .store
+                        .resolve_asset_path(&candidate.recognition.instant_model_path);
+                    match phorminx_vosk::inspect(&runtime, &model, &candidate.recognition.language) {
+                        phorminx_vosk::Readiness::Ready { .. } => {}
+                        phorminx_vosk::Readiness::MissingRuntime { .. } => {
+                            return Err(UiBridgeError::validation(
+                                "instant_runtime_path",
+                                "Select a local Vosk runtime bundle containing libvosk.dll.",
+                            ));
+                        }
+                        phorminx_vosk::Readiness::MissingModel { .. } => {
+                            return Err(UiBridgeError::validation(
+                                "instant_model_path",
+                                "Select an unpacked local Vosk model directory.",
+                            ));
+                        }
+                        phorminx_vosk::Readiness::UnsupportedLanguage { .. } => {
+                            return Err(UiBridgeError::validation(
+                                "language",
+                                "Instant mode currently supports en and pt-br.",
+                            ));
+                        }
+                        phorminx_vosk::Readiness::IncompatibleModelLanguage { .. } => {
+                            return Err(UiBridgeError::validation(
+                                "instant_model_path",
+                                "Choose a Vosk model whose official directory name matches the selected language.",
+                            ));
+                        }
+                        phorminx_vosk::Readiness::LoadFailed { .. } => {
+                            return Err(UiBridgeError::validation(
+                                "instant_runtime_path",
+                                "The selected Vosk runtime could not be loaded.",
+                            ));
+                        }
                     }
                 }
             }
@@ -1902,6 +1909,34 @@ mod tests {
         assert_eq!(outcome.mutation, UiMutation::SearchSaved);
         assert_eq!(outcome.effects, [UiEffect::ReloadRuntime]);
         assert_eq!(test.bridge.store.load().unwrap().recognition.minimum_rms, 0.005);
+    }
+
+    #[test]
+    fn formatting_saves_never_reload_the_unchanged_recognizer() {
+        // Regression: every save loaded the Vosk model (or hashed the Whisper
+        // file) on the window thread, which hung the app on a cold disk.
+        // Missing assets prove the unchanged recognizer is not touched.
+        let mut test = TestBridge::new();
+        let mut instant = test.bridge.settings().clone();
+        instant.recognition.mode = crate::settings::RecognitionMode::Instant;
+        test.bridge.store.save(&instant).unwrap();
+        test.bridge.reload_settings().unwrap();
+        let readiness = test.readiness();
+
+        let mut candidate = test.bridge.settings().clone();
+        candidate.formatting.passes = 3;
+        test.bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+            .unwrap();
+        assert_eq!(test.bridge.store.load().unwrap().formatting.passes, 3);
+
+        let mut changed = test.bridge.settings().clone();
+        changed.recognition.language = "pt-br".into();
+        assert!(matches!(
+            test.bridge
+                .execute(UiCommand::SaveSettings(changed), &readiness, 11),
+            Err(error) if error.to_string().contains("Vosk runtime")
+        ));
     }
 
     #[test]

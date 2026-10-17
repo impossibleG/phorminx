@@ -177,6 +177,7 @@ fn run() -> Result<()> {
             .map(|store| store.path().to_path_buf()),
         None => default_settings_path.clone(),
     };
+    let startup_clock = Instant::now();
     let lifecycle = requested_settings_path
         .as_deref()
         .and_then(LifecycleLog::for_settings);
@@ -252,6 +253,7 @@ fn run() -> Result<()> {
             settings_store.path().display()
         )
     })?;
+    record_startup_phase(lifecycle.as_ref(), startup_clock, "settings");
     for note in settings.preserved.notes() {
         record_lifecycle(
             lifecycle.as_ref(),
@@ -354,6 +356,7 @@ fn run() -> Result<()> {
         None
     };
 
+    record_startup_phase(lifecycle.as_ref(), startup_clock, "model_verified");
     let mut effective_microphone = resolve_effective_microphone(&settings);
 
     let database_path = settings_store
@@ -373,6 +376,7 @@ fn run() -> Result<()> {
         .lexicon()
         .list()
         .context("failed to load the personal lexicon")?;
+    record_startup_phase(lifecycle.as_ref(), startup_clock, "database");
     let worker_formatting = WorkerFormatting::from_settings(&settings)?;
     let mut dictation_context = DictationContext::global(&settings, verified_variant)?;
 
@@ -416,6 +420,7 @@ fn run() -> Result<()> {
         Err(error) => return Err(error),
     };
 
+    record_startup_phase(lifecycle.as_ref(), startup_clock, "recognizer");
     let mut applied_interaction = settings.interaction.clone();
     let hotkey = GlobalHoldHotkey::start_with_bindings(phorminx_windows::ShortcutBindings::parse(
         &applied_interaction.launcher_shortcut,
@@ -485,6 +490,7 @@ fn run() -> Result<()> {
             .context("failed to start the product shell")?,
         )
     };
+    record_startup_phase(lifecycle.as_ref(), startup_clock, "window");
     let mut settings_window = None;
     let mut history_window = None;
     let mut lexicon_window = None;
@@ -1574,6 +1580,18 @@ fn finish_runtime_exit_with(
             final_error.map_or(Ok(()), Err)
         }
     }
+}
+
+/// Time since launch at each startup step, so a slow open can be traced to
+/// the step that caused it.
+fn record_startup_phase(lifecycle: Option<&LifecycleLog>, started: Instant, phase: &str) {
+    record_lifecycle(
+        lifecycle,
+        &format!(
+            "event=startup_phase phase={phase} ms={}",
+            started.elapsed().as_millis()
+        ),
+    );
 }
 
 fn record_lifecycle(lifecycle: Option<&LifecycleLog>, event: &str) {
@@ -4275,6 +4293,7 @@ impl TranscriptionWorker {
                     None
                 };
                 if formatting.uses_ollama() {
+                    let identity_started = Instant::now();
                     // Starting a verified local daemon does not authorize a
                     // model. The exact saved identity is checked immediately
                     // below before any transcript can be sent.
@@ -4301,6 +4320,10 @@ impl TranscriptionWorker {
                             "dictation_id=0 state=Starting event=ollama_identity_unverified recovery=deterministic"
                         );
                     }
+                    eprintln!(
+                        "dictation_id=0 state=Starting event=ollama_identity_checked verified={verified} ms={}",
+                        identity_started.elapsed().as_millis()
+                    );
                 }
                 if ready_tx.send(Ok(readiness)).is_err() {
                     return;

@@ -69,7 +69,7 @@ pub fn install_meeting_commands(
         ])
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_actions(
     state: State<'_, MeetingTauriState>,
 ) -> Result<Vec<ActionItemView>, String> {
@@ -99,7 +99,7 @@ pub(crate) struct ActionEditRequest {
     payload_prompt: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_save_action(
     action: ActionEditRequest,
     state: State<'_, MeetingTauriState>,
@@ -136,7 +136,7 @@ pub(crate) fn meeting_save_action(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_delete_action(
     id: String,
     state: State<'_, MeetingTauriState>,
@@ -154,7 +154,7 @@ pub(crate) fn meeting_delete_action(
     meeting.send(WorkspaceEvent::DeleteAction(id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_provider(
     state: State<'_, MeetingTauriState>,
 ) -> Result<ProviderView, String> {
@@ -180,7 +180,7 @@ pub(crate) struct ProviderEditRequest {
     preset: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_save_provider(
     provider: ProviderEditRequest,
     state: State<'_, MeetingTauriState>,
@@ -211,7 +211,7 @@ pub(crate) fn meeting_save_provider(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_theme(state: State<'_, MeetingTauriState>) -> Result<&'static str, String> {
     let preference = state
         .store
@@ -232,7 +232,7 @@ pub(crate) fn meeting_theme(state: State<'_, MeetingTauriState>) -> Result<&'sta
     Ok(if dark { "dark" } else { "light" })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_snapshot(
     since: Option<u64>,
     state: State<'_, MeetingTauriState>,
@@ -350,7 +350,7 @@ fn meeting_event(
     Ok(Some(event))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_layout(
     view: String,
     language: String,
@@ -379,7 +379,7 @@ pub(crate) fn meeting_layout(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_save_translation(
     language: String,
     model: String,
@@ -408,7 +408,7 @@ pub(crate) fn meeting_save_translation(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_save_devices(
     output_device: Option<String>,
     microphone_device: Option<String>,
