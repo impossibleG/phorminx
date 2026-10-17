@@ -50,8 +50,9 @@ $installer = Join-Path $InstallerDirectory "Phorminx-$Version-x64-setup.exe"
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
     throw "Installer not found: $installer. Build it with Build-PhorminxInstaller.ps1 -Version $Version."
 }
-$embedded = (Get-Item -LiteralPath $installer).VersionInfo.ProductVersion
-if ($embedded -and $embedded -ne $Version) {
+# Inno Setup stamps a padded four-part version such as "0.2.0.0".
+$embedded = "$((Get-Item -LiteralPath $installer).VersionInfo.ProductVersion)".Trim()
+if ($embedded -and $embedded -notin @($Version, "$Version.0")) {
     throw "Installer reports version '$embedded', not '$Version'."
 }
 
