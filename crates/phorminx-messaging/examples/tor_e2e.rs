@@ -66,6 +66,10 @@ fn contacts_address(db: &Path) -> OnionAddress {
 }
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_ansi(false)
+        .init();
     let root = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "tor-e2e".into()));
     let t0 = Instant::now();
     let ana = start(&root, "ana", t0);
