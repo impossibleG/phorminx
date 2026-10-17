@@ -97,8 +97,32 @@ pub struct MessagingHost {
     drafts_rx: Mutex<Option<mpsc::Receiver<MessageDraft>>>,
 }
 
+/// Opt-in diagnostics: with `PHORMINX_MESSAGING_LOG=<file>`, Tor (Arti)
+/// warnings and onion-service events are appended to that file. Arti
+/// redacts onion addresses in its logs; message text is never logged.
+fn init_tor_log() {
+    let Some(path) = std::env::var_os("PHORMINX_MESSAGING_LOG") else {
+        return;
+    };
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "warn,tor_hsservice=info,tor_hsclient=debug",
+        ))
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(file))
+        .try_init();
+}
+
 impl MessagingHost {
     pub fn start(store: &SettingsStore, database: &Path) -> Self {
+        init_tor_log();
         let revision = Arc::new(AtomicU64::new(1));
         let focused = Arc::new(AtomicI64::new(0));
         let (drafts_tx, drafts_rx) = mpsc::channel();
@@ -378,8 +402,10 @@ fn show_arrival(app: &tauri::AppHandle) {
 }
 
 fn close_arrival(app: &tauri::AppHandle) {
+    // `close()` would only hide it (the shell turns close requests into
+    // hide), and a hidden panel is never shown again. Destroy it instead.
     if let Some(window) = app.get_webview_window(ARRIVAL_WINDOW) {
-        let _ = window.close();
+        let _ = window.destroy();
     }
 }
 

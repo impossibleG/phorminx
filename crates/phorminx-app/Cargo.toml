@@ -12,7 +12,7 @@ default = []
 desktop = []
 vulkan = ["phorminx-whisper/vulkan"]
 tauri-preview = ["dep:tauri", "dep:tauri-build"]
-tauri-shell = ["tauri-preview", "dep:phorminx-messaging"]
+tauri-shell = ["tauri-preview", "dep:phorminx-messaging", "dep:tracing-subscriber"]
 release-tools = []
 
 [dependencies]
@@ -30,6 +30,8 @@ phorminx-core = { path = "../phorminx-core" }
 phorminx-ollama = { path = "../phorminx-ollama" }
 phorminx-messaging = { path = "../phorminx-messaging", optional = true, features = ["tor"] }
 phorminx-persistence = { path = "../phorminx-persistence" }
+# Opt-in Tor diagnostics for messaging (PHORMINX_MESSAGING_LOG).
+tracing-subscriber = { version = "=0.3.23", optional = true, features = ["env-filter"] }
 phorminx-session = { path = "../phorminx-session" }
 phorminx-setup = { path = "../phorminx-setup" }
 phorminx-ui = { path = "../phorminx-ui" }
