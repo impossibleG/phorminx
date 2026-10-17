@@ -6,7 +6,7 @@
 //! messaging on (or had it on when Phorminx last ran).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -65,6 +65,8 @@ pub struct MessagingSnapshot {
     pub launcher_slot: Option<u8>,
     /// Main-launcher keys 3-9 not used by a saved HTTP action.
     pub free_main_keys: Vec<u8>,
+    /// Set once after the launcher asked to show the Messages page.
+    pub open_page: bool,
 }
 
 pub struct MessagingHost {
@@ -77,6 +79,7 @@ pub struct MessagingHost {
     revision: Arc<AtomicU64>,
     /// The conversation open in the Messages page, or 0.
     focused: Arc<AtomicI64>,
+    open_page: AtomicBool,
     draft: Arc<Mutex<DraftView>>,
     drafts_tx: mpsc::Sender<MessageDraft>,
     drafts_rx: Mutex<Option<mpsc::Receiver<MessageDraft>>>,
@@ -127,6 +130,7 @@ impl MessagingHost {
             ),
             revision,
             focused,
+            open_page: AtomicBool::new(false),
             draft: Arc::default(),
             drafts_tx,
             drafts_rx: Mutex::new(Some(drafts_rx)),
@@ -139,6 +143,12 @@ impl MessagingHost {
                 .clone()
                 .unwrap_or_else(|| "Messaging is unavailable.".into())
         })
+    }
+
+    /// Asks the main window to switch to the Messages page.
+    pub fn request_page(&self) {
+        self.open_page.store(true, Ordering::Release);
+        self.bump();
     }
 
     fn bump(&self) {
@@ -177,6 +187,7 @@ impl MessagingHost {
             contacts: messenger.contacts().map_err(text)?,
             launcher_slot: self.launcher_slot(),
             free_main_keys: (3..=9).filter(|k| !used.contains(k)).collect(),
+            open_page: self.open_page.swap(false, Ordering::AcqRel),
         })
     }
 

@@ -68,6 +68,9 @@ pub enum ProductShellControl {
     MessageContact {
         contact_id: i64,
     },
+    /// Show the Messages page (the launcher's Messages key while messaging is
+    /// off or has no contacts yet).
+    OpenMessages,
     Quit,
 }
 
@@ -2145,7 +2148,7 @@ impl eframe::App for ProductShellApp {
                     self.set_error(message);
                     self.refresh();
                 }
-                ProductShellControl::MessageContact { .. } => {
+                ProductShellControl::MessageContact { .. } | ProductShellControl::OpenMessages => {
                     self.set_error("Messaging is available in the new Phorminx window.".into());
                     self.refresh();
                 }

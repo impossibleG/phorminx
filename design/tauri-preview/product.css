@@ -156,5 +156,5 @@ main :is(.page,.record-list,.record-detail,.scroll-content,.session-list,.recent
 :root[data-theme="light"] .messaging-empty strong{color:#202326}
 :root[data-theme="light"] .messaging-compose .primary,:root[data-theme="light"] .messaging-enable .primary,:root[data-theme="light"] .messaging-dialog .dialog-actions .primary{background:#815026;border-color:#815026;color:#fff}
 :root[data-theme="light"] .nav-badge{background:#815026;color:#fff}
-#messages [hidden]{display:none!important}
+#messaging [hidden]{display:none!important}
 .nav-badge[hidden]{display:none}

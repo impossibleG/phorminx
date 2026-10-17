@@ -27,7 +27,8 @@ function makeElement(tag, className, text) {
 
 function showRoute(route, persist = true) {
   if (currentRoute === 'settings' && route !== 'settings' && capturingShortcut) void endShortcutCapture();
-  const pageId = route === 'settings' ? 'app-settings' : route;
+  // The meeting chat log already owns id="messages", so the Messages page is #messaging.
+  const pageId = route === 'settings' ? 'app-settings' : route === 'messages' ? 'messaging' : route;
   const page = node(pageId);
   if (!page) return;
   currentRoute = route;

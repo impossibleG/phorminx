@@ -1,6 +1,8 @@
 //! Application orchestration for Phorminx.
 
 pub mod feedback;
+#[cfg(test)]
+mod frontend_tests;
 mod history_loader;
 pub mod incremental;
 pub mod launcher_messaging;

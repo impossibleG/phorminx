@@ -1350,6 +1350,14 @@ fn control_loop(
             ProductShellControl::ActivationBlocked(_) => {
                 host.notice("That action is unavailable right now.")
             }
+            ProductShellControl::OpenMessages => {
+                app.state::<MessagingHost>().request_page();
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            }
             ProductShellControl::MessageContact { contact_id } => {
                 if let Err(error) = app.state::<MessagingHost>().dictate(&app, contact_id) {
                     host.notice(&error);

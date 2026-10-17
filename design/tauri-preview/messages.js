@@ -14,6 +14,8 @@
   let selectedId = null;
   let visible = false;
   let conversationKey = '';
+  // The result line is showing loading or failure text, not a user action's.
+  let statusShown = true;
 
   const networkText = {
     disabled: 'Off',
@@ -132,9 +134,20 @@
       const changed = !snapshot || next.revision !== revision;
       snapshot = next;
       revision = next.revision;
+      if (statusShown) { statusShown = false; result(''); }
       if (changed) render();
+      // The launcher's Messages key asks for this page.
+      if (next.openPage && typeof showRoute === 'function') showRoute('messages');
       if (visible && changed) await loadConversation();
-    } catch (error) { result(String(error)); }
+    } catch (error) {
+      // Never leave the page blank: say what failed.
+      if (!snapshot) {
+        $('messaging-off').hidden = true;
+        $('messaging-on').hidden = true;
+      }
+      statusShown = true;
+      result(`Messaging is unavailable: ${error}`);
+    }
   }
 
   function select(id) {
@@ -300,5 +313,5 @@
     },
   };
 
-  if (invoke) { void refresh(); setInterval(() => { void refresh(); }, 1500); }
+  if (invoke) { result('Loading messaging…'); void refresh(); setInterval(() => { void refresh(); }, 1500); }
 })();

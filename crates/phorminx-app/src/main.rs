@@ -379,7 +379,8 @@ fn run() -> Result<()> {
     let mut launcher_open = false;
     let mut launcher_action_configs: Vec<phorminx_assistant::ActionConfig> = Vec::new();
     let mut launcher_messaging = LauncherMessaging::load(&persistence);
-    hotkey.set_messaging_slot(launcher_messaging.launcher_slot);
+    let mut launcher_layout = launcher_messaging.layout(&[]);
+    hotkey.set_messaging_slot(launcher_layout.panel_key());
     let mut launcher_recording = false;
     let capture = ExtendedCaptureFactory::new(ExtendedCaptureConfig::new(
         settings_store
@@ -631,15 +632,14 @@ fn run() -> Result<()> {
                         .filter_map(|a| a.launcher_slot)
                         .collect();
                     launcher_messaging = LauncherMessaging::load(&persistence);
-                    hotkey.set_messaging_slot(
-                        launcher_messaging.effective_launcher_slot(&action_keys),
-                    );
+                    launcher_layout = launcher_messaging.layout(&action_keys);
+                    hotkey.set_messaging_slot(launcher_layout.panel_key());
                     overlay.set_launcher_contacts(None)?;
                     overlay.set_launcher_actions(
                         launcher_action_configs
                             .iter()
                             .filter_map(|a| a.launcher_slot.map(|slot| (slot, a.name.clone())))
-                            .chain(launcher_messaging.main_rows(&action_keys))
+                            .chain(launcher_layout.main_rows())
                             .collect(),
                     )?;
                     // The hook already armed selection atomically. Reopening it
@@ -702,13 +702,13 @@ fn run() -> Result<()> {
                             .cloned()
                             .map(ProductShellControl::TriggerAction)
                             .or_else(|| {
-                                let action_keys: Vec<u8> = launcher_action_configs
-                                    .iter()
-                                    .filter_map(|a| a.launcher_slot)
-                                    .collect();
-                                launcher_messaging.promoted_contact(slot, &action_keys).map(
-                                    |contact_id| ProductShellControl::MessageContact { contact_id },
-                                )
+                                (launcher_layout.page_key() == Some(slot))
+                                    .then_some(ProductShellControl::OpenMessages)
+                            })
+                            .or_else(|| {
+                                launcher_layout.promoted_contact(slot).map(|contact_id| {
+                                    ProductShellControl::MessageContact { contact_id }
+                                })
                             }),
                         _ => Some(ProductShellControl::StartMeeting),
                     };
