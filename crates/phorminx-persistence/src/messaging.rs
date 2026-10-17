@@ -233,6 +233,37 @@ impl<'a> MessagingRepository<'a> {
         Ok(())
     }
 
+    /// How an arriving message is announced: `preview` (name and a short
+    /// snippet, the default), `name` (name only) or `off`.
+    pub fn arrival_notice(&self) -> Result<String> {
+        let value: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM persistence_settings WHERE key='messaging_arrival_notice'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(value
+            .filter(|v| matches!(v.as_str(), "preview" | "name" | "off"))
+            .unwrap_or_else(|| "preview".to_owned()))
+    }
+
+    pub fn set_arrival_notice(&self, mode: &str) -> Result<()> {
+        if !matches!(mode, "preview" | "name" | "off") {
+            return Err(invalid(
+                "messaging_arrival_notice",
+                "must be preview, name or off",
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO persistence_settings(key,value) VALUES ('messaging_arrival_notice',?1) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [mode],
+        )?;
+        Ok(())
+    }
+
     pub fn set_enabled(&self, enabled: bool) -> Result<()> {
         self.connection.execute(
             "UPDATE messaging_identity SET enabled=?1 WHERE singleton=1",
@@ -989,6 +1020,19 @@ mod tests {
             (invite.secret_hash.clone(), invite.expires_at_ms),
             (vec![7; 32], 20)
         );
+    }
+
+    #[test]
+    fn arrival_notice_defaults_to_preview_and_validates() {
+        let (_d, db) = open();
+        let repo = db.messaging();
+        assert_eq!(repo.arrival_notice().unwrap(), "preview");
+        repo.set_arrival_notice("name").unwrap();
+        assert_eq!(repo.arrival_notice().unwrap(), "name");
+        repo.set_arrival_notice("off").unwrap();
+        assert_eq!(repo.arrival_notice().unwrap(), "off");
+        assert!(repo.set_arrival_notice("loud").is_err());
+        assert_eq!(repo.arrival_notice().unwrap(), "off");
     }
 
     #[test]

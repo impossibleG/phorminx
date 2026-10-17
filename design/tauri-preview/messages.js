@@ -138,6 +138,7 @@
       if (changed) render();
       // The launcher's Messages key asks for this page.
       if (next.openPage && typeof showRoute === 'function') showRoute('messages');
+      if (next.openContact && next.contacts.some((c) => c.id === next.openContact)) select(next.openContact);
       if (visible && changed) await loadConversation();
     } catch (error) {
       // Never leave the page blank: say what failed.
@@ -283,6 +284,7 @@
   $('messaging-settings-open').addEventListener('click', () => {
     $('messaging-self-name').value = snapshot?.status.displayName || '';
     keyOptions($('messaging-launcher-key'), snapshot?.freeMainKeys || [], snapshot?.launcherSlot, 'Automatic (first free key)');
+    $('messaging-arrival-notice').value = snapshot?.arrivalNotice || 'preview';
     $('messaging-settings-result').textContent = '';
     $('messaging-settings-dialog').showModal();
   });
@@ -293,6 +295,7 @@
       if (name && name !== snapshot?.status.displayName) await invoke('host_messaging_set_name', {name});
       const key = $('messaging-launcher-key').value ? Number($('messaging-launcher-key').value) : null;
       await invoke('host_messaging_launcher_key', {slot: key});
+      await invoke('host_messaging_arrival_notice', {mode: $('messaging-arrival-notice').value});
       $('messaging-settings-dialog').close();
       await refresh();
     } catch (error) { $('messaging-settings-result').textContent = String(error); }

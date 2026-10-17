@@ -1151,6 +1151,9 @@ fn run_shell(
             crate::tauri_messaging::host_messaging_dictate,
             crate::tauri_messaging::host_messaging_draft,
             crate::tauri_messaging::host_messaging_draft_action,
+            crate::tauri_messaging::host_messaging_arrival,
+            crate::tauri_messaging::host_messaging_arrival_open,
+            crate::tauri_messaging::host_messaging_arrival_notice,
         ])
         .setup(move |app| {
             if !initially_visible {

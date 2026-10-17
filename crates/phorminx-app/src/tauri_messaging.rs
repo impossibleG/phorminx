@@ -21,10 +21,14 @@ use serde::Serialize;
 use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::meeting_workspace::{MessageCapture, MessageDraft};
+use crate::message_arrival::{ArrivalNotice, ArrivalView, Arrivals};
 use crate::settings::SettingsStore;
 use crate::tauri_meetings::MeetingTauriState;
 
 const REVIEW_WINDOW: &str = "message-review";
+const ARRIVAL_WINDOW: &str = "message-arrival";
+/// How long the arrival panel stays up after the latest message.
+const ARRIVAL_SHOWN_FOR: std::time::Duration = std::time::Duration::from_secs(7);
 const CONVERSATION_LIMIT: usize = 500;
 
 /// DPAPI protection for the identity key, bound to this Windows account.
@@ -67,6 +71,10 @@ pub struct MessagingSnapshot {
     pub free_main_keys: Vec<u8>,
     /// Set once after the launcher asked to show the Messages page.
     pub open_page: bool,
+    /// Set once with a conversation the page should open (from the arrival panel).
+    pub open_contact: Option<i64>,
+    /// `preview`, `name` or `off`.
+    pub arrival_notice: String,
 }
 
 pub struct MessagingHost {
@@ -80,6 +88,10 @@ pub struct MessagingHost {
     /// The conversation open in the Messages page, or 0.
     focused: Arc<AtomicI64>,
     open_page: AtomicBool,
+    open_contact: AtomicI64,
+    arrival_notice: Mutex<String>,
+    arrival: Arc<Mutex<Option<ArrivalView>>>,
+    events_rx: Mutex<Option<mpsc::Receiver<Event>>>,
     draft: Arc<Mutex<DraftView>>,
     drafts_tx: mpsc::Sender<MessageDraft>,
     drafts_rx: Mutex<Option<mpsc::Receiver<MessageDraft>>>,
@@ -90,8 +102,8 @@ impl MessagingHost {
         let revision = Arc::new(AtomicU64::new(1));
         let focused = Arc::new(AtomicI64::new(0));
         let (drafts_tx, drafts_rx) = mpsc::channel();
+        let (events_tx, events_rx) = mpsc::channel();
         let events_revision = revision.clone();
-        let events_focused = focused.clone();
         let result = Messenger::start(
             TorTransport::new(store.resolve_asset_path(Path::new("tor"))),
             database,
@@ -99,19 +111,8 @@ impl MessagingHost {
             Config::default(),
             move |event| {
                 events_revision.fetch_add(1, Ordering::AcqRel);
-                if let Event::MessageReceived {
-                    contact_id,
-                    contact_name,
-                    ..
-                } = event
-                    && events_focused.load(Ordering::Acquire) != contact_id
-                {
-                    // Names only: message text never appears in a notification.
-                    let _ = phorminx_windows::show_tray_notification(
-                        "Phorminx",
-                        &format!("New message from {contact_name}"),
-                    );
-                }
+                // Handled on the notice thread: it calls back into the engine.
+                let _ = events_tx.send(event);
             },
         );
         let (messenger, start_error) = match result {
@@ -131,6 +132,15 @@ impl MessagingHost {
             revision,
             focused,
             open_page: AtomicBool::new(false),
+            open_contact: AtomicI64::new(0),
+            arrival_notice: Mutex::new(
+                Persistence::open(database)
+                    .ok()
+                    .and_then(|db| db.messaging().arrival_notice().ok())
+                    .unwrap_or_else(|| "preview".into()),
+            ),
+            arrival: Arc::default(),
+            events_rx: Mutex::new(Some(events_rx)),
             draft: Arc::default(),
             drafts_tx,
             drafts_rx: Mutex::new(Some(drafts_rx)),
@@ -188,6 +198,8 @@ impl MessagingHost {
             launcher_slot: self.launcher_slot(),
             free_main_keys: (3..=9).filter(|k| !used.contains(k)).collect(),
             open_page: self.open_page.swap(false, Ordering::AcqRel),
+            open_contact: Some(self.open_contact.swap(0, Ordering::AcqRel)).filter(|id| *id != 0),
+            arrival_notice: self.notice_setting(),
         })
     }
 
@@ -220,7 +232,34 @@ impl MessagingHost {
 
     /// Follows the dictation of a draft and opens the review window when the
     /// transcript is ready.
+    fn notice_setting(&self) -> String {
+        self.arrival_notice
+            .lock()
+            .map(|n| n.clone())
+            .unwrap_or_else(|_| "preview".into())
+    }
+
+    /// Unread messages across all contacts, for the tray dot.
+    fn unread_total(&self) -> u32 {
+        self.messenger()
+            .ok()
+            .and_then(|m| m.contacts().ok())
+            .map(|contacts| contacts.iter().map(|c| c.unread).sum())
+            .unwrap_or(0)
+    }
+
+    /// Follows engine events: the arrival panel and the tray dot.
+    pub fn spawn_notice_listener(&self, app: tauri::AppHandle) {
+        let Some(events) = self.events_rx.lock().ok().and_then(|mut r| r.take()) else {
+            return;
+        };
+        let _ = thread::Builder::new()
+            .name("phorminx-message-notices".into())
+            .spawn(move || notice_loop(app, events));
+    }
+
     pub fn spawn_draft_listener(&self, app: tauri::AppHandle) {
+        self.spawn_notice_listener(app.clone());
         let Some(drafts) = self.drafts_rx.lock().ok().and_then(|mut r| r.take()) else {
             return;
         };
@@ -235,6 +274,112 @@ impl MessagingHost {
                     let _ = open_review(&app);
                 }
             });
+    }
+}
+
+fn notice_loop(app: tauri::AppHandle, events: mpsc::Receiver<Event>) {
+    let mut arrivals = Arrivals::default();
+    let mut hide_at: Option<std::time::Instant> = None;
+    // Messages that arrived while Phorminx was closed still mark the tray.
+    let _ = phorminx_windows::set_tray_badge(app.state::<MessagingHost>().unread_total());
+    loop {
+        let wait = hide_at
+            .map(|at| at.saturating_duration_since(std::time::Instant::now()))
+            .unwrap_or(std::time::Duration::from_secs(3600));
+        let event = match events.recv_timeout(wait) {
+            Ok(event) => Some(event),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let host = app.state::<MessagingHost>();
+        match event {
+            Some(Event::MessageReceived {
+                contact_id,
+                message_id,
+                contact_name,
+            }) => {
+                let reading = host.focused.load(Ordering::Acquire) == contact_id
+                    && main_window_in_front(&app);
+                let notice = ArrivalNotice::from_setting(&host.notice_setting());
+                if !reading && notice != ArrivalNotice::Off {
+                    let text = host
+                        .messenger()
+                        .ok()
+                        .and_then(|m| m.conversation(contact_id, 20).ok())
+                        .and_then(|all| all.into_iter().find(|m| m.id == message_id))
+                        .map(|m| m.text)
+                        .unwrap_or_default();
+                    arrivals.push(contact_id, &contact_name, &text);
+                    if let Ok(mut view) = host.arrival.lock() {
+                        *view = arrivals.view(notice);
+                    }
+                    show_arrival(&app);
+                    hide_at = Some(std::time::Instant::now() + ARRIVAL_SHOWN_FOR);
+                }
+                let _ = phorminx_windows::set_tray_badge(host.unread_total());
+            }
+            Some(Event::ContactsChanged | Event::ConversationChanged { .. }) => {
+                let focused = host.focused.load(Ordering::Acquire);
+                if focused != 0 {
+                    arrivals.clear_contact(focused);
+                }
+                let _ = phorminx_windows::set_tray_badge(host.unread_total());
+            }
+            Some(_) => {}
+            None => {
+                arrivals.clear();
+                hide_at = None;
+                if let Ok(mut view) = host.arrival.lock() {
+                    *view = None;
+                }
+                close_arrival(&app);
+            }
+        }
+    }
+}
+
+fn main_window_in_front(app: &tauri::AppHandle) -> bool {
+    app.get_webview_window("main").is_some_and(|w| {
+        w.is_visible().unwrap_or(false)
+            && w.is_focused().unwrap_or(false)
+            && !w.is_minimized().unwrap_or(false)
+    })
+}
+
+/// Shows the arrival panel in the corner above the tray, without taking
+/// focus. An open panel just picks up the new content when it next polls.
+fn show_arrival(app: &tauri::AppHandle) {
+    if app.get_webview_window(ARRIVAL_WINDOW).is_some() {
+        return;
+    }
+    let (width, height) = (340.0, 92.0);
+    let mut builder = WebviewWindowBuilder::new(
+        app,
+        ARRIVAL_WINDOW,
+        WebviewUrl::App("tauri-preview/arrival.html".into()),
+    )
+    .title("Phorminx · Message")
+    .inner_size(width, height)
+    .resizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .focused(false)
+    .shadow(true);
+    if let Ok(Some(monitor)) = app.primary_monitor() {
+        let scale = monitor.scale_factor();
+        let area = monitor.work_area();
+        let margin = 16.0;
+        let x = (area.position.x as f64 + area.size.width as f64) / scale - width - margin;
+        let y = (area.position.y as f64 + area.size.height as f64) / scale - height - margin;
+        builder = builder.position(x, y);
+    }
+    let _ = builder.build();
+}
+
+fn close_arrival(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(ARRIVAL_WINDOW) {
+        let _ = window.close();
     }
 }
 
@@ -456,6 +601,58 @@ pub(crate) fn host_messaging_dictate(
     state: State<'_, MessagingHost>,
 ) -> Result<(), String> {
     state.dictate(&app, contact_id)
+}
+
+/// What the arrival panel shows; `None` closes it.
+#[tauri::command]
+pub(crate) fn host_messaging_arrival(
+    state: State<'_, MessagingHost>,
+) -> Result<Option<ArrivalView>, String> {
+    state
+        .arrival
+        .lock()
+        .map(|v| v.clone())
+        .map_err(|_| "The notice is unavailable.".into())
+}
+
+/// Clicking the arrival panel opens that conversation in the main window.
+#[tauri::command]
+pub(crate) fn host_messaging_arrival_open(
+    app: tauri::AppHandle,
+    state: State<'_, MessagingHost>,
+) -> Result<(), String> {
+    let contact_id = state
+        .arrival
+        .lock()
+        .ok()
+        .and_then(|v| v.as_ref().map(|v| v.contact_id));
+    if let Some(id) = contact_id {
+        state.open_contact.store(id, Ordering::Release);
+    }
+    state.request_page();
+    close_arrival(&app);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn host_messaging_arrival_notice(
+    mode: String,
+    state: State<'_, MessagingHost>,
+) -> Result<(), String> {
+    let db = Persistence::open(&state.database).map_err(|e| e.to_string())?;
+    db.messaging()
+        .set_arrival_notice(&mode)
+        .map_err(|e| e.to_string())?;
+    if let Ok(mut current) = state.arrival_notice.lock() {
+        *current = mode;
+    }
+    state.bump();
+    Ok(())
 }
 
 #[tauri::command]

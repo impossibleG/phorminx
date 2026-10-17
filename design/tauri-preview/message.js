@@ -66,6 +66,10 @@
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); void primary(); }
   });
 
-  if (invoke) { void poll(); setInterval(() => { void poll(); }, 300); }
+  if (invoke) {
+    void invoke('meeting_theme').then((theme) => { document.documentElement.dataset.theme = theme; }).catch(() => {});
+    void poll();
+    setInterval(() => { void poll(); }, 300);
+  }
   else $('review-status').textContent = 'Open this window inside Phorminx.';
 })();

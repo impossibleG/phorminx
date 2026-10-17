@@ -6,6 +6,7 @@ mod frontend_tests;
 mod history_loader;
 pub mod incremental;
 pub mod launcher_messaging;
+pub mod message_arrival;
 mod library_search;
 pub mod meeting_audio;
 pub mod meeting_memory;
