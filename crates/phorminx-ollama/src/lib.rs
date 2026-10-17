@@ -13,7 +13,7 @@ mod validation;
 
 pub use client::{
     CancellationToken, ClientError, ClientTimeouts, FallbackReason, FormatAttempt, FormatResult,
-    KeepAlive, OllamaClient, OllamaEndpoint,
+    KeepAlive, OllamaClient, OllamaEndpoint, PassesOutcome,
 };
 pub use document::{
     DocumentChunk, DocumentChunkError, DocumentChunkOutcome, DocumentChunkPolicy,

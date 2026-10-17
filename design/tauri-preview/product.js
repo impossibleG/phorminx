@@ -538,6 +538,7 @@ function renderApp(view, runtimeStatus, notice) {
     node('minimum-rms').value = view.settings.minimumRms;
     node('formatting-strength').value = view.settings.formattingStrength;
     node('model-residency').value = view.settings.modelResidency;
+    node('formatting-passes').value = String(view.settings.formattingPasses || 2);
     const select = node('formatting-model');
     const options = [makeElement('option', '', 'No model')];
     options[0].value = '';
@@ -812,6 +813,7 @@ node('dictation-form').addEventListener('submit', async (event) => {
       model: node('formatting-model').value || null,
       lifecycle: node('model-residency').value,
       customInstructions: node('custom-instructions').value.trim() || null,
+      passes: Number(node('formatting-passes').value),
     });
     dictationDirty = false;
     node('dictation-result').textContent = 'Saved.';

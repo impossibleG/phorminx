@@ -137,6 +137,10 @@ impl Settings {
         {
             return Err(SettingsError::CustomInstructionsTooLong);
         }
+        self.formatting.passes = self
+            .formatting
+            .passes
+            .clamp(MIN_FORMATTING_PASSES, MAX_FORMATTING_PASSES);
         if self.formatting.strength == FormattingStrength::Custom
             && self
                 .formatting
@@ -293,7 +297,14 @@ pub struct FormattingSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ollama_model_identity: Option<OllamaModelIdentity>,
     pub ollama_lifecycle: OllamaLifecycle,
+    /// How many times AI formatting runs, each pass on the previous pass's
+    /// validated output. A failed pass keeps the last good text.
+    pub passes: u8,
 }
+
+pub const MIN_FORMATTING_PASSES: u8 = 1;
+pub const MAX_FORMATTING_PASSES: u8 = 5;
+pub const DEFAULT_FORMATTING_PASSES: u8 = 2;
 
 impl Default for FormattingSettings {
     fn default() -> Self {
@@ -303,6 +314,7 @@ impl Default for FormattingSettings {
             ollama_model: None,
             ollama_model_identity: None,
             ollama_lifecycle: OllamaLifecycle::Balanced,
+            passes: DEFAULT_FORMATTING_PASSES,
         }
     }
 }
@@ -1022,6 +1034,48 @@ mod tests {
             HistoryRetention::SevenDays
         );
         assert_eq!(settings.appearance.theme, AppearancePreference::System);
+    }
+
+    /// The setup script writes these settings for fresh installs; the app
+    /// must accept them as they are.
+    #[test]
+    fn starter_settings_from_setup_script_are_valid() {
+        let script = include_str!("../../../scripts/Initialize-Phorminx.ps1");
+        let start = script.find("return @\"").unwrap() + "return @\"".len();
+        let end = start + script[start..].find("\"@").unwrap();
+        let toml_text = script[start..end]
+            .replace("$($Digest.ToLowerInvariant())", &"a".repeat(64))
+            .replace("$Bytes", "986061892");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        std::fs::write(&path, toml_text).unwrap();
+        let mut settings = SettingsStore::new(path).unwrap().load().unwrap();
+        settings.validate_and_normalize().unwrap();
+        settings.ensure_runtime_supported().unwrap();
+        assert_eq!(settings.recognition.mode, RecognitionMode::Accurate);
+        assert_eq!(settings.formatting.strength, FormattingStrength::Custom);
+        assert!(settings.formatting.custom_instructions.is_some());
+        assert_eq!(
+            settings.formatting.ollama_model.as_deref(),
+            Some("qwen2.5:1.5b")
+        );
+        assert_eq!(
+            settings.formatting.ollama_lifecycle,
+            OllamaLifecycle::Instant
+        );
+        assert_eq!(settings.formatting.passes, 2);
+    }
+
+    #[test]
+    fn formatting_passes_are_bounded_and_default_to_two() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.formatting.passes, DEFAULT_FORMATTING_PASSES);
+        settings.formatting.passes = 0;
+        settings.validate_and_normalize().unwrap();
+        assert_eq!(settings.formatting.passes, 1);
+        settings.formatting.passes = 9;
+        settings.validate_and_normalize().unwrap();
+        assert_eq!(settings.formatting.passes, MAX_FORMATTING_PASSES);
     }
 
     #[test]

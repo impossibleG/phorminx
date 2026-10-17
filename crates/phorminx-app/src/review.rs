@@ -6,8 +6,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
 use phorminx_ollama::{
-    CancellationToken, ClientTimeouts, FallbackReason, FormatProfile, FormatResult, KeepAlive,
-    ModelName, OllamaClient, OllamaEndpoint, SelectionPolicy, ValidationError,
+    CancellationToken, ClientTimeouts, FallbackReason, FormatProfile, KeepAlive, ModelName,
+    OllamaClient, OllamaEndpoint, SelectionPolicy, ValidationError,
 };
 
 use crate::settings::{FormattingStrength, OllamaLifecycle, OllamaModelIdentity, Settings};
@@ -42,7 +42,14 @@ pub struct ReviewView {
 }
 
 /// Result of one reformat: the new text, or a short reason it was kept.
-pub type ReformatResult = Result<String, String>;
+pub type ReformatResult = Result<Reformatted, String>;
+
+/// A successful reformat and, for multi-pass runs, how many passes applied.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Reformatted {
+    pub text: String,
+    pub note: Option<String>,
+}
 
 #[derive(Default)]
 pub struct ReviewPanel {
@@ -149,10 +156,13 @@ impl ReviewPanel {
         };
         self.job = None;
         match result {
-            Ok(text) => {
+            Ok(Reformatted { text, note }) => {
                 self.text = text;
                 self.revision = self.revision.wrapping_add(1);
-                self.notice = "Reformatted. Copy it, or replace the pasted text.".into();
+                self.notice = match note {
+                    Some(note) => format!("{note}. Copy it, or replace the pasted text."),
+                    None => "Reformatted. Copy it, or replace the pasted text.".into(),
+                };
             }
             Err(reason) => self.notice = format!("{reason} Your text is unchanged."),
         }
@@ -236,24 +246,61 @@ pub fn reformat_with_local_model(
         OllamaLifecycle::Balanced => KeepAlive::For(Duration::from_secs(15 * 60)),
         OllamaLifecycle::MemorySaver => KeepAlive::UnloadAfterRequest,
     };
-    match client
-        .format_detailed(
-            &model,
-            &text,
-            &profile,
-            keep_alive,
-            &CancellationToken::new(),
-        )
-        .result
-    {
-        FormatResult::Formatted { text, .. } => Ok(phorminx_core::normalize_formatted(&text)),
-        FormatResult::Fallback { reason, .. } => {
+    let outcome = client.format_passes(
+        &model,
+        &text,
+        &profile,
+        keep_alive,
+        &CancellationToken::new(),
+        settings.formatting.passes,
+    );
+    match (outcome.completed, outcome.failure) {
+        (0, Some(reason)) => {
             let label = format!("ollama_fallback:{}", fallback_label(&reason));
             let note = formatting_fallback_note(&[label])
                 .unwrap_or("Unformatted: the model's rewrite was not used");
             Err(sentence(note.trim_start_matches("Unformatted: ")))
         }
+        (completed, _) => Ok(Reformatted {
+            text: phorminx_core::normalize_formatted(&outcome.text),
+            note: (outcome.requested > 1).then(|| {
+                passes_note(completed, outcome.requested).replacen("Formatted", "Reformatted", 1)
+            }),
+        }),
     }
+}
+
+/// Content-free warning recording how many formatting passes applied.
+pub fn passes_warning(completed: u8, requested: u8) -> String {
+    format!("formatting_passes:{completed}/{requested}")
+}
+
+fn passes_note(completed: u8, requested: u8) -> String {
+    format!("Formatted in {completed} of {requested} passes")
+}
+
+/// "Formatted in 2 of 3 passes" for a multi-pass dictation.
+pub fn formatting_passes_note(warnings: &[String]) -> Option<String> {
+    warnings.iter().find_map(|warning| {
+        let (completed, requested) = warning
+            .strip_prefix("formatting_passes:")?
+            .split_once('/')?;
+        Some(passes_note(
+            completed.parse().ok()?,
+            requested.parse().ok()?,
+        ))
+    })
+}
+
+/// Everything worth saying about a dictation's formatting, for History and
+/// the review panel: the passes that applied and why formatting fell back.
+pub fn formatting_summary(warnings: &[String]) -> Option<String> {
+    let parts = [
+        formatting_passes_note(warnings),
+        formatting_fallback_note(warnings).map(str::to_owned),
+    ];
+    let parts = parts.into_iter().flatten().collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// "the model added commentary" becomes "The model added commentary."
@@ -387,7 +434,9 @@ mod tests {
         let mut panel = ReviewPanel::default();
         assert!(
             panel
-                .start_reformat("x", FormattingStrength::Light, None, |_, t| Ok(t))
+                .start_reformat("x", FormattingStrength::Light, None, |_, text| {
+                    Ok(Reformatted { text, note: None })
+                })
                 .is_err()
         );
         panel.open(seed());
@@ -405,12 +454,16 @@ mod tests {
                 None,
                 |profile, text| {
                     assert_eq!(profile, FormatProfile::Structured);
-                    Ok(format!("- {text}"))
+                    Ok(Reformatted {
+                        text: format!("- {text}"),
+                        note: Some("Reformatted in 2 of 2 passes".into()),
+                    })
                 },
             )
             .unwrap();
         let done = settle(&mut panel);
         assert_eq!(done.text, "- edited draft");
+        assert!(done.notice.starts_with("Reformatted in 2 of 2 passes."));
         assert_eq!(done.strength, FormattingStrength::Structured);
         assert!(done.revision > opened.revision);
         assert!(!done.busy);
@@ -433,6 +486,34 @@ mod tests {
             "a failure never overwrites the editor"
         );
         assert!(done.notice.contains("unchanged"));
+    }
+
+    #[test]
+    fn passes_are_reported_with_any_fallback() {
+        let warnings = |items: &[&str]| items.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        assert_eq!(passes_warning(1, 3), "formatting_passes:1/3");
+        assert_eq!(
+            formatting_summary(&warnings(&["formatting_passes:2/2"])).as_deref(),
+            Some("Formatted in 2 of 2 passes")
+        );
+        assert_eq!(
+            formatting_summary(&warnings(&[
+                "formatting_passes:0/2",
+                "ollama_fallback:service_timeout"
+            ]))
+            .as_deref(),
+            Some(
+                "Formatted in 0 of 2 passes · Unformatted: the local model did not answer in time"
+            )
+        );
+        assert_eq!(
+            formatting_summary(&warnings(&["recognition_repeated_phrase"])),
+            None
+        );
+        assert_eq!(
+            formatting_passes_note(&warnings(&["formatting_passes:x/2"])),
+            None
+        );
     }
 
     #[test]

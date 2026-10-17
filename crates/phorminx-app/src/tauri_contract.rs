@@ -214,6 +214,7 @@ pub struct AppSettingsView {
     pub formatting_strength: String,
     pub formatting_model: Option<String>,
     pub model_residency: String,
+    pub formatting_passes: u8,
     pub recording_mode: String,
     pub launcher_shortcut: String,
     pub show_live_text: bool,
@@ -299,8 +300,7 @@ impl From<&UiSnapshot> for AppView {
                     language: item.language.clone(),
                     target_app: item.target_executable.clone(),
                     duration_ms: item.audio_duration_ms,
-                    formatting_note: crate::review::formatting_fallback_note(&item.warnings)
-                        .map(str::to_owned),
+                    formatting_note: crate::review::formatting_summary(&item.warnings),
                 })
                 .collect(),
             lexicon: value
@@ -341,6 +341,7 @@ impl From<&UiSnapshot> for AppView {
                 formatting_model: settings.formatting.ollama_model.clone(),
                 model_residency: format!("{:?}", settings.formatting.ollama_lifecycle)
                     .to_lowercase(),
+                formatting_passes: settings.formatting.passes,
                 recording_mode: format!("{:?}", settings.interaction.recording_mode).to_lowercase(),
                 launcher_shortcut: settings.interaction.launcher_shortcut.clone(),
                 show_live_text: settings.interaction.show_live_text,

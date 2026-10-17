@@ -54,6 +54,33 @@ pub struct BenchConfig {
     pub samples: Option<Vec<String>>,
     pub output: Option<PathBuf>,
     pub timeout_seconds: u64,
+    /// Formatting passes to compare, e.g. [1, 2, 3].
+    pub passes: Vec<u8>,
+}
+
+struct Row {
+    sample: &'static str,
+    profile: String,
+    passes: u8,
+    completed: u8,
+    verdict: String,
+    elapsed: Duration,
+    list_items: usize,
+    characters: usize,
+}
+
+/// Lines that read as list items: "- x", "* x" or "1. x".
+fn list_items(text: &str) -> usize {
+    text.lines()
+        .map(str::trim_start)
+        .filter(|line| {
+            line.starts_with("- ")
+                || line.starts_with("* ")
+                || line.split_once(". ").is_some_and(|(number, _)| {
+                    !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+                })
+        })
+        .count()
 }
 
 pub fn run(config: BenchConfig) -> Result<()> {
@@ -87,52 +114,110 @@ pub fn run(config: BenchConfig) -> Result<()> {
         writeln!(report, "## {}\n\n> {}\n", sample.name, sample.text)?;
         for profile_name in &config.profiles {
             let profile = profile_from_name(profile_name, config.custom.as_deref())?;
-            let attempt = client.format_detailed(
-                &model,
-                sample.text,
-                &profile,
-                KeepAlive::For(Duration::from_secs(300)),
-                &cancel,
-            );
-            let verdict = verdict(&attempt.result);
-            let changed = attempt.result.text() != sample.text;
-            summary.push((
-                sample.name,
-                profile_name.clone(),
-                verdict.clone(),
-                attempt.elapsed,
-            ));
-            writeln!(
-                report,
-                "### {profile_name} · {verdict} · {:.1}s\n",
-                attempt.elapsed.as_secs_f64()
-            )?;
-            match attempt.raw_output.as_deref() {
-                Some(raw) => writeln!(report, "Raw model output:\n\n```text\n{raw}\n```\n")?,
-                None => writeln!(report, "Raw model output: (none)\n")?,
+            for &passes in &config.passes {
+                let outcome = client.format_passes(
+                    &model,
+                    sample.text,
+                    &profile,
+                    KeepAlive::For(Duration::from_secs(300)),
+                    &cancel,
+                    passes,
+                );
+                let elapsed = outcome
+                    .attempts
+                    .iter()
+                    .map(|attempt| attempt.elapsed)
+                    .sum::<Duration>();
+                let verdict = match (outcome.completed, outcome.attempts.last()) {
+                    (0, Some(attempt)) => verdict(&attempt.result),
+                    _ => "formatted".to_owned(),
+                };
+                let changed = outcome.text != sample.text;
+                writeln!(
+                    report,
+                    "### {profile_name} · {} of {passes} passes · {verdict} · {:.1}s\n",
+                    outcome.completed,
+                    elapsed.as_secs_f64()
+                )?;
+                for (index, attempt) in outcome.attempts.iter().enumerate() {
+                    match attempt.raw_output.as_deref() {
+                        Some(raw) => writeln!(
+                            report,
+                            "Pass {} raw output ({}):\n\n```text\n{raw}\n```\n",
+                            index + 1,
+                            self::verdict(&attempt.result)
+                        )?,
+                        None => writeln!(report, "Pass {} raw output: (none)\n", index + 1)?,
+                    }
+                }
+                writeln!(
+                    report,
+                    "Inserted text{}:\n\n```text\n{}\n```\n",
+                    if changed { "" } else { " (unchanged)" },
+                    outcome.text
+                )?;
+                summary.push(Row {
+                    sample: sample.name,
+                    profile: profile_name.clone(),
+                    passes,
+                    completed: outcome.completed,
+                    verdict,
+                    elapsed,
+                    list_items: list_items(&outcome.text),
+                    characters: outcome.text.chars().count(),
+                });
             }
-            writeln!(
-                report,
-                "Inserted text{}:\n\n```text\n{}\n```\n",
-                if changed { "" } else { " (unchanged)" },
-                attempt.result.text()
-            )?;
         }
     }
     writeln!(report, "## Summary\n")?;
-    writeln!(report, "| sample | profile | verdict | seconds |")?;
-    writeln!(report, "| --- | --- | --- | --- |")?;
-    for (sample, profile, verdict, elapsed) in &summary {
+    writeln!(
+        report,
+        "| sample | profile | passes | applied | verdict | seconds | list items | chars |"
+    )?;
+    writeln!(report, "| --- | --- | --- | --- | --- | --- | --- | --- |")?;
+    for row in &summary {
         writeln!(
             report,
-            "| {sample} | {profile} | {verdict} | {:.1} |",
-            elapsed.as_secs_f64()
+            "| {} | {} | {} | {} | {} | {:.1} | {} | {} |",
+            row.sample,
+            row.profile,
+            row.passes,
+            row.completed,
+            row.verdict,
+            row.elapsed.as_secs_f64(),
+            row.list_items,
+            row.characters
         )?;
     }
-    let formatted = summary
-        .iter()
-        .filter(|(_, _, verdict, _)| verdict == "formatted")
-        .count();
+    writeln!(
+        report,
+        "\n| profile | passes | formatted | avg seconds | avg list items |"
+    )?;
+    writeln!(report, "| --- | --- | --- | --- | --- |")?;
+    for profile in &config.profiles {
+        for &passes in &config.passes {
+            let rows = summary
+                .iter()
+                .filter(|row| &row.profile == profile && row.passes == passes)
+                .collect::<Vec<_>>();
+            if rows.is_empty() {
+                continue;
+            }
+            let count = rows.len() as f64;
+            writeln!(
+                report,
+                "| {profile} | {passes} | {}/{} | {:.1} | {:.1} |",
+                rows.iter().filter(|row| row.completed > 0).count(),
+                rows.len(),
+                rows.iter()
+                    .map(|row| row.elapsed.as_secs_f64())
+                    .sum::<f64>()
+                    / count,
+                rows.iter().map(|row| row.list_items as f64).sum::<f64>() / count
+            )?;
+        }
+    }
+    let formatted = summary.iter().filter(|row| row.completed > 0).count();
     writeln!(report, "\n{formatted}/{} formatted.", summary.len())?;
 
     match config.output {

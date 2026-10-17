@@ -384,6 +384,49 @@ impl OllamaClient {
             .result
     }
 
+    /// Runs `passes` formatting passes, each on the previous pass's validated
+    /// output with the same profile. The first failed pass stops the run and
+    /// the last good text is kept, so a later pass can never lose text.
+    pub fn format_passes(
+        &self,
+        model: &ModelName,
+        transcript: &str,
+        profile: &FormatProfile,
+        keep_alive: KeepAlive,
+        cancel: &CancellationToken,
+        passes: u8,
+    ) -> PassesOutcome {
+        let requested = passes.max(1);
+        let mut text = transcript.to_owned();
+        let mut completed = 0;
+        let mut failure = None;
+        let mut attempts = Vec::new();
+        for _ in 0..requested {
+            let attempt = self.format_detailed(model, &text, profile, keep_alive.clone(), cancel);
+            match &attempt.result {
+                FormatResult::Formatted {
+                    text: formatted, ..
+                } => {
+                    text = formatted.clone();
+                    completed += 1;
+                    attempts.push(attempt);
+                }
+                FormatResult::Fallback { reason, .. } => {
+                    failure = Some(reason.clone());
+                    attempts.push(attempt);
+                    break;
+                }
+            }
+        }
+        PassesOutcome {
+            text,
+            completed,
+            requested,
+            failure,
+            attempts,
+        }
+    }
+
     /// Like [`Self::format`], and also reports the model's unvalidated output
     /// and the elapsed time so a caller can explain a fallback.
     pub fn format_detailed(
@@ -967,6 +1010,18 @@ enum RequestLane {
     Document,
 }
 
+/// Result of [`OllamaClient::format_passes`].
+#[derive(Clone, Debug)]
+pub struct PassesOutcome {
+    /// The last validated text, or the input when no pass succeeded.
+    pub text: String,
+    pub completed: u8,
+    pub requested: u8,
+    /// Why the run stopped early, if it did.
+    pub failure: Option<FallbackReason>,
+    pub attempts: Vec<FormatAttempt>,
+}
+
 /// Everything one formatting attempt produced, for diagnostics and the bench.
 #[derive(Clone, Debug)]
 pub struct FormatAttempt {
@@ -1341,6 +1396,57 @@ mod tests {
             .strip_suffix("\n</transcript>")
             .unwrap();
         transcript.to_owned()
+    }
+
+    #[test]
+    fn passes_feed_each_validated_output_into_the_next_pass() {
+        let server = FakeServer::start(vec![
+            format_response("Hello, team. The demo is Friday."),
+            format_response("- Demo: Friday"),
+        ]);
+        let outcome = client(&server).format_passes(
+            &model(),
+            "hello team the demo is friday",
+            &FormatProfile::Structured,
+            KeepAlive::For(Duration::from_secs(60)),
+            &CancellationToken::new(),
+            2,
+        );
+        assert_eq!(
+            transcript_from_request(&server.request()),
+            "hello team the demo is friday"
+        );
+        assert_eq!(
+            transcript_from_request(&server.request()),
+            "Hello, team. The demo is Friday."
+        );
+        assert_eq!(outcome.text, "- Demo: Friday");
+        assert_eq!((outcome.completed, outcome.requested), (2, 2));
+        assert!(outcome.failure.is_none());
+    }
+
+    #[test]
+    fn a_failed_later_pass_keeps_the_last_good_text() {
+        let server = FakeServer::start(vec![
+            format_response("Budget is 12500 dollars."),
+            // The second pass drops a protected number and is rejected.
+            format_response("Budget is twelve thousand."),
+        ]);
+        let outcome = client(&server).format_passes(
+            &model(),
+            "budget is 12500 dollars",
+            &FormatProfile::Strong,
+            KeepAlive::For(Duration::from_secs(60)),
+            &CancellationToken::new(),
+            3,
+        );
+        assert_eq!(outcome.text, "Budget is 12500 dollars.");
+        assert_eq!((outcome.completed, outcome.requested), (1, 3));
+        assert!(matches!(
+            outcome.failure,
+            Some(FallbackReason::OutputRejected(_))
+        ));
+        assert_eq!(outcome.attempts.len(), 2);
     }
 
     #[test]

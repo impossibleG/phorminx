@@ -369,6 +369,7 @@ fn host_save_dictation_settings(
     model: Option<String>,
     lifecycle: String,
     custom_instructions: Option<String>,
+    passes: Option<u8>,
     state: State<'_, HostState>,
 ) -> Result<(), String> {
     let mode = match mode.as_str() {
@@ -420,6 +421,9 @@ fn host_save_dictation_settings(
     candidate.recognition.language = language;
     candidate.recognition.minimum_rms = minimum_rms;
     candidate.formatting.strength = strength;
+    if let Some(passes) = passes {
+        candidate.formatting.passes = passes;
+    }
     candidate.formatting.ollama_lifecycle = lifecycle;
     candidate.formatting.custom_instructions = custom_instructions;
     let selected = model.filter(|model| !model.trim().is_empty());

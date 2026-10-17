@@ -83,6 +83,9 @@ enum Command {
         output: Option<PathBuf>,
         #[arg(long, default_value_t = 120)]
         timeout_seconds: u64,
+        /// Formatting passes to compare (comma separated).
+        #[arg(long, value_delimiter = ',', default_value = "1")]
+        passes: Vec<u8>,
     },
     /// Repeatedly exercise real default-microphone capture without retaining audio.
     #[command(hide = true)]
@@ -158,6 +161,7 @@ fn main() -> Result<()> {
             samples,
             output,
             timeout_seconds,
+            passes,
         } => format_bench::run(format_bench::BenchConfig {
             model,
             profiles,
@@ -165,6 +169,7 @@ fn main() -> Result<()> {
             samples,
             output,
             timeout_seconds,
+            passes,
         })?,
     }
 

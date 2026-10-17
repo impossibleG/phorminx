@@ -25,7 +25,9 @@ use phorminx_app::performance_runtime::{
 #[cfg(not(feature = "tauri-shell"))]
 use phorminx_app::product_shell::ProductShell;
 use phorminx_app::product_shell::{ProductShellControl, ProductShellEvent};
-use phorminx_app::review::{ReviewSeed, fallback_label, formatting_fallback_note};
+use phorminx_app::review::{
+    ReviewSeed, fallback_label, formatting_fallback_note, formatting_summary, passes_warning,
+};
 use phorminx_app::runtime::text_for_insertion;
 use phorminx_app::runtime::{
     AppIo, AppRuntime, FinishedAudio, InsertDisposition, ReleaseTiming, RuntimeNotice, UiStatus,
@@ -50,8 +52,8 @@ use phorminx_core::{
     normalize_transcript,
 };
 use phorminx_ollama::{
-    CancellationToken, ClientTimeouts, DocumentFormatDisposition, FormatProfile, FormatResult,
-    KeepAlive, ModelName, OllamaClient, OllamaEndpoint, SelectionPolicy,
+    CancellationToken, ClientTimeouts, DocumentFormatDisposition, FormatProfile, KeepAlive,
+    ModelName, OllamaClient, OllamaEndpoint, SelectionPolicy,
 };
 use phorminx_persistence::{
     AppProfile, CasePolicy, DictationDraft, ExecutableIdentity, FormattingStyle,
@@ -1210,7 +1212,7 @@ fn run() -> Result<()> {
                                     .formatting
                                     .custom_instructions
                                     .clone(),
-                                formatting_note: formatting_note.map(str::to_owned),
+                                formatting_note: formatting_summary(&processed.warnings),
                             });
                             worker.recovery.discard(completed.id.0);
                             if let Some(lifecycle) = processed.lifecycle {
@@ -7213,6 +7215,7 @@ struct WorkerFormatting {
     model: Option<ModelName>,
     model_identity: Option<OllamaModelIdentity>,
     keep_alive: KeepAlive,
+    passes: u8,
 }
 
 impl WorkerFormatting {
@@ -7261,6 +7264,7 @@ impl WorkerFormatting {
             model,
             model_identity,
             keep_alive,
+            passes: settings.formatting.passes,
         })
     }
 
@@ -7363,19 +7367,24 @@ fn process_transcript(
                             }
                         }
                     } else {
-                        match client.format(
+                        let outcome = client.format_passes(
                             model,
                             &normalized_text,
                             &formatting.profile,
                             formatting.keep_alive.clone(),
                             cancel,
-                        ) {
-                            FormatResult::Formatted { text, .. } => (text.clone(), Some(text)),
-                            FormatResult::Fallback { reason, .. } => {
+                            formatting.passes,
+                        );
+                        if outcome.requested > 1 {
+                            warnings.push(passes_warning(outcome.completed, outcome.requested));
+                        }
+                        match (outcome.completed, outcome.failure) {
+                            (0, Some(reason)) => {
                                 warnings
                                     .push(format!("ollama_fallback:{}", fallback_label(&reason)));
                                 (normalized_text.clone(), None)
                             }
+                            _ => (outcome.text.clone(), Some(outcome.text)),
                         }
                     }
                 }
@@ -8884,6 +8893,7 @@ mod composition_tests {
         )
         .unwrap();
         let formatting = WorkerFormatting {
+            passes: 1,
             profile: FormatProfile::Strong,
             model: Some(ModelName::parse("qwen2.5:3b").unwrap()),
             model_identity: Some(OllamaModelIdentity::new("a".repeat(64), 1_000).unwrap()),
@@ -9093,6 +9103,7 @@ mod composition_tests {
                 recognized.clone(),
                 "en",
                 &WorkerFormatting {
+                    passes: 1,
                     profile: profile.clone(),
                     model: None,
                     model_identity: None,
@@ -10082,6 +10093,7 @@ mod composition_tests {
             transcript("timed"),
             "en",
             &WorkerFormatting {
+                passes: 1,
                 profile: FormatProfile::Raw,
                 model: None,
                 model_identity: None,
@@ -10148,6 +10160,7 @@ mod composition_tests {
             transcript("private transient text"),
             "en",
             &WorkerFormatting {
+                passes: 1,
                 profile: FormatProfile::Raw,
                 model: None,
                 model_identity: None,
