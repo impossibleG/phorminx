@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use phorminx_persistence::{
-    MessagingContactRecord, MessagingDirection, MessagingIdentityRecord, MessagingInviteRecord,
-    MessagingMessageRecord, MessagingMessageState, NewMessagingContact, Persistence,
+    MESSAGING_SPARE_INVITE_EXPIRY, MessagingContactRecord, MessagingDirection,
+    MessagingIdentityRecord, MessagingInviteRecord, MessagingMessageRecord, MessagingMessageState,
+    NewMessagingContact, Persistence,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -732,6 +733,7 @@ impl<T: Transport> Engine<T> {
         }
         self.refresh_contacts_service();
         self.relaunch_invites();
+        self.ensure_spare_invite();
         self.backoff.clear();
         self.retry_outbox(true);
         self.announce();
@@ -866,16 +868,61 @@ impl<T: Transport> Engine<T> {
         if !self.online() {
             return Err(MessagingError::NotOnline);
         }
-        if self.invite_services.len() >= MAX_INVITES {
+        let repo = self.store.messaging();
+        let invites = repo.invites().map_err(store_err)?;
+        let handed_out = invites
+            .iter()
+            .filter(|i| i.expires_at_ms != MESSAGING_SPARE_INVITE_EXPIRY)
+            .count();
+        if handed_out >= MAX_INVITES {
             return Err(MessagingError::TooManyInvites);
         }
+        let secret = random_bytes::<INVITE_SECRET_LEN>()?;
+        let now = now_ms();
+        let expires_at_ms = now + self.config.invite_ttl.as_millis() as i64;
+        // Prefer the spare: it was published in advance, so it is usually
+        // reachable by the time the person receives the invite.
+        let spare = invites
+            .iter()
+            .filter(|i| i.expires_at_ms == MESSAGING_SPARE_INVITE_EXPIRY)
+            .find(|i| self.invite_services.contains_key(&i.id))
+            .map(|i| i.id.clone());
+        let id = match spare {
+            Some(id)
+                if repo
+                    .claim_spare_invite(&id, &sha256(&secret), now, expires_at_ms)
+                    .map_err(store_err)? =>
+            {
+                id
+            }
+            _ => self.launch_invite(&sha256(&secret), now, expires_at_ms)?,
+        };
+        let address = self
+            .invite_services
+            .get(&id)
+            .map(|(address, _)| address.clone())
+            .ok_or(MessagingError::Network)?;
+        self.ensure_spare_invite();
+        Ok(Invite {
+            name: self.display_name.clone(),
+            address,
+            secret,
+            expires_at: (expires_at_ms / 1000) as u64,
+        }
+        .encode())
+    }
+
+    /// Publishes a new invite service and records it.
+    fn launch_invite(
+        &mut self,
+        secret_hash: &[u8],
+        created_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<String, MessagingError> {
         let id = random_bytes::<8>()?
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
-        let secret = random_bytes::<INVITE_SECRET_LEN>()?;
-        let now = now_ms();
-        let expires_at_ms = now + self.config.invite_ttl.as_millis() as i64;
         let handle = self
             .transport
             .launch(&format!("{INVITE_PREFIX}{id}"), None)
@@ -884,22 +931,35 @@ impl<T: Transport> Engine<T> {
             .messaging()
             .insert_invite(&MessagingInviteRecord {
                 id: id.clone(),
-                secret_hash: sha256(&secret).to_vec(),
+                secret_hash: secret_hash.to_vec(),
                 address: handle.address.to_string(),
-                created_at_ms: now,
+                created_at_ms,
                 expires_at_ms,
             })
             .map_err(store_err)?;
-        let invite = Invite {
-            name: self.display_name.clone(),
-            address: handle.address.clone(),
-            secret,
-            expires_at: (expires_at_ms / 1000) as u64,
-        };
         self.forward_incoming(handle.incoming, ServiceKind::Invite(id.clone()));
         self.invite_services
-            .insert(id, (handle.address, handle._guard));
-        Ok(invite.encode())
+            .insert(id.clone(), (handle.address, handle._guard));
+        Ok(id)
+    }
+
+    /// Keeps one invite service published ahead of time. Its stored secret
+    /// is random and never shared, so nobody can redeem it until it is
+    /// handed out with a real secret.
+    fn ensure_spare_invite(&mut self) {
+        if !self.online() {
+            return;
+        }
+        let has_spare = self.store.messaging().invites().is_ok_and(|all| {
+            all.iter()
+                .any(|i| i.expires_at_ms == MESSAGING_SPARE_INVITE_EXPIRY)
+        });
+        if has_spare {
+            return;
+        }
+        if let Ok(placeholder) = random_bytes::<32>() {
+            let _ = self.launch_invite(&placeholder, now_ms(), MESSAGING_SPARE_INVITE_EXPIRY);
+        }
     }
 
     fn relaunch_invites(&mut self) {
@@ -950,6 +1010,7 @@ impl<T: Transport> Engine<T> {
             .into_iter()
             .find(|i| i.id == invite_id)?;
         if invite.expires_at_ms <= now_ms()
+            || invite.expires_at_ms == MESSAGING_SPARE_INVITE_EXPIRY
             || !same_secret(&sha256(secret), &invite.secret_hash)
             || peer.key == our_key
             || !valid_name(&peer.display_name)
@@ -1037,7 +1098,11 @@ impl<T: Transport> Engine<T> {
         let actor = self.actor.clone();
         tokio::spawn(async move {
             let address = invite.address.clone();
-            let connect = async move { transport.connect(&address).await };
+            let connect = move || {
+                let transport = transport.clone();
+                let address = address.clone();
+                async move { transport.connect(&address).await }
+            };
             let result =
                 session::redeem(ctx, connect, invite, our_address, keypair.map(|k| k.secret)).await;
             let _ = actor.send(Internal::RedeemDone {

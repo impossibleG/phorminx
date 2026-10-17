@@ -7,6 +7,8 @@ use crate::{PersistenceError, Result};
 
 /// Upper bound for a stored message body, matching the wire limit.
 pub const MESSAGING_MAX_TEXT_BYTES: usize = 16 * 1024;
+/// Expiry stored for a pre-published invite that has not been handed out yet.
+pub const MESSAGING_SPARE_INVITE_EXPIRY: i64 = i64::MAX;
 const MAX_NAME_CHARS: usize = 64;
 const MAX_ADDRESS_BYTES: usize = 128;
 const MAX_BLOB_BYTES: usize = 4096;
@@ -334,6 +336,29 @@ impl<'a> MessagingRepository<'a> {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Hands out a pre-published spare invite: sets its real secret and
+    /// expiry. Returns false when the row is gone or was already handed out.
+    pub fn claim_spare_invite(
+        &self,
+        id: &str,
+        secret_hash: &[u8],
+        now_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<bool> {
+        blob("secret_hash", secret_hash)?;
+        Ok(self.connection.execute(
+            "UPDATE messaging_invites SET secret_hash=?2, expires_at_ms=?3, created_at_ms=?4 \
+             WHERE id=?1 AND expires_at_ms=?5",
+            params![
+                id,
+                secret_hash,
+                expires_at_ms,
+                now_ms,
+                MESSAGING_SPARE_INVITE_EXPIRY
+            ],
+        )? > 0)
     }
 
     /// Removes an invite. Returns whether it still existed, so exactly one
@@ -943,6 +968,27 @@ mod tests {
         assert_eq!(repo.invites().unwrap().len(), 1);
         assert!(repo.delete_invite("a1").unwrap());
         assert!(!repo.delete_invite("a1").unwrap());
+    }
+
+    #[test]
+    fn spare_invites_are_claimed_once() {
+        let (_d, db) = open();
+        let repo = db.messaging();
+        repo.insert_invite(&MessagingInviteRecord {
+            id: "s1".into(),
+            secret_hash: vec![0; 32],
+            address: "inv.onion".into(),
+            created_at_ms: 1,
+            expires_at_ms: MESSAGING_SPARE_INVITE_EXPIRY,
+        })
+        .unwrap();
+        assert!(repo.claim_spare_invite("s1", &[7; 32], 10, 20).unwrap());
+        assert!(!repo.claim_spare_invite("s1", &[8; 32], 10, 20).unwrap());
+        let invite = &repo.invites().unwrap()[0];
+        assert_eq!(
+            (invite.secret_hash.clone(), invite.expires_at_ms),
+            (vec![7; 32], 20)
+        );
     }
 
     #[test]

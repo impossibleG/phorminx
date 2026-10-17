@@ -14,9 +14,9 @@ mod meeting_memory;
 mod messaging;
 pub use meeting_memory::{MeetingMemoryPassage, MeetingMemoryRepository, MeetingTitleSource};
 pub use messaging::{
-    MESSAGING_MAX_TEXT_BYTES, MessagingContactRecord, MessagingDirection, MessagingIdentityRecord,
-    MessagingInviteRecord, MessagingMessageRecord, MessagingMessageState, MessagingRepository,
-    NewMessagingContact,
+    MESSAGING_MAX_TEXT_BYTES, MESSAGING_SPARE_INVITE_EXPIRY, MessagingContactRecord,
+    MessagingDirection, MessagingIdentityRecord, MessagingInviteRecord, MessagingMessageRecord,
+    MessagingMessageState, MessagingRepository, NewMessagingContact,
 };
 mod migration;
 pub use meeting::{

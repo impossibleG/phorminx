@@ -22,6 +22,9 @@ use crate::protocol::{
 use crate::transport::BoxStream;
 use crate::{Config, MessagingError};
 
+/// Pause between attempts to reach an invite that is not reachable yet.
+const REDEEM_RETRY_PAUSE: Duration = Duration::from_secs(5);
+
 /// How long an invite service waits for the redeemer to hang up after replying.
 const INVITE_LINGER: Duration = Duration::from_secs(30);
 
@@ -266,17 +269,32 @@ pub(crate) struct Redeemed {
 
 /// Redeems an invite: connect, prove our key and the invite secret, and
 /// exchange contacts addresses and discovery keys.
-pub(crate) async fn redeem(
+pub(crate) async fn redeem<F>(
     ctx: Ctx,
-    connect: impl Future<Output = Result<BoxStream, crate::transport::TransportError>>,
+    connect: impl Fn() -> F,
     invite: Invite,
     our_contacts_address: OnionAddress,
     our_discovery_secret: Option<SecretBytes>,
-) -> Result<Redeemed, MessagingError> {
+) -> Result<Redeemed, MessagingError>
+where
+    F: Future<Output = Result<BoxStream, crate::transport::TransportError>>,
+{
+    // A fresh invite service can take minutes to become reachable over Tor,
+    // so keep trying within the redeem budget instead of failing at once.
+    let deadline = Instant::now() + ctx.config.redeem_timeout;
+    let mut stream = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || invite_expired(&invite) {
+            return Err(MessagingError::InviteUnreachable);
+        }
+        if let Ok(Ok(stream)) = timeout(ctx.config.connect_timeout.min(remaining), connect()).await
+        {
+            break stream;
+        }
+        let pause = REDEEM_RETRY_PAUSE.min(deadline.saturating_duration_since(Instant::now()));
+        sleep(pause).await;
+    };
     let flow = async {
-        let mut stream = connect
-            .await
-            .map_err(|_| MessagingError::InviteUnreachable)?;
         let peer = answer_challenge(&mut stream, &ctx, &invite.address)
             .await
             .map_err(|_| MessagingError::InviteUnreachable)?;
@@ -313,9 +331,17 @@ pub(crate) async fn redeem(
             _ => Err(MessagingError::InviteRejected),
         }
     };
-    timeout(ctx.config.connect_timeout, flow)
+    timeout(ctx.config.handshake_timeout, flow)
         .await
         .map_err(|_| MessagingError::InviteUnreachable)?
+}
+
+fn invite_expired(invite: &Invite) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    invite.expires_at <= now
 }
 
 /// Token bucket limiting how fast one contact can push messages at us.

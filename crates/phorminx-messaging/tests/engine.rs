@@ -28,6 +28,7 @@ fn fast() -> Config {
         tick: Duration::from_millis(20),
         handshake_timeout: Duration::from_secs(3),
         connect_timeout: Duration::from_secs(3),
+        redeem_timeout: Duration::from_secs(1),
         idle_timeout: Duration::from_secs(30),
         restart_delay: Duration::from_millis(100),
         rate_burst: 30,
@@ -478,4 +479,23 @@ fn open_invites_are_capped() {
         ana.m().create_invite(),
         Err(MessagingError::TooManyInvites)
     ));
+}
+
+#[test]
+fn a_spare_invite_is_published_before_it_is_needed() {
+    let network = MemoryNetwork::new();
+    let ana = Peer::new(&network, 1, fast());
+    let bob = Peer::new(&network, 2, fast());
+    ana.enable("Ana");
+    // Only the spare invite service runs: no contacts yet.
+    wait(|| network.published_count() == 1);
+    bob.enable("Bob");
+    wait(|| network.published_count() == 2);
+    let invite = ana.m().create_invite().unwrap();
+    // Ana handed out her spare and published a new one.
+    wait(|| network.published_count() == 3);
+    bob.m().redeem_invite(&invite).unwrap();
+    // The used invite is gone; both now run a contacts service and a spare.
+    wait(|| network.published_count() == 4);
+    assert_eq!(ana.contact("Bob").name, "Bob");
 }

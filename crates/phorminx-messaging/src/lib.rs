@@ -94,6 +94,8 @@ pub struct Config {
     pub tick: Duration,
     pub handshake_timeout: Duration,
     pub connect_timeout: Duration,
+    /// Total time to keep trying to reach an invite that is not reachable yet.
+    pub redeem_timeout: Duration,
     pub idle_timeout: Duration,
     pub restart_delay: Duration,
     /// Messages a contact may send in a burst, refilled one per `rate_refill`.
@@ -115,6 +117,7 @@ impl Default for Config {
             tick: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(90),
             connect_timeout: Duration::from_secs(150),
+            redeem_timeout: Duration::from_secs(300),
             idle_timeout: Duration::from_secs(10 * 60),
             restart_delay: Duration::from_secs(60),
             rate_burst: 30,

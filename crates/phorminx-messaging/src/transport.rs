@@ -153,6 +153,11 @@ impl MemoryNetwork {
         Arc::default()
     }
 
+    /// How many services are currently published.
+    pub fn published_count(&self) -> usize {
+        self.services.lock().unwrap().len()
+    }
+
     /// Whether a service is currently published at `address`.
     pub fn is_published(&self, address: &OnionAddress) -> bool {
         self.services.lock().unwrap().contains_key(address)
