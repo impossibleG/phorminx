@@ -128,7 +128,7 @@ settings recommend `nomic-embed-text:latest`; existing embedding selections and
 indexes are not silently replaced.
 
 Launcher **0 · Give feedback** records a draft locally. Only clicking **Send**
-submits its reviewed text to `www.phorminx.net`; optional diagnostics are shown
+submits its reviewed text to `phorminx.net`; optional diagnostics are shown
 separately. Audio and logs are not attached automatically. Release-enabled
 builds check stable GitHub Releases daily by default; automatic download and
 install after exit are on by default, with an onboarding opt-out and a Settings

@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use crate::meeting_audio::{MeetingAudioEvent, MeetingAudioService, MeetingAudioSource};
 use crate::settings::{Settings, SettingsStore};
 
-const ENDPOINT: &str = "https://www.phorminx.net/api/v1/feedback";
+// The apex host: www redirects there, and submissions deliberately refuse
+// redirects, so a www endpoint would never reach the service.
+const ENDPOINT: &str = "https://phorminx.net/api/v1/feedback";
 const MAX_TEXT_BYTES: usize = 12_000;
 
 #[derive(Clone, Serialize)]
@@ -425,5 +427,22 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn feedback_posts_to_the_apex_host_because_redirects_are_refused() {
+        assert!(ENDPOINT.starts_with("https://phorminx.net/"));
+    }
+
+    #[test]
+    #[ignore = "sends one clearly marked test ticket to the production feedback service"]
+    fn live_feedback_service_accepts_and_confirms_a_test_ticket() {
+        let request = FeedbackSubmission {
+            schema_version: 1,
+            submission_id: submission_id().unwrap(),
+            text: "TEST - app feedback path verification. Safe to ignore or delete.".into(),
+            diagnostics: None,
+        };
+        assert_eq!(submit(&request).unwrap(), request.submission_id);
     }
 }
