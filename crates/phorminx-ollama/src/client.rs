@@ -165,7 +165,10 @@ impl KeepAlive {
             Self::ServerDefault => None,
             Self::UnloadAfterRequest => Some("0s".to_owned()),
             Self::For(duration) => Some(format!("{}s", duration.as_secs().max(1))),
-            Self::Indefinite => Some("-1".to_owned()),
+            // Ollama parses string values as Go durations, which need a unit:
+            // a bare "-1" is rejected with HTTP 400 on every request. Any
+            // negative duration keeps the model loaded.
+            Self::Indefinite => Some("-1s".to_owned()),
         }
     }
 }
@@ -1426,7 +1429,7 @@ mod tests {
         let warm: serde_json::Value = serde_json::from_slice(&server.request().body).unwrap();
         let unload: serde_json::Value = serde_json::from_slice(&server.request().body).unwrap();
         assert_eq!(warm["prompt"], "");
-        assert_eq!(warm["keep_alive"], "-1");
+        assert_eq!(warm["keep_alive"], "-1s");
         assert_eq!(unload["prompt"], "");
         assert_eq!(unload["keep_alive"], "0s");
     }

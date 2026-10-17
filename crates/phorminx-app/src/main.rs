@@ -25,7 +25,7 @@ use phorminx_app::performance_runtime::{
 #[cfg(not(feature = "tauri-shell"))]
 use phorminx_app::product_shell::ProductShell;
 use phorminx_app::product_shell::{ProductShellControl, ProductShellEvent};
-use phorminx_app::review::{ReviewSeed, formatting_fallback_note};
+use phorminx_app::review::{ReviewSeed, fallback_label, formatting_fallback_note};
 use phorminx_app::runtime::text_for_insertion;
 use phorminx_app::runtime::{
     AppIo, AppRuntime, FinishedAudio, InsertDisposition, ReleaseTiming, RuntimeNotice, UiStatus,
@@ -7373,7 +7373,7 @@ fn process_transcript(
                             FormatResult::Formatted { text, .. } => (text.clone(), Some(text)),
                             FormatResult::Fallback { reason, .. } => {
                                 warnings
-                                    .push(format!("ollama_fallback:{}", fallback_reason(&reason)));
+                                    .push(format!("ollama_fallback:{}", fallback_label(&reason)));
                                 (normalized_text.clone(), None)
                             }
                         }
@@ -7429,25 +7429,6 @@ fn document_disposition(disposition: DocumentFormatDisposition) -> &'static str 
         DocumentFormatDisposition::Cancelled => "cancelled",
         DocumentFormatDisposition::ServiceLost => "service_lost",
         DocumentFormatDisposition::SourceFallbackOutputLimit => "output_limit",
-    }
-}
-
-fn fallback_reason(reason: &phorminx_ollama::FallbackReason) -> &'static str {
-    match reason {
-        phorminx_ollama::FallbackReason::RawProfile => "raw_profile",
-        phorminx_ollama::FallbackReason::PromptRejected(_) => "prompt_rejected",
-        phorminx_ollama::FallbackReason::Cancelled => "cancelled",
-        phorminx_ollama::FallbackReason::ServiceUnavailable(_) => "service_unavailable",
-        phorminx_ollama::FallbackReason::OutputRejected(error) => match error {
-            phorminx_ollama::ValidationError::ProtectedTokenChanged { .. } => {
-                "output_rejected_protected"
-            }
-            phorminx_ollama::ValidationError::ModelCommentary => "output_rejected_commentary",
-            phorminx_ollama::ValidationError::OutputTooLarge { .. } => "output_rejected_size",
-            phorminx_ollama::ValidationError::EmptyOutput => "output_rejected_empty",
-            phorminx_ollama::ValidationError::UnexpectedOutputForEmptyInput
-            | phorminx_ollama::ValidationError::ControlCharacter => "output_rejected",
-        },
     }
 }
 

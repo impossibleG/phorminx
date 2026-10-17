@@ -289,7 +289,7 @@ pub fn fallback_label(reason: &FallbackReason) -> &'static str {
         FallbackReason::RawProfile => "raw_profile",
         FallbackReason::PromptRejected(_) => "prompt_rejected",
         FallbackReason::Cancelled => "cancelled",
-        FallbackReason::ServiceUnavailable(_) => "service_unavailable",
+        FallbackReason::ServiceUnavailable(message) => service_label(message),
         FallbackReason::OutputRejected(error) => match error {
             ValidationError::ProtectedTokenChanged { .. } => "output_rejected_protected",
             ValidationError::ModelCommentary => "output_rejected_commentary",
@@ -299,6 +299,26 @@ pub fn fallback_label(reason: &FallbackReason) -> &'static str {
                 "output_rejected"
             }
         },
+    }
+}
+
+/// Splits request failures so the note says what actually happened: a slow
+/// model, a request Ollama refused, or no Ollama at all.
+fn service_label(message: &str) -> &'static str {
+    if message.starts_with("Ollama request timed out") {
+        "service_timeout"
+    } else if [
+        "Ollama returned HTTP status",
+        "Ollama reported an error",
+        "Ollama returned invalid JSON",
+        "Ollama generation ended",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
+    {
+        "service_rejected"
+    } else {
+        "service_unavailable"
     }
 }
 
@@ -313,9 +333,9 @@ pub fn formatting_fallback_note(warnings: &[String]) -> Option<&'static str> {
             .strip_prefix("ollama_fallback:")
             .or_else(|| warning.strip_prefix("ollama_document:"))?;
         Some(match reason {
-            "service_unavailable" | "service_lost" => {
-                "Unformatted: the local model did not answer in time"
-            }
+            "service_timeout" => "Unformatted: the local model did not answer in time",
+            "service_rejected" => "Unformatted: Ollama rejected the request",
+            "service_unavailable" | "service_lost" => "Unformatted: Ollama is not reachable",
             "model_identity_unverified" => "Unformatted: the local model is still starting",
             "prompt_rejected" => "Unformatted: check the custom instructions",
             "output_rejected_protected" => {
@@ -416,6 +436,26 @@ mod tests {
     }
 
     #[test]
+    fn request_failures_say_what_happened() {
+        let label =
+            |message: &str| fallback_label(&FallbackReason::ServiceUnavailable(message.to_owned()));
+        assert_eq!(label("Ollama request timed out"), "service_timeout");
+        assert_eq!(label("Ollama returned HTTP status 400"), "service_rejected");
+        assert_eq!(
+            label("Ollama reported an error: time: missing unit in duration"),
+            "service_rejected"
+        );
+        assert_eq!(
+            label("Ollama transport failed: connection refused"),
+            "service_unavailable"
+        );
+        assert_eq!(
+            note(&["ollama_fallback:service_rejected"]),
+            Some("Unformatted: Ollama rejected the request")
+        );
+    }
+
+    #[test]
     fn reformat_failures_read_as_sentences() {
         assert_eq!(
             sentence("the model added commentary"),
@@ -470,7 +510,7 @@ mod tests {
                 "recognition_repeated_phrase",
                 "ollama_fallback:service_unavailable"
             ]),
-            Some("Unformatted: the local model did not answer in time")
+            Some("Unformatted: Ollama is not reachable")
         );
         assert_eq!(
             note(&["ollama_fallback:output_rejected_protected"]),
