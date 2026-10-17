@@ -817,6 +817,94 @@ impl UiBridge {
         Ok(())
     }
 
+    pub fn prompts(&self) -> Result<Vec<phorminx_persistence::Prompt>, UiBridgeError> {
+        self.persistence.prompts().list().map_err(prompt_error)
+    }
+
+    pub fn prompt_versions(
+        &self,
+        id: i64,
+    ) -> Result<Vec<phorminx_persistence::PromptVersion>, UiBridgeError> {
+        self.persistence
+            .prompts()
+            .versions(id)
+            .map_err(prompt_error)
+    }
+
+    /// Creates a prompt (`id` is `None`) or saves its next version.
+    pub fn save_prompt(
+        &self,
+        id: Option<i64>,
+        draft: &phorminx_persistence::PromptDraft,
+        now_ms: i64,
+    ) -> Result<i64, UiBridgeError> {
+        let prompts = self.persistence.prompts();
+        match id {
+            None => prompts.create(draft, now_ms).map_err(prompt_error),
+            Some(id) => match prompts.save(id, draft, now_ms).map_err(prompt_error)? {
+                true => Ok(id),
+                false => Err(UiBridgeError::not_found("prompt")),
+            },
+        }
+    }
+
+    pub fn restore_prompt(&self, id: i64, version: i64, now_ms: i64) -> Result<(), UiBridgeError> {
+        match self
+            .persistence
+            .prompts()
+            .restore(id, version, now_ms)
+            .map_err(prompt_error)?
+        {
+            true => Ok(()),
+            false => Err(UiBridgeError::not_found("prompt_version")),
+        }
+    }
+
+    pub fn delete_prompt(&self, id: i64) -> Result<(), UiBridgeError> {
+        self.persistence
+            .prompts()
+            .delete(id)
+            .map(|_| ())
+            .map_err(prompt_error)
+    }
+
+    /// Where a prompt is referenced among the instructions this bridge owns:
+    /// dictation formatting and application profiles. Meeting and Action
+    /// instructions live in the assistant configuration; see
+    /// [`crate::prompts::assistant_usages`].
+    pub fn prompt_usages(&self, id: i64) -> Result<Vec<String>, UiBridgeError> {
+        let mut usages = Vec::new();
+        if self
+            .settings
+            .formatting
+            .custom_instructions
+            .as_deref()
+            .is_some_and(|text| crate::prompts::refers_to(text, id))
+        {
+            usages.push("Dictation custom formatting".to_owned());
+        }
+        for profile in self
+            .persistence
+            .app_profiles()
+            .list()
+            .map_err(UiBridgeError::persistence)?
+        {
+            if profile
+                .custom_instructions
+                .as_deref()
+                .is_some_and(|text| crate::prompts::refers_to(text, id))
+            {
+                usages.push(format!("Profile for {}", profile.executable.as_str()));
+            }
+        }
+        Ok(usages)
+    }
+
+    /// Instructions with every prompt reference replaced by its latest text.
+    pub fn resolve_instructions(&self, text: &str) -> crate::prompts::Resolved {
+        crate::prompts::resolve_with(&self.persistence, text)
+    }
+
     pub fn history_text(
         &self,
         id: i64,
@@ -1225,6 +1313,15 @@ fn same_recognizer(candidate: &Settings, current: &Settings) -> bool {
     recognition.minimum_rms = current.recognition.minimum_rms;
     recognition.microphone = current.recognition.microphone.clone();
     recognition == current.recognition
+}
+
+fn prompt_error(error: phorminx_persistence::PersistenceError) -> UiBridgeError {
+    match error {
+        phorminx_persistence::PersistenceError::Validation { field, reason } => {
+            UiBridgeError::validation(field, reason)
+        }
+        other => UiBridgeError::persistence(other),
+    }
 }
 
 fn requires_ollama(strength: FormattingStrength) -> bool {

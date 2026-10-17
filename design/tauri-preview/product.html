@@ -6,9 +6,12 @@
   <title>Phorminx</title>
   <link rel="stylesheet" href="preview.css">
   <link rel="stylesheet" href="product.css">
+  <link rel="stylesheet" href="instruction-field.css">
   <script src="markdown.js" defer></script>
   <script src="preview.js" defer></script>
+  <script src="instruction-field.js" defer></script>
   <script src="product.js" defer></script>
+  <script src="prompts.js" defer></script>
 </head>
 <body data-shell="product">
   <div class="shell">
@@ -20,6 +23,7 @@
         <button type="button" data-route="history">History</button>
         <button type="button" data-route="lexicon">Lexicon</button>
         <button type="button" data-route="profiles">Profiles</button>
+        <button type="button" data-route="prompts">Prompts</button>
         <button type="button" data-route="models">Models</button>
         <button type="button" data-route="actions">Actions</button>
         <button type="button" data-route="settings">Settings</button>
@@ -64,10 +68,31 @@
             <label>Formatting<select id="profile-style"><option value="raw">Raw</option><option value="light">Light</option><option value="balanced">Balanced</option><option value="strong">Strong</option><option value="structured">Structured · Markdown</option><option value="custom">Custom</option></select></label>
             <label>Language<input id="profile-language" placeholder="Use default language"></label>
             <label>Insertion<select id="profile-insertion"><option value="automatic">Automatic</option><option value="direct">Direct</option><option value="clipboard">Clipboard only</option></select></label>
-            <label>Custom instructions<textarea id="profile-instructions" rows="5" placeholder="Only for Custom formatting"></textarea></label>
+            <label>Custom instructions<textarea id="profile-instructions" rows="5" placeholder="Only for Custom formatting. Type @ to insert a prompt." data-instruction-field></textarea></label>
             <label class="check-row"><input id="profile-deny" type="checkbox">Block dictation in this application</label>
             <div class="action-form-buttons"><button type="submit" class="primary">Save profile</button><button id="delete-profile" type="button" hidden>Delete profile</button><span id="profile-result" role="status"></span></div>
           </form>
+        </section>
+        <section id="prompts" class="page" hidden>
+          <div class="page-head"><div><small>INSTRUCTIONS</small><h1>Prompts</h1></div><button id="new-prompt" type="button" class="primary">New prompt</button></div>
+          <p class="page-intro">Reusable instructions. Type @ in any instruction field to insert one; it always uses the latest version saved here.</p>
+          <div class="prompts-layout">
+            <div class="prompts-browser">
+              <input id="prompt-query" aria-label="Search prompts" placeholder="Search prompts…" autocomplete="off">
+              <div id="prompt-tags" class="prompt-tag-filter" aria-label="Filter by tag"></div>
+              <div id="prompt-list" class="record-list"></div>
+            </div>
+            <article class="record-detail prompt-editor">
+              <form id="prompt-form" class="action-form">
+                <input id="prompt-id" type="hidden">
+                <label>Name<input id="prompt-name" maxlength="80" required placeholder="Meeting notes"></label>
+                <label>Tags<input id="prompt-tags-input" placeholder="work, email" autocomplete="off"></label>
+                <label>Instructions<textarea id="prompt-body" rows="9" maxlength="4096" required placeholder="What the model should do"></textarea></label>
+                <div class="action-form-buttons"><button type="submit" class="primary">Save version</button><button id="delete-prompt" type="button" hidden>Delete prompt</button><span id="prompt-result" role="status"></span></div>
+              </form>
+              <section class="prompt-versions" aria-labelledby="prompt-versions-title"><h2 id="prompt-versions-title">Versions</h2><div id="prompt-versions"></div></section>
+            </article>
+          </div>
         </section>
         <section id="models" class="page" hidden>
           <div class="page-head"><div><small>LOCAL COMPUTE</small><h1>Models</h1></div></div>
@@ -87,7 +112,7 @@
             <label>Payload mode<select id="action-payload-mode"><option value="template">Template</option><option value="ai-json">Local AI writes JSON</option></select></label>
             <label>Payload template<textarea id="action-template" rows="5" placeholder='{"note": "{{text}}"}'></textarea></label>
             <label>Local model<input id="action-model" maxlength="200" placeholder="Used for AI JSON mode"></label>
-            <label>Instructions for local model<textarea id="action-prompt" rows="4" placeholder="Describe the JSON to produce"></textarea></label>
+            <label>Instructions for local model<textarea id="action-prompt" rows="4" placeholder="Describe the JSON to produce. Type @ to insert a prompt." data-instruction-field></textarea></label>
             <label>Authorization<input id="action-auth" type="password" autocomplete="new-password" placeholder="Leave blank to retain a saved credential"></label>
             <label>Headers (JSON object)<textarea id="action-headers" rows="3" placeholder='{"X-Token": "secret"}'></textarea></label>
             <div class="action-form-buttons"><button type="submit" class="primary">Save action</button><button id="delete-action" type="button" hidden>Delete action</button><span id="action-result" role="status"></span></div>
@@ -114,7 +139,7 @@
             <form id="dictation-form" class="preferences-form">
               <div class="setting-card"><small>RECOGNITION</small><h2>Speech</h2><div class="setting-form"><label>Mode<select id="recognition-mode"><option value="accurate">Accurate · Whisper</option><option value="instant">Instant · Vosk</option></select></label><label>Microphone<select id="dictation-microphone"><option value="">Windows default</option></select></label><label>Compute backend<select id="accurate-backend"><option value="auto">Automatic</option><option value="vulkan">Vulkan</option><option value="cpu">CPU</option></select></label><label>Language<input id="recognition-language" placeholder="en or pt-br"></label><label>Minimum speech level<input id="minimum-rms" type="number" min="0" max="1" step="0.0001"></label></div></div>
               <div class="setting-card"><small>FORMATTING</small><h2>Finish the thought</h2><div class="setting-form"><label>Strength<select id="formatting-strength"><option value="raw">Raw</option><option value="light">Light</option><option value="balanced">Balanced</option><option value="strong">Strong</option><option value="structured">Structured · Markdown</option><option value="custom">Custom</option></select></label><label>Local model<select id="formatting-model"><option value="">No model</option></select></label><label>Model residency<select id="model-residency"><option value="instant">Instant</option><option value="balanced">Balanced</option><option value="memorysaver">Memory saver</option></select></label><label title="Each pass reformats the previous result; a failed pass keeps the last good text.">Formatting passes<select id="formatting-passes"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option></select></label></div><p id="formatting-hint" class="setting-hint" hidden></p></div>
-              <div class="setting-card"><small>CUSTOM</small><h2>Instructions</h2><textarea id="custom-instructions" rows="8" placeholder="Used for Custom formatting"></textarea></div>
+              <div class="setting-card"><small>CUSTOM</small><h2>Instructions</h2><textarea id="custom-instructions" rows="8" placeholder="Used for Custom formatting. Type @ to insert a prompt." data-instruction-field></textarea></div>
               <div class="preferences-save"><button class="primary" type="submit">Save dictation</button><span id="dictation-result" role="status"></span></div>
             </form>
           </div>
@@ -148,7 +173,7 @@
         <section id="meeting-settings" class="page" hidden>
           <div class="page-head"><div><small>MEETINGS / CONFIGURATION</small><h1>Meeting settings</h1></div></div>
           <div class="meeting-tabs" role="tablist" aria-label="Meetings"><button type="button" role="tab" aria-selected="false" data-route="live">Live session</button><button type="button" role="tab" aria-selected="false" data-route="saved">Saved sessions</button><button class="active" type="button" role="tab" aria-selected="true" data-route="meeting-settings">Meeting settings</button></div>
-          <div class="settings-grid"><section class="setting-card"><small>AUDIO</small><h2>Computer and microphone</h2><p>Both sources are captured when a meeting starts. Mute either one from the companion.</p><form id="devices-form" class="setting-form"><label for="output-device">Computer device</label><select id="output-device"><option value="">Windows default</option></select><label for="input-device">Microphone</label><select id="input-device"><option value="">Windows default</option></select><button type="submit">Save devices</button></form></section><section class="setting-card"><small>LANGUAGE</small><h2>Live translation</h2><form id="translation-form" class="setting-form"><label for="translation-language">Target language</label><input id="translation-language" placeholder="Off, or a language such as Portuguese (Brazil)"><label for="translation-model">Local model</label><select id="translation-model"><option value="">Choose an installed model</option></select><button type="submit">Save translation</button></form><p id="translation-notice"></p></section><section class="setting-card assistant-card"><small>ASSISTANT</small><h2>Meeting perspective</h2><form id="provider-form" class="setting-form"><label>Provider<select id="provider-kind"><option value="ollama">Local · Ollama</option><option value="openai">External · OpenAI</option><option value="anthropic">External · Anthropic</option></select></label><label>Answer model<input id="provider-model" placeholder="Installed local model or provider model"></label><label>Fallback local model<input id="provider-fallback" placeholder="Optional"></label><label>Endpoint<input id="provider-endpoint" placeholder="http://127.0.0.1:11434"></label><label>API key<input id="provider-key" type="password" autocomplete="new-password" placeholder="Leave blank to retain existing key"></label><label class="check-row"><input id="provider-clear-key" type="checkbox">Remove saved key</label><label>Meeting instructions<textarea id="provider-preset" rows="5" placeholder="How the assistant should help during this meeting"></textarea></label><div class="provider-actions"><button type="submit">Save assistant</button><span id="provider-result" role="status"></span></div></form></section></div>
+          <div class="settings-grid"><section class="setting-card"><small>AUDIO</small><h2>Computer and microphone</h2><p>Both sources are captured when a meeting starts. Mute either one from the companion.</p><form id="devices-form" class="setting-form"><label for="output-device">Computer device</label><select id="output-device"><option value="">Windows default</option></select><label for="input-device">Microphone</label><select id="input-device"><option value="">Windows default</option></select><button type="submit">Save devices</button></form></section><section class="setting-card"><small>LANGUAGE</small><h2>Live translation</h2><form id="translation-form" class="setting-form"><label for="translation-language">Target language</label><input id="translation-language" placeholder="Off, or a language such as Portuguese (Brazil)"><label for="translation-model">Local model</label><select id="translation-model"><option value="">Choose an installed model</option></select><button type="submit">Save translation</button></form><p id="translation-notice"></p></section><section class="setting-card assistant-card"><small>ASSISTANT</small><h2>Meeting perspective</h2><form id="provider-form" class="setting-form"><label>Provider<select id="provider-kind"><option value="ollama">Local · Ollama</option><option value="openai">External · OpenAI</option><option value="anthropic">External · Anthropic</option></select></label><label>Answer model<input id="provider-model" placeholder="Installed local model or provider model"></label><label>Fallback local model<input id="provider-fallback" placeholder="Optional"></label><label>Endpoint<input id="provider-endpoint" placeholder="http://127.0.0.1:11434"></label><label>API key<input id="provider-key" type="password" autocomplete="new-password" placeholder="Leave blank to retain existing key"></label><label class="check-row"><input id="provider-clear-key" type="checkbox">Remove saved key</label><label>Meeting instructions<textarea id="provider-preset" rows="5" placeholder="How the assistant should help during this meeting. Type @ to insert a prompt." data-instruction-field></textarea></label><div class="provider-actions"><button type="submit">Save assistant</button><span id="provider-result" role="status"></span></div></form></section></div>
         </section>
       </main>
     </div>

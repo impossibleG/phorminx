@@ -1291,7 +1291,7 @@ impl Host {
             return Err("Automatic commentary paused because this transcript portion exceeds the local context budget. It remains available for a manual question.".into());
         }
         self.cancel_answer();
-        let (mut messages, omitted) = build_context(&self.config.preset, &self.view.messages);
+        let (mut messages, omitted) = build_context(&self.resolved_preset(), &self.view.messages);
         messages.push(ChatMessage {
             role: ChatRole::User,
             content: question_content(AUTO_COMMENTARY_PROMPT, &context),
@@ -1453,7 +1453,7 @@ impl Host {
             .ok_or("There is no submitted message to retry.")?;
         self.preflight_message(&latest.text)?;
         self.cancel_answer();
-        let (messages, omitted) = build_context(&self.config.preset, &self.view.messages);
+        let (messages, omitted) = build_context(&self.resolved_preset(), &self.view.messages);
         let generation = self.runs.begin().ok_or("Answer generation exhausted.")?;
         self.view.messages.push(ChatLine {
             role: "Assistant".into(),
@@ -1701,7 +1701,7 @@ impl Host {
             context_text: context,
             context_samples: context_start.zip(cutoff),
         });
-        let (messages, omitted) = build_context(&self.config.preset, &self.view.messages);
+        let (messages, omitted) = build_context(&self.resolved_preset(), &self.view.messages);
         let generation = self.runs.begin().ok_or("Answer generation exhausted.")?;
         self.view.messages.push(ChatLine {
             role: "Assistant".into(),
@@ -2323,6 +2323,11 @@ impl Host {
         self.view.notice = "Action saved. Nothing has been sent.".into();
         Ok(())
     }
+    /// Meeting instructions with prompt references replaced by the latest
+    /// prompt text.
+    fn resolved_preset(&self) -> String {
+        crate::prompts::resolve_with(&self.db, &self.config.preset).text
+    }
     fn deliver(&mut self, id: String, text: String) -> Result<(), String> {
         if self.delivery_cancel.is_some() {
             return Err("A delivery is already in progress.".into());
@@ -2336,11 +2341,12 @@ impl Host {
             .ok_or("Select a saved action.")?;
         self.deliver_config(action, text)
     }
-    fn deliver_config(&mut self, action: ActionConfig, text: String) -> Result<(), String> {
+    fn deliver_config(&mut self, mut action: ActionConfig, text: String) -> Result<(), String> {
         if self.delivery_cancel.is_some() {
             return Err("A delivery is already in progress.".into());
         }
         action.validate().map_err(|e| e.to_string())?;
+        action.payload_prompt = crate::prompts::resolve_with(&self.db, &action.payload_prompt).text;
         if text.trim().is_empty() {
             return Err("Write or dictate a note before sending.".into());
         }

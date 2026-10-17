@@ -18,6 +18,11 @@ pub use meeting::{
     MeetingRepository, MeetingSegmentRecord,
 };
 mod profile;
+mod prompt;
+pub use prompt::{
+    MAX_PROMPT_BODY_CHARS, MAX_PROMPT_NAME_CHARS, Prompt, PromptDraft, PromptRepository,
+    PromptVersion,
+};
 mod recovery;
 pub use recovery::{RecoveryRecord, RecoveryRepository};
 
@@ -185,6 +190,10 @@ impl Persistence {
 
     pub fn app_profiles(&self) -> AppProfileRepository<'_> {
         AppProfileRepository::new(&self.connection)
+    }
+
+    pub fn prompts(&self) -> PromptRepository<'_> {
+        PromptRepository::new(&self.connection)
     }
 
     pub fn schema_version(&self) -> Result<u32> {

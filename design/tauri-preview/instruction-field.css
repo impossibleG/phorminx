@@ -1,0 +1,34 @@
+.instruction-field-source{position:absolute!important;width:1px!important;height:1px!important;opacity:0;pointer-events:none;margin:0!important;padding:0!important;border:0!important}
+.instruction-field{display:block;width:100%;box-sizing:border-box;background:#101416;color:#e8e5dd;border:1px solid #394046;border-radius:4px;padding:9px 10px;font:12px/1.6 "Segoe UI",Arial,sans-serif;white-space:pre-wrap;overflow-wrap:anywhere;overflow-y:auto;max-height:18em;outline:0;text-align:left;cursor:text}
+.instruction-field:focus{border-color:#c69767;box-shadow:0 0 0 1px #c69767}
+.instruction-field.is-empty::before{content:attr(data-placeholder);color:#858c90;pointer-events:none}
+.prompt-chip{display:inline-block;margin:0 2px;padding:0 9px;border:1px solid #c69767;border-radius:999px;background:rgba(198,151,103,.16);color:#ecd6bf;font-size:11px;line-height:1.7;white-space:nowrap;cursor:pointer;user-select:none;vertical-align:baseline}
+.prompt-chip::before{content:'@';opacity:.65;margin-right:2px}
+.prompt-chip:focus-visible{outline:2px solid #c69767;outline-offset:1px}
+.prompt-chip.missing{border-style:dashed;border-color:#c97b70;background:rgba(201,123,112,.14);color:#f0c4bd}
+.prompt-chip.missing::before{content:'!';margin-right:4px}
+.instruction-menu,.instruction-popover{position:relative;z-index:20;margin-top:4px;background:#171b1e;border:1px solid #394046;border-radius:6px;box-shadow:0 8px 22px rgba(0,0,0,.35);font-size:12px;text-align:left}
+.instruction-menu[hidden],.instruction-popover[hidden]{display:none}
+.instruction-menu{max-height:230px;overflow-y:auto;padding:4px}
+.instruction-menu button{display:block;width:100%;text-align:left;border:0;border-radius:4px;background:transparent;color:#e8e5dd;padding:7px 9px;cursor:pointer}
+.instruction-menu button.active,.instruction-menu button:hover{background:#22282c}
+.instruction-menu button strong{display:block;font-size:12px;font-weight:600}
+.instruction-menu button span{display:block;color:#a8adb0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.instruction-menu-empty{margin:0;padding:8px 9px;color:#a8adb0}
+.instruction-popover{padding:12px 14px;max-width:460px}
+.instruction-popover small{display:block;color:#c69767;font-size:9px;letter-spacing:.12em}
+.instruction-popover strong{display:block;margin:3px 0 2px;font-size:13px}
+.instruction-popover-tags{display:block;color:#a8adb0;font-size:11px}
+.instruction-popover-body{margin:8px 0 10px;white-space:pre-wrap;color:#d6d3cc;max-height:160px;overflow:auto;line-height:1.5}
+.instruction-popover button{margin-right:6px;border:1px solid #394046;border-radius:4px;background:#101416;color:#e8e5dd;padding:6px 10px;font-size:11px;cursor:pointer}
+.instruction-popover button:hover{border-color:#c69767}
+:root[data-theme="light"] .instruction-field{background:#f7f5f0;color:#202326;border-color:#a5a39d}
+:root[data-theme="light"] .prompt-chip{background:rgba(129,80,38,.10);border-color:#815026;color:#5b3d22}
+:root[data-theme="light"] .prompt-chip.missing{background:rgba(160,60,48,.08);border-color:#a03c30;color:#7a2a20}
+:root[data-theme="light"] .instruction-menu,:root[data-theme="light"] .instruction-popover{background:#f7f5f0;border-color:#b9b7b0;box-shadow:0 8px 22px rgba(0,0,0,.12)}
+:root[data-theme="light"] .instruction-menu button{color:#202326}
+:root[data-theme="light"] .instruction-menu button.active,:root[data-theme="light"] .instruction-menu button:hover{background:#eae7e0}
+:root[data-theme="light"] .instruction-menu button span,:root[data-theme="light"] .instruction-popover-tags,:root[data-theme="light"] .instruction-menu-empty{color:#555b60}
+:root[data-theme="light"] .instruction-popover small{color:#815026}
+:root[data-theme="light"] .instruction-popover-body{color:#2c2f32}
+:root[data-theme="light"] .instruction-popover button{background:#eae7e0;color:#202326;border-color:#a5a39d}

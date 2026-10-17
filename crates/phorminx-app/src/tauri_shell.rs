@@ -61,6 +61,8 @@ struct HostState {
     status: Mutex<UiRuntimeStatus>,
     notice: Mutex<String>,
     review: Mutex<ReviewPanel>,
+    /// A prompt another window asked the main window to open for editing.
+    prompt_focus: Mutex<Option<i64>>,
     events: Sender<ProductShellEvent>,
 }
 
@@ -1092,6 +1094,7 @@ fn run_shell(
         status: Mutex::new(initial_status),
         notice: Mutex::new(String::new()),
         review: Mutex::new(ReviewPanel::default()),
+        prompt_focus: Mutex::new(None),
         events: events.clone(),
     };
     let stopping = Arc::new(AtomicBool::new(false));
@@ -1151,6 +1154,14 @@ fn run_shell(
             review_copy,
             review_replace,
             review_close,
+            prompts_list,
+            prompt_versions,
+            prompt_save,
+            prompt_restore,
+            prompt_usages,
+            prompt_delete,
+            prompt_open,
+            prompt_take_focus,
         ])
         .setup(move |app| {
             if !initially_visible {
@@ -1396,6 +1407,151 @@ fn focus_route(app: &tauri::AppHandle, host: &HostState, route: UiRoute) {
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptView {
+    id: i64,
+    name: String,
+    tags: Vec<String>,
+    body: String,
+    version: i64,
+    updated_at_ms: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptVersionView {
+    version: i64,
+    name: String,
+    body: String,
+    created_at_ms: i64,
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+#[tauri::command]
+fn prompts_list(state: State<'_, HostState>) -> Result<Vec<PromptView>, String> {
+    let prompts = state
+        .bridge
+        .lock()
+        .map_err(|_| "Prompts are unavailable.")?
+        .prompts()
+        .map_err(|error| error.to_string())?;
+    Ok(prompts
+        .into_iter()
+        .map(|prompt| PromptView {
+            id: prompt.id,
+            name: prompt.name,
+            tags: prompt.tags,
+            body: prompt.body,
+            version: prompt.version,
+            updated_at_ms: prompt.updated_at_ms,
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn prompt_versions(id: i64, state: State<'_, HostState>) -> Result<Vec<PromptVersionView>, String> {
+    let versions = state
+        .bridge
+        .lock()
+        .map_err(|_| "Prompts are unavailable.")?
+        .prompt_versions(id)
+        .map_err(|error| error.to_string())?;
+    Ok(versions
+        .into_iter()
+        .map(|version| PromptVersionView {
+            version: version.version,
+            name: version.name,
+            body: version.body,
+            created_at_ms: version.created_at_ms,
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn prompt_save(
+    id: Option<i64>,
+    name: String,
+    tags: Vec<String>,
+    body: String,
+    state: State<'_, HostState>,
+) -> Result<i64, String> {
+    state
+        .bridge
+        .lock()
+        .map_err(|_| "Prompts are unavailable.")?
+        .save_prompt(
+            id,
+            &phorminx_persistence::PromptDraft { name, tags, body },
+            now_ms(),
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn prompt_restore(id: i64, version: i64, state: State<'_, HostState>) -> Result<(), String> {
+    state
+        .bridge
+        .lock()
+        .map_err(|_| "Prompts are unavailable.")?
+        .restore_prompt(id, version, now_ms())
+        .map_err(|error| error.to_string())
+}
+
+/// Every place that refers to the prompt, so deleting it can warn first.
+#[tauri::command]
+fn prompt_usages(id: i64, state: State<'_, HostState>) -> Result<Vec<String>, String> {
+    let mut bridge = state.bridge.lock().map_err(|_| "Prompts are unavailable.")?;
+    bridge.reload_settings().map_err(|error| error.to_string())?;
+    let mut usages = bridge.prompt_usages(id).map_err(|error| error.to_string())?;
+    drop(bridge);
+    if let Some(directory) = state.store.path().parent()
+        && let Ok(config) =
+            phorminx_assistant::ConfigStore::new(directory.join("assistant.json")).load()
+    {
+        usages.extend(crate::prompts::assistant_usages(&config, id));
+    }
+    Ok(usages)
+}
+
+#[tauri::command]
+fn prompt_delete(id: i64, state: State<'_, HostState>) -> Result<(), String> {
+    state
+        .bridge
+        .lock()
+        .map_err(|_| "Prompts are unavailable.")?
+        .delete_prompt(id)
+        .map_err(|error| error.to_string())
+}
+
+/// Opens a prompt in the main window's Prompts page, from any window.
+#[tauri::command]
+fn prompt_open(id: i64, app: tauri::AppHandle, state: State<'_, HostState>) -> Result<(), String> {
+    *state.prompt_focus.lock().map_err(|_| "Prompts are unavailable.")? = Some(id);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn prompt_take_focus(state: State<'_, HostState>) -> Result<Option<i64>, String> {
+    Ok(state
+        .prompt_focus
+        .lock()
+        .map_err(|_| "Prompts are unavailable.")?
+        .take())
+}
+
 const REVIEW_WINDOW: &str = "review";
 
 fn open_review(app: &tauri::AppHandle) -> Result<(), String> {
@@ -1479,6 +1635,17 @@ fn review_reformat(
         _ => return Err("Choose a supported formatting.".into()),
     };
     let settings = state.store.load().map_err(|error| error.to_string())?;
+    let instruction = match instruction {
+        Some(instruction) => Some(
+            state
+                .bridge
+                .lock()
+                .map_err(|_| "Prompts are unavailable.")?
+                .resolve_instructions(&instruction)
+                .text,
+        ),
+        None => None,
+    };
     state
         .review
         .lock()

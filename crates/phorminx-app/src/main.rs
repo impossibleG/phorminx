@@ -556,6 +556,7 @@ fn run() -> Result<()> {
                     effective_microphone.as_deref(),
                     &mut dictation_context,
                     &settings,
+                    &persistence,
                     &capture,
                     &workloads,
                     &mut active_dictation_activity,
@@ -663,6 +664,7 @@ fn run() -> Result<()> {
                     effective_microphone.as_deref(),
                     &mut dictation_context,
                     &settings,
+                    &persistence,
                     &capture,
                     &workloads,
                     &mut active_dictation_activity,
@@ -980,6 +982,7 @@ fn run() -> Result<()> {
                     effective_microphone.as_deref(),
                     &mut dictation_context,
                     &settings,
+                    &persistence,
                     &capture,
                     &workloads,
                     &mut active_dictation_activity,
@@ -1223,7 +1226,10 @@ fn run() -> Result<()> {
                                 custom_instructions: settings
                                     .formatting
                                     .custom_instructions
-                                    .clone(),
+                                    .as_deref()
+                                    .map(|text| {
+                                        phorminx_app::prompts::resolve_with(&persistence, text).text
+                                    }),
                                 formatting_note: formatting_summary(&processed.warnings),
                             });
                             worker.recovery.discard(completed.id.0);
@@ -3628,6 +3634,7 @@ fn handle_test_dictation(
     microphone: Option<&str>,
     context: &mut DictationContext,
     settings: &Settings,
+    persistence: &Persistence,
     capture: &ExtendedCaptureFactory,
     workloads: &Arc<WorkloadCoordinator>,
     active_dictation_activity: &mut Option<RuntimeActivityLease>,
@@ -3641,6 +3648,7 @@ fn handle_test_dictation(
             );
         }
         *context = DictationContext::global(settings, context.verified_variant)?;
+        context.resolve_prompts(persistence);
         runtime.configure_next_dictation(
             context.language.clone(),
             context.runtime_formatting,
@@ -7161,7 +7169,24 @@ impl DictationContext {
     ) -> Result<Self> {
         let context = Self::global(settings, verified_variant)?;
         let executable = target.and_then(TargetSnapshot::executable_name);
-        Self::for_executable(context, executable, persistence, settings)
+        let mut context = Self::for_executable(context, executable, persistence, settings)?;
+        context.resolve_prompts(persistence);
+        Ok(context)
+    }
+
+    /// Replaces prompt references in custom instructions with each prompt's
+    /// latest text, so library edits apply to the next dictation.
+    fn resolve_prompts(&mut self, persistence: &Persistence) {
+        if let FormatProfile::Custom(instructions) = &self.formatting.profile {
+            let resolved = phorminx_app::prompts::resolve_with(persistence, instructions);
+            if !resolved.missing.is_empty() {
+                eprintln!(
+                    "dictation_id=0 state=Idle event=prompt_missing count={}",
+                    resolved.missing.len()
+                );
+            }
+            self.formatting.profile = FormatProfile::Custom(resolved.text);
+        }
     }
 
     fn for_executable(
