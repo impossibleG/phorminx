@@ -1511,12 +1511,18 @@ fn prompt_usages(id: i64, state: State<'_, HostState>) -> Result<Vec<String>, St
     let mut bridge = state.bridge.lock().map_err(|_| "Prompts are unavailable.")?;
     bridge.reload_settings().map_err(|error| error.to_string())?;
     let mut usages = bridge.prompt_usages(id).map_err(|error| error.to_string())?;
+    let prompt = bridge
+        .prompts()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|prompt| prompt.id == id);
     drop(bridge);
-    if let Some(directory) = state.store.path().parent()
+    if let Some(prompt) = prompt
+        && let Some(directory) = state.store.path().parent()
         && let Ok(config) =
             phorminx_assistant::ConfigStore::new(directory.join("assistant.json")).load()
     {
-        usages.extend(crate::prompts::assistant_usages(&config, id));
+        usages.extend(crate::prompts::assistant_usages(&config, &prompt));
     }
     Ok(usages)
 }

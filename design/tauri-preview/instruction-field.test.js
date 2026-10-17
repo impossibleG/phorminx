@@ -7,34 +7,40 @@ const context = {window: {}};
 vm.createContext(context);
 vm.runInContext(fs.readFileSync(path.join(__dirname, 'instruction-field.js'), 'utf8'), context);
 const text = context.window.InstructionFieldText;
+const plain = (value) => JSON.parse(JSON.stringify(value));
 
-// Stored text round-trips through parts, references included.
-const stored = 'Keep names. @{prompt:3} Then @{prompt:12}\nThanks';
-const parts = text.parse(stored);
-assert.deepEqual(JSON.parse(JSON.stringify(parts)), [
-  {type: 'text', value: 'Keep names. '},
-  {type: 'prompt', id: 3},
-  {type: 'text', value: ' Then '},
-  {type: 'prompt', id: 12},
-  {type: 'text', value: '\nThanks'},
+// References are found in order, once each, by name (any case) or old id.
+assert.deepEqual(plain(text.references('Keep names. @[Short email] then @[short email], @{prompt:12}\n@[Lists]')), [
+  {name: 'Short email'},
+  {id: 12},
+  {name: 'Lists'},
 ]);
-assert.equal(text.serialize(parts), stored);
-assert.equal(text.serialize(text.parse('')), '');
-assert.equal(text.serialize(text.parse('mail @{prompt:x}')), 'mail @{prompt:x}');
-
-// "@" opens the menu only at a word start, and the query follows it.
-assert.equal(text.mentionQuery('Use @'), '');
-assert.equal(text.mentionQuery('Use @mee'), 'mee');
-assert.equal(text.mentionQuery('@mee'), 'mee');
-assert.equal(text.mentionQuery('mail me@example'), null);
-assert.equal(text.mentionQuery('Use @mee ting'), null);
+assert.deepEqual(plain(text.references('mail me@example.com @[] @[ ] @[a[b] @[open @{prompt:x} @{prompt:0}')), []);
+assert.deepEqual(plain(text.references(`@[${'n'.repeat(81)}]`)), []);
+assert.equal(text.token(' Short email '), '@[Short email]');
 
 const prompts = [
   {id: 1, name: 'Meeting notes', tags: ['work'], body: 'Summarize decisions.'},
   {id: 2, name: 'Email', tags: ['writing'], body: 'Write an email.'},
 ];
+assert.equal(text.find(prompts, {name: 'meeting NOTES'}).id, 1);
+assert.equal(text.find(prompts, {id: 2}).name, 'Email');
+assert.equal(text.find(prompts, {name: 'Gone'}), undefined);
+
+// "@" opens suggestions only at a word start; the query follows it.
+assert.deepEqual(plain(text.mention('Use @')), {query: '', start: 4});
+assert.deepEqual(plain(text.mention('Use @mee')), {query: 'mee', start: 4});
+assert.deepEqual(plain(text.mention('@mee')), {query: 'mee', start: 0});
+assert.equal(text.mention('mail me@example'), null);
+assert.equal(text.mention('Use @mee ting'), null);
+assert.equal(text.mention('Use @[Email] '), null);
+
 assert.deepEqual(text.filter(prompts, 'MEET').map((prompt) => prompt.id), [1]);
 assert.deepEqual(text.filter(prompts, 'writ').map((prompt) => prompt.id), [2]);
 assert.equal(text.filter(prompts, '').length, 2);
+
+// The component must not replace the textarea with an editable element.
+const source = fs.readFileSync(path.join(__dirname, 'instruction-field.js'), 'utf8');
+assert.ok(!/contentEditable|contenteditable/.test(source));
 
 console.log('instruction-field: ok');

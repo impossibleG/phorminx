@@ -873,13 +873,16 @@ impl UiBridge {
     /// instructions live in the assistant configuration; see
     /// [`crate::prompts::assistant_usages`].
     pub fn prompt_usages(&self, id: i64) -> Result<Vec<String>, UiBridgeError> {
+        let Some(prompt) = self.persistence.prompts().get(id).map_err(prompt_error)? else {
+            return Ok(Vec::new());
+        };
         let mut usages = Vec::new();
         if self
             .settings
             .formatting
             .custom_instructions
             .as_deref()
-            .is_some_and(|text| crate::prompts::refers_to(text, id))
+            .is_some_and(|text| crate::prompts::refers_to(text, &prompt))
         {
             usages.push("Dictation custom formatting".to_owned());
         }
@@ -892,7 +895,7 @@ impl UiBridge {
             if profile
                 .custom_instructions
                 .as_deref()
-                .is_some_and(|text| crate::prompts::refers_to(text, id))
+                .is_some_and(|text| crate::prompts::refers_to(text, &prompt))
             {
                 usages.push(format!("Profile for {}", profile.executable.as_str()));
             }
@@ -2366,6 +2369,92 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.field, Some("executable"));
         assert_eq!(test.bridge.persistence.lexicon().list().unwrap(), []);
+    }
+
+    #[test]
+    fn prompt_references_save_verbatim_in_every_instruction_field_and_resolve() {
+        let mut test = TestBridge::new();
+        let readiness = test.readiness();
+        let draft = |name: &str, body: &str| phorminx_persistence::PromptDraft {
+            name: name.into(),
+            tags: Vec::new(),
+            body: body.into(),
+        };
+        let lists = test
+            .bridge
+            .save_prompt(None, &draft("Lists", "Use bullets."), 1)
+            .unwrap();
+        let text = "Keep names. @[Lists] @[Gone]";
+
+        // Dictation custom instructions.
+        let mut candidate = test.bridge.settings().clone();
+        candidate.formatting.custom_instructions = Some(text.into());
+        test.bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+            .unwrap();
+        let saved = test.bridge.store.load().unwrap();
+        assert_eq!(saved.formatting.custom_instructions.as_deref(), Some(text));
+
+        // An application profile.
+        test.bridge
+            .execute(
+                UiCommand::SaveProfile(UiProfileDraft {
+                    original_executable: None,
+                    executable: "code.exe".to_owned(),
+                    formatting_style: FormattingStyle::Custom,
+                    custom_instructions: Some(text.into()),
+                    language: None,
+                    insertion_preference: InsertionPreference::Automatic,
+                    deny: false,
+                }),
+                &readiness,
+                11,
+            )
+            .unwrap();
+        let profiles = test.bridge.persistence.app_profiles().list().unwrap();
+        assert_eq!(profiles[0].custom_instructions.as_deref(), Some(text));
+
+        // Meeting instructions and an Action, which live in assistant.json.
+        let mut config = phorminx_assistant::AssistantConfig {
+            preset: text.into(),
+            ..Default::default()
+        };
+        config.actions.push(phorminx_assistant::ActionConfig {
+            name: "Notes".into(),
+            payload_prompt: text.into(),
+            ..Default::default()
+        });
+        let store = phorminx_assistant::ConfigStore::new(test.root.join("assistant.json"));
+        store.save(&config).unwrap();
+        let config = store.load().unwrap();
+
+        let resolved = test.bridge.resolve_instructions(text);
+        assert_eq!(resolved.text, "Keep names. Use bullets.");
+        assert_eq!(resolved.missing, ["Gone"]);
+        for stored in [&config.preset, &config.actions[0].payload_prompt] {
+            assert_eq!(test.bridge.resolve_instructions(stored), resolved);
+        }
+        assert_eq!(
+            test.bridge.prompt_usages(lists).unwrap(),
+            ["Dictation custom formatting", "Profile for code.exe"]
+        );
+        let prompt = test.bridge.prompts().unwrap().remove(0);
+        assert_eq!(
+            crate::prompts::assistant_usages(&config, &prompt),
+            [
+                "Meeting assistant instructions",
+                "Action \u{201c}Notes\u{201d}"
+            ]
+        );
+
+        // Editing the prompt changes every field from the next use on.
+        test.bridge
+            .save_prompt(Some(lists), &draft("Lists", "Use numbered steps."), 2)
+            .unwrap();
+        assert_eq!(
+            test.bridge.resolve_instructions(text).text,
+            "Keep names. Use numbered steps."
+        );
     }
 
     #[test]

@@ -89,6 +89,13 @@ fn names_are_unique_and_inputs_are_validated() {
         })
     ));
     assert!(matches!(
+        prompts.create(&draft("Use [brackets]", &[], "Body"), NOW),
+        Err(PersistenceError::Validation {
+            field: "prompt_name",
+            ..
+        })
+    ));
+    assert!(matches!(
         prompts.create(&draft("Empty", &[], "  "), NOW),
         Err(PersistenceError::Validation {
             field: "prompt_body",

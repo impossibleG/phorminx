@@ -1,33 +1,38 @@
-// Instruction field: a text box where "@" inserts a prompt from the library
-// as a chip. The underlying <textarea> keeps the stored text, with each chip
-// written as @{prompt:ID}, so existing forms keep reading and writing
-// `.value` unchanged. Chips resolve to the prompt's latest text when used.
+// Instruction field: a plain <textarea> where typing "@" suggests prompts
+// from the library. Picking one inserts a reference such as @[Short email]
+// as ordinary text, so undo, copy and paste, selection, IME and screen
+// readers behave exactly as in any text box. A row of pills under the box
+// lists the prompts the text refers to; a pill opens a preview, and a pill
+// for a prompt that no longer exists is marked missing.
 (function () {
   'use strict';
 
-  const TOKEN = /@\{prompt:(\d+)\}/g;
+  const REFERENCE = /@\[([^\[\]\r\n]{1,80})\]|@\{prompt:(\d+)\}/g;
 
   // Pure text helpers, shared with instruction-field.test.js.
   const InstructionFieldText = {
-    parse(text) {
-      const parts = [];
-      let last = 0;
-      const value = String(text || '');
-      for (const match of value.matchAll(TOKEN)) {
-        if (match.index > last) parts.push({type: 'text', value: value.slice(last, match.index)});
-        parts.push({type: 'prompt', id: Number(match[1])});
-        last = match.index + match[0].length;
+    /** Distinct references in order: {name} or {id} for old @{prompt:ID} text. */
+    references(text) {
+      const found = [];
+      for (const match of String(text || '').matchAll(REFERENCE)) {
+        const reference = match[1] !== undefined ? {name: match[1].trim()} : {id: Number(match[2])};
+        if (reference.name === '' || reference.id === 0) continue;
+        const key = this.key(reference);
+        if (!found.some((known) => this.key(known) === key)) found.push(reference);
       }
-      if (last < value.length) parts.push({type: 'text', value: value.slice(last)});
-      return parts;
+      return found;
     },
-    serialize(parts) {
-      return parts.map((part) => part.type === 'prompt' ? `@{prompt:${part.id}}` : part.value).join('');
+    key(reference) { return reference.name !== undefined ? `n:${reference.name.toLocaleLowerCase()}` : `i:${reference.id}`; },
+    find(prompts, reference) {
+      return prompts.find((prompt) => reference.name !== undefined
+        ? prompt.name.toLocaleLowerCase() === reference.name.toLocaleLowerCase()
+        : prompt.id === reference.id);
     },
-    // "@que" immediately before the caret, or null.
-    mentionQuery(textBeforeCaret) {
-      const match = /(^|\s)@([^\s@]{0,40})$/.exec(textBeforeCaret);
-      return match ? match[2] : null;
+    token(name) { return `@[${name.trim()}]`; },
+    /** The "@query" being typed just before the caret, or null. */
+    mention(textBeforeCaret) {
+      const match = /(^|\s)@([^\s@\[\]]{0,40})$/.exec(textBeforeCaret);
+      return match ? {query: match[2], start: textBeforeCaret.length - match[2].length - 1} : null;
     },
     filter(prompts, query) {
       const needle = String(query || '').toLocaleLowerCase();
@@ -44,11 +49,14 @@
   const invoke = (command, args) => window.__TAURI__?.core?.invoke(command, args);
   const fields = [];
   let prompts = [];
+  let lastRefresh = 0;
+  let sequence = 0;
   const valueProperty = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
 
   async function refreshPrompts() {
+    lastRefresh = Date.now();
     try { prompts = (await invoke('prompts_list')) || []; } catch { return; }
-    for (const field of fields) field.render();
+    for (const field of fields) field.renderPills();
   }
   window.addEventListener('prompts:changed', () => { void refreshPrompts(); });
 
@@ -59,180 +67,177 @@
     return node;
   }
 
+  /** Viewport position of the caret, measured with a mirror of the textarea. */
+  function caretPoint(textarea) {
+    const style = getComputedStyle(textarea);
+    const mirror = element('div');
+    for (const name of ['boxSizing', 'width', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth', 'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing', 'lineHeight', 'textTransform', 'wordSpacing', 'tabSize']) {
+      mirror.style[name] = style[name];
+    }
+    Object.assign(mirror.style, {position: 'fixed', visibility: 'hidden', top: '0', left: '-9999px', whiteSpace: 'pre-wrap', overflowWrap: 'break-word', borderStyle: 'solid'});
+    mirror.textContent = textarea.value.slice(0, textarea.selectionStart);
+    const marker = element('span', '', '​');
+    mirror.append(marker);
+    document.body.append(mirror);
+    const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.4;
+    const box = textarea.getBoundingClientRect();
+    const point = {
+      left: box.left + marker.offsetLeft - textarea.scrollLeft,
+      top: box.top + marker.offsetTop - textarea.scrollTop + lineHeight,
+    };
+    mirror.remove();
+    return point;
+  }
+
   class InstructionField {
     constructor(textarea) {
       this.textarea = textarea;
-      this.editor = element('div', 'instruction-field');
-      this.editor.contentEditable = 'true';
-      this.editor.spellcheck = true;
-      this.editor.setAttribute('role', 'textbox');
-      this.editor.setAttribute('aria-multiline', String(textarea.tagName === 'TEXTAREA' && textarea.rows !== 1));
-      this.editor.dataset.placeholder = textarea.placeholder || 'Type instructions, or @ to insert a prompt';
-      if (textarea.rows) this.editor.style.minHeight = `${Math.max(1, textarea.rows) * 1.6 + 1}em`;
-      const label = textarea.closest('label');
-      if (label) this.editor.setAttribute('aria-label', label.firstChild?.textContent?.trim() || 'Instructions');
-      textarea.classList.add('instruction-field-source');
-      textarea.after(this.editor);
-      this.menu = element('div', 'instruction-menu');
-      this.menu.hidden = true;
-      this.menu.setAttribute('role', 'listbox');
-      this.editor.after(this.menu);
-      this.popover = element('div', 'instruction-popover');
-      this.popover.hidden = true;
-      this.menu.after(this.popover);
+      this.id = `instruction-field-${++sequence}`;
       this.matches = [];
       this.highlight = 0;
+      this.mention = null;
+      this.preview = null;
 
+      this.menu = element('div', 'instruction-menu');
+      this.menu.id = `${this.id}-menu`;
+      this.menu.hidden = true;
+      this.menu.setAttribute('role', 'listbox');
+      this.menu.setAttribute('aria-label', 'Prompts');
+      document.body.append(this.menu);
+
+      this.pills = element('div', 'instruction-pills');
+      this.pills.setAttribute('aria-label', 'Prompts used');
+      this.pills.hidden = true;
+      this.popover = element('div', 'instruction-popover');
+      this.popover.hidden = true;
+      this.popover.setAttribute('role', 'region');
+      this.popover.setAttribute('aria-label', 'Prompt preview');
+      textarea.after(this.pills, this.popover);
+
+      textarea.setAttribute('aria-autocomplete', 'list');
+      textarea.setAttribute('aria-controls', this.menu.id);
+      textarea.setAttribute('aria-expanded', 'false');
+
+      // Forms fill the box by assigning .value, which fires no event.
       const field = this;
       Object.defineProperty(textarea, 'value', {
         configurable: true,
         get() { return valueProperty.get.call(textarea); },
-        set(value) { valueProperty.set.call(textarea, value); field.render(); },
+        set(value) { valueProperty.set.call(textarea, value); field.renderPills(); },
       });
-      // Labels focus their textarea; move that focus into the visible editor.
-      textarea.addEventListener('focus', () => this.editor.focus());
-      this.editor.addEventListener('input', () => { this.sync(); this.updateMenu(); });
-      this.editor.addEventListener('keydown', (event) => this.keydown(event));
-      this.editor.addEventListener('paste', (event) => {
-        event.preventDefault();
-        document.execCommand('insertText', false, event.clipboardData.getData('text/plain'));
-      });
-      this.editor.addEventListener('click', (event) => {
-        const chip = event.target.closest('.prompt-chip');
-        if (chip) this.showPopover(chip); else this.popover.hidden = true;
-      });
-      this.editor.addEventListener('blur', () => setTimeout(() => {
-        if (!this.menu.contains(document.activeElement)) this.menu.hidden = true;
-      }, 150));
-      document.addEventListener('mousedown', (event) => {
-        if (!this.popover.contains(event.target) && !event.target.closest?.('.prompt-chip')) this.popover.hidden = true;
-      });
-      this.render();
+      textarea.addEventListener('input', () => { this.renderPills(); this.updateMenu(); });
+      textarea.addEventListener('keydown', (event) => this.keydown(event));
+      textarea.addEventListener('click', () => this.updateMenu());
+      textarea.addEventListener('focus', () => { if (Date.now() - lastRefresh > 5000) void refreshPrompts(); });
+      textarea.addEventListener('blur', () => setTimeout(() => this.closeMenu(), 120));
+      textarea.addEventListener('scroll', () => this.closeMenu());
+      window.addEventListener('resize', () => this.closeMenu());
+      this.renderPills();
     }
 
-    render() {
-      if (document.activeElement === this.editor && this.rendered === this.textarea.value) return;
-      const fragment = document.createDocumentFragment();
-      for (const part of InstructionFieldText.parse(this.textarea.value)) {
-        fragment.append(part.type === 'prompt' ? this.chip(part.id) : document.createTextNode(part.value));
-      }
-      this.editor.replaceChildren(fragment);
-      this.rendered = this.textarea.value;
-      this.editor.classList.toggle('is-empty', !this.textarea.value);
-    }
-
-    chip(id) {
-      const prompt = prompts.find((entry) => entry.id === id);
-      const chip = element('span', prompt ? 'prompt-chip' : 'prompt-chip missing', prompt ? prompt.name : 'Missing prompt');
-      chip.contentEditable = 'false';
-      chip.dataset.promptId = String(id);
-      chip.tabIndex = 0;
-      chip.setAttribute('role', 'button');
-      chip.title = prompt ? 'Prompt from your library. Click to read it.' : 'This prompt was deleted.';
-      chip.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); this.showPopover(chip); }
+    renderPills() {
+      const references = InstructionFieldText.references(valueProperty.get.call(this.textarea));
+      const pills = references.map((reference) => {
+        const prompt = InstructionFieldText.find(prompts, reference);
+        const label = prompt ? prompt.name : reference.name ?? `#${reference.id}`;
+        const pill = element('button', prompt ? 'instruction-pill' : 'instruction-pill missing', prompt ? label : `Missing: ${label}`);
+        pill.type = 'button';
+        pill.title = prompt ? 'Show this prompt' : 'No prompt has this name';
+        pill.setAttribute('aria-expanded', String(this.preview === InstructionFieldText.key(reference)));
+        pill.addEventListener('click', () => this.togglePreview(reference, pill));
+        return pill;
       });
-      return chip;
-    }
-
-    // DOM back to stored text: chips become references, line breaks stay.
-    sync() {
-      const parts = [];
-      const walk = (node) => {
-        for (const child of node.childNodes) {
-          if (child.nodeType === Node.TEXT_NODE) parts.push({type: 'text', value: child.nodeValue});
-          else if (child.dataset?.promptId) parts.push({type: 'prompt', id: Number(child.dataset.promptId)});
-          else if (child.nodeName === 'BR') parts.push({type: 'text', value: '\n'});
-          else {
-            if (child.nodeName === 'DIV' && parts.length) parts.push({type: 'text', value: '\n'});
-            walk(child);
-          }
-        }
-      };
-      walk(this.editor);
-      const value = InstructionFieldText.serialize(parts);
-      valueProperty.set.call(this.textarea, value);
-      this.rendered = value;
-      this.editor.classList.toggle('is-empty', !value);
-      this.textarea.dispatchEvent(new Event('input', {bubbles: true}));
-    }
-
-    caretText() {
-      const selection = window.getSelection();
-      if (!selection.rangeCount || !this.editor.contains(selection.anchorNode)) return null;
-      const node = selection.anchorNode;
-      if (node.nodeType !== Node.TEXT_NODE) return null;
-      return {node, offset: selection.anchorOffset, before: node.nodeValue.slice(0, selection.anchorOffset)};
+      this.pills.replaceChildren(...(pills.length ? [element('span', 'instruction-pills-label', 'Uses'), ...pills] : []));
+      this.pills.hidden = !pills.length;
+      if (this.preview && !references.some((reference) => InstructionFieldText.key(reference) === this.preview)) this.closePreview();
     }
 
     updateMenu() {
-      const caret = this.caretText();
-      const query = caret ? InstructionFieldText.mentionQuery(caret.before) : null;
-      if (query === null) { this.menu.hidden = true; return; }
-      this.matches = InstructionFieldText.filter(prompts, query);
+      const textarea = this.textarea;
+      if (document.activeElement !== textarea || textarea.selectionStart !== textarea.selectionEnd) { this.closeMenu(); return; }
+      this.mention = InstructionFieldText.mention(textarea.value.slice(0, textarea.selectionStart));
+      if (!this.mention) { this.closeMenu(); return; }
+      this.matches = InstructionFieldText.filter(prompts, this.mention.query);
       this.highlight = 0;
       const items = this.matches.map((prompt, index) => {
-        const item = element('button', index === 0 ? 'active' : '');
-        item.type = 'button';
+        const item = element('div', 'instruction-option');
+        item.id = `${this.id}-option-${index}`;
         item.setAttribute('role', 'option');
         item.append(element('strong', '', prompt.name), element('span', '', prompt.body.slice(0, 90)));
+        // mousedown keeps focus (and the caret) in the textarea.
         item.addEventListener('mousedown', (event) => { event.preventDefault(); this.insert(prompt); });
         return item;
       });
       if (!items.length) items.push(element('p', 'instruction-menu-empty', prompts.length ? 'No prompt matches.' : 'No prompts yet. Create them under Prompts.'));
       this.menu.replaceChildren(...items);
+      this.markHighlight();
+      const point = caretPoint(textarea);
       this.menu.hidden = false;
+      const width = Math.min(320, window.innerWidth - 16);
+      const below = point.top + 4;
+      const height = this.menu.offsetHeight;
+      this.menu.style.width = `${width}px`;
+      this.menu.style.left = `${Math.max(8, Math.min(point.left, window.innerWidth - width - 8))}px`;
+      this.menu.style.top = `${below + height > window.innerHeight - 8 ? Math.max(8, point.top - height - 24) : below}px`;
+      textarea.setAttribute('aria-expanded', 'true');
+    }
+
+    markHighlight() {
+      [...this.menu.querySelectorAll('[role="option"]')].forEach((item, index) => {
+        const active = index === this.highlight;
+        item.classList.toggle('active', active);
+        item.setAttribute('aria-selected', String(active));
+        if (active) item.scrollIntoView({block: 'nearest'});
+      });
+      if (this.matches.length) this.textarea.setAttribute('aria-activedescendant', `${this.id}-option-${this.highlight}`);
+      else this.textarea.removeAttribute('aria-activedescendant');
+    }
+
+    closeMenu() {
+      if (this.menu.hidden) return;
+      this.menu.hidden = true;
+      this.textarea.setAttribute('aria-expanded', 'false');
+      this.textarea.removeAttribute('aria-activedescendant');
     }
 
     keydown(event) {
-      if (!this.menu.hidden && this.matches.length) {
-        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-          event.preventDefault();
-          const step = event.key === 'ArrowDown' ? 1 : -1;
-          this.highlight = (this.highlight + step + this.matches.length) % this.matches.length;
-          [...this.menu.children].forEach((item, index) => item.classList.toggle('active', index === this.highlight));
-          return;
-        }
-        if (event.key === 'Enter' || event.key === 'Tab') {
-          event.preventDefault();
-          this.insert(this.matches[this.highlight]);
-          return;
-        }
-      }
-      if (event.key === 'Escape' && !this.menu.hidden) { event.preventDefault(); this.menu.hidden = true; return; }
-      if (event.key === 'Enter' && this.textarea.rows !== 1) {
+      if (this.menu.hidden || event.isComposing) return;
+      if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && this.matches.length) {
         event.preventDefault();
-        document.execCommand('insertText', false, '\n');
-      } else if (event.key === 'Enter') {
+        const step = event.key === 'ArrowDown' ? 1 : -1;
+        this.highlight = (this.highlight + step + this.matches.length) % this.matches.length;
+        this.markHighlight();
+      } else if ((event.key === 'Enter' || event.key === 'Tab') && this.matches.length) {
         event.preventDefault();
+        this.insert(this.matches[this.highlight]);
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeMenu();
       }
     }
 
+    /** Replaces the typed "@query" with the reference, through the browser's
+     *  own editing so the change can be undone with Ctrl+Z. */
     insert(prompt) {
-      const caret = this.caretText();
-      if (!caret) return;
-      const query = InstructionFieldText.mentionQuery(caret.before) ?? '';
-      const start = caret.offset - query.length - 1;
-      const range = document.createRange();
-      range.setStart(caret.node, start);
-      range.setEnd(caret.node, caret.offset);
-      range.deleteContents();
-      const chip = this.chip(prompt.id);
-      const space = document.createTextNode(' ');
-      range.insertNode(space);
-      range.insertNode(chip);
-      const selection = window.getSelection();
-      selection.removeAllRanges();
-      const after = document.createRange();
-      after.setStart(space, 1);
-      selection.addRange(after);
-      this.menu.hidden = true;
-      this.sync();
+      const textarea = this.textarea;
+      const mention = this.mention;
+      if (!mention) return;
+      textarea.focus();
+      textarea.setSelectionRange(mention.start, textarea.selectionStart);
+      const text = `${InstructionFieldText.token(prompt.name)} `;
+      if (!document.execCommand('insertText', false, text)) {
+        textarea.setRangeText(text, mention.start, textarea.selectionEnd, 'end');
+        textarea.dispatchEvent(new Event('input', {bubbles: true}));
+      }
+      this.closeMenu();
     }
 
-    showPopover(chip) {
-      const id = Number(chip.dataset.promptId);
-      const prompt = prompts.find((entry) => entry.id === id);
+    togglePreview(reference, pill) {
+      const key = InstructionFieldText.key(reference);
+      if (this.preview === key) { this.closePreview(); pill.focus(); return; }
+      this.preview = key;
+      const prompt = InstructionFieldText.find(prompts, reference);
       const children = [];
       if (prompt) {
         children.push(element('small', '', 'PROMPT'), element('strong', '', prompt.name));
@@ -241,20 +246,28 @@
         const edit = element('button', '', 'Edit in Prompts');
         edit.type = 'button';
         edit.addEventListener('click', () => {
-          this.popover.hidden = true;
-          window.dispatchEvent(new CustomEvent('prompts:open', {detail: {id}}));
-          void invoke('prompt_open', {id});
+          this.closePreview();
+          window.dispatchEvent(new CustomEvent('prompts:open', {detail: {id: prompt.id}}));
+          void invoke('prompt_open', {id: prompt.id});
         });
         children.push(edit);
       } else {
-        children.push(element('small', '', 'MISSING PROMPT'), element('p', 'instruction-popover-body', 'This prompt was deleted, so it adds nothing to these instructions. Remove the chip or insert another prompt with @.'));
+        const label = reference.name ?? `#${reference.id}`;
+        children.push(element('small', '', 'MISSING PROMPT'), element('p', 'instruction-popover-body', `No prompt is named “${label}”, so this reference adds nothing. Create a prompt with that name, or replace the reference by typing @.`));
       }
-      const remove = element('button', '', 'Remove from field');
-      remove.type = 'button';
-      remove.addEventListener('click', () => { chip.remove(); this.popover.hidden = true; this.sync(); });
-      children.push(remove);
+      const close = element('button', '', 'Close');
+      close.type = 'button';
+      close.addEventListener('click', () => { this.closePreview(); this.textarea.focus(); });
+      children.push(close);
       this.popover.replaceChildren(...children);
       this.popover.hidden = false;
+      for (const other of this.pills.querySelectorAll('.instruction-pill')) other.setAttribute('aria-expanded', String(other === pill));
+    }
+
+    closePreview() {
+      this.preview = null;
+      this.popover.hidden = true;
+      for (const pill of this.pills.querySelectorAll('.instruction-pill')) pill.setAttribute('aria-expanded', 'false');
     }
   }
 
@@ -269,5 +282,4 @@
   window.InstructionField = {upgrade, refreshPrompts};
   upgrade();
   void refreshPrompts();
-  setInterval(() => { void refreshPrompts(); }, 15000);
 })();

@@ -7,6 +7,7 @@
   let selectedId = null;
   let activeTag = null;
   let pendingDelete = false;
+  let pendingRename = null;
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -50,6 +51,7 @@
   async function select(id) {
     selectedId = id;
     pendingDelete = false;
+    pendingRename = null;
     const prompt = library.find((entry) => entry.id === id);
     byId('prompt-id').value = prompt ? String(prompt.id) : '';
     byId('prompt-name').value = prompt?.name || '';
@@ -103,6 +105,20 @@
   byId('prompt-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     const id = byId('prompt-id').value ? Number(byId('prompt-id').value) : null;
+    const name = byId('prompt-name').value.trim().replace(/\s+/g, ' ');
+    const current = library.find((prompt) => prompt.id === id);
+    // Fields refer to a prompt by name, so a rename leaves them pointing at
+    // the old one. Say where, and save only on a second press.
+    if (current && name.toLocaleLowerCase() !== current.name.toLocaleLowerCase() && pendingRename !== name) {
+      let usages = [];
+      try { usages = (await invoke('prompt_usages', {id})) || []; } catch (error) { notice(String(error)); return; }
+      if (usages.length) {
+        pendingRename = name;
+        notice(`Used as @[${current.name}] in: ${usages.join('; ')}. After renaming, those references show as missing until you change them to @[${name}]. Press Save again to rename.`);
+        return;
+      }
+    }
+    pendingRename = null;
     notice('Saving…');
     try {
       const saved = await invoke('prompt_save', {
@@ -124,7 +140,7 @@
       pendingDelete = true;
       byId('delete-prompt').textContent = 'Delete anyway';
       notice(usages.length
-        ? `Used in: ${usages.join('; ')}. Those fields will show a missing-prompt chip and add nothing until you replace it. Press again to delete.`
+        ? `Used in: ${usages.join('; ')}. Those references will show as missing and add nothing until you replace them. Press again to delete.`
         : 'Not used anywhere. Press again to delete this prompt and its history.');
       return;
     }

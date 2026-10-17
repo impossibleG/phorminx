@@ -238,6 +238,13 @@ fn normalized(draft: &PromptDraft) -> Result<PromptDraft> {
             reason: "the name is too long",
         });
     }
+    // Instruction fields refer to prompts as `@[Name]`.
+    if name.contains(['[', ']']) {
+        return Err(PersistenceError::Validation {
+            field: "prompt_name",
+            reason: "a prompt name cannot contain [ or ]",
+        });
+    }
     if draft.body.trim().is_empty() {
         return Err(PersistenceError::Validation {
             field: "prompt_body",

@@ -1,91 +1,130 @@
 //! Prompt references inside instruction fields.
 //!
-//! An instruction field stores free text with references such as
-//! `@{prompt:12}`. The editor shows each reference as a chip. When the
-//! instructions are used, every reference is replaced by that prompt's latest
-//! text. A reference to a deleted prompt resolves to nothing and is reported
-//! as missing, so callers can say so instead of silently losing text.
+//! Instruction fields are plain text boxes. A reference to a library prompt is
+//! written as `@[Prompt name]`, so the stored text stays readable and editable
+//! anywhere. When the instructions are used, every reference is replaced by
+//! that prompt's latest text. A reference to a prompt that does not exist
+//! resolves to nothing and is reported as missing, so callers can say so
+//! instead of silently losing text.
+//!
+//! The first test builds wrote references as `@{prompt:ID}`; those still
+//! resolve.
 
-use phorminx_persistence::Persistence;
+use phorminx_persistence::{Persistence, Prompt};
 
-const OPEN: &str = "@{prompt:";
-const CLOSE: char = '}';
+const OPEN: &str = "@[";
+const CLOSE: char = ']';
+const LEGACY_OPEN: &str = "@{prompt:";
+const LEGACY_CLOSE: char = '}';
+/// The longest prompt name, matching the library's limit.
+pub const MAX_NAME_CHARS: usize = 80;
+
+/// What a reference points at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reference<'text> {
+    Name(&'text str),
+    /// `@{prompt:ID}` from the first test builds.
+    Id(i64),
+}
+
+impl Reference<'_> {
+    /// Whether this reference points at `prompt`.
+    pub fn matches(&self, prompt: &Prompt) -> bool {
+        match self {
+            Self::Name(name) => same_name(name, &prompt.name),
+            Self::Id(id) => *id == prompt.id,
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Name(name) => (*name).to_owned(),
+            Self::Id(id) => format!("#{id}"),
+        }
+    }
+}
 
 /// One piece of an instruction field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Segment<'text> {
     Text(&'text str),
-    Prompt(i64),
+    Prompt(Reference<'text>),
 }
 
-/// Splits instructions into text and prompt references, in order.
+/// Prompt names compare without case and surrounding spaces.
+pub fn same_name(left: &str, right: &str) -> bool {
+    left.trim().to_lowercase() == right.trim().to_lowercase()
+}
+
+/// Splits instructions into text and prompt references, in order. Anything
+/// that is not a well-formed reference stays text exactly as typed.
 pub fn segments(text: &str) -> Vec<Segment<'_>> {
     let mut parts = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find(OPEN) {
-        let after = &rest[start + OPEN.len()..];
-        let reference = after
-            .find(CLOSE)
-            .and_then(|end| Some((after[..end].parse::<i64>().ok()?, end)));
-        match reference {
-            Some((id, end)) if id > 0 => {
-                if start > 0 {
-                    parts.push(Segment::Text(&rest[..start]));
+    let mut text_start = 0;
+    let mut cursor = 0;
+    while let Some(offset) = text[cursor..].find('@') {
+        let start = cursor + offset;
+        match reference_at(&text[start..]) {
+            Some((reference, length)) => {
+                if start > text_start {
+                    parts.push(Segment::Text(&text[text_start..start]));
                 }
-                parts.push(Segment::Prompt(id));
-                rest = &after[end + CLOSE.len_utf8()..];
+                parts.push(Segment::Prompt(reference));
+                cursor = start + length;
+                text_start = cursor;
             }
-            _ => {
-                // Not a well-formed reference: keep it as typed.
-                let keep = start + OPEN.len();
-                parts.push(Segment::Text(&rest[..keep]));
-                rest = &rest[keep..];
-            }
+            None => cursor = start + 1,
         }
     }
-    if !rest.is_empty() {
-        parts.push(Segment::Text(rest));
+    if text_start < text.len() {
+        parts.push(Segment::Text(&text[text_start..]));
     }
     parts
 }
 
-/// The distinct prompt ids an instruction field refers to.
-pub fn referenced_ids(text: &str) -> Vec<i64> {
-    let mut ids = Vec::new();
-    for segment in segments(text) {
-        if let Segment::Prompt(id) = segment
-            && !ids.contains(&id)
-        {
-            ids.push(id);
-        }
+/// The reference at the start of `text` and its length in bytes.
+fn reference_at(text: &str) -> Option<(Reference<'_>, usize)> {
+    if let Some(rest) = text.strip_prefix(OPEN) {
+        let end = rest.find(CLOSE)?;
+        let name = &rest[..end];
+        let valid = !name.trim().is_empty()
+            && name.chars().count() <= MAX_NAME_CHARS
+            && !name.contains(['[', '\n', '\r']);
+        return valid.then_some((Reference::Name(name.trim()), OPEN.len() + end + 1));
     }
-    ids
+    let rest = text.strip_prefix(LEGACY_OPEN)?;
+    let end = rest.find(LEGACY_CLOSE)?;
+    let id = rest[..end].parse::<i64>().ok().filter(|id| *id > 0)?;
+    Some((Reference::Id(id), LEGACY_OPEN.len() + end + 1))
 }
 
-/// Whether `text` refers to the prompt `id`.
-pub fn refers_to(text: &str, id: i64) -> bool {
-    referenced_ids(text).contains(&id)
+/// Whether `text` refers to `prompt`.
+pub fn refers_to(text: &str, prompt: &Prompt) -> bool {
+    segments(text).iter().any(
+        |segment| matches!(segment, Segment::Prompt(reference) if reference.matches(prompt)),
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resolved {
     pub text: String,
-    /// Ids of referenced prompts that no longer exist.
-    pub missing: Vec<i64>,
+    /// Names (or `#ID` for old references) of prompts that do not exist.
+    pub missing: Vec<String>,
 }
 
 /// Replaces every reference with the text `lookup` returns for it.
-pub fn resolve(text: &str, mut lookup: impl FnMut(i64) -> Option<String>) -> Resolved {
+pub fn resolve(text: &str, mut lookup: impl FnMut(&Reference<'_>) -> Option<String>) -> Resolved {
     let mut resolved = String::with_capacity(text.len());
-    let mut missing = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
     for segment in segments(text) {
         match segment {
             Segment::Text(text) => resolved.push_str(text),
-            Segment::Prompt(id) => match lookup(id) {
+            Segment::Prompt(reference) => match lookup(&reference) {
                 Some(body) => resolved.push_str(&body),
                 None => {
-                    if !missing.contains(&id) {
-                        missing.push(id);
+                    let label = reference.label();
+                    if !missing.iter().any(|known| same_name(known, &label)) {
+                        missing.push(label);
                     }
                 }
             },
@@ -99,39 +138,41 @@ pub fn resolve(text: &str, mut lookup: impl FnMut(i64) -> Option<String>) -> Res
 
 /// Resolves against the prompt library, using each prompt's latest version.
 pub fn resolve_with(persistence: &Persistence, text: &str) -> Resolved {
-    if !text.contains(OPEN) {
+    if !text.contains(OPEN) && !text.contains(LEGACY_OPEN) {
         return Resolved {
             text: text.to_owned(),
             missing: Vec::new(),
         };
     }
-    resolve(text, |id| {
-        persistence
-            .prompts()
-            .get(id)
-            .ok()
-            .flatten()
-            .map(|prompt| prompt.body)
+    let library = persistence.prompts().list().unwrap_or_default();
+    resolve(text, |reference| {
+        library
+            .iter()
+            .find(|prompt| reference.matches(prompt))
+            .map(|prompt| prompt.body.clone())
     })
 }
 
 /// Where a prompt is referenced in meeting and Action instructions.
-pub fn assistant_usages(config: &phorminx_assistant::AssistantConfig, id: i64) -> Vec<String> {
+pub fn assistant_usages(
+    config: &phorminx_assistant::AssistantConfig,
+    prompt: &Prompt,
+) -> Vec<String> {
     let mut usages = Vec::new();
-    if refers_to(&config.preset, id) {
+    if refers_to(&config.preset, prompt) {
         usages.push("Meeting assistant instructions".to_owned());
     }
     for action in &config.actions {
-        if refers_to(&action.payload_prompt, id) {
+        if refers_to(&action.payload_prompt, prompt) {
             usages.push(format!("Action \u{201c}{}\u{201d}", action.name));
         }
     }
     usages
 }
 
-/// The reference text an instruction field stores for prompt `id`.
-pub fn reference(id: i64) -> String {
-    format!("{OPEN}{id}{CLOSE}")
+/// The reference text an instruction field stores for a prompt.
+pub fn reference(name: &str) -> String {
+    format!("{OPEN}{}{CLOSE}", name.trim())
 }
 
 #[cfg(test)]
@@ -139,87 +180,109 @@ mod tests {
     use super::*;
     use phorminx_persistence::PromptDraft;
 
+    fn prompt(id: i64, name: &str) -> Prompt {
+        Prompt {
+            id,
+            name: name.into(),
+            tags: Vec::new(),
+            body: String::new(),
+            version: 1,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
     #[test]
     fn references_are_parsed_in_order_and_malformed_ones_stay_text() {
         assert_eq!(
-            segments("Be brief. @{prompt:3} Then @{prompt:12}!"),
+            segments("Be brief. @[Short email] Then @{prompt:12}!"),
             [
                 Segment::Text("Be brief. "),
-                Segment::Prompt(3),
+                Segment::Prompt(Reference::Name("Short email")),
                 Segment::Text(" Then "),
-                Segment::Prompt(12),
+                Segment::Prompt(Reference::Id(12)),
                 Segment::Text("!"),
             ]
         );
-        let malformed = "mail me @{prompt:x} or @{prompt:0} or @{prompt:7";
+        let malformed =
+            "mail me@example.com @[] @[ ] @[a[b] @[open @{prompt:x} @{prompt:0} @{prompt:7";
         assert_eq!(resolve(malformed, |_| None).text, malformed);
-        assert_eq!(referenced_ids(malformed), Vec::<i64>::new());
-        assert_eq!(referenced_ids("@{prompt:4}@{prompt:4}@{prompt:5}"), [4, 5]);
-        assert!(refers_to("x @{prompt:9}", 9));
-        assert_eq!(reference(9), "@{prompt:9}");
+        assert!(resolve(malformed, |_| None).missing.is_empty());
+        let long = format!("@[{}]", "n".repeat(MAX_NAME_CHARS + 1));
+        assert_eq!(segments(&long), [Segment::Text(&long)]);
+        assert_eq!(
+            segments("@[ Lists ]"),
+            [Segment::Prompt(Reference::Name("Lists"))]
+        );
+        assert_eq!(reference(" Lists "), "@[Lists]");
+    }
+
+    #[test]
+    fn names_match_without_case_and_old_ids_still_match() {
+        let lists = prompt(9, "Lists");
+        assert!(refers_to("x @[lists]", &lists));
+        assert!(refers_to("x @{prompt:9}", &lists));
+        assert!(!refers_to("x @[Lists2] @{prompt:8}", &lists));
+        let missing = resolve("@[Gone] @[gone] @{prompt:4}", |_| None).missing;
+        assert_eq!(missing, ["Gone", "#4"]);
     }
 
     #[test]
     fn assistant_usages_name_the_meeting_preset_and_actions() {
+        let target = prompt(5, "Notes style");
         let mut config = phorminx_assistant::AssistantConfig {
-            preset: format!("Be concise. {}", reference(5)),
+            preset: format!("Be concise. {}", reference("Notes style")),
             ..Default::default()
         };
         config.actions.push(phorminx_assistant::ActionConfig {
             name: "Notes".into(),
-            payload_prompt: reference(5),
+            payload_prompt: reference("notes style"),
             ..Default::default()
         });
         assert_eq!(
-            assistant_usages(&config, 5),
+            assistant_usages(&config, &target),
             [
                 "Meeting assistant instructions",
                 "Action \u{201c}Notes\u{201d}"
             ]
         );
-        assert!(assistant_usages(&config, 6).is_empty());
+        assert!(assistant_usages(&config, &prompt(6, "Other")).is_empty());
     }
 
     #[test]
     fn references_resolve_to_the_latest_version_and_missing_ones_are_reported() {
         let directory = tempfile::tempdir().unwrap();
         let persistence = Persistence::open(directory.path().join("p.db")).unwrap();
+        let draft = |body: &str| PromptDraft {
+            name: "Lists".into(),
+            tags: Vec::new(),
+            body: body.into(),
+        };
         let id = persistence
             .prompts()
-            .create(
-                &PromptDraft {
-                    name: "Lists".into(),
-                    tags: Vec::new(),
-                    body: "Use bullets.".into(),
-                },
-                1,
-            )
+            .create(&draft("Use bullets."), 1)
             .unwrap();
-        let instructions = format!("Keep names. {}", reference(id));
+        let instructions = format!("Keep names. {}", reference("Lists"));
         assert_eq!(
             resolve_with(&persistence, &instructions).text,
             "Keep names. Use bullets."
         );
         persistence
             .prompts()
-            .save(
-                id,
-                &PromptDraft {
-                    name: "Lists".into(),
-                    tags: Vec::new(),
-                    body: "Use numbered steps.".into(),
-                },
-                2,
-            )
+            .save(id, &draft("Use numbered steps."), 2)
             .unwrap();
         assert_eq!(
             resolve_with(&persistence, &instructions).text,
             "Keep names. Use numbered steps."
         );
+        assert_eq!(
+            resolve_with(&persistence, &format!("Old: @{{prompt:{id}}}")).text,
+            "Old: Use numbered steps."
+        );
         persistence.prompts().delete(id).unwrap();
         let resolved = resolve_with(&persistence, &instructions);
         assert_eq!(resolved.text, "Keep names.");
-        assert_eq!(resolved.missing, [id]);
+        assert_eq!(resolved.missing, ["Lists"]);
         assert_eq!(resolve_with(&persistence, "plain").text, "plain");
     }
 }
