@@ -293,7 +293,14 @@ pub struct FormattingSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ollama_model_identity: Option<OllamaModelIdentity>,
     pub ollama_lifecycle: OllamaLifecycle,
+    /// How many times AI formatting runs, each pass on the previous pass's
+    /// validated output. A failed pass keeps the last good text.
+    pub passes: u8,
 }
+
+/// Kept identical to the dictation-fixes branch so settings written by
+/// either build open in the other (unknown fields are rejected).
+pub const DEFAULT_FORMATTING_PASSES: u8 = 2;
 
 impl Default for FormattingSettings {
     fn default() -> Self {
@@ -303,6 +310,7 @@ impl Default for FormattingSettings {
             ollama_model: None,
             ollama_model_identity: None,
             ollama_lifecycle: OllamaLifecycle::Balanced,
+            passes: DEFAULT_FORMATTING_PASSES,
         }
     }
 }
@@ -364,6 +372,8 @@ pub struct InteractionSettings {
     pub recording_mode: RecordingMode,
     pub launcher_shortcut: String,
     pub direct_dictation_shortcut: Option<String>,
+    /// Shows the last line or two of recognized speech in the status pill.
+    pub show_live_text: bool,
 }
 
 impl Default for InteractionSettings {
@@ -372,6 +382,7 @@ impl Default for InteractionSettings {
             recording_mode: RecordingMode::default(),
             launcher_shortcut: DEFAULT_LAUNCHER_SHORTCUT.to_owned(),
             direct_dictation_shortcut: None,
+            show_live_text: true,
         }
     }
 }
@@ -901,6 +912,23 @@ pub enum SettingsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Settings written by the dictation-fixes build must open here: unknown
+    /// fields are fatal at startup, which once stopped Phorminx from starting.
+    #[test]
+    fn settings_from_the_dictation_build_load_and_keep_their_values() {
+        let text = "schema_version = 7\n[formatting]\nstrength = 'custom'\npasses = 3\n\
+                    ollama_lifecycle = 'instant'\n[interaction]\nshow_live_text = false\n";
+        let settings: Settings = toml::from_str(text).unwrap();
+        assert_eq!(settings.formatting.passes, 3);
+        assert!(!settings.interaction.show_live_text);
+        let saved = toml::to_string(&settings).unwrap();
+        let reloaded: Settings = toml::from_str(&saved).unwrap();
+        assert_eq!(reloaded, settings);
+        let defaults: Settings = toml::from_str("schema_version = 7\n").unwrap();
+        assert_eq!(defaults.formatting.passes, DEFAULT_FORMATTING_PASSES);
+        assert!(defaults.interaction.show_live_text);
+    }
 
     #[test]
     fn fresh_install_recommends_nomic_without_migrating_existing_search_preferences() {
