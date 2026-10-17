@@ -1827,6 +1827,7 @@ fn setup_shell_vosk_probe() -> UiVoskProbe {
     UiVoskProbe::FullValidation
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_setup_mode(
     overlay: StatusOverlay,
     tray: SystemTray,

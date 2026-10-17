@@ -341,8 +341,10 @@ impl FeedbackPanel {
                 } else if ui.add_enabled(can_record && editing, egui::Button::new("Record report")).clicked() {
                     self.start_recording(settings, store);
                 }
-                if ui.add_enabled(editing && !self.text.trim().is_empty() && self.text.trim().len() <= MAX_TEXT_BYTES, egui::Button::new("Send report")).clicked() {
-                    if let Err(error) = self.send_report(settings) { self.notice = error; }
+                if ui.add_enabled(editing && !self.text.trim().is_empty() && self.text.trim().len() <= MAX_TEXT_BYTES, egui::Button::new("Send report")).clicked()
+                    && let Err(error) = self.send_report(settings)
+                {
+                    self.notice = error;
                 }
             });
             if !self.notice.is_empty() { ui.add_space(8.0); ui.label(&self.notice); }

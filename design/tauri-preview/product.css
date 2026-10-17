@@ -57,7 +57,7 @@ main .meeting-tabs > button.active{border-bottom-color:#c69767;color:#e8e5dd;fon
 :root[data-theme="light"] .side button:hover:not(.active){background:#e2ded6;color:#202326}
 
 /* Scroll content without a flashing gutter. Every long page stays reachable. */
-#models,#meeting-settings{overflow-x:hidden;overflow-y:auto}
+#models,#meeting-settings,#benchmarks{overflow-x:hidden;overflow-y:auto}
 #app-settings .settings-panel{flex:1;overflow-x:hidden;overflow-y:auto}
 .single-list{flex:1;overflow-x:hidden;overflow-y:auto}
 .history-layout,.live-grid,.saved-grid{min-width:0}

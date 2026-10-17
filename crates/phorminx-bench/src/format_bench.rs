@@ -17,33 +17,50 @@ use phorminx_ollama::{
 
 pub struct Sample {
     pub name: &'static str,
+    pub language: &'static str,
     pub text: &'static str,
 }
 
 pub const SAMPLES: &[Sample] = &[
     Sample {
         name: "status-update",
+        language: "en",
         text: "so um I wanted to give you an update on the project we finished the login page yesterday and the next thing is the settings screen I think we need three things first the dark mode toggle second the language picker and third a way to export the data also the meeting on friday moved to 3 pm and Ana will send the agenda before that",
     },
     Sample {
         name: "email-numbers-url",
+        language: "en",
         text: "hi Carlos thanks for the call today just to confirm the budget is 12500 dollars for phase 1 and the deadline is march 14 you can find the spec at https://example.com/spec and if anything changes send it to ops@example.com thanks",
     },
     Sample {
         name: "rambling-idea",
+        language: "en",
         text: "okay so I was thinking that maybe we should um change how the onboarding works because right now people get lost like they open the app and they don't know what to do so maybe we show them a short tour or maybe just one screen that explains the shortcut and then they try it once and that's it I don't know I think the one screen is better because tours are annoying",
     },
     Sample {
         name: "short-note",
+        language: "en",
         text: "remind me to call the dentist tomorrow morning",
     },
     Sample {
         name: "shopping-list",
+        language: "en",
         text: "for the trip we need sunscreen two towels the charger for the camera snacks for the car and um the passports don't forget the passports",
     },
     Sample {
         name: "portuguese",
+        language: "pt",
         text: "então pessoal a reunião de amanhã vai ser às 10 horas e a gente precisa decidir três coisas o orçamento do segundo semestre a contratação do novo designer e a data do lançamento que provavelmente vai ficar para novembro",
+    },
+    Sample {
+        name: "portuguese-tasks",
+        language: "pt",
+        text: "lembra de comprar pão leite e café amanhã cedo depois ligar para o João sobre o contrato de 4500 reais e mandar o relatório para a Marta até sexta-feira",
+    },
+    Sample {
+        name: "portuguese-email",
+        language: "pt",
+        text: "oi Fernanda tudo bem então tipo eu queria confirmar que a proposta fica em R$ 8.200 e o prazo é 15 de dezembro né qualquer dúvida pode escrever para contato@exemplo.com.br obrigado",
     },
 ];
 
@@ -70,7 +87,7 @@ struct Row {
 }
 
 /// Lines that read as list items: "- x", "* x" or "1. x".
-fn list_items(text: &str) -> usize {
+pub(crate) fn list_items(text: &str) -> usize {
     text.lines()
         .map(str::trim_start)
         .filter(|line| {
@@ -235,7 +252,7 @@ pub fn run(config: BenchConfig) -> Result<()> {
     Ok(())
 }
 
-fn profile_from_name(name: &str, custom: Option<&str>) -> Result<FormatProfile> {
+pub(crate) fn profile_from_name(name: &str, custom: Option<&str>) -> Result<FormatProfile> {
     Ok(match name {
         "light" => FormatProfile::Light,
         "balanced" => FormatProfile::Balanced,
@@ -250,7 +267,7 @@ fn profile_from_name(name: &str, custom: Option<&str>) -> Result<FormatProfile> 
     })
 }
 
-fn verdict(result: &FormatResult) -> String {
+pub(crate) fn verdict(result: &FormatResult) -> String {
     match result {
         FormatResult::Formatted { .. } => "formatted".to_owned(),
         FormatResult::Fallback { reason, .. } => match reason {

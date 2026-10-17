@@ -49,11 +49,12 @@ function showRoute(route, persist = true) {
   if (route === 'history' && node('history-query').value.trim()) void startHistorySearch();
   if (route === 'meeting-settings') void refreshProvider();
   if (route === 'prompts') window.dispatchEvent(new Event('prompts:show'));
+  if (route === 'benchmarks') void showBenchmarks();
   document.dispatchEvent(new CustomEvent('phorminx:route', {detail: route}));
   window.phorminxMessages?.routeChanged(route);
-  // Prompts, Investigations and Messages are pages of this window only; the
-  // host keeps the last other route.
-  if (persist && hostInvoke && !['prompts', 'investigations', 'messages'].includes(route)) {
+  // Prompts, Investigations, Messages and Benchmarks are pages of this window
+  // only; the host keeps the last other route.
+  if (persist && hostInvoke && !['prompts', 'investigations', 'messages', 'benchmarks'].includes(route)) {
     const hostRoute = ['live', 'saved', 'meeting-settings'].includes(route) ? 'meetings' : route === 'action-editor' ? 'actions' : route === 'lexicon-editor' ? 'lexicon' : route === 'profile-editor' ? 'profiles' : route;
     lastHostRoute = hostRoute;
     void hostInvoke('plugin:phorminx-host|host_select_route', {route: hostRoute}).catch((error) => { node('status').textContent = String(error); });
@@ -590,6 +591,34 @@ async function refreshApp() {
     }
   } catch (error) { node('status').textContent = String(error); }
   finally { appRefreshInFlight = false; }
+}
+
+let benchmarksShown = false;
+let benchmarksOnline = false;
+
+function renderBenchmarks(collection) {
+  window.PhorminxBenchmarks.render(node('benchmarks-view'), collection, {
+    loadReport: (id) => hostInvoke('benchmarks_report', {id, online: benchmarksOnline}),
+    onRefresh: () => void refreshBenchmarks(),
+  });
+}
+
+async function refreshBenchmarks() {
+  try {
+    const collection = await hostInvoke('benchmarks_load', {online: true});
+    benchmarksOnline = collection.source === 'online';
+    renderBenchmarks(collection);
+  } catch (error) { node('status').textContent = String(error); }
+}
+
+// Shows the bundled results at once, then quietly checks for newer published ones.
+async function showBenchmarks() {
+  if (benchmarksShown || !hostInvoke || !window.PhorminxBenchmarks) return;
+  benchmarksShown = true;
+  try {
+    renderBenchmarks(await hostInvoke('benchmarks_load', {online: false}));
+    void refreshBenchmarks();
+  } catch (error) { benchmarksShown = false; node('status').textContent = String(error); }
 }
 
 for (const button of document.querySelectorAll('[data-route]')) {

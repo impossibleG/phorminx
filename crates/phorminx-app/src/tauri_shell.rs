@@ -973,6 +973,29 @@ async fn host_open_feedback(app: tauri::AppHandle, state: State<'_, HostState>) 
     present_feedback(&app, &state, false)
 }
 
+/// Published benchmark results: the bundled copy, or a read-only refresh
+/// from the repository when `online` is set.
+#[tauri::command]
+async fn benchmarks_load(online: bool) -> Result<crate::benchmarks::BenchmarkCollection, String> {
+    if !online {
+        return Ok(crate::benchmarks::bundled());
+    }
+    tauri::async_runtime::spawn_blocking(crate::benchmarks::refreshed)
+        .await
+        .map_err(|_| "Benchmarks are unavailable.".to_owned())
+}
+
+/// One archived benchmark report for the report picker.
+#[tauri::command]
+async fn benchmarks_report(
+    id: String,
+    online: bool,
+) -> Result<phorminx_core::benchmark_report::BenchmarkFile, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::benchmarks::report(&id, online))
+        .await
+        .map_err(|_| "Benchmarks are unavailable.".to_owned())?
+}
+
 pub struct TauriShell {
     controls: Sender<ProductShellControl>,
     events: Receiver<ProductShellEvent>,
@@ -1208,6 +1231,8 @@ fn run_shell(
             crate::tauri_messaging::host_messaging_arrival,
             crate::tauri_messaging::host_messaging_arrival_open,
             crate::tauri_messaging::host_messaging_arrival_notice,
+            benchmarks_load,
+            benchmarks_report,
         ])
         .setup(move |app| {
             if !initially_visible {

@@ -1,5 +1,6 @@
 //! Application orchestration for Phorminx.
 
+pub mod benchmarks;
 pub mod feedback;
 #[cfg(test)]
 mod frontend_tests;
