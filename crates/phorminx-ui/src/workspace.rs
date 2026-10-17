@@ -10,8 +10,9 @@ use eframe::egui::{RichText, ScrollArea, TextEdit, Ui};
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CaptureSource {
     #[default]
-    SystemAudio,
+    Both,
     Microphone,
+    SystemAudio,
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CaptureState {
@@ -41,6 +42,7 @@ impl ProviderChoice {
 pub struct ProviderDraft {
     pub kind: ProviderChoice,
     pub model: String,
+    pub fallback_model: String,
     pub endpoint: String,
     pub api_key: String,
     pub has_credential: bool,
@@ -88,6 +90,13 @@ pub struct MeetingLine {
     pub text: String,
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TranslationLine {
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub language: String,
+    pub text: String,
+}
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ChatLine {
     pub role: String,
     pub text: String,
@@ -103,8 +112,23 @@ pub struct SavedMeeting {
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WorkspaceSnapshot {
+    pub translation_language: String,
+    pub translation_model: String,
+    pub translations: Vec<TranslationLine>,
+    pub translation_notice: String,
     pub meeting_source: CaptureSource,
     pub meeting_device: Option<String>,
+    pub meeting_microphone_device: Option<String>,
+    pub meeting_devices_revision: u64,
+    pub meeting_devices_error: String,
+    pub microphone_muted: bool,
+    pub computer_audio_muted: bool,
+    pub auto_commentary_enabled: bool,
+    pub auto_commentary_interval_secs: u32,
+    pub auto_commentary_notice: String,
+    pub companion_view: CompanionView,
+    pub companion_translation_view: TranslationView,
+    pub companion_split_fraction: u16,
     pub revision: u64,
     pub deletion_revision: u64,
     pub deletion_failed: bool,
@@ -122,6 +146,7 @@ pub struct WorkspaceSnapshot {
     pub actions: Vec<ActionDraft>,
     pub notice: String,
     pub ai_busy: bool,
+    pub active_answer_model: String,
     pub send_pending: bool,
     pub delivery_busy: bool,
     pub note_text: String,
@@ -147,9 +172,28 @@ pub struct WorkspaceSnapshot {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceEvent {
+    SaveCompanionLayout {
+        view: CompanionView,
+        translation_view: TranslationView,
+        split_fraction: u16,
+    },
+    SetMeetingSourceMuted {
+        source: CaptureSource,
+        muted: bool,
+    },
+    SetAutoCommentary(bool),
+    SetAutoCommentaryInterval(u32),
+    SaveTranslation {
+        language: String,
+        model: String,
+    },
     SaveCapturePreferences {
         source: CaptureSource,
         device: Option<String>,
+    },
+    SaveMeetingDevices {
+        output_device: Option<String>,
+        microphone_device: Option<String>,
     },
     TriggerAction(String),
     TriggerActionSlot(u8),
@@ -197,17 +241,38 @@ enum Tab {
     #[default]
     Live,
     Saved,
-    Assistant,
+    Settings,
     #[cfg(test)]
     Actions,
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CompanionView {
+    Transcript,
+    Assistant,
+    #[default]
+    Split,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TranslationView {
+    #[default]
+    Original,
+    Translation,
+    Both,
+}
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WorkspaceState {
+    translation_language: String,
+    translation_model: String,
+    translation_seen: Option<(String, String)>,
     capture_preferences_pending: Option<(CaptureSource, Option<String>)>,
     capture_preferences_seen: Option<(CaptureSource, Option<String>)>,
+    meeting_devices_pending: Option<(u64, Option<String>, Option<String>)>,
+    meeting_devices_seen: Option<(Option<String>, Option<String>)>,
+    meeting_devices_dirty: bool,
     tab: Tab,
     source: CaptureSource,
     device: String,
+    microphone_device: String,
     chat: String,
     query: String,
     provider: ProviderDraft,
@@ -222,7 +287,11 @@ pub(crate) struct WorkspaceState {
     delivery_review: Option<(u64, ActionDraft, String)>,
     saved_detail: Option<i64>,
     detail_conversation: bool,
-    transcript_expanded: bool,
+    companion_view: CompanionView,
+    translation_view: TranslationView,
+    split_fraction: f32,
+    companion_layout_pending: Option<(CompanionView, TranslationView, u16)>,
+    companion_layout_seen: Option<(CompanionView, TranslationView, u16)>,
     companion_picker: bool,
     note: String,
     note_revision: String,
@@ -246,10 +315,60 @@ impl WorkspaceState {
         if self.capture_preferences_seen.as_ref() != Some(&received)
             && self.capture_preferences_pending.is_none()
         {
-            self.source = received.0;
-            self.device = received.1.clone().unwrap_or_default();
+            self.source = CaptureSource::Both;
         }
         self.capture_preferences_seen = Some(received);
+        let devices = (
+            snapshot.meeting_device.clone(),
+            snapshot.meeting_microphone_device.clone(),
+        );
+        if self
+            .meeting_devices_pending
+            .as_ref()
+            .is_some_and(|(revision, _, _)| snapshot.meeting_devices_revision > *revision)
+        {
+            let (_, output, microphone) = self
+                .meeting_devices_pending
+                .take()
+                .expect("checked pending");
+            if devices == (output.clone(), microphone.clone())
+                && (device(self), microphone_device(self)) == (output, microphone)
+            {
+                self.meeting_devices_dirty = false;
+            }
+        }
+        if self.meeting_devices_seen.as_ref() != Some(&devices)
+            && self.meeting_devices_pending.is_none()
+            && !self.meeting_devices_dirty
+        {
+            self.device = if snapshot.meeting_source == CaptureSource::Both {
+                devices.0.clone().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            self.microphone_device = devices.1.clone().unwrap_or_default();
+        }
+        self.meeting_devices_seen = Some(devices);
+        let layout = (
+            snapshot.companion_view,
+            snapshot.companion_translation_view,
+            if snapshot.companion_split_fraction == 0 {
+                570
+            } else {
+                snapshot.companion_split_fraction.clamp(280, 720)
+            },
+        );
+        if self.companion_layout_pending.as_ref() == Some(&layout) {
+            self.companion_layout_pending = None;
+        }
+        if self.companion_layout_seen.as_ref() != Some(&layout)
+            && self.companion_layout_pending.is_none()
+        {
+            self.companion_view = layout.0;
+            self.translation_view = layout.1;
+            self.split_fraction = f32::from(layout.2) / 1000.0;
+        }
+        self.companion_layout_seen = Some(layout);
         if self
             .provider_pending
             .as_ref()
@@ -363,6 +482,51 @@ impl WorkspaceState {
             },
         );
     }
+    fn save_companion_layout(&mut self, out: &mut Vec<ShellEvent>) {
+        let fraction = if self.split_fraction <= 0.0 {
+            570
+        } else {
+            (self.split_fraction.clamp(0.28, 0.72) * 1000.0).round() as u16
+        };
+        let layout = (self.companion_view, self.translation_view, fraction);
+        if self.companion_layout_pending.as_ref() == Some(&layout)
+            || (self.companion_layout_pending.is_none()
+                && self.companion_layout_seen.as_ref() == Some(&layout))
+        {
+            return;
+        }
+        self.companion_layout_pending = Some(layout);
+        emit(
+            out,
+            WorkspaceEvent::SaveCompanionLayout {
+                view: layout.0,
+                translation_view: layout.1,
+                split_fraction: layout.2,
+            },
+        );
+    }
+    fn save_meeting_devices(&mut self, snapshot: &WorkspaceSnapshot, out: &mut Vec<ShellEvent>) {
+        if snapshot.capture != CaptureState::Idle
+            || self.meeting_devices_pending.is_some()
+            || !self.meeting_devices_dirty
+        {
+            return;
+        }
+        let output = device(self);
+        let microphone = microphone_device(self);
+        self.meeting_devices_pending = Some((
+            snapshot.meeting_devices_revision,
+            output.clone(),
+            microphone.clone(),
+        ));
+        emit(
+            out,
+            WorkspaceEvent::SaveMeetingDevices {
+                output_device: output,
+                microphone_device: microphone,
+            },
+        );
+    }
 }
 fn emit(out: &mut Vec<ShellEvent>, event: WorkspaceEvent) {
     out.push(ShellEvent::Workspace(event));
@@ -467,6 +631,10 @@ fn device(state: &WorkspaceState) -> Option<String> {
     let value = state.device.trim();
     (!value.is_empty()).then(|| value.to_owned())
 }
+fn microphone_device(state: &WorkspaceState) -> Option<String> {
+    let value = state.microphone_device.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
 fn transcript(ui: &mut Ui, s: &WorkspaceSnapshot, out: &mut Vec<ShellEvent>) {
     transcript_content(ui, s, out, 420.0);
 }
@@ -529,6 +697,7 @@ fn transcript_content(ui: &mut Ui, s: &WorkspaceSnapshot, out: &mut Vec<ShellEve
                     .small(),
                 );
                 ui.label(&line.text);
+                translated_line(ui, s, line);
                 ui.add_space(Space::SM);
             }
             if !s.provisional_text.is_empty() {
@@ -539,6 +708,21 @@ fn transcript_content(ui: &mut Ui, s: &WorkspaceSnapshot, out: &mut Vec<ShellEve
                 );
             }
         });
+}
+
+fn translated_line(ui: &mut Ui, s: &WorkspaceSnapshot, line: &MeetingLine) {
+    for translation in s
+        .translations
+        .iter()
+        .filter(|t| t.start_sample == line.start_sample && t.end_sample == line.end_sample)
+    {
+        ui.label(
+            RichText::new(format!("{} · Translation", translation.language))
+                .small()
+                .color(ui.tokens().secondary_text),
+        );
+        ui.label(RichText::new(&translation.text).color(ui.tokens().accent));
+    }
 }
 fn conversation(
     ui: &mut Ui,
@@ -555,7 +739,7 @@ fn conversation_content(
     out: &mut Vec<ShellEvent>,
     height: f32,
 ) {
-    conversation_messages(ui, s, state, out, height);
+    conversation_messages(ui, s, state, out, height, false);
     composer(ui, s, state, out);
 }
 fn conversation_messages(
@@ -564,14 +748,19 @@ fn conversation_messages(
     state: &mut WorkspaceState,
     out: &mut Vec<ShellEvent>,
     height: f32,
+    companion_style: bool,
 ) {
     let tokens = ui.tokens();
     if s.ai_busy || s.send_pending {
         ui.horizontal_wrapped(|ui| {
             ui.label(
-                RichText::new(&s.provider.model)
-                    .small()
-                    .color(tokens.secondary_text),
+                RichText::new(if s.active_answer_model.is_empty() {
+                    "Assistant"
+                } else {
+                    &s.active_answer_model
+                })
+                .small()
+                .color(tokens.secondary_text),
             );
             if s.ai_busy && action(ui, "Stop answer", ActionTone::Quiet).clicked() {
                 emit(out, WorkspaceEvent::CancelAnswer);
@@ -589,7 +778,7 @@ fn conversation_messages(
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show(ui, |ui| {
-            if s.messages.is_empty() {
+            if s.messages.is_empty() && !companion_style {
                 ui.label(RichText::new("An answer, when you need one.").size(20.0));
                 ui.add_space(Space::XS);
                 ui.label(
@@ -618,12 +807,11 @@ fn conversation_messages(
                         ui.add_space(Space::XXS);
                     }
                     if line.role.eq_ignore_ascii_case("assistant") {
-                        let label = if s.provider.model.is_empty() {
-                            "ASSISTANT".into()
-                        } else {
-                            format!("{} · ASSISTANT", s.provider.model)
-                        };
-                        ui.label(RichText::new(label).size(11.0).color(tokens.secondary_text));
+                        ui.label(
+                            RichText::new(if companion_style { "PHORMINX" } else { "ASSISTANT" })
+                                .size(11.0)
+                                .color(tokens.secondary_text),
+                        );
                         state.markdown.show(ui, index, &line.text);
                         if !matches!(line.status.as_str(), "complete" | "sent" | "") {
                             ui.label(
@@ -632,6 +820,14 @@ fn conversation_messages(
                                     .color(tokens.secondary_text),
                             );
                         }
+                    } else if companion_style {
+                        egui::Frame::new()
+                            .fill(tokens.raised)
+                            .inner_margin(egui::Margin::symmetric(12, 9))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("YOU").size(10.0).strong().color(tokens.accent));
+                                ui.label(&line.text);
+                            });
                     } else {
                         let response = egui::Frame::new()
                             .inner_margin(egui::Margin {
@@ -662,47 +858,7 @@ fn composer(
     out: &mut Vec<ShellEvent>,
 ) {
     let edit_id = ui.make_persistent_id("meeting-chat-composer");
-    let focused = ui.memory(|memory| memory.has_focus(edit_id));
-    let ime_id = edit_id.with("ime-active");
-    let mut ime_active = focused && ui.data(|data| data.get_temp::<bool>(ime_id).unwrap_or(false));
-    let enter = ui.input_mut(|input| {
-        let mut composing_this_frame = ime_active;
-        for event in &input.events {
-            if focused && let egui::Event::Ime(event) = event {
-                composing_this_frame = true;
-                match event {
-                    egui::ImeEvent::Preedit { text, .. } => ime_active = !text.is_empty(),
-                    egui::ImeEvent::Commit(_) => ime_active = false,
-                    _ => {}
-                }
-            }
-        }
-        // `consume_key(NONE, Enter)` also matches Shift+Enter in egui's
-        // logical modifier matching. Inspect exact modifiers, and do not let
-        // held-key repeat generate multiple network submissions.
-        if !focused || composing_this_frame {
-            return false;
-        }
-        let mut submit = false;
-        input.events.retain(|event| {
-            if let egui::Event::Key {
-                key: egui::Key::Enter,
-                pressed: true,
-                repeat,
-                modifiers,
-                ..
-            } = event
-                && modifiers.matches_exact(egui::Modifiers::NONE)
-            {
-                submit |= !repeat;
-                false
-            } else {
-                true
-            }
-        });
-        submit
-    });
-    ui.data_mut(|data| data.insert_temp(ime_id, ime_active));
+    let enter = composer_enter(ui, edit_id);
     ScrollArea::vertical()
         .id_salt("composer-input-scroll")
         .max_height(48.0)
@@ -756,6 +912,51 @@ fn composer(
     if answer_retry_available(s) && action(ui, "Retry answer", ActionTone::Quiet).clicked() {
         emit(out, WorkspaceEvent::RetryAnswer);
     }
+}
+
+fn composer_enter(ui: &mut Ui, edit_id: egui::Id) -> bool {
+    let focused = ui.memory(|memory| memory.has_focus(edit_id));
+    let ime_id = edit_id.with("ime-active");
+    let mut ime_active = focused && ui.data(|data| data.get_temp::<bool>(ime_id).unwrap_or(false));
+    let enter = ui.input_mut(|input| {
+        let mut composing_this_frame = ime_active;
+        for event in &input.events {
+            if focused && let egui::Event::Ime(event) = event {
+                composing_this_frame = true;
+                match event {
+                    egui::ImeEvent::Preedit { text, .. } => ime_active = !text.is_empty(),
+                    egui::ImeEvent::Commit(_) => ime_active = false,
+                    _ => {}
+                }
+            }
+        }
+        // `consume_key(NONE, Enter)` also matches Shift+Enter in egui's
+        // logical modifier matching. Inspect exact modifiers, and do not let
+        // held-key repeat generate multiple network submissions.
+        if !focused || composing_this_frame {
+            return false;
+        }
+        let mut submit = false;
+        input.events.retain(|event| {
+            if let egui::Event::Key {
+                key: egui::Key::Enter,
+                pressed: true,
+                repeat,
+                modifiers,
+                ..
+            } = event
+                && modifiers.matches_exact(egui::Modifiers::NONE)
+            {
+                submit |= !repeat;
+                false
+            } else {
+                true
+            }
+        });
+        submit
+    });
+    ui.data_mut(|data| data.insert_temp(ime_id, ime_active));
+    enter
 }
 fn answer_retry_available(s: &WorkspaceSnapshot) -> bool {
     !s.ai_busy
@@ -1054,7 +1255,7 @@ mod tests {
     }
     #[test]
     fn workspace_routes_paint_and_emit_no_side_effects() {
-        for tab in [Tab::Live, Tab::Saved, Tab::Assistant, Tab::Actions] {
+        for tab in [Tab::Live, Tab::Saved, Tab::Settings, Tab::Actions] {
             let mut state = WorkspaceState {
                 tab,
                 ..Default::default()
@@ -1128,7 +1329,7 @@ mod tests {
             .find_map(|shape| match &shape.shape {
                 egui::epaint::Shape::Text(text)
                     if text.galley.text() == label
-                        || (label == "Send message" && text.galley.text() == "↑") =>
+                        || (label == "Send message" && matches!(text.galley.text(), "↑" | "↗")) =>
                 {
                     Some(text.pos + text.galley.size() / 2.0)
                 }
@@ -1165,7 +1366,7 @@ mod tests {
         let context = egui::Context::default();
         let mut snapshot = WorkspaceSnapshot::default();
         let mut state = WorkspaceState {
-            tab: Tab::Assistant,
+            tab: Tab::Settings,
             provider_dirty: true,
             provider: ProviderDraft {
                 kind: ProviderChoice::OpenAi,
@@ -1399,7 +1600,7 @@ mod tests {
             ..Default::default()
         };
         let mut out = vec![];
-        for label in ["Assistant", "Saved sessions", "Live session"] {
+        for label in ["Meeting settings", "Saved sessions", "Live session"] {
             click(&context, &mut state, &snapshot, &mut out, label);
         }
         assert_eq!(state.provider, provider);
@@ -1475,7 +1676,7 @@ mod tests {
         );
     }
     #[test]
-    fn source_changes_reset_device_selection_and_model_choices_paint() {
+    fn meeting_defaults_to_both_sources_and_settings_offer_installed_models() {
         let context = egui::Context::default();
         let snapshot = WorkspaceSnapshot {
             input_devices: vec!["Synthetic microphone".into()],
@@ -1484,29 +1685,25 @@ mod tests {
             ..Default::default()
         };
         let mut state = WorkspaceState {
-            device: "Synthetic speakers".into(),
+            device: "Unsaved manual draft".into(),
+            meeting_devices_dirty: true,
             ..Default::default()
         };
         let mut out = vec![];
+        click(&context, &mut state, &snapshot, &mut out, "Start listening");
+        assert!(out.contains(&ShellEvent::Workspace(WorkspaceEvent::StartMeeting)));
+        assert!(
+            !out.iter()
+                .any(|event| matches!(event, ShellEvent::Workspace(WorkspaceEvent::Start { .. })))
+        );
+        out.clear();
         click(
             &context,
             &mut state,
             &snapshot,
             &mut out,
-            "Microphone\nYour voice only",
+            "Meeting settings",
         );
-        assert!(state.device.is_empty());
-        assert_eq!(state.source, CaptureSource::Microphone);
-        state.device = "Synthetic microphone".into();
-        click(
-            &context,
-            &mut state,
-            &snapshot,
-            &mut out,
-            "Computer audio\nYour meeting, video or call",
-        );
-        assert!(state.device.is_empty());
-        click(&context, &mut state, &snapshot, &mut out, "Assistant");
         click(
             &context,
             &mut state,
@@ -1523,19 +1720,7 @@ mod tests {
         );
         assert_eq!(state.provider.model, "synthetic-local-model");
         assert!(state.provider_dirty);
-        assert_eq!(
-            out,
-            vec![
-                ShellEvent::Workspace(WorkspaceEvent::SaveCapturePreferences {
-                    source: CaptureSource::Microphone,
-                    device: None
-                }),
-                ShellEvent::Workspace(WorkspaceEvent::SaveCapturePreferences {
-                    source: CaptureSource::SystemAudio,
-                    device: None
-                }),
-            ]
-        );
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -1547,18 +1732,66 @@ mod tests {
         };
         let mut state = WorkspaceState::default();
         state.reconcile(&snapshot);
-        assert_eq!(state.source, CaptureSource::Microphone);
-        assert_eq!(state.device, "Saved mic");
-        state.source = CaptureSource::SystemAudio;
+        assert_eq!(state.source, CaptureSource::Both);
+        assert!(
+            state.device.is_empty(),
+            "legacy source device is not used as a computer output"
+        );
         state.device = "New output".into();
-        state.capture_preferences_pending = Some((state.source, device(&state)));
+        state.capture_preferences_pending = Some((CaptureSource::Both, device(&state)));
         state.reconcile(&snapshot);
         assert_eq!(state.device, "New output");
-        snapshot.meeting_source = CaptureSource::SystemAudio;
+        snapshot.meeting_source = CaptureSource::Both;
         snapshot.meeting_device = Some("New output".into());
         state.reconcile(&snapshot);
         assert!(state.capture_preferences_pending.is_none());
         assert_eq!(state.device, "New output");
+    }
+    #[test]
+    fn meeting_device_draft_waits_for_explicit_save_and_survives_failed_ack() {
+        let context = egui::Context::default();
+        let mut snapshot = WorkspaceSnapshot {
+            output_devices: vec!["Synthetic speakers".into()],
+            input_devices: vec!["Synthetic microphone".into()],
+            ..Default::default()
+        };
+        let mut state = WorkspaceState {
+            tab: Tab::Settings,
+            ..Default::default()
+        };
+        let mut out = vec![];
+        click(&context, &mut state, &snapshot, &mut out, "System default");
+        click(
+            &context,
+            &mut state,
+            &snapshot,
+            &mut out,
+            "Synthetic speakers",
+        );
+        assert_eq!(state.device, "Synthetic speakers");
+        assert!(state.meeting_devices_dirty);
+        assert!(out.is_empty(), "Choosing a device is only an unsaved draft");
+        click(&context, &mut state, &snapshot, &mut out, "Save devices");
+        assert_eq!(
+            out.as_slice(),
+            &[ShellEvent::Workspace(WorkspaceEvent::SaveMeetingDevices {
+                output_device: Some("Synthetic speakers".into()),
+                microphone_device: None,
+            })]
+        );
+        assert!(state.meeting_devices_pending.is_some());
+        snapshot.meeting_devices_revision = 1;
+        snapshot.meeting_devices_error = "Device unavailable".into();
+        let text = rendered_text(&paint(&context, &mut state, &snapshot, &mut out, vec![]));
+        assert!(text.contains("Devices were not saved"));
+        assert_eq!(state.device, "Synthetic speakers");
+        assert!(state.meeting_devices_pending.is_none());
+        click(&context, &mut state, &snapshot, &mut out, "Save devices");
+        assert_eq!(
+            out.len(),
+            2,
+            "Failed save permits explicit retry with the same draft"
+        );
     }
 
     fn rendered_text(frame: &egui::FullOutput) -> String {
@@ -1683,12 +1916,134 @@ mod tests {
         };
         let mut state = WorkspaceState::default();
         let mut out = vec![];
-        click(&context, &mut state, &snapshot, &mut out, "−");
+        click(&context, &mut state, &snapshot, &mut out, "Hide");
         assert_eq!(
             out,
             vec![ShellEvent::Workspace(WorkspaceEvent::HideCompanion)]
         );
         assert_eq!(snapshot.capture, CaptureState::Listening);
+    }
+    #[test]
+    fn companion_views_keep_original_and_translation_separate_and_mutes_capture_sources() {
+        let context = egui::Context::default();
+        companion_surface(&context, true);
+        let snapshot = WorkspaceSnapshot {
+            capture: CaptureState::Listening,
+            translation_language: "Brazilian Portuguese".into(),
+            transcript: vec![MeetingLine {
+                start_sample: 0,
+                end_sample: 16000,
+                text: "Original fixture".into(),
+            }],
+            translations: vec![TranslationLine {
+                start_sample: 0,
+                end_sample: 16000,
+                language: "Brazilian Portuguese".into(),
+                text: "Traducao fixture".into(),
+            }],
+            ..Default::default()
+        };
+        let mut state = WorkspaceState {
+            companion_view: CompanionView::Transcript,
+            ..Default::default()
+        };
+        let mut out = vec![];
+        let original = rendered_text(&paint(&context, &mut state, &snapshot, &mut out, vec![]));
+        assert!(original.contains("Original fixture"));
+        assert!(!original.contains("Traducao fixture"));
+        click(&context, &mut state, &snapshot, &mut out, "Português");
+        let translated = rendered_text(&paint(&context, &mut state, &snapshot, &mut out, vec![]));
+        assert!(translated.contains("Traducao fixture"));
+        assert!(!translated.contains("Original fixture"));
+        click(&context, &mut state, &snapshot, &mut out, "Both");
+        let both = rendered_text(&paint(&context, &mut state, &snapshot, &mut out, vec![]));
+        assert!(both.contains("Traducao fixture") && both.contains("Original fixture"));
+        out.clear();
+        click(
+            &context,
+            &mut state,
+            &snapshot,
+            &mut out,
+            "▪ Mic on",
+        );
+        assert_eq!(
+            out.last(),
+            Some(&ShellEvent::Workspace(
+                WorkspaceEvent::SetMeetingSourceMuted {
+                    source: CaptureSource::Microphone,
+                    muted: true,
+                }
+            ))
+        );
+        click(
+            &context,
+            &mut state,
+            &snapshot,
+            &mut out,
+            "▪ Computer on",
+        );
+        assert_eq!(
+            out.last(),
+            Some(&ShellEvent::Workspace(
+                WorkspaceEvent::SetMeetingSourceMuted {
+                    source: CaptureSource::SystemAudio,
+                    muted: true,
+                }
+            ))
+        );
+    }
+    #[test]
+    fn active_fallback_model_is_named_without_misattributing_older_answers() {
+        let context = egui::Context::default();
+        companion_surface(&context, true);
+        let snapshot = WorkspaceSnapshot {
+            ai_busy: true,
+            provider: ProviderDraft {
+                model: "primary-model".into(),
+                ..Default::default()
+            },
+            active_answer_model: "fallback-model".into(),
+            messages: vec![ChatLine {
+                role: "Assistant".into(),
+                text: "Earlier answer".into(),
+                status: "complete".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut state = WorkspaceState {
+            companion_view: CompanionView::Assistant,
+            ..Default::default()
+        };
+        let mut out = vec![];
+        let text = rendered_text(&paint(&context, &mut state, &snapshot, &mut out, vec![]));
+        assert!(text.contains("fallback-model"));
+        assert!(!text.contains("primary-model"));
+        assert!(text.contains("PHORMINX"));
+    }
+    #[test]
+    fn meeting_settings_do_not_emit_configuration_changes_during_capture() {
+        let context = egui::Context::default();
+        let snapshot = WorkspaceSnapshot {
+            capture: CaptureState::Listening,
+            ..Default::default()
+        };
+        let mut state = WorkspaceState {
+            tab: Tab::Settings,
+            ..Default::default()
+        };
+        let mut out = vec![];
+        let text = rendered_text(&paint(&context, &mut state, &snapshot, &mut out, vec![]));
+        assert!(text.contains("Finish the current meeting"));
+        click(&context, &mut state, &snapshot, &mut out, "Save assistant");
+        click(
+            &context,
+            &mut state,
+            &snapshot,
+            &mut out,
+            "Save translation",
+        );
+        assert!(out.is_empty());
     }
     #[test]
     fn companion_composer_remains_reachable_at_compact_and_minimum_sizes_with_long_content() {
@@ -1720,17 +2075,20 @@ mod tests {
                 };
                 let mut state = WorkspaceState {
                     chat: "Compact window question".into(),
-                    transcript_expanded: true,
+                    companion_view: CompanionView::Split,
                     ..Default::default()
                 };
                 let mut out = vec![];
+                // A narrow companion uses one legible pane at a time. The
+                // assistant tab exposes its anchored composer without clipping.
+                click(&context, &mut state, &snapshot, &mut out, "Assistant");
                 let frame = paint(&context, &mut state, &snapshot, &mut out, vec![]);
                 let rect = frame
                     .shapes
                     .iter()
                     .find_map(|shape| match &shape.shape {
                         egui::epaint::Shape::Text(text)
-                            if matches!(text.galley.text(), "Send message" | "↑") =>
+                            if matches!(text.galley.text(), "Send message" | "↑" | "↗") =>
                         {
                             Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
                         }
@@ -1746,15 +2104,56 @@ mod tests {
                         && rect.right() <= size.x,
                     "Composer is clipped at {size:?} in {theme:?}: {rect:?}"
                 );
+                out.clear();
                 click(&context, &mut state, &snapshot, &mut out, "Send message");
                 assert!(matches!(
                     out.as_slice(),
                     [ShellEvent::Workspace(
                         WorkspaceEvent::SendChatRequest { .. }
                     )]
-                ));
+                ), "unexpected events: {out:?}");
             }
         }
+    }
+    #[test]
+    fn companion_split_gives_the_conversation_height_and_keeps_the_composer_in_assistant() {
+        let context = egui::Context::default();
+        companion_surface(&context, true);
+        context.data_mut(|data| {
+            data.insert_temp(egui::Id::new("test-surface-size"), egui::vec2(980.0, 720.0))
+        });
+        let snapshot = WorkspaceSnapshot {
+            capture: CaptureState::Listening,
+            title: "Release scope".into(),
+            transcript: vec![MeetingLine {
+                start_sample: 0,
+                end_sample: 16_000,
+                text: "First live phrase".into(),
+            }],
+            ..Default::default()
+        };
+        let mut state = WorkspaceState {
+            chat: "Question".into(),
+            companion_view: CompanionView::Split,
+            ..Default::default()
+        };
+        let mut out = vec![];
+        let frame = paint(&context, &mut state, &snapshot, &mut out, vec![]);
+        let text = rendered_text(&frame);
+        assert!(!text.contains("VOICE, DISCIPLINED."));
+        assert!(!text.contains("In your corner."));
+        let phrase = frame.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.text() == "First live phrase" =>
+                Some(text.pos),
+            _ => None,
+        }).expect("transcript phrase is visible");
+        let send = frame.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.text() == "↗" =>
+                Some(text.pos),
+            _ => None,
+        }).expect("assistant send control is visible");
+        assert!(phrase.y < 170.0, "transcript starts too low: {phrase:?}");
+        assert!(send.x > 570.0 && send.y > 620.0, "composer is not anchored in the assistant pane: {send:?}");
     }
     #[test]
     fn long_multiline_composer_draft_keeps_send_control_reachable() {
@@ -1773,6 +2172,8 @@ mod tests {
             ..Default::default()
         };
         let mut out = vec![];
+        click(&context, &mut state, &snapshot, &mut out, "Assistant");
+        out.clear();
         click(&context, &mut state, &snapshot, &mut out, "Send message");
         assert!(matches!(
             out.as_slice(),

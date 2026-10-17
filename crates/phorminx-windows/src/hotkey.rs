@@ -279,6 +279,7 @@ unsafe fn install_and_run(
                     .launcher_target
                     .is_none_or(|target| target.is_current());
                 let choice = match message.wParam.0 {
+                    0 => KeyAction::Action(0),
                     1 => KeyAction::Choose,
                     2 => KeyAction::Meetings,
                     3..=9 => KeyAction::Action(message.wParam.0 as u8),
@@ -421,10 +422,12 @@ impl KeyboardState {
             return (consumed, None);
         }
         let modifiers = self.modifiers();
-        if self.launcher_open && matches!(key, 0x31..=0x39 | 0x61..=0x69 | 0x0d | 0x1b) {
+        if self.launcher_open && matches!(key, 0x30..=0x39 | 0x60..=0x69 | 0x0d | 0x1b) {
             let choice = match key {
                 0x1b => KeyAction::Dismiss,
                 0x32 | 0x62 => KeyAction::Meetings,
+                // Zero is a built-in feedback action; saved HTTP slots remain 3..=9.
+                0x30 | 0x60 => KeyAction::Action(0),
                 0x33..=0x39 => KeyAction::Action((key - 0x30) as u8),
                 0x63..=0x69 => KeyAction::Action((key - 0x60) as u8),
                 _ => KeyAction::Choose,
@@ -701,6 +704,8 @@ mod tests {
     #[test]
     fn workspace_choices_consume_repeat_release_without_starting_dictation() {
         for (key, choice) in [
+            (0x30, KeyAction::Action(0)),
+            (0x60, KeyAction::Action(0)),
             (0x32, KeyAction::Meetings),
             (0x62, KeyAction::Meetings),
             (0x33, KeyAction::Action(3)),

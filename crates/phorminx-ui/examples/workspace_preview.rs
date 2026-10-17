@@ -7,6 +7,7 @@ struct Preview {
     shell: PhorminxUi,
     snapshot: ShellSnapshot,
     theme: ThemeMode,
+    companion: bool,
 }
 
 impl Default for Preview {
@@ -16,7 +17,13 @@ impl Default for Preview {
         snapshot.workspace = phorminx_ui::workspace::WorkspaceSnapshot {
             history_enabled: true,
             title: "Product review · synthetic preview".into(),
+            capture: phorminx_ui::workspace::CaptureState::Listening,
+            captured_samples: 480000,
+            committed_samples: 480000,
             transcript: vec![phorminx_ui::workspace::MeetingLine { start_sample:0, end_sample:480000, text:"We should confirm the delivery date before discussing the next milestone.".into() }],
+            translation_language: "Brazilian Portuguese".into(),
+            translation_model: "example-local-model".into(),
+            translations: vec![phorminx_ui::workspace::TranslationLine { start_sample:0, end_sample:480000, language:"Brazilian Portuguese".into(), text:"Devemos confirmar a data de entrega antes de discutir o próximo marco.".into() }],
             messages: vec![phorminx_ui::workspace::ChatLine { role:"You".into(),text:"Help me respond to the timing question.".into(),status:"sent".into(), context_text:"Synthetic meeting context".into(), ..Default::default() },phorminx_ui::workspace::ChatLine { role:"Assistant".into(),text:"**Clarify the milestone first.**\n\n- Ask which milestone is essential.\n- Confirm the dependencies before committing to a date.".into(),status:"complete".into(), ..Default::default() }],
             input_devices: vec!["Example microphone".into()],
             output_devices: vec!["Example speakers".into()],
@@ -39,6 +46,7 @@ impl Default for Preview {
             shell: PhorminxUi::new(snapshot.clone()),
             snapshot,
             theme: ThemeMode::AuthoredLight,
+            companion: false,
         }
     }
 }
@@ -47,6 +55,8 @@ impl eframe::App for Preview {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.horizontal_wrapped(|ui| {
             ui.label("SYNTHETIC PREVIEW · no real data or actions");
+            ui.selectable_value(&mut self.companion, false, "Main workspace");
+            ui.selectable_value(&mut self.companion, true, "Companion");
             for (theme, label) in [
                 (ThemeMode::AuthoredLight, "Light"),
                 (ThemeMode::AuthoredDark, "Dark"),
@@ -56,7 +66,11 @@ impl eframe::App for Preview {
             }
         });
         self.shell.set_theme(self.theme);
-        self.shell.show(ui);
+        if self.companion {
+            self.shell.show_meeting_companion(ui);
+        } else {
+            self.shell.show(ui);
+        }
         for event in self.shell.take_events() {
             match event {
                 ShellEvent::Navigate(route) => self.snapshot.route = route,

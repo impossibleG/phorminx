@@ -1,6 +1,7 @@
 //! Durable unified product shell hosted beside the latency-sensitive runtime loop.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -48,6 +49,7 @@ use winit::platform::windows::EventLoopBuilderExtWindows;
 
 #[derive(Clone, Debug)]
 pub enum ProductShellControl {
+    Feedback,
     FocusActions,
     StartMeeting,
     TriggerAction(phorminx_assistant::ActionConfig),
@@ -74,6 +76,8 @@ pub enum ProductShellEvent {
     CancelWhisperModelDownload,
     RuntimeReloadRequested(UiMutation),
     ApplyLaunchAtLogin(bool),
+    /// Exit the whole app, e.g. so a scheduled update can install.
+    QuitRequested,
     Hidden,
     Failed(String),
 }
@@ -211,20 +215,33 @@ fn run_shell(
         readiness_tx,
     );
 
+    let placements =
+        load_window_placements(&store.resolve_asset_path(Path::new("window-geometry.json")));
+    let mut root_viewport = egui::ViewportBuilder::default()
+        .with_title("Phorminx")
+        .with_icon(
+            eframe::icon_data::from_png_bytes(include_bytes!(
+                "../../../design/brand/png/app/phorminx-app-256.png"
+            ))
+            .map_err(|error| format!("failed to decode the embedded window icon: {error}"))?,
+        )
+        .with_visible(initially_visible)
+        .with_inner_size(placements.main.size)
+        .with_min_inner_size(Vec2::new(900.0, 620.0))
+        .with_maximized(placements.main.maximized)
+        .with_resizable(true);
+    if let Some(position) = placements.main.position {
+        root_viewport = root_viewport.with_position(position);
+    }
     let mut native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Phorminx")
-            .with_icon(
-                eframe::icon_data::from_png_bytes(include_bytes!(
-                    "../../../design/brand/png/app/phorminx-app-256.png"
-                ))
-                .map_err(|error| format!("failed to decode the embedded window icon: {error}"))?,
-            )
-            .with_visible(initially_visible)
-            .with_inner_size(Vec2::new(1120.0, 760.0))
-            .with_min_inner_size(Vec2::new(900.0, 620.0))
-            .with_resizable(true),
-        centered: true,
+        viewport: root_viewport,
+        centered: placements.main.position.is_none(),
+        // The root can become the companion while the app is hidden. eframe's
+        // single automatic root key would then overwrite the main placement.
+        persist_window: false,
+        // A separate eframe store prevents its old single-window placement
+        // from overriding the two validated placements loaded above.
+        persistence_path: Some(store.resolve_asset_path(Path::new("eframe-v2.ron"))),
         ..Default::default()
     };
     #[cfg(windows)]
@@ -278,6 +295,17 @@ fn probe_readiness(
     thread::Builder::new()
         .name("phorminx-readiness".to_owned())
         .spawn(move || {
+            if matches!(
+                settings.formatting.strength,
+                FormattingStrength::Balanced
+                    | FormattingStrength::Strong
+                    | FormattingStrength::Custom
+            ) || settings.search.embedding_model.is_some()
+            {
+                crate::ollama_recovery::recover_local_ollama(&std::sync::atomic::AtomicBool::new(
+                    false,
+                ));
+            }
             let ollama = OllamaClient::new(
                 OllamaEndpoint::default(),
                 ClientTimeouts {
@@ -303,6 +331,9 @@ fn probe_readiness(
 const AUTOMATIC_REFRESH_VOSK_PROBE: UiVoskProbe = UiVoskProbe::LayoutOnly;
 
 struct ProductShellApp {
+    vosk_models: crate::vosk_models::VoskModels,
+    updates: crate::update_center::UpdateCenter,
+    feedback: crate::feedback::FeedbackPanel,
     shell: PhorminxUi,
     bridge: UiBridge,
     readiness: UiReadinessSnapshot,
@@ -333,6 +364,11 @@ struct ProductShellApp {
     companion_hide_requested: bool,
     root_companion: bool,
     main_window_geometry: Option<MainWindowGeometry>,
+    main_window_resting: MainWindowGeometry,
+    companion_window_geometry: Option<MainWindowGeometry>,
+    window_geometry_path: PathBuf,
+    root_position_check_pending: bool,
+    child_position_check_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -342,22 +378,360 @@ struct MainWindowGeometry {
     maximized: bool,
 }
 
-const COMPANION_SIZE: Vec2 = Vec2::new(430.0, 680.0);
-const COMPANION_MIN_SIZE: Vec2 = Vec2::new(360.0, 420.0);
+#[derive(Clone, Copy, Debug)]
+struct WindowPlacements {
+    main: MainWindowGeometry,
+    companion: Option<MainWindowGeometry>,
+}
 
-fn companion_viewport() -> egui::ViewportBuilder {
-    egui::ViewportBuilder::default()
-        .with_title("Phorminx · Companion")
-        .with_inner_size(COMPANION_SIZE)
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MonitorWorkArea {
+    rect: egui::Rect,
+    primary: bool,
+}
+
+/// These coordinates are egui points in the viewport's current pixel scale.
+/// In particular, negative coordinates on a monitor left of primary are valid.
+#[cfg(windows)]
+fn current_monitor_work_areas(pixels_per_point: f32) -> Vec<MonitorWorkArea> {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct WinRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[repr(C)]
+    struct MonitorInfo {
+        size: u32,
+        monitor: WinRect,
+        work: WinRect,
+        flags: u32,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumDisplayMonitors(
+            dc: *mut c_void,
+            clip: *const WinRect,
+            callback: Option<
+                unsafe extern "system" fn(*mut c_void, *mut c_void, *mut WinRect, isize) -> i32,
+            >,
+            data: isize,
+        ) -> i32;
+        fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MonitorInfo) -> i32;
+    }
+    unsafe extern "system" fn collect(
+        monitor: *mut c_void,
+        _dc: *mut c_void,
+        _rect: *mut WinRect,
+        data: isize,
+    ) -> i32 {
+        // EnumDisplayMonitors invokes this synchronously before the borrowed
+        // vector leaves scope. GetMonitorInfoW writes only our initialized C
+        // struct and never retains its pointer.
+        let areas = unsafe { &mut *(data as *mut Vec<(WinRect, bool)>) };
+        let mut info = MonitorInfo {
+            size: std::mem::size_of::<MonitorInfo>() as u32,
+            monitor: WinRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            work: WinRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            flags: 0,
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
+            areas.push((info.work, info.flags & 1 != 0));
+        }
+        1
+    }
+    if !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
+        return Vec::new();
+    }
+    let mut raw = Vec::<(WinRect, bool)>::new();
+    if unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(collect),
+            (&mut raw as *mut Vec<(WinRect, bool)>) as isize,
+        )
+    } == 0
+    {
+        return Vec::new();
+    }
+    raw.into_iter()
+        .filter_map(|(rect, primary)| {
+            (rect.right > rect.left && rect.bottom > rect.top).then_some(MonitorWorkArea {
+                rect: egui::Rect::from_min_max(
+                    egui::pos2(
+                        rect.left as f32 / pixels_per_point,
+                        rect.top as f32 / pixels_per_point,
+                    ),
+                    egui::pos2(
+                        rect.right as f32 / pixels_per_point,
+                        rect.bottom as f32 / pixels_per_point,
+                    ),
+                ),
+                primary,
+            })
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn system_pixels_per_point() -> f32 {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetDpiForSystem() -> u32;
+    }
+    (unsafe { GetDpiForSystem() } as f32 / 96.0).max(1.0)
+}
+
+#[cfg(not(windows))]
+fn current_monitor_work_areas(_pixels_per_point: f32) -> Vec<MonitorWorkArea> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+fn system_pixels_per_point() -> f32 {
+    1.0
+}
+
+fn titlebar_reachable(geometry: MainWindowGeometry, areas: &[MonitorWorkArea]) -> bool {
+    let Some(position) = geometry.position else {
+        return true;
+    };
+    let strip = egui::Rect::from_min_size(
+        position + egui::vec2(24.0, 0.0),
+        egui::vec2((geometry.size.x - 48.0).min(400.0), 36.0),
+    );
+    areas.iter().any(|area| {
+        let visible = strip.intersect(area.rect);
+        visible.width() >= 120.0 && visible.height() >= 24.0
+    })
+}
+
+fn relocate_offscreen_geometry(
+    geometry: MainWindowGeometry,
+    min_size: Vec2,
+    areas: &[MonitorWorkArea],
+) -> Option<MainWindowGeometry> {
+    if areas.is_empty() || titlebar_reachable(geometry, areas) {
+        return None;
+    }
+    let area = areas
+        .iter()
+        .find(|area| area.primary)
+        .unwrap_or(&areas[0])
+        .rect;
+    let available = (area.size() - Vec2::splat(32.0)).max(min_size);
+    let size = geometry.size.min(available).max(min_size);
+    let position = area.min + (area.size() - size) / 2.0;
+    Some(MainWindowGeometry {
+        position: Some(position),
+        size,
+        maximized: geometry.maximized,
+    })
+}
+
+impl Default for WindowPlacements {
+    fn default() -> Self {
+        Self {
+            main: MainWindowGeometry {
+                position: None,
+                size: Vec2::new(1120.0, 760.0),
+                maximized: false,
+            },
+            companion: None,
+        }
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredPlacement {
+    x: Option<f32>,
+    y: Option<f32>,
+    width: f32,
+    height: f32,
+    maximized: bool,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredWindowPlacements {
+    schema_version: u32,
+    main: StoredPlacement,
+    companion: Option<StoredPlacement>,
+}
+
+impl StoredPlacement {
+    fn from_geometry(geometry: MainWindowGeometry) -> Self {
+        Self {
+            x: geometry.position.map(|position| position.x),
+            y: geometry.position.map(|position| position.y),
+            width: geometry.size.x,
+            height: geometry.size.y,
+            maximized: geometry.maximized,
+        }
+    }
+
+    fn into_geometry(self, min_size: Vec2) -> Option<MainWindowGeometry> {
+        let size = Vec2::new(self.width, self.height);
+        if !size.x.is_finite()
+            || !size.y.is_finite()
+            || size.x < min_size.x
+            || size.y < min_size.y
+            || size.x > 20_000.0
+            || size.y > 20_000.0
+        {
+            return None;
+        }
+        let position = match (self.x, self.y) {
+            (None, None) => None,
+            (Some(x), Some(y))
+                if x.is_finite()
+                    && y.is_finite()
+                    && x.abs() <= 100_000.0
+                    && y.abs() <= 100_000.0 =>
+            {
+                Some(egui::pos2(x, y))
+            }
+            _ => return None,
+        };
+        Some(MainWindowGeometry {
+            position,
+            size,
+            maximized: self.maximized,
+        })
+    }
+}
+
+fn load_window_placements(path: &Path) -> WindowPlacements {
+    let fallback = WindowPlacements::default();
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return fallback;
+    };
+    if metadata.len() > 4096 {
+        return fallback;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return fallback;
+    };
+    let Ok(saved) = serde_json::from_slice::<StoredWindowPlacements>(&bytes) else {
+        return fallback;
+    };
+    if saved.schema_version != 1 {
+        return fallback;
+    }
+    let mut placements = WindowPlacements {
+        main: saved
+            .main
+            .into_geometry(Vec2::new(900.0, 620.0))
+            .unwrap_or(fallback.main),
+        companion: saved
+            .companion
+            .and_then(|geometry| geometry.into_geometry(COMPANION_MIN_SIZE)),
+    };
+    let areas = current_monitor_work_areas(system_pixels_per_point());
+    let mut corrected = false;
+    if let Some(geometry) =
+        relocate_offscreen_geometry(placements.main, Vec2::new(900.0, 620.0), &areas)
+    {
+        placements.main = geometry;
+        corrected = true;
+    }
+    if let Some(companion) = placements.companion
+        && let Some(geometry) = relocate_offscreen_geometry(companion, COMPANION_MIN_SIZE, &areas)
+    {
+        placements.companion = Some(geometry);
+        corrected = true;
+    }
+    if corrected {
+        let _ = save_window_placements(path, placements);
+    }
+    placements
+}
+
+fn save_window_placements(path: &Path, placements: WindowPlacements) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing parent",
+        ));
+    };
+    std::fs::create_dir_all(parent)?;
+    let saved = StoredWindowPlacements {
+        schema_version: 1,
+        main: StoredPlacement::from_geometry(placements.main),
+        companion: placements.companion.map(StoredPlacement::from_geometry),
+    };
+    let bytes = serde_json::to_vec(&saved).map_err(std::io::Error::other)?;
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let outcome = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)
+    })();
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    outcome
+}
+
+const COMPANION_SIZE: Vec2 = Vec2::new(980.0, 720.0);
+const COMPANION_MIN_SIZE: Vec2 = Vec2::new(430.0, 480.0);
+const COMPANION_TITLE: &str = "Phorminx · Live companion";
+
+fn companion_viewport(geometry: Option<MainWindowGeometry>) -> egui::ViewportBuilder {
+    let geometry = geometry.unwrap_or(MainWindowGeometry {
+        position: None,
+        size: COMPANION_SIZE,
+        maximized: false,
+    });
+    let mut builder = egui::ViewportBuilder::default()
+        .with_title(COMPANION_TITLE)
+        .with_inner_size(geometry.size)
         .with_min_inner_size(COMPANION_MIN_SIZE)
-        .with_decorations(false)
-        .with_always_on_top()
+        .with_resizable(true)
+        .with_decorations(true)
+        .with_close_button(true)
+        .with_minimize_button(true)
+        .with_maximize_button(true)
+        .with_taskbar(true)
+        .with_window_level(egui::WindowLevel::Normal)
+        .with_maximized(geometry.maximized);
+    if let Some(position) = geometry.position {
+        builder = builder.with_position(position);
+    }
+    builder
 }
 
 impl Drop for ProductShellApp {
     fn drop(&mut self) {
         // Also cover unexpected window/renderer exit, not just the close button.
         let _ = phorminx_windows::set_global_shortcut_capture(false);
+        self.persist_window_placements();
     }
 }
 
@@ -381,12 +755,19 @@ impl ProductShellApp {
         readiness_started: bool,
         initially_visible: bool,
     ) -> Self {
+        let window_geometry_path = store.resolve_asset_path(Path::new("window-geometry.json"));
+        let placements = load_window_placements(&window_geometry_path);
         let mut setup = setup_center
             .as_ref()
             .map(|center| center.snapshot(&readiness))
             .unwrap_or_else(unavailable_setup_snapshot);
         setup_features.enrich(&mut setup);
         let mut app = Self {
+            vosk_models: crate::vosk_models::VoskModels::default(),
+            updates: crate::update_center::UpdateCenter::new(
+                store.resolve_asset_path(std::path::Path::new("updates")),
+            ),
+            feedback: crate::feedback::FeedbackPanel::default(),
             shell: PhorminxUi::new(map_snapshot_with_setup(snapshot, route, None, Some(setup))),
             bridge,
             readiness,
@@ -417,6 +798,11 @@ impl ProductShellApp {
             companion_hide_requested: false,
             root_companion: false,
             main_window_geometry: None,
+            main_window_resting: placements.main,
+            companion_window_geometry: placements.companion,
+            window_geometry_path,
+            root_position_check_pending: true,
+            child_position_check_pending: true,
         };
         app.configure_library();
         app.refresh();
@@ -435,37 +821,64 @@ impl ProductShellApp {
     /// existing native root as the companion instead; no main-window flash and
     /// no unsupported UI calls inside egui's logic-only pass are needed.
     fn open_companion(&mut self, ctx: &egui::Context) {
+        self.child_position_check_pending = true;
+        if self.root_companion {
+            self.root_position_check_pending = true;
+        }
         self.companion_hide_requested = false;
         self.companion_open = true;
         let child_id = egui::ViewportId::from_hash_of("phorminx-meeting-companion");
+        let corrected = self.repair_saved_companion_geometry(
+            ctx.input(|input| input.viewport().native_pixels_per_point)
+                .unwrap_or_else(system_pixels_per_point),
+        );
         let needs_bootstrap = ctx.input(|i| {
-            let child_visible = i
-                .raw
-                .viewports
-                .get(&child_id)
-                .is_some_and(|v| v.visible() != Some(false));
-            (!self.window_visible || i.viewport().visible() == Some(false)) && !child_visible
+            // Occlusion is not a hidden window. A minimized companion can be
+            // restored directly, so do not turn the root into a second one.
+            let child_exists = i.raw.viewports.contains_key(&child_id);
+            (!self.window_visible || i.viewport().minimized == Some(true)) && !child_exists
         });
         if needs_bootstrap && !self.root_companion {
-            self.main_window_geometry = Some(ctx.input(|i| {
-                let viewport = i.viewport();
-                MainWindowGeometry {
-                    position: viewport.outer_rect.map(|rect| rect.min),
-                    size: viewport
-                        .inner_rect
-                        .map_or(Vec2::new(1120.0, 760.0), |rect| rect.size())
-                        .max(Vec2::new(900.0, 620.0)),
-                    maximized: viewport.maximized.unwrap_or(false),
-                }
-            }));
+            if self.window_visible {
+                let viewport = ctx.input(|input| input.viewport().clone());
+                self.remember_main_geometry(&viewport);
+            }
+            self.main_window_geometry = Some(self.main_window_resting);
             self.root_companion = true;
             self.window_visible = true;
+            self.root_position_check_pending = true;
+            let geometry = self
+                .companion_window_geometry
+                .unwrap_or(MainWindowGeometry {
+                    position: None,
+                    size: COMPANION_SIZE,
+                    maximized: false,
+                });
             ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
-            ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
+            ctx.send_viewport_cmd(ViewportCommand::Decorations(true));
+            ctx.send_viewport_cmd(ViewportCommand::Resizable(true));
             ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(COMPANION_MIN_SIZE));
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(COMPANION_SIZE));
-            ctx.send_viewport_cmd(ViewportCommand::Title("Phorminx · Companion".into()));
-            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(geometry.size));
+            if let Some(position) = geometry.position {
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(position));
+            }
+            ctx.send_viewport_cmd(ViewportCommand::Title(COMPANION_TITLE.into()));
+            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+            ctx.send_viewport_cmd(ViewportCommand::Maximized(geometry.maximized));
+        }
+        if !needs_bootstrap && let Some(geometry) = corrected {
+            let target = if self.root_companion {
+                egui::ViewportId::ROOT
+            } else {
+                child_id
+            };
+            ctx.send_viewport_cmd_to(target, ViewportCommand::Maximized(false));
+            ctx.send_viewport_cmd_to(target, ViewportCommand::InnerSize(geometry.size));
+            ctx.send_viewport_cmd_to(
+                target,
+                ViewportCommand::OuterPosition(geometry.position.unwrap()),
+            );
+            ctx.send_viewport_cmd_to(target, ViewportCommand::Maximized(geometry.maximized));
         }
         let viewport = if self.root_companion {
             egui::ViewportId::ROOT
@@ -484,14 +897,12 @@ impl ProductShellApp {
             return;
         }
         self.root_companion = false;
+        self.root_position_check_pending = true;
+        self.child_position_check_pending = true;
         let geometry = self
             .main_window_geometry
             .take()
-            .unwrap_or(MainWindowGeometry {
-                position: None,
-                size: Vec2::new(1120.0, 760.0),
-                maximized: false,
-            });
+            .unwrap_or(self.main_window_resting);
         ctx.send_viewport_cmd(ViewportCommand::Title("Phorminx".into()));
         ctx.send_viewport_cmd(ViewportCommand::Decorations(true));
         ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
@@ -503,14 +914,173 @@ impl ProductShellApp {
         ctx.send_viewport_cmd(ViewportCommand::Maximized(geometry.maximized));
     }
 
+    /// Preserve the companion's normal bounds while maximized so restoring the
+    /// window later still gives it a useful size. Persisted bounds are checked
+    /// against the current monitor work areas before they are used again.
+    fn remember_companion_geometry(&mut self, viewport: &egui::ViewportInfo) {
+        if viewport.minimized == Some(true) {
+            return;
+        }
+        let mut geometry = self
+            .companion_window_geometry
+            .unwrap_or(MainWindowGeometry {
+                position: None,
+                size: COMPANION_SIZE,
+                maximized: false,
+            });
+        geometry.maximized = viewport.maximized.unwrap_or(false);
+        if !geometry.maximized {
+            if let Some(size) = viewport.inner_rect.map(|rect| rect.size())
+                && size.x.is_finite()
+                && size.y.is_finite()
+                && size.x >= COMPANION_MIN_SIZE.x
+                && size.y >= COMPANION_MIN_SIZE.y
+            {
+                geometry.size = size;
+            }
+            if let Some(position) = viewport.outer_rect.map(|rect| rect.min)
+                && position.x.is_finite()
+                && position.y.is_finite()
+            {
+                geometry.position = Some(position);
+            }
+        }
+        self.companion_window_geometry = Some(geometry);
+    }
+
+    fn remember_main_geometry(&mut self, viewport: &egui::ViewportInfo) {
+        if viewport.minimized == Some(true) {
+            return;
+        }
+        let mut geometry = self.main_window_resting;
+        geometry.maximized = viewport.maximized.unwrap_or(false);
+        if !geometry.maximized {
+            if let Some(size) = viewport.inner_rect.map(|rect| rect.size())
+                && size.x.is_finite()
+                && size.y.is_finite()
+                && size.x >= 900.0
+                && size.y >= 620.0
+            {
+                geometry.size = size;
+            }
+            if let Some(position) = viewport.outer_rect.map(|rect| rect.min)
+                && position.x.is_finite()
+                && position.y.is_finite()
+            {
+                geometry.position = Some(position);
+            }
+        }
+        self.main_window_resting = geometry;
+    }
+
+    fn repair_saved_companion_geometry(
+        &mut self,
+        pixels_per_point: f32,
+    ) -> Option<MainWindowGeometry> {
+        let geometry = self.companion_window_geometry?;
+        let areas = current_monitor_work_areas(pixels_per_point);
+        let corrected = relocate_offscreen_geometry(geometry, COMPANION_MIN_SIZE, &areas)?;
+        self.companion_window_geometry = Some(corrected);
+        self.persist_window_placements();
+        Some(corrected)
+    }
+
+    /// Verify the actual native placement once the viewport exists. This
+    /// catches DPI changes that cannot be known when loading saved geometry.
+    fn check_native_window_placement(
+        &mut self,
+        ctx: &egui::Context,
+        viewport: &egui::ViewportInfo,
+        companion: bool,
+        root: bool,
+    ) -> bool {
+        let pending = if root {
+            &mut self.root_position_check_pending
+        } else {
+            &mut self.child_position_check_pending
+        };
+        if !*pending || viewport.minimized == Some(true) {
+            return false;
+        }
+        let Some(outer) = viewport.outer_rect else {
+            return false;
+        };
+        let areas = current_monitor_work_areas(
+            viewport
+                .native_pixels_per_point
+                .unwrap_or_else(system_pixels_per_point),
+        );
+        if areas.is_empty() {
+            return false;
+        }
+        *pending = false;
+        let stored = if companion {
+            self.companion_window_geometry
+                .unwrap_or(MainWindowGeometry {
+                    position: None,
+                    size: COMPANION_SIZE,
+                    maximized: false,
+                })
+        } else {
+            self.main_window_resting
+        };
+        let native = MainWindowGeometry {
+            position: Some(outer.min),
+            size: if viewport.maximized == Some(true) {
+                stored.size
+            } else {
+                viewport.inner_rect.map_or(stored.size, |rect| rect.size())
+            },
+            maximized: viewport.maximized.unwrap_or(stored.maximized),
+        };
+        let min_size = if companion {
+            COMPANION_MIN_SIZE
+        } else {
+            Vec2::new(900.0, 620.0)
+        };
+        let Some(corrected) = relocate_offscreen_geometry(native, min_size, &areas) else {
+            return false;
+        };
+        if native.maximized {
+            ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+        }
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(corrected.size));
+        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(corrected.position.unwrap()));
+        if native.maximized {
+            ctx.send_viewport_cmd(ViewportCommand::Maximized(true));
+        }
+        if companion {
+            self.companion_window_geometry = Some(corrected);
+        } else {
+            self.main_window_resting = corrected;
+        }
+        self.persist_window_placements();
+        true
+    }
+
+    fn persist_window_placements(&self) {
+        let _ = save_window_placements(
+            &self.window_geometry_path,
+            WindowPlacements {
+                main: self.main_window_resting,
+                companion: self.companion_window_geometry,
+            },
+        );
+    }
+
     fn close_root_companion(&mut self, ctx: &egui::Context) {
         if self.root_companion {
+            let viewport = ctx.input(|input| input.viewport().clone());
+            if viewport.title.as_deref() == Some(COMPANION_TITLE) {
+                self.remember_companion_geometry(&viewport);
+            }
             // Hide before resizing so closing the compact window cannot flash
             // the full control panel. Recording deliberately remains untouched.
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
             self.companion_open = false;
             self.restore_main_window(ctx);
             self.window_visible = false;
+            self.persist_window_placements();
         }
     }
 
@@ -524,6 +1094,7 @@ impl ProductShellApp {
             self.close_root_companion(ctx);
         } else {
             self.companion_open = false;
+            self.persist_window_placements();
             ctx.send_viewport_cmd_to(
                 egui::ViewportId::from_hash_of("phorminx-meeting-companion"),
                 ViewportCommand::Visible(false),
@@ -766,13 +1337,31 @@ impl ProductShellApp {
         self.refresh();
     }
 
+    // Missing recognition assets must not prevent their own installation.
+    // Capture readiness is stricter than eligibility for idle maintenance.
+    fn maintenance_idle(&self) -> bool {
+        !library_runtime_busy(self.runtime_status)
+            && !self.feedback.is_busy()
+            && self.meeting_snapshot.capture == phorminx_ui::workspace::CaptureState::Idle
+    }
+
+    fn apply_validated_model(&mut self) {
+        if self.maintenance_idle()
+            && let Some(proof) = self.vosk_models.take_validated()
+        {
+            self.execute(UiCommand::ActivateVerifiedVosk(proof));
+        }
+    }
+
     fn setup_mutation_active(&self) -> bool {
-        self.setup_center.as_ref().is_some_and(|center| {
-            matches!(
-                center.snapshot(&self.readiness).stage,
-                SetupStage::AwaitingConsent | SetupStage::Working | SetupStage::Benchmarking
-            )
-        })
+        self.vosk_models.busy()
+            || self.feedback.is_busy()
+            || self.setup_center.as_ref().is_some_and(|center| {
+                matches!(
+                    center.snapshot(&self.readiness).stage,
+                    SetupStage::AwaitingConsent | SetupStage::Working | SetupStage::Benchmarking
+                )
+            })
     }
 
     fn ensure_history_detail(&mut self) {
@@ -862,6 +1451,17 @@ impl ProductShellApp {
     }
 
     fn execute(&mut self, command: UiCommand) -> bool {
+        if self.setup_mutation_active()
+            && matches!(
+                &command,
+                UiCommand::SaveSettings(_) | UiCommand::ActivateVerifiedVosk(_)
+            )
+        {
+            self.set_error(
+                "Finish feedback or model/setup work before changing runtime settings.".into(),
+            );
+            return false;
+        }
         let history_changes = matches!(&command, UiCommand::ClearHistory)
             || matches!(&command, UiCommand::SaveSettings(candidate)
                 if candidate.privacy != self.bridge.settings().privacy);
@@ -932,12 +1532,17 @@ impl ProductShellApp {
 
     fn handle_shell_event(&mut self, event: ShellEvent) {
         match event {
+            ShellEvent::OpenVoskModels => self.vosk_models.open = true,
+            ShellEvent::OpenSoftwareUpdates => self.updates.open = true,
             ShellEvent::Workspace(event) => {
                 if matches!(event, phorminx_ui::workspace::WorkspaceEvent::HideCompanion) {
                     self.companion_hide_requested = true;
                     return;
                 }
                 if matches!(event, phorminx_ui::workspace::WorkspaceEvent::OpenCompanion) {
+                    if !self.companion_open {
+                        self.child_position_check_pending = true;
+                    }
                     self.companion_open = true;
                     return;
                 }
@@ -945,6 +1550,9 @@ impl ProductShellApp {
                     event,
                     phorminx_ui::workspace::WorkspaceEvent::TriggerAction(_)
                 ) {
+                    if !self.companion_open {
+                        self.child_position_check_pending = true;
+                    }
                     self.companion_open = true;
                 }
                 if matches!(
@@ -1110,6 +1718,10 @@ impl ProductShellApp {
                 self.refresh();
             }
             ShellEvent::RefreshSetup => {
+                if self.vosk_models.busy() || self.feedback.is_busy() {
+                    self.set_error("Finish or cancel model acquisition/validation and feedback before recovering setup transactions.".into());
+                    return;
+                }
                 if let Some(message) = self
                     .setup_center
                     .as_mut()
@@ -1125,7 +1737,10 @@ impl ProductShellApp {
                 self.refresh();
             }
             ShellEvent::StartSetupAction(id) | ShellEvent::RetrySetupAction(id) => {
-                if self.setup_features.mutation_conflict() {
+                if self.setup_features.mutation_conflict()
+                    || self.vosk_models.busy()
+                    || self.feedback.is_busy()
+                {
                     self.set_error("Finish or cancel calibration, measurement, or model acquisition before changing setup assets.".to_owned());
                     self.refresh();
                     return;
@@ -1359,7 +1974,17 @@ fn resolve_theme(
 }
 
 impl eframe::App for ProductShellApp {
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.persist_window_placements();
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.vosk_models.poll();
+        self.feedback.poll();
+        // Complete explicit model activation even when the root window is hidden.
+        self.apply_validated_model();
+        self.updates
+            .poll(self.maintenance_idle() && !self.setup_mutation_active());
         self.apply_companion_hide(ctx);
         if matches!(self.route, UiRoute::Meetings | UiRoute::Actions) {
             self.ensure_meeting_workspace();
@@ -1405,6 +2030,19 @@ impl eframe::App for ProductShellApp {
         ));
         while let Ok(control) = self.controls.try_recv() {
             match control {
+                ProductShellControl::Feedback => {
+                    self.restore_main_window(ctx);
+                    self.window_visible = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    let idle = self.runtime_status == UiRuntimeStatus::Ready
+                        && !self.setup_mutation_active()
+                        && self.meeting_snapshot.capture
+                            == phorminx_ui::workspace::CaptureState::Idle;
+                    self.feedback
+                        .open(self.bridge.settings(), &self.store, idle);
+                }
                 ProductShellControl::StartMeeting | ProductShellControl::TriggerAction(_) => {
                     self.ensure_meeting_workspace();
                     self.open_companion(ctx);
@@ -1669,19 +2307,57 @@ impl eframe::App for ProductShellApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let idle = self.runtime_status == UiRuntimeStatus::Ready
+            && !self.feedback.is_busy()
+            && self.meeting_snapshot.capture == phorminx_ui::workspace::CaptureState::Idle;
+        let operations_idle = self.maintenance_idle() && !self.setup_mutation_active();
+        let feedback_ready = idle && !self.setup_mutation_active();
+        self.feedback.show(
+            ui.ctx(),
+            self.bridge.settings(),
+            &self.store,
+            feedback_ready,
+        );
+        self.updates.show(ui.ctx(), operations_idle);
+        self.vosk_models.show(ui.ctx(), operations_idle);
         if self.root_companion {
+            let viewport = ui.input(|input| input.viewport().clone());
+            if viewport.title.as_deref() == Some(COMPANION_TITLE)
+                && !self.check_native_window_placement(ui.ctx(), &viewport, true, true)
+            {
+                self.remember_companion_geometry(&viewport);
+            }
             self.shell.show_meeting_companion(ui);
         } else {
+            if self.window_visible {
+                let viewport = ui.input(|input| input.viewport().clone());
+                if viewport.title.as_deref() == Some("Phorminx")
+                    && !self.check_native_window_placement(ui.ctx(), &viewport, false, true)
+                {
+                    self.remember_main_geometry(&viewport);
+                }
+            }
             self.shell.show(ui);
         }
         if self.companion_open && !self.root_companion && !self.quitting {
             let ctx = ui.ctx().clone();
+            if self.child_position_check_pending {
+                self.repair_saved_companion_geometry(
+                    ui.input(|input| input.viewport().native_pixels_per_point)
+                        .unwrap_or_else(system_pixels_per_point),
+                );
+            }
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("phorminx-meeting-companion"),
-                companion_viewport(),
+                companion_viewport(self.companion_window_geometry),
                 |ui, _| {
+                    let viewport = ui.input(|input| input.viewport().clone());
+                    if !self.check_native_window_placement(ui.ctx(), &viewport, true, false) {
+                        self.remember_companion_geometry(&viewport);
+                    }
                     if ui.input(|i| i.viewport().close_requested()) {
                         self.companion_open = false;
+                        self.persist_window_placements();
                     }
                     self.shell.show_meeting_companion(ui);
                     ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -2315,16 +2991,20 @@ mod tests {
         fixture.app.window_visible = false;
         let ctx = egui::Context::default();
         let original = Vec2::new(1400.0, 900.0);
+        fixture.app.main_window_resting = MainWindowGeometry {
+            position: Some(egui::pos2(80.0, 72.0)),
+            size: original,
+            maximized: false,
+        };
         let output = ctx.run_logic(&companion_input(original, false), |ctx| {
             fixture.app.open_companion(ctx)
         });
         let commands = &output.viewport_commands[&egui::ViewportId::ROOT];
         assert!(commands.contains(&ViewportCommand::Visible(true)));
         assert!(commands.contains(&ViewportCommand::InnerSize(COMPANION_SIZE)));
-        assert!(commands.contains(&ViewportCommand::Decorations(false)));
-        assert!(commands.contains(&ViewportCommand::WindowLevel(
-            egui::WindowLevel::AlwaysOnTop
-        )));
+        assert!(commands.contains(&ViewportCommand::Decorations(true)));
+        assert!(commands.contains(&ViewportCommand::Resizable(true)));
+        assert!(commands.contains(&ViewportCommand::WindowLevel(egui::WindowLevel::Normal)));
         assert!(
             fixture.app.root_companion && fixture.app.companion_open && fixture.app.window_visible
         );
@@ -2368,6 +3048,43 @@ mod tests {
             output.viewport_commands[&egui::ViewportId::ROOT]
                 .contains(&ViewportCommand::Minimized(false))
         );
+
+        // An already existing child is restored even when both the main and
+        // child windows are minimized; no duplicate root companion is made.
+        let _ = ctx.run_logic(&companion_input(Vec2::new(1120.0, 760.0), true), |ctx| {
+            fixture.app.restore_main_window(ctx)
+        });
+        fixture.app.window_visible = true;
+        let mut input = companion_input(Vec2::new(1120.0, 760.0), true);
+        input.viewports.insert(
+            child,
+            egui::ViewportInfo {
+                minimized: Some(true),
+                ..Default::default()
+            },
+        );
+        let output = ctx.run_logic(&input, |ctx| fixture.app.open_companion(ctx));
+        assert!(!fixture.app.root_companion);
+        assert!(output.viewport_commands[&child].contains(&ViewportCommand::Minimized(false)));
+        assert!(
+            !output
+                .viewport_commands
+                .contains_key(&egui::ViewportId::ROOT)
+        );
+
+        let mut input = companion_input(Vec2::new(1120.0, 760.0), false);
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .occluded = Some(true);
+        let output = ctx.run_logic(&input, |ctx| fixture.app.open_companion(ctx));
+        assert!(!fixture.app.root_companion);
+        assert!(
+            !output
+                .viewport_commands
+                .contains_key(&egui::ViewportId::ROOT)
+        );
     }
 
     #[test]
@@ -2376,6 +3093,11 @@ mod tests {
         fixture.app.meeting_snapshot.capture = phorminx_ui::workspace::CaptureState::Listening;
         let ctx = egui::Context::default();
         let input = companion_input(Vec2::new(1200.0, 800.0), false);
+        fixture.app.main_window_resting = MainWindowGeometry {
+            position: Some(egui::pos2(80.0, 72.0)),
+            size: Vec2::new(1200.0, 800.0),
+            maximized: false,
+        };
         let _ = ctx.run_logic(&input, |ctx| fixture.app.open_companion(ctx));
         let closed = ctx.run_logic(&input, |ctx| fixture.app.close_root_companion(ctx));
         let commands = &closed.viewport_commands[&egui::ViewportId::ROOT];
@@ -2400,12 +3122,233 @@ mod tests {
     }
 
     #[test]
-    fn companion_child_chrome_matches_borderless_root_bootstrap() {
-        let builder = companion_viewport();
+    fn companion_child_has_native_window_controls_and_restores_last_normal_bounds() {
+        let builder = companion_viewport(None);
         assert_eq!(builder.inner_size, Some(COMPANION_SIZE));
         assert_eq!(builder.min_inner_size, Some(COMPANION_MIN_SIZE));
-        assert_eq!(builder.decorations, Some(false));
-        assert_eq!(builder.window_level, Some(egui::WindowLevel::AlwaysOnTop));
+        assert_eq!(builder.decorations, Some(true));
+        assert_eq!(builder.resizable, Some(true));
+        assert_eq!(builder.close_button, Some(true));
+        assert_eq!(builder.minimize_button, Some(true));
+        assert_eq!(builder.maximize_button, Some(true));
+        assert_eq!(builder.taskbar, Some(true));
+        assert_eq!(builder.maximized, Some(false));
+        assert_eq!(builder.window_level, Some(egui::WindowLevel::Normal));
+
+        let mut fixture = LibraryFixture::new();
+        let mut viewport = egui::ViewportInfo {
+            inner_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(64.0, 88.0),
+                Vec2::new(1100.0, 760.0),
+            )),
+            outer_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(64.0, 52.0),
+                Vec2::new(1100.0, 796.0),
+            )),
+            maximized: Some(false),
+            minimized: Some(false),
+            ..Default::default()
+        };
+        fixture.app.remember_companion_geometry(&viewport);
+        let builder = companion_viewport(fixture.app.companion_window_geometry);
+        assert_eq!(builder.inner_size, Some(Vec2::new(1100.0, 760.0)));
+        assert_eq!(builder.position, Some(egui::pos2(64.0, 52.0)));
+
+        // Maximization must retain the restorable size rather than storing the
+        // full monitor rectangle as the normal window size.
+        viewport.maximized = Some(true);
+        viewport.inner_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            Vec2::new(2560.0, 1440.0),
+        ));
+        fixture.app.remember_companion_geometry(&viewport);
+        let builder = companion_viewport(fixture.app.companion_window_geometry);
+        assert_eq!(builder.inner_size, Some(Vec2::new(1100.0, 760.0)));
+        assert_eq!(builder.position, Some(egui::pos2(64.0, 52.0)));
+        assert_eq!(builder.maximized, Some(true));
+    }
+
+    #[test]
+    fn companion_placement_survives_restart_without_replacing_main_placement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("window-geometry.json");
+        let placements = WindowPlacements {
+            main: MainWindowGeometry {
+                position: Some(egui::pos2(80.0, 72.0)),
+                size: Vec2::new(1400.0, 900.0),
+                maximized: false,
+            },
+            companion: Some(MainWindowGeometry {
+                position: Some(egui::pos2(310.0, 110.0)),
+                size: Vec2::new(1080.0, 760.0),
+                maximized: true,
+            }),
+        };
+        save_window_placements(&path, placements).unwrap();
+        let restored = load_window_placements(&path);
+        assert_eq!(restored.main.size, Vec2::new(1400.0, 900.0));
+        assert_eq!(restored.main.position, Some(egui::pos2(80.0, 72.0)));
+        let companion = companion_viewport(restored.companion);
+        assert_eq!(companion.inner_size, Some(Vec2::new(1080.0, 760.0)));
+        assert_eq!(companion.position, Some(egui::pos2(310.0, 110.0)));
+        assert_eq!(companion.maximized, Some(true));
+        save_window_placements(&path, restored).unwrap(); // replaces an existing file on Windows
+
+        let mut fixture = LibraryFixture::new();
+        fixture.app.main_window_resting = restored.main;
+        fixture.app.companion_window_geometry = restored.companion;
+        fixture.app.window_visible = false;
+        let ctx = egui::Context::default();
+        let input = companion_input(Vec2::new(1400.0, 900.0), false);
+        let opened = ctx.run_logic(&input, |ctx| fixture.app.open_companion(ctx));
+        let commands = &opened.viewport_commands[&egui::ViewportId::ROOT];
+        assert!(commands.contains(&ViewportCommand::InnerSize(Vec2::new(1080.0, 760.0))));
+        assert!(commands.contains(&ViewportCommand::Maximized(true)));
+        assert_eq!(
+            fixture.app.main_window_geometry.unwrap().size,
+            restored.main.size
+        );
+        let _ = ctx.run_logic(&input, |ctx| fixture.app.close_root_companion(ctx));
+        fixture.app.persist_window_placements();
+        let saved_again = load_window_placements(&fixture.app.window_geometry_path);
+        assert_eq!(saved_again.main.size, restored.main.size);
+        assert_eq!(saved_again.main.position, restored.main.position);
+        assert_eq!(
+            saved_again.companion.unwrap().size,
+            restored.companion.unwrap().size
+        );
+    }
+
+    #[test]
+    fn corrupt_or_unbounded_window_geometry_falls_back_to_safe_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("window-geometry.json");
+        std::fs::write(&path, b"{not-json").unwrap();
+        assert_eq!(
+            load_window_placements(&path).main.size,
+            Vec2::new(1120.0, 760.0)
+        );
+        std::fs::write(&path, vec![b'x'; 4097]).unwrap();
+        assert_eq!(
+            load_window_placements(&path).main.size,
+            Vec2::new(1120.0, 760.0)
+        );
+    }
+
+    #[test]
+    fn disconnected_monitor_placement_moves_to_real_primary_work_area() {
+        let areas = [
+            MonitorWorkArea {
+                rect: egui::Rect::from_min_max(egui::pos2(-1600.0, 0.0), egui::pos2(0.0, 900.0)),
+                primary: false,
+            },
+            MonitorWorkArea {
+                rect: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1920.0, 1040.0)),
+                primary: true,
+            },
+        ];
+        let mut geometry = MainWindowGeometry {
+            position: Some(egui::pos2(-1500.0, 90.0)),
+            size: Vec2::new(920.0, 720.0),
+            maximized: false,
+        };
+        assert!(relocate_offscreen_geometry(geometry, COMPANION_MIN_SIZE, &areas).is_none());
+        geometry.position = Some(egui::pos2(5000.0, 100.0));
+        let repaired = relocate_offscreen_geometry(geometry, COMPANION_MIN_SIZE, &areas).unwrap();
+        assert_eq!(repaired.position, Some(egui::pos2(500.0, 160.0)));
+        assert_eq!(repaired.size, geometry.size);
+        assert!(titlebar_reachable(repaired, &areas));
+        geometry.position = Some(egui::pos2(1900.0, 80.0));
+        geometry.maximized = true;
+        let repaired = relocate_offscreen_geometry(geometry, COMPANION_MIN_SIZE, &areas).unwrap();
+        assert!(repaired.maximized);
+        assert!(titlebar_reachable(repaired, &areas));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_monitor_work_areas_are_available_at_current_dpi() {
+        let areas = current_monitor_work_areas(system_pixels_per_point());
+        assert!(!areas.is_empty());
+        assert!(areas.iter().any(|area| area.primary));
+        assert!(
+            areas
+                .iter()
+                .all(|area| area.rect.width() > 0.0 && area.rect.height() > 0.0)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disconnected_monitor_saved_position_is_repaired_and_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("window-geometry.json");
+        let areas = current_monitor_work_areas(system_pixels_per_point());
+        let beyond = areas
+            .iter()
+            .map(|area| area.rect.max.x)
+            .fold(0.0_f32, f32::max)
+            + 5000.0;
+        assert!(beyond <= 100_000.0);
+        let stale = WindowPlacements {
+            main: WindowPlacements::default().main,
+            companion: Some(MainWindowGeometry {
+                position: Some(egui::pos2(beyond, 200.0)),
+                size: COMPANION_SIZE,
+                maximized: false,
+            }),
+        };
+        save_window_placements(&path, stale).unwrap();
+        let repaired = load_window_placements(&path);
+        assert!(titlebar_reachable(repaired.companion.unwrap(), &areas));
+        assert_ne!(
+            repaired.companion.unwrap().position,
+            stale.companion.unwrap().position
+        );
+        assert_eq!(
+            load_window_placements(&path).companion.unwrap().position,
+            repaired.companion.unwrap().position
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn first_native_frame_recovers_unreachable_root_without_touching_capture() {
+        let mut fixture = LibraryFixture::new();
+        fixture.app.meeting_snapshot.capture = phorminx_ui::workspace::CaptureState::Listening;
+        let areas = current_monitor_work_areas(system_pixels_per_point());
+        let beyond = areas
+            .iter()
+            .map(|area| area.rect.max.x)
+            .fold(0.0_f32, f32::max)
+            + 5000.0;
+        let mut input = companion_input(COMPANION_SIZE, false);
+        let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+        viewport.outer_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(beyond, 200.0),
+            COMPANION_SIZE,
+        ));
+        viewport.native_pixels_per_point = Some(system_pixels_per_point());
+        fixture.app.root_position_check_pending = true;
+        let ctx = egui::Context::default();
+        let output = ctx.run_logic(&input, |ctx| {
+            let viewport = ctx.input(|input| input.viewport().clone());
+            assert!(
+                fixture
+                    .app
+                    .check_native_window_placement(ctx, &viewport, true, true)
+            );
+        });
+        let commands = &output.viewport_commands[&egui::ViewportId::ROOT];
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd, ViewportCommand::OuterPosition(_)))
+        );
+        assert_eq!(
+            fixture.app.meeting_snapshot.capture,
+            phorminx_ui::workspace::CaptureState::Listening
+        );
     }
 
     #[test]
@@ -2414,6 +3357,11 @@ mod tests {
             let mut fixture = LibraryFixture::new();
             fixture.app.window_visible = !root_bootstrap;
             fixture.app.meeting_snapshot.capture = phorminx_ui::workspace::CaptureState::Listening;
+            fixture.app.main_window_resting = MainWindowGeometry {
+                position: Some(egui::pos2(80.0, 72.0)),
+                size: Vec2::new(1400.0, 900.0),
+                maximized: true,
+            };
             let ctx = egui::Context::default();
             let mut input = companion_input(Vec2::new(1400.0, 900.0), false);
             input
@@ -2458,6 +3406,61 @@ mod tests {
             let no_repeat = ctx.run_logic(&input, |ctx| fixture.app.apply_companion_hide(ctx));
             assert!(no_repeat.viewport_commands.is_empty());
         }
+    }
+
+    #[test]
+    fn qa_maintenance_allows_missing_assets_and_hidden_window_but_excludes_capture() {
+        let mut fixture = LibraryFixture::new();
+        for visible in [false, true] {
+            fixture.app.window_visible = visible;
+            for status in [
+                UiRuntimeStatus::Ready,
+                UiRuntimeStatus::NeedsAttention,
+                UiRuntimeStatus::NoSpeech,
+                UiRuntimeStatus::Copied,
+                UiRuntimeStatus::Inserted,
+            ] {
+                fixture.app.runtime_status = status;
+                assert!(
+                    fixture.app.maintenance_idle(),
+                    "Repair must remain available in {status:?}, visible={visible}"
+                );
+            }
+            for status in [
+                UiRuntimeStatus::Starting,
+                UiRuntimeStatus::Listening,
+                UiRuntimeStatus::Transcribing,
+                UiRuntimeStatus::Refining,
+            ] {
+                fixture.app.runtime_status = status;
+                assert!(
+                    !fixture.app.maintenance_idle(),
+                    "Maintenance must not interrupt {status:?}"
+                );
+            }
+            fixture.app.runtime_status = UiRuntimeStatus::NeedsAttention;
+            for capture in [
+                phorminx_ui::workspace::CaptureState::Starting,
+                phorminx_ui::workspace::CaptureState::Listening,
+                phorminx_ui::workspace::CaptureState::Stopping,
+            ] {
+                fixture.app.meeting_snapshot.capture = capture;
+                assert!(!fixture.app.maintenance_idle());
+            }
+            fixture.app.meeting_snapshot.capture = phorminx_ui::workspace::CaptureState::Idle;
+        }
+    }
+
+    #[test]
+    fn qa_hidden_maintenance_cannot_activate_without_a_native_validation_proof() {
+        let mut fixture = LibraryFixture::new();
+        fixture.app.window_visible = false;
+        fixture.app.runtime_status = UiRuntimeStatus::NeedsAttention;
+        let before = fixture.app.bridge.settings().clone();
+        assert!(fixture.app.maintenance_idle());
+        fixture.app.apply_validated_model();
+        assert_eq!(fixture.app.bridge.settings(), &before);
+        assert!(!fixture.app.vosk_models.busy());
     }
 
     /// Entirely synthetic shell composition: no native window, global shortcut,

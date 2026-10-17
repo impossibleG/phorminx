@@ -1,6 +1,8 @@
 //! Windows shell integration for Phorminx.
 
 #[cfg(windows)]
+mod app_icon;
+#[cfg(windows)]
 mod appearance;
 #[cfg(windows)]
 mod asset_dialog;
@@ -18,6 +20,8 @@ mod insertion;
 mod lexicon_window;
 #[cfg(windows)]
 mod ollama;
+#[cfg(windows)]
+mod ollama_start;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
@@ -38,6 +42,8 @@ mod startup;
 mod target;
 #[cfg(windows)]
 mod tray;
+#[cfg(windows)]
+mod user_idle;
 
 #[cfg(windows)]
 pub use appearance::{SystemAppearance, system_appearance, system_apps_use_dark_theme};
@@ -67,6 +73,8 @@ pub use ollama::{
     inspect_ollama_installation, ollama_automatic_install_availability,
     ollama_model_disk_free_bytes, open_official_ollama_download,
 };
+#[cfg(windows)]
+pub use ollama_start::{OllamaStartError, start_verified_ollama};
 #[cfg(windows)]
 pub use overlay::{OverlayError, OverlayStatus, StatusOverlay};
 #[cfg(windows)]
@@ -102,6 +110,8 @@ pub use startup::{
 pub use target::TargetSnapshot;
 #[cfg(windows)]
 pub use tray::{SystemTray, TrayError, TrayEvent, TrayStatus};
+#[cfg(windows)]
+pub use user_idle::user_idle_duration;
 
 #[cfg(not(windows))]
 compile_error!("phorminx-windows only supports Windows");

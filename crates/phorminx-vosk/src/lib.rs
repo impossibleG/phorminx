@@ -18,12 +18,12 @@ const WINDOWS_RUNTIME_FILES: [&str; 4] = [
     "libstdc++-6.dll",
     "libwinpthread-1.dll",
 ];
-const MODEL_FILES: [&str; 4] = [
-    "am/final.mdl",
-    "conf/model.conf",
-    "graph/HCLr.fst",
-    "graph/Gr.fst",
-];
+const MODEL_FILES: [&str; 2] = ["am/final.mdl", "conf/model.conf"];
+
+fn nonempty_file(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+}
 
 type ModelNew = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type ModelFree = unsafe extern "C" fn(*mut c_void);
@@ -113,6 +113,17 @@ pub fn validate_asset_layout(runtime_bundle: &Path, model: &Path, language: &str
         {
             return AssetLayout::MissingModel { expected };
         }
+    }
+    // Large static-graph models use HCLG; lightweight/dynamic models use the
+    // split HCLr + Gr graph. Both are official Vosk layouts. Neither layout
+    // check replaces the subsequent native model/session readiness probe.
+    if !nonempty_file(&model.join("graph/HCLG.fst"))
+        && !(nonempty_file(&model.join("graph/HCLr.fst"))
+            && nonempty_file(&model.join("graph/Gr.fst")))
+    {
+        return AssetLayout::MissingModel {
+            expected: model.join("graph"),
+        };
     }
     if !model_matches_language(model, &language) {
         return AssetLayout::IncompatibleModelLanguage { language };
@@ -533,6 +544,21 @@ mod tests {
     use std::fs;
 
     #[test]
+    #[ignore = "requires installed local Vosk runtime and English model"]
+    fn native_silent_twenty_second_rollover_finishes_without_a_word() {
+        let runtime = std::env::var("PHORMINX_TEST_VOSK_RUNTIME").unwrap();
+        let model_path = std::env::var("PHORMINX_TEST_VOSK_MODEL").unwrap();
+        let model = VoskModel::load(Path::new(&runtime), Path::new(&model_path), "en").unwrap();
+        let mut session = model.session(16_000).unwrap();
+        let silence = vec![0.0_f32; 4_000];
+        for _ in 0..80 {
+            session.accept_f32(&silence).unwrap();
+        }
+        let final_segment = session.finish().unwrap();
+        assert!(final_segment.text.is_empty());
+    }
+
+    #[test]
     fn partial_text_is_separate_from_finalized_text_and_rejects_malformed_json() {
         assert_eq!(
             parse_partial(br#"{"partial":"  provisional words  ","text":"not final"}"#).unwrap(),
@@ -639,6 +665,23 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, [1]).unwrap();
         }
+        fs::create_dir_all(model.join("graph")).unwrap();
+        fs::write(model.join("graph/HCLG.fst"), [1]).unwrap();
+        assert!(matches!(
+            validate_asset_layout(&runtime, &model, "en"),
+            AssetLayout::Present { .. }
+        ));
+        fs::remove_file(model.join("graph/HCLG.fst")).unwrap();
+        fs::write(model.join("graph/HCLr.fst"), [1]).unwrap();
+        assert!(matches!(
+            validate_asset_layout(&runtime, &model, "en"),
+            AssetLayout::MissingModel { .. }
+        ));
+        fs::write(model.join("graph/Gr.fst"), [1]).unwrap();
+        assert!(matches!(
+            validate_asset_layout(&runtime, &model, "en"),
+            AssetLayout::Present { .. }
+        ));
         assert!(matches!(
             inspect(&runtime, &model, "en"),
             Readiness::LoadFailed { .. }

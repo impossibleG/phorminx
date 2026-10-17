@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phorminx · Live companion</title>
+  <link rel="stylesheet" href="../meeting-showcase/styles.css">
+  <link rel="stylesheet" href="companion.css">
+  <script src="markdown.js" defer></script>
+  <script src="companion.js" defer></script>
+</head>
+<body>
+  <div class="window-frame dark" id="window-frame" data-view="together" data-language="both">
+    <div class="companion">
+      <header class="utility-bar">
+        <div class="session-name"><small>MEETING</small><strong id="session-title">Untitled session</strong></div>
+        <span class="record-state"><i></i><span id="record-status">READY</span><em id="elapsed">00:00</em></span>
+        <div class="sources">
+          <button id="mic" type="button" aria-pressed="true"><i></i><span>Mic</span><em>on</em></button>
+          <button id="computer" type="button" aria-pressed="true"><i></i><span>Computer</span><em>on</em></button>
+        </div>
+        <div class="window-actions"><button type="button" id="hide">Hide</button><button type="button" id="finish" class="finish">Finish</button></div>
+      </header>
+      <nav class="room-tabs" aria-label="Companion views">
+        <div class="view-choices"><button type="button" data-room-tab="transcript">Transcript</button><button type="button" data-room-tab="together" class="active">Together</button><button type="button" data-room-tab="assistant">Assistant</button></div>
+        <div class="nav-tools">
+          <div class="language-tabs" role="group" aria-label="Transcript language"><button type="button" data-language-choice="original">Original</button><button type="button" data-language-choice="both" class="active">Both</button><button type="button" data-language-choice="translation" id="translation-choice">Translation</button></div>
+          <div class="commentary-control"><span>Commentary</span><button type="button" id="commentary" class="switch" role="switch" aria-checked="false" aria-label="Commentary"><i></i></button></div>
+        </div>
+      </nav>
+      <div class="room" id="room">
+        <section class="transcript-pane" aria-label="Transcript"><div class="transcript-scroll" id="transcript-scroll" role="log" aria-live="polite"></div></section>
+        <div class="divider" id="divider" role="separator" aria-label="Resize transcript and assistant" aria-orientation="vertical" tabindex="0" title="Drag to resize; double-click to reset"><span></span></div>
+        <section class="assistant-pane" aria-label="Assistant conversation">
+          <div class="conversation-scroll" id="conversation-scroll" role="log" aria-live="polite"></div>
+          <form class="composer" id="composer"><label class="sr-only" for="question">Ask about this meeting</label><div class="composer-field"><input id="question" type="text" autocomplete="off" placeholder="Ask about this meeting…"><button type="submit" aria-label="Send question">↗</button></div></form>
+        </section>
+      </div>
+      <div class="status-strip" id="status-strip" role="status"></div>
+    </div>
+  </div>
+</body>
+</html>

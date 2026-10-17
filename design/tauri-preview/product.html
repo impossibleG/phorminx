@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phorminx</title>
+  <link rel="stylesheet" href="preview.css">
+  <link rel="stylesheet" href="product.css">
+  <script src="markdown.js" defer></script>
+  <script src="preview.js" defer></script>
+  <script src="product.js" defer></script>
+</head>
+<body data-shell="product">
+  <div class="shell">
+    <header class="topbar"><img class="mark" src="../brand/png/app/phorminx-app-32.png" width="28" height="28" alt=""><strong>PHORMINX</strong><span id="status" role="status">Opening local systems…</span></header>
+    <div class="workspace">
+      <nav class="side" aria-label="Phorminx sections">
+        <button class="active" type="button" data-route="home">Home</button>
+        <button type="button" data-route="live">Meetings</button>
+        <button type="button" data-route="history">History</button>
+        <button type="button" data-route="lexicon">Lexicon</button>
+        <button type="button" data-route="profiles">Profiles</button>
+        <button type="button" data-route="models">Models</button>
+        <button type="button" data-route="actions">Actions</button>
+        <button type="button" data-route="settings">Settings</button>
+        <button type="button" data-route="setup">Setup &amp; repair</button>
+        <button id="open-feedback" type="button">Feedback</button>
+        <p>LOCAL ONLY</p>
+      </nav>
+      <main>
+        <section id="home" class="page">
+          <div class="page-head"><div><small>THE INSTRUMENT</small><h1 id="home-title">Ready when you are.</h1></div><button id="test-dictation" type="button" class="primary">Test dictation</button></div>
+          <div class="home-grid">
+            <section class="hero-block"><small>DICTATION</small><div id="runtime-state" class="big-state">Checking</div><div id="shortcut-display" class="shortcut-display">Ctrl Alt Space</div></section>
+            <section class="systems-block"><small>LOCAL SYSTEMS</small><div id="systems"></div></section>
+          </div>
+          <section class="recent"><div class="section-head"><small>RECENTLY HELD</small><button type="button" data-route="history">View history</button></div><div id="recent-history"></div></section>
+        </section>
+        <section id="history" class="page" hidden>
+          <div class="page-head"><div><small>LIBRARY</small><h1>History</h1></div><div class="history-controls"><input id="history-query" aria-label="Search history" placeholder="Search dictations…"><select id="history-mode" aria-label="Search mode"><option value="exact">Exact words</option><option value="semantic">Meaning</option></select></div></div>
+          <p id="history-status" role="status"></p>
+          <div class="history-layout"><div id="history-list" class="record-list"></div><article class="record-detail"><div class="history-detail-head"><small>SELECTED TEXT</small><select id="history-variant" aria-label="Text version"><option value="output">Final output</option><option value="raw">Raw speech</option><option value="normalized">Normalized</option><option value="cleaned">Cleaned</option></select></div><div id="history-detail">Select an entry to read it.</div></article></div>
+        </section>
+        <section id="lexicon" class="page" hidden><div class="page-head"><div><small>LANGUAGE</small><h1>Lexicon</h1></div><button id="new-lexicon" type="button" class="primary">New entry</button></div><div id="lexicon-list" class="record-list single-list"></div></section>
+        <section id="lexicon-editor" class="page" hidden>
+          <div class="page-head"><div><small>LANGUAGE / EDITOR</small><h1 id="lexicon-editor-title">New entry</h1></div><button type="button" data-route="lexicon">Back to lexicon</button></div>
+          <form id="lexicon-form" class="action-form">
+            <input id="lexicon-id" type="hidden">
+            <label>Recognized as<input id="lexicon-alias" required placeholder="What speech recognition hears"></label>
+            <label>Write as<input id="lexicon-canonical" required placeholder="Correct spelling"></label>
+            <label>Language<input id="lexicon-language" placeholder="Optional, e.g. en"></label>
+            <label>Application<input id="lexicon-app" placeholder="Optional executable name"></label>
+            <label>Letter case<select id="lexicon-case"><option value="preserve-input">Preserve input</option><option value="canonical">Use spelling above</option><option value="lowercase">Lowercase</option><option value="uppercase">Uppercase</option></select></label>
+            <label class="check-row"><input id="lexicon-enabled" type="checkbox" checked>Enabled</label>
+            <div class="action-form-buttons"><button type="submit" class="primary">Save entry</button><button id="delete-lexicon" type="button" hidden>Delete entry</button><span id="lexicon-result" role="status"></span></div>
+          </form>
+        </section>
+        <section id="profiles" class="page" hidden><div class="page-head"><div><small>CONTEXT</small><h1>Profiles</h1></div><button id="new-profile" type="button" class="primary">New profile</button></div><div id="profile-list" class="record-list single-list"></div></section>
+        <section id="profile-editor" class="page" hidden>
+          <div class="page-head"><div><small>CONTEXT / EDITOR</small><h1 id="profile-editor-title">New profile</h1></div><button type="button" data-route="profiles">Back to profiles</button></div>
+          <form id="profile-form" class="action-form">
+            <input id="profile-original" type="hidden">
+            <label>Application executable<input id="profile-executable" required placeholder="application.exe"></label>
+            <label>Formatting<select id="profile-style"><option value="raw">Raw</option><option value="light">Light</option><option value="balanced">Balanced</option><option value="strong">Strong</option><option value="custom">Custom</option></select></label>
+            <label>Language<input id="profile-language" placeholder="Use default language"></label>
+            <label>Insertion<select id="profile-insertion"><option value="automatic">Automatic</option><option value="direct">Direct</option><option value="clipboard">Clipboard only</option></select></label>
+            <label>Custom instructions<textarea id="profile-instructions" rows="5" placeholder="Only for Custom formatting"></textarea></label>
+            <label class="check-row"><input id="profile-deny" type="checkbox">Block dictation in this application</label>
+            <div class="action-form-buttons"><button type="submit" class="primary">Save profile</button><button id="delete-profile" type="button" hidden>Delete profile</button><span id="profile-result" role="status"></span></div>
+          </form>
+        </section>
+        <section id="models" class="page" hidden>
+          <div class="page-head"><div><small>LOCAL COMPUTE</small><h1>Models</h1></div></div>
+          <div class="model-grid"><div class="setting-card"><small>SPEECH / ACCURATE</small><h2>Whisper</h2><p id="selected-whisper">Checking selection…</p><div class="model-choices"><button type="button" data-whisper-model="whisper-tiny-en-f16">Tiny · English</button><button type="button" data-whisper-model="whisper-base-en-f16">Base · English</button><button type="button" data-whisper-model="whisper-tiny-multilingual-f16">Tiny · Multilingual</button><button type="button" data-whisper-model="whisper-base-multilingual-f16">Base · Multilingual</button></div></div><div class="setting-card"><small>SPEECH / INSTANT</small><h2>Vosk</h2><p id="vosk-state">Checking assets…</p><button id="install-vosk" type="button">Install verified assets</button></div></div>
+          <div class="setting-card model-ollama"><small>LOCAL LANGUAGE MODELS</small><h2>Ollama</h2><div id="ollama-models"></div></div>
+          <p id="model-result" role="status"></p>
+        </section>
+        <section id="actions" class="page" hidden><div class="page-head"><div><small>AUTOMATION</small><h1>Actions</h1></div><button id="new-action" type="button" class="primary">New action</button></div><div id="actions-list" class="record-list single-list"></div></section>
+        <section id="action-editor" class="page" hidden>
+          <div class="page-head"><div><small>AUTOMATION / EDITOR</small><h1 id="action-editor-title">New action</h1></div><button type="button" data-route="actions">Back to actions</button></div>
+          <form id="action-form" class="action-form">
+            <input id="action-id" type="hidden">
+            <label>Name<input id="action-name" maxlength="200" required placeholder="Send a note"></label>
+            <label>Launcher slot<input id="action-slot" type="number" min="1" max="9" placeholder="Optional"></label>
+            <label>Method<select id="action-method"><option>POST</option><option>GET</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select></label>
+            <label>Endpoint<input id="action-endpoint" type="url" maxlength="2048" required placeholder="https://example.com/notes"></label>
+            <label>Payload mode<select id="action-payload-mode"><option value="template">Template</option><option value="ai-json">Local AI writes JSON</option></select></label>
+            <label>Payload template<textarea id="action-template" rows="5" placeholder='{"note": "{{text}}"}'></textarea></label>
+            <label>Local model<input id="action-model" maxlength="200" placeholder="Used for AI JSON mode"></label>
+            <label>Instructions for local model<textarea id="action-prompt" rows="4" placeholder="Describe the JSON to produce"></textarea></label>
+            <label>Authorization<input id="action-auth" type="password" autocomplete="new-password" placeholder="Leave blank to retain a saved credential"></label>
+            <label>Headers (JSON object)<textarea id="action-headers" rows="3" placeholder='{"X-Token": "secret"}'></textarea></label>
+            <div class="action-form-buttons"><button type="submit" class="primary">Save action</button><button id="delete-action" type="button" hidden>Delete action</button><span id="action-result" role="status"></span></div>
+          </form>
+        </section>
+        <section id="setup" class="page" hidden>
+          <div class="page-head"><div><small>CARE</small><h1>Setup &amp; repair</h1></div><button id="setup-start" type="button" class="primary" hidden>Start Phorminx</button></div>
+          <div id="bootstrap-card" class="setting-card"><small>RECOMMENDED STARTER</small><h2>Ready in one guided run</h2><p>Prepare instant and accurate recognition, local formatting, and semantic search. Downloads stay on this computer.</p><div class="bootstrap-control"><button id="bootstrap-start" type="button" class="primary">Prepare everything</button><button id="bootstrap-cancel" type="button" hidden>Stop after this step</button><span id="bootstrap-progress" role="status"></span></div><p id="bootstrap-message"></p></div>
+          <div id="setup-updates-card" class="setting-card"><small>NEW FEATURES</small><h2>Keep Phorminx current</h2><label class="check-row"><input id="setup-auto-updates" type="checkbox" checked>Keep getting tested new features automatically</label><p>Phorminx checks signed GitHub Releases daily and installs a verified update when Phorminx restarts, or after you have been away for 30 minutes with nothing recording. Turn this off here or later in Settings → Updates.</p><p id="setup-update-note" role="status"></p></div>
+          <small id="repair-label">INDIVIDUAL REPAIR</small><div class="setup-intro"><strong id="setup-stage">Inspecting this machine</strong><p id="setup-summary">Reading local capabilities…</p></div><div id="setup-list" class="record-list single-list"></div>
+        </section>
+        <section id="app-settings" class="page" hidden>
+          <div class="page-head"><div><small>PREFERENCES</small><h1>Settings</h1></div></div>
+          <div class="meeting-tabs settings-tabs" role="tablist" aria-label="Settings"><button class="active" type="button" role="tab" aria-selected="true" aria-controls="settings-general" data-settings-tab="general">General</button><button type="button" role="tab" aria-selected="false" aria-controls="settings-dictation" data-settings-tab="dictation">Dictation</button><button type="button" role="tab" aria-selected="false" aria-controls="settings-privacy" data-settings-tab="privacy">Privacy &amp; search</button><button type="button" role="tab" aria-selected="false" aria-controls="settings-updates" data-settings-tab="updates">Updates</button></div>
+          <div id="settings-general" class="settings-panel">
+            <form id="preferences-form" class="preferences-form">
+              <div class="setting-card"><small>APPEARANCE</small><h2>Theme</h2><select id="app-theme" aria-label="Theme"><option value="system">Follow system</option><option value="light">Light</option><option value="dark">Dark</option></select></div>
+              <div class="setting-card"><small>INPUT</small><h2>Recording</h2><select id="recording-mode" aria-label="Recording mode"><option value="toggle">Toggle</option><option value="hold">Hold</option></select></div>
+              <div class="setting-card"><small>SHORTCUT</small><h2>Open Phorminx</h2><input id="launcher-shortcut" aria-label="Launcher shortcut" autocomplete="off"><button id="capture-shortcut" type="button">Capture keys</button></div>
+              <div class="preferences-save"><button class="primary" type="submit">Save preferences</button><span id="preferences-result" role="status"></span></div>
+            </form>
+          </div>
+          <div id="settings-dictation" class="settings-panel" hidden>
+            <form id="dictation-form" class="preferences-form">
+              <div class="setting-card"><small>RECOGNITION</small><h2>Speech</h2><div class="setting-form"><label>Mode<select id="recognition-mode"><option value="accurate">Accurate · Whisper</option><option value="instant">Instant · Vosk</option></select></label><label>Microphone<select id="dictation-microphone"><option value="">Windows default</option></select></label><label>Compute backend<select id="accurate-backend"><option value="auto">Automatic</option><option value="vulkan">Vulkan</option><option value="cpu">CPU</option></select></label><label>Language<input id="recognition-language" placeholder="en or pt-br"></label><label>Minimum speech level<input id="minimum-rms" type="number" min="0" max="1" step="0.0001"></label></div></div>
+              <div class="setting-card"><small>FORMATTING</small><h2>Finish the thought</h2><div class="setting-form"><label>Strength<select id="formatting-strength"><option value="raw">Raw</option><option value="light">Light</option><option value="balanced">Balanced</option><option value="strong">Strong</option><option value="custom">Custom</option></select></label><label>Local model<select id="formatting-model"><option value="">No model</option></select></label><label>Model residency<select id="model-residency"><option value="instant">Instant</option><option value="balanced">Balanced</option><option value="memorysaver">Memory saver</option></select></label></div></div>
+              <div class="setting-card"><small>CUSTOM</small><h2>Instructions</h2><textarea id="custom-instructions" rows="8" placeholder="Used for Custom formatting"></textarea></div>
+              <div class="preferences-save"><button class="primary" type="submit">Save dictation</button><span id="dictation-result" role="status"></span></div>
+            </form>
+          </div>
+          <div id="settings-privacy" class="settings-panel" hidden>
+            <form id="privacy-form" class="preferences-form">
+              <div class="setting-card"><small>HISTORY</small><h2>Retention</h2><select id="history-retention"><option value="disabled">Off</option><option value="one-day">One day</option><option value="seven-days">Seven days</option><option value="thirty-days">Thirty days</option><option value="indefinite">Until deleted</option></select></div>
+              <div class="setting-card"><small>SEARCH</small><h2>Local embeddings</h2><input id="embedding-model" placeholder="nomic-embed-text:latest"><p>Leave blank to turn semantic search off.</p></div>
+              <div class="setting-card"><small>STARTUP &amp; INPUT</small><h2>Behavior</h2><label class="check-row"><input id="launch-at-login" type="checkbox">Launch at login</label><label>Direct dictation shortcut<input id="direct-shortcut" placeholder="Optional"></label></div>
+              <div class="preferences-save"><button class="primary" type="submit">Save privacy &amp; search</button><span id="privacy-result" role="status"></span></div>
+            </form>
+          </div>
+          <div id="settings-updates" class="settings-panel" hidden>
+            <div class="updates-grid">
+              <section class="setting-card"><small>INSTALLED</small><h2>Phorminx <span id="update-installed">…</span></h2><p id="update-available">Checking release status…</p><p id="update-last-check"></p></section>
+              <section class="setting-card"><small>DELIVERY</small><h2>Stay current</h2><label class="check-row"><input id="update-daily" type="checkbox">Check GitHub Releases daily</label><label class="check-row"><input id="update-automatic" type="checkbox">Download automatically; install on restart or after 30 idle minutes</label><p>Updates never interrupt an active dictation or meeting.</p></section>
+            </div>
+            <div class="update-actions"><button id="update-check" type="button">Check now</button><button id="update-download" type="button">Download verified update</button><button id="update-restart" type="button" class="primary">Restart to update</button><button id="update-install" type="button">Install after closing</button></div>
+            <p id="update-notice" role="status"></p>
+          </div>
+        </section>
+        <section id="live" class="page" hidden>
+          <div class="page-head"><div><small>MEETINGS / LIVE</small><h1>Live session</h1></div><div class="head-actions"><button id="start" type="button" class="primary">Start meeting</button><button id="stop" type="button">Finish</button><button id="companion" type="button">Open companion</button></div></div>
+          <div class="meeting-tabs" role="tablist" aria-label="Meetings"><button class="active" type="button" role="tab" aria-selected="true" data-route="live">Live session</button><button type="button" role="tab" aria-selected="false" data-route="saved">Saved sessions</button><button type="button" role="tab" aria-selected="false" data-route="meeting-settings">Meeting settings</button></div>
+          <div class="live-grid"><section class="pane"><h2>Transcript</h2><div id="transcript" class="scroll-content" role="log"></div></section><section class="pane"><div class="pane-head"><h2>Assistant</h2><button id="commentary" type="button" aria-pressed="false">Commentary off</button></div><div id="messages" class="scroll-content" role="log"></div><form id="ask"><input id="question" aria-label="Ask about this meeting" placeholder="Ask about this meeting…" autocomplete="off"><button type="submit">Send</button></form></section></div>
+        </section>
+        <section id="saved" class="page" hidden>
+          <div class="page-head"><div><small>MEETINGS / LIBRARY</small><h1>Saved sessions</h1></div><form id="search"><input id="query" aria-label="Search saved sessions" placeholder="Search sessions…"><button type="submit">Search</button></form></div>
+          <div class="meeting-tabs" role="tablist" aria-label="Meetings"><button type="button" role="tab" aria-selected="false" data-route="live">Live session</button><button class="active" type="button" role="tab" aria-selected="true" data-route="saved">Saved sessions</button><button type="button" role="tab" aria-selected="false" data-route="meeting-settings">Meeting settings</button></div>
+          <div class="saved-grid"><div id="sessions" class="session-list" aria-label="Saved session list"></div><section class="pane saved-detail"><h2 id="saved-title">Select a session</h2><div id="saved-transcript" class="scroll-content"></div></section></div>
+        </section>
+        <section id="meeting-settings" class="page" hidden>
+          <div class="page-head"><div><small>MEETINGS / CONFIGURATION</small><h1>Meeting settings</h1></div></div>
+          <div class="meeting-tabs" role="tablist" aria-label="Meetings"><button type="button" role="tab" aria-selected="false" data-route="live">Live session</button><button type="button" role="tab" aria-selected="false" data-route="saved">Saved sessions</button><button class="active" type="button" role="tab" aria-selected="true" data-route="meeting-settings">Meeting settings</button></div>
+          <div class="settings-grid"><section class="setting-card"><small>AUDIO</small><h2>Computer and microphone</h2><p>Both sources are captured when a meeting starts. Mute either one from the companion.</p><form id="devices-form" class="setting-form"><label for="output-device">Computer device</label><select id="output-device"><option value="">Windows default</option></select><label for="input-device">Microphone</label><select id="input-device"><option value="">Windows default</option></select><button type="submit">Save devices</button></form></section><section class="setting-card"><small>LANGUAGE</small><h2>Live translation</h2><form id="translation-form" class="setting-form"><label for="translation-language">Target language</label><input id="translation-language" placeholder="Off, or a language such as Portuguese (Brazil)"><label for="translation-model">Local model</label><select id="translation-model"><option value="">Choose an installed model</option></select><button type="submit">Save translation</button></form><p id="translation-notice"></p></section><section class="setting-card assistant-card"><small>ASSISTANT</small><h2>Meeting perspective</h2><form id="provider-form" class="setting-form"><label>Provider<select id="provider-kind"><option value="ollama">Local · Ollama</option><option value="openai">External · OpenAI</option><option value="anthropic">External · Anthropic</option></select></label><label>Answer model<input id="provider-model" placeholder="Installed local model or provider model"></label><label>Fallback local model<input id="provider-fallback" placeholder="Optional"></label><label>Endpoint<input id="provider-endpoint" placeholder="http://127.0.0.1:11434"></label><label>API key<input id="provider-key" type="password" autocomplete="new-password" placeholder="Leave blank to retain existing key"></label><label class="check-row"><input id="provider-clear-key" type="checkbox">Remove saved key</label><label>Meeting instructions<textarea id="provider-preset" rows="5" placeholder="How the assistant should help during this meeting"></textarea></label><div class="provider-actions"><button type="submit">Save assistant</button><span id="provider-result" role="status"></span></div></form></section></div>
+        </section>
+      </main>
+    </div>
+  </div>
+  <dialog id="setup-consent"><form method="dialog"><small>BEFORE CONTINUING</small><h2 id="setup-consent-title">Confirm setup</h2><div id="setup-consent-details"></div><div class="dialog-actions"><button value="cancel">Cancel</button><button id="setup-consent-confirm" value="confirm" class="primary">Confirm changes</button></div></form></dialog>
+  <dialog id="bootstrap-consent"><form method="dialog"><small>BEFORE CONTINUING</small><h2>Prepare your local starter</h2><p>Phorminx will download verified speech assets, install Ollama and a small local language model, and install Vulkan if Windows needs it. Windows may ask for administrator approval for Vulkan. Existing text and settings are preserved; this can take several minutes and use substantial disk space.</p><div class="dialog-actions"><button value="cancel">Not now</button><button value="confirm" class="primary">Install starter</button></div></form></dialog>
+</body>
+</html>

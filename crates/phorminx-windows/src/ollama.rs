@@ -173,8 +173,10 @@ fn inspect_at(local_app_data: &Path) -> Result<OllamaInstallation, OllamaInstall
     }
     // Do not return an executable path or spawn capability. LocalAppData is
     // user-writable and no signer identity is pinned, so a file could be
-    // replaced after this observation. Phorminx requires the user to start
-    // Ollama and interacts only with its loopback API.
+    // replaced after this observation. Automatic startup uses the separate
+    // start_verified_ollama path, which verifies its publisher while holding
+    // the executable open against replacement. This inspection grants no
+    // execution authority by itself.
     Ok(OllamaInstallation::Present)
 }
 

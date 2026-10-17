@@ -110,6 +110,8 @@ impl Persistence {
             tx.execute("UPDATE persistence_settings SET value=CAST(value AS INTEGER)+1 WHERE key='recovery_epoch'", [])?;
         }
         if selection.meeting_transcripts {
+            tx.execute("DELETE FROM meeting_source_segments", [])?;
+            tx.execute("DELETE FROM meeting_capture_modes", [])?;
             tx.execute("DELETE FROM meeting_segments", [])?;
             tx.execute(
                 "UPDATE meeting_sessions SET next_sequence=0,committed_sample=0",

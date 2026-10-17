@@ -11,3 +11,5 @@ rolling dictation, and transactional setup.
 
 For current build and test commands, use [DEVELOPMENT.md](DEVELOPMENT.md).
 For the product overview and privacy boundaries, use the [README](../README.md).
+For the current work sequence and release gates, use the
+[product roadmap](PRODUCT-ROADMAP.md).

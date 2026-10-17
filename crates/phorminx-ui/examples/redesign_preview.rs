@@ -1,5 +1,5 @@
 //! Native-renderer visual QA. Synthetic data only; no runtime, network or clipboard.
-//! Usage: redesign_preview [--companion|--actions] [--dark] [--small] [--capture=PATH]
+//! Usage: redesign_preview [--companion|--actions] [--assistant] [--dark] [--small] [--capture=PATH]
 use eframe::egui;
 use phorminx_ui::theme::ThemeMode;
 use phorminx_ui::workspace::*;
@@ -22,13 +22,20 @@ impl Preview {
         let companion = args.iter().any(|a| a == "--companion");
         snapshot.workspace = WorkspaceSnapshot {
             history_enabled: true,
-            capture: if companion { CaptureState::Listening } else { CaptureState::Idle },
+            meeting_source: CaptureSource::Both,
+            capture: if companion || args.iter().any(|a| a == "--active") { CaptureState::Listening } else { CaptureState::Idle },
             captured_samples: 11_648_000,
             committed_samples: 11_648_000,
             title: "Release scope & Friday delivery".into(),
-            transcript: vec![MeetingLine { start_sample: 11_520_000, end_sample: 11_648_000, text: "If we narrow the first release to the core workflow, could we have it ready by Friday?".into() }],
+            transcript: vec![MeetingLine { start_sample: 11_200_000, end_sample: 11_360_000, text: "[11:40.000 · Computer audio] Let's move the launch review to Thursday. That gives design one more day to resolve the last details.".into() }, MeetingLine { start_sample: 11_360_000, end_sample: 11_520_000, text: "[11:50.000 · You / microphone] That works for me. I'll have the revised flow ready before the review.".into() }, MeetingLine { start_sample: 11_520_000, end_sample: 11_648_000, text: "[12:00.000 · Computer audio] If we narrow the first release to the core workflow, could we have it ready by Friday?".into() }],
+            translation_language: "Brazilian Portuguese".into(),
+            translation_model: "Qwen 3 · 8B".into(),
+            translations: vec![TranslationLine { start_sample: 11_200_000, end_sample: 11_360_000, language: "Brazilian Portuguese".into(), text: "Vamos passar a revisão do lançamento para quinta-feira. Isso dá ao design mais um dia para resolver os últimos detalhes.".into() }, TranslationLine { start_sample: 11_360_000, end_sample: 11_520_000, language: "Brazilian Portuguese".into(), text: "Por mim, tudo bem. Vou deixar o fluxo revisado pronto antes da revisão.".into() }, TranslationLine { start_sample: 11_520_000, end_sample: 11_648_000, language: "Brazilian Portuguese".into(), text: "Se reduzirmos a primeira versão ao fluxo principal, conseguiremos entregá-la até sexta-feira?".into() }],
+            companion_translation_view: TranslationView::Both,
+            companion_view: if args.iter().any(|a| a == "--assistant") { CompanionView::Assistant } else { CompanionView::Split },
             messages: vec![ChatLine { role: "You".into(), text: "Can we commit to Friday?".into(), status: "sent".into(), context_samples: Some((0,11_648_000)), ..Default::default() }, ChatLine { role: "Assistant".into(), text: "**Give a conditional commitment.**\n\n“Friday is realistic for the core workflow, provided we have final sign-off tomorrow.”\n\n- Confirm what stays in the first release.\n- Ask who owns the remaining sign-off.".into(), status: "complete".into(), ..Default::default() }],
             provider: ProviderDraft { model: "Qwen 3 · 8B".into(), ..Default::default() },
+            active_answer_model: "Qwen 3 · 8B".into(),
             input_devices: vec!["Example microphone".into()],
             output_devices: vec!["Headphones".into()],
             available_models: vec!["Qwen 3 · 8B".into()],
@@ -99,8 +106,10 @@ impl eframe::App for Preview {
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
     let companion = args.iter().any(|a| a == "--companion");
-    let size = if companion {
+    let size = if companion && args.iter().any(|a| a == "--small") {
         [430.0, 680.0]
+    } else if companion {
+        [980.0, 720.0]
     } else if args.iter().any(|a| a == "--small") {
         [900.0, 700.0]
     } else {
@@ -111,7 +120,7 @@ fn main() -> eframe::Result {
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size(size)
-                .with_decorations(!companion)
+                .with_decorations(true)
                 .with_active(false),
             ..Default::default()
         },

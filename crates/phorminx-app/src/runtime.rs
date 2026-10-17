@@ -182,6 +182,10 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
         self.pending_id
     }
 
+    pub fn minimum_rms(&self) -> f32 {
+        self.minimum_rms
+    }
+
     /// Read-only access used by the event-loop incremental scheduler. The
     /// recording remains owned by the runtime and can still be finalized or
     /// dropped through the existing state-machine paths.
@@ -205,12 +209,14 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
         &mut self,
         language: String,
         formatting: RuntimeFormatting,
+        minimum_rms: f32,
     ) -> Result<(), StateError> {
         if self.machine.state() != RuntimeState::Idle {
             return Err(StateError::Busy(self.machine.state()));
         }
         self.language = language;
         self.formatting = formatting;
+        self.minimum_rms = minimum_rms;
         Ok(())
     }
 
@@ -850,6 +856,15 @@ mod tests {
     }
 
     #[test]
+    fn speech_level_change_applies_to_the_next_dictation() {
+        let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".to_owned()).unwrap();
+        runtime
+            .configure_next_dictation("en".to_owned(), RuntimeFormatting::Light, 0.005)
+            .unwrap();
+        assert_eq!(runtime.minimum_rms, 0.005);
+    }
+
+    #[test]
     fn automatic_stop_racing_a_physical_release_finalizes_only_once() {
         let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".to_owned()).unwrap();
         let mut io = FakeIo::default();
@@ -868,6 +883,48 @@ mod tests {
         assert_eq!(io.submitted.len(), 1);
         assert_eq!(io.recording_drops.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.state(), RuntimeState::Transcribing);
+    }
+
+    #[test]
+    fn empty_recognizer_result_during_initial_silence_cannot_stop_capture() {
+        let mut runtime = AppRuntime::<u64, FakeRecording>::new(0.003, "en".to_owned()).unwrap();
+        let mut io = FakeIo {
+            finish_plan: FinishPlan::Quiet,
+            ..FakeIo::default()
+        };
+        runtime.hold_started(Some(1), &mut io).unwrap();
+        let id = runtime.active_id().unwrap();
+        // Model an arbitrarily long silent period. Empty endpoint results and
+        // delayed stale completions have no authority to end live capture.
+        for _ in 0..600 {
+            let notices = runtime
+                .transcription_completed(
+                    id,
+                    Ok(Transcript {
+                        text: String::new(),
+                        backend: "fake",
+                        model_load_time: Duration::ZERO,
+                        inference_time: Duration::ZERO,
+                        audio_duration: Duration::from_secs(1),
+                    }),
+                    &mut io,
+                )
+                .unwrap();
+            assert!(
+                notices
+                    .iter()
+                    .all(|notice| matches!(notice, RuntimeNotice::StaleTranscription { .. }))
+            );
+            assert_eq!(runtime.state(), RuntimeState::Listening);
+            assert!(runtime.active_recording().is_some());
+        }
+        assert_eq!(io.recording_drops.load(Ordering::Relaxed), 0);
+        assert!(!io.statuses.contains(&UiStatus::NoSpeech));
+        // Speech arriving later remains accepted until the explicit stop.
+        io.finish_plan = FinishPlan::SpeechThenSilence;
+        runtime.hold_ended(&mut io).unwrap();
+        assert_eq!(runtime.state(), RuntimeState::Transcribing);
+        assert_eq!(io.submitted.len(), 1);
     }
 
     #[test]

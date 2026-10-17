@@ -1115,8 +1115,16 @@ fn handle_backend_notification(progress: &SharedProgress, kind: cpal::ErrorKind,
         return;
     }
     let code = backend_kind_code(kind);
-    if kind == cpal::ErrorKind::RealtimeDenied
-        || (loopback && matches!(kind, cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged))
+    // An xrun reports a discontinuity, not a dead input stream. In particular,
+    // treating a microphone xrun as terminal made an otherwise healthy dual-
+    // source meeting lose the microphone as soon as Windows missed one period.
+    // Keep capturing and surface the possible gap to the caller. Device changes
+    // remain source-specific: a microphone route change may invalidate its
+    // stream, while WASAPI loopback can continue on the backend-selected route.
+    if matches!(
+        kind,
+        cpal::ErrorKind::RealtimeDenied | cpal::ErrorKind::Xrun
+    ) || (loopback && kind == cpal::ErrorKind::DeviceChanged)
     {
         progress.backend_notice_kind.store(code, Ordering::Release);
         progress.backend_notices.fetch_add(1, Ordering::Release);
@@ -2205,12 +2213,10 @@ mod tests {
             assert!(progress.snapshot().backend_failure.is_some());
             assert_eq!(progress.snapshot().backend_notice_count, 0);
         }
-        let strict = SharedProgress::new();
-        handle_backend_notification(&strict, cpal::ErrorKind::Xrun, false);
-        assert_eq!(
-            strict.snapshot().sticky_fault,
-            Some(ExtendedCaptureFault::StreamFailed)
-        );
+        let microphone = SharedProgress::new();
+        handle_backend_notification(&microphone, cpal::ErrorKind::Xrun, false);
+        assert_eq!(microphone.snapshot().sticky_fault, None);
+        assert_eq!(microphone.snapshot().backend_notice, Some("Xrun"));
     }
     #[test]
     fn scheduling_notice_and_loopback_route_change_allow_capture() {

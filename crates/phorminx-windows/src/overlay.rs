@@ -18,7 +18,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DI_NORMAL, DefWindowProcW, DestroyWindow, DispatchMessageW,
     DrawIconEx, GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
-    HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IsWindow, KillTimer, LoadIconW, MA_NOACTIVATE, MSG,
+    HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IsWindow, KillTimer, MA_NOACTIVATE, MSG,
     PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
     SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
     UnregisterClassW, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEACTIVATE,
@@ -565,6 +565,7 @@ fn clean_launcher_actions(actions: Vec<(u8, String)>) -> Vec<(u8, String)> {
 fn launcher_rows(actions: &[(u8, String)]) -> Vec<(u8, String)> {
     let mut rows = vec![(1, "Dictate".into()), (2, "Start meeting".into())];
     rows.extend_from_slice(actions);
+    rows.push((0, "Give feedback".into()));
     rows
 }
 
@@ -656,12 +657,7 @@ unsafe fn paint_launcher(
         );
     };
     if let Ok(module) = unsafe { GetModuleHandleW(None) }
-        && let Ok(icon) = unsafe {
-            LoadIconW(
-                Some(HINSTANCE(module.0)),
-                windows::core::PCWSTR(std::ptr::without_provenance::<u16>(1)),
-            )
-        }
+        && let Some(icon) = crate::app_icon::load_app_icon(HINSTANCE(module.0))
     {
         let _ = unsafe {
             DrawIconEx(
@@ -758,7 +754,8 @@ mod tests {
             assert_eq!(launcher_hit_test(p(30), p(200), dpi, &rows, 54), Some(7));
             assert_eq!(launcher_hit_test(p(30), p(30), dpi, &rows, 54), None);
             assert_eq!(launcher_hit_test(p(30), p(119), dpi, &rows, 54), None);
-            assert_eq!(launcher_hit_test(p(30), p(250), dpi, &rows, 54), None);
+            assert_eq!(launcher_hit_test(p(30), p(260), dpi, &rows, 54), Some(0));
+            assert_eq!(launcher_hit_test(p(30), p(310), dpi, &rows, 54), None);
             assert_eq!(OverlayStatus::LauncherDark.hide_after_ms(), None);
         }
     }
@@ -778,7 +775,11 @@ mod tests {
         assert_eq!(actions[1].1.chars().count(), 80);
         assert_eq!(
             launcher_rows(&[]),
-            vec![(1, "Dictate".into()), (2, "Start meeting".into())]
+            vec![
+                (1, "Dictate".into()),
+                (2, "Start meeting".into()),
+                (0, "Give feedback".into())
+            ]
         );
         assert_eq!(launcher_height(2, 54), 224);
     }

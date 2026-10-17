@@ -626,6 +626,7 @@ pub struct UiProfileDraft {
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Synchronous, low-frequency intent; never queued on the audio path.
 pub enum UiCommand {
+    ActivateVerifiedVosk(crate::vosk_models::ValidatedVosk),
     SaveSettings(Settings),
     ClearHistory,
     SaveLexicon(UiLexiconDraft),
@@ -714,6 +715,17 @@ impl UiBridge {
             .history()
             .summary(id)
             .map(|summary| summary.map(history_item))
+            .map_err(UiBridgeError::persistence)
+    }
+
+    /// Loads a single profile's editable instructions only after it is selected.
+    pub fn profile_detail(&self, executable: &str) -> Result<Option<UiProfileItem>, UiBridgeError> {
+        let executable = ExecutableIdentity::new(executable.trim())
+            .map_err(|_| UiBridgeError::validation("executable", "Use a basename only."))?;
+        self.persistence
+            .app_profiles()
+            .get(&executable)
+            .map(|profile| profile.map(profile_item))
             .map_err(UiBridgeError::persistence)
     }
 
@@ -819,6 +831,14 @@ impl UiBridge {
         now_ms: i64,
     ) -> Result<UiCommandOutcome, UiBridgeError> {
         match command {
+            UiCommand::ActivateVerifiedVosk(proof) => {
+                let mut candidate = self.settings.clone();
+                proof.apply_to(&mut candidate);
+                candidate
+                    .validate_and_normalize()
+                    .map_err(UiBridgeError::settings)?;
+                self.commit_settings(candidate, now_ms, UiMutation::SettingsSaved)
+            }
             UiCommand::SaveSettings(candidate) => self.save_settings(candidate, readiness, now_ms),
             UiCommand::ClearHistory => {
                 let removed = self
@@ -948,13 +968,23 @@ impl UiBridge {
             ).map_err(|_| UiBridgeError::validation("shortcut", "Choose a supported, distinct shortcut."))?
                 .check_available().map_err(|_| UiBridgeError::validation("shortcut", "Windows reports that a selected shortcut is unavailable. Choose another combination."))?;
         }
-        // Preferences unrelated to recognition must remain editable even when a
-        // model is unavailable. Do not hash/load native assets just to rebind a
-        // shortcut, switch the theme or select a search model.
+        // A redundant Save in non-AI formatting mode must not require a
+        // recognition model or restart the desktop runtime. AI formatting
+        // still checks its pinned model identity before taking the no-op path.
+        if candidate == self.settings && !requires_ollama(candidate.formatting.strength) {
+            return Ok(UiCommandOutcome {
+                mutation: UiMutation::SearchSaved,
+                effects: Vec::new(),
+            });
+        }
+        // Speech level and preferences unrelated to the recognizer can change
+        // without a model reload. Retention is committed to the local database
+        // below; neither edit needs a speech model or an Ollama probe.
+        let mut recognition_without_speech_level = candidate.recognition.clone();
+        recognition_without_speech_level.minimum_rms = self.settings.recognition.minimum_rms;
         if candidate != self.settings
-            && candidate.recognition == self.settings.recognition
+            && recognition_without_speech_level == self.settings.recognition
             && candidate.formatting == self.settings.formatting
-            && candidate.privacy == self.settings.privacy
         {
             let mutation = if candidate.interaction != self.settings.interaction {
                 UiMutation::ShortcutsSaved
@@ -962,6 +992,23 @@ impl UiBridge {
                 UiMutation::SearchSaved
             };
             return self.commit_settings(candidate, now_ms, mutation);
+        }
+        // An instruction draft is inert until Custom formatting is selected.
+        // Saving that draft must not depend on Whisper files or a live Ollama
+        // daemon when the active formatting mode does not use it.
+        if candidate != self.settings
+            && candidate.recognition == self.settings.recognition
+            && candidate.privacy == self.settings.privacy
+            && candidate.formatting.strength != FormattingStrength::Custom
+            && candidate.formatting.strength == self.settings.formatting.strength
+            && candidate.formatting.ollama_model == self.settings.formatting.ollama_model
+            && candidate.formatting.ollama_model_identity
+                == self.settings.formatting.ollama_model_identity
+            && candidate.formatting.ollama_lifecycle == self.settings.formatting.ollama_lifecycle
+            && candidate.formatting.custom_instructions
+                != self.settings.formatting.custom_instructions
+        {
+            return self.commit_settings(candidate, now_ms, UiMutation::SearchSaved);
         }
         match candidate.recognition.mode {
             crate::settings::RecognitionMode::Accurate => {
@@ -1045,7 +1092,23 @@ impl UiBridge {
                 }
             }
         }
-        if requires_ollama(candidate.formatting.strength) {
+        let retained_ollama_selection = candidate.formatting.ollama_model.is_some()
+            && candidate.formatting.ollama_model == self.settings.formatting.ollama_model
+            && candidate.formatting.ollama_model_identity.is_some()
+            && candidate.formatting.ollama_model_identity
+                == self.settings.formatting.ollama_model_identity;
+        // An unavailable daemon cannot establish that a model is missing.
+        // Existing verified selections remain editable offline; runtime still
+        // verifies the exact digest before using AI formatting.
+        if requires_ollama(candidate.formatting.strength)
+            && !(retained_ollama_selection && !readiness.ollama.daemon_reachable)
+        {
+            if !readiness.ollama.daemon_reachable {
+                return Err(UiBridgeError::validation(
+                    "ollama_model",
+                    "Ollama is not reachable. Start Ollama to verify a newly selected model; existing preferences are unchanged.",
+                ));
+            }
             let selected = candidate
                 .formatting
                 .ollama_model
@@ -1095,6 +1158,13 @@ impl UiBridge {
         candidate
             .ensure_runtime_supported()
             .map_err(UiBridgeError::settings)?;
+
+        if candidate == self.settings {
+            return Ok(UiCommandOutcome {
+                mutation: UiMutation::SearchSaved,
+                effects: Vec::new(),
+            });
+        }
 
         self.commit_settings(candidate, now_ms, UiMutation::SettingsSaved)
     }
@@ -1753,6 +1823,87 @@ mod tests {
     }
 
     #[test]
+    fn privacy_save_without_model_readiness_applies_retention_and_startup_effect() {
+        let mut test = TestBridge::new();
+        fs::remove_file(&test.bridge.settings().recognition.model_path).unwrap();
+        let readiness = UiReadinessSnapshot::checking(test.bridge.settings(), &test.bridge.store);
+        let mut candidate = test.bridge.settings().clone();
+        candidate.privacy.history_retention = crate::settings::HistoryRetention::OneDay;
+        candidate.startup.launch_at_login = true;
+
+        let result = test
+            .bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+            .unwrap();
+
+        assert_eq!(result.mutation, UiMutation::SearchSaved);
+        assert_eq!(
+            result.effects,
+            [UiEffect::ReloadRuntime, UiEffect::ApplyLaunchAtLogin(true)]
+        );
+        let saved = test.bridge.store.load().unwrap();
+        assert_eq!(saved.privacy.history_retention, crate::settings::HistoryRetention::OneDay);
+        assert!(saved.startup.launch_at_login);
+        assert_eq!(
+            test.bridge.persistence.history().retention().unwrap(),
+            RetentionPolicy::Hours24
+        );
+    }
+
+    #[test]
+    fn unchanged_settings_save_does_not_require_a_model_or_restart_runtime() {
+        let mut test = TestBridge::new();
+        fs::remove_file(&test.bridge.settings().recognition.model_path).unwrap();
+        let readiness = UiReadinessSnapshot::checking(test.bridge.settings(), &test.bridge.store);
+        let unchanged = test.bridge.settings().clone();
+
+        let outcome = test
+            .bridge
+            .execute(UiCommand::SaveSettings(unchanged), &readiness, 10)
+            .unwrap();
+
+        assert_eq!(outcome.mutation, UiMutation::SearchSaved);
+        assert!(outcome.effects.is_empty());
+    }
+
+    #[test]
+    fn speech_level_save_is_live_and_does_not_require_model_readiness() {
+        let mut test = TestBridge::new();
+        fs::remove_file(&test.bridge.settings().recognition.model_path).unwrap();
+        let readiness = UiReadinessSnapshot::checking(test.bridge.settings(), &test.bridge.store);
+        let mut candidate = test.bridge.settings().clone();
+        candidate.recognition.minimum_rms = 0.005;
+
+        let outcome = test
+            .bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+            .unwrap();
+
+        assert_eq!(outcome.mutation, UiMutation::SearchSaved);
+        assert_eq!(outcome.effects, [UiEffect::ReloadRuntime]);
+        assert_eq!(test.bridge.store.load().unwrap().recognition.minimum_rms, 0.005);
+    }
+
+    #[test]
+    fn inactive_custom_instructions_persist_when_recognition_is_unavailable() {
+        let mut test = TestBridge::new();
+        fs::remove_file(&test.bridge.settings().recognition.model_path).unwrap();
+        let readiness = UiReadinessSnapshot::checking(test.bridge.settings(), &test.bridge.store);
+        let mut candidate = test.bridge.settings().clone();
+        candidate.formatting.custom_instructions = Some("Keep proper nouns verbatim.".into());
+
+        let outcome = test
+            .bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+            .unwrap();
+        assert_eq!(outcome.mutation, UiMutation::SearchSaved);
+        assert_eq!(
+            test.bridge.store.load().unwrap().formatting.custom_instructions.as_deref(),
+            Some("Keep proper nouns verbatim.")
+        );
+    }
+
+    #[test]
     fn combined_shortcut_and_recognition_change_still_requires_recognition_validation() {
         let mut test = TestBridge::new();
         let readiness = test.readiness();
@@ -1808,6 +1959,44 @@ mod tests {
             .execute(UiCommand::SaveSettings(missing_ollama), &readiness, 10)
             .unwrap_err();
         assert_eq!(error.field, Some("ollama_model"));
+    }
+
+    #[test]
+    fn stopped_ollama_does_not_block_residency_changes_or_replace_saved_identity() {
+        let mut test = TestBridge::new();
+        let readiness = test.readiness();
+        let mut candidate = test.bridge.settings().clone();
+        candidate.formatting.strength = FormattingStrength::Balanced;
+        candidate.formatting.ollama_model = Some("qwen2.5:3b".to_owned());
+        test.bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+            .unwrap();
+        let pin = test
+            .bridge
+            .settings()
+            .formatting
+            .ollama_model_identity
+            .clone();
+        let mut offline = readiness.clone();
+        offline.ollama.daemon_reachable = false;
+        offline.ollama.models.clear();
+        let mut candidate = test.bridge.settings().clone();
+        candidate.formatting.ollama_lifecycle = crate::settings::OllamaLifecycle::MemorySaver;
+        test.bridge
+            .execute(UiCommand::SaveSettings(candidate), &offline, 11)
+            .unwrap();
+        assert_eq!(test.bridge.settings().formatting.ollama_model_identity, pin);
+        let mut new_model = test.bridge.settings().clone();
+        new_model.formatting.ollama_model = Some("different:latest".into());
+        new_model.formatting.ollama_model_identity = None;
+        let error = test
+            .bridge
+            .execute(UiCommand::SaveSettings(new_model), &offline, 12)
+            .unwrap_err();
+        assert_eq!(error.field, Some("ollama_model"));
+        assert!(error.message.contains("not reachable"));
+        assert!(!error.message.contains("not currently installed"));
+        assert_eq!(test.bridge.settings().formatting.ollama_model_identity, pin);
     }
 
     #[test]
@@ -1992,6 +2181,13 @@ mod tests {
             snapshot.profiles[0].summary(),
             "In code.exe: Light formatting · en · Clipboard only"
         );
+        let selected = test.bridge.profile_detail("code.exe").unwrap().unwrap();
+        assert_eq!(selected.language.as_deref(), Some("en"));
+        assert_eq!(
+            selected.insertion_preference,
+            InsertionPreference::Clipboard
+        );
+        assert!(test.bridge.profile_detail("missing.exe").unwrap().is_none());
 
         let error = test
             .bridge

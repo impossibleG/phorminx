@@ -2,6 +2,51 @@ use super::*;
 
 #[test]
 #[ignore = "requires installed Whisper model"]
+fn native_accurate_speech_retained_quiet_room_tone_does_not_invent_suffix() {
+    let model = std::env::var_os("PHORMINX_WHISPER_MODEL").unwrap();
+    let recognizer =
+        WhisperRecognizer::load_with_backend(Path::new(&model), WhisperBackendPreference::Auto)
+            .unwrap();
+    for amplitude in [0.0, 0.0001, 0.0005] {
+        let prefix = "previously recognized words";
+        let accumulator = PartialAccumulator {
+            text: prefix.to_owned(),
+            stable_end: Duration::from_secs(180),
+            accepted_through: Duration::from_secs(180),
+            timestamp_stable: true,
+            next_sequence: 60,
+            ..PartialAccumulator::default()
+        };
+        let transcript = transcribe_extended_accurate_with_source(
+            &recognizer,
+            Some(accumulator),
+            FinalAudioStats {
+                total_samples: 16_000 * 183,
+                peak_retained_samples: 16_000 * 45,
+                auto_stopped: false,
+            },
+            16_000 * 178,
+            "en",
+            DictationId(943),
+            |range| {
+                AudioClip::new(
+                    (0..range.len())
+                        .map(|i| {
+                            amplitude * (i as f32 * std::f32::consts::TAU * 120.0 / 16_000.0).sin()
+                        })
+                        .collect(),
+                    16_000,
+                )
+                .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+        assert_eq!(transcript.text, prefix, "room tone amplitude={amplitude}");
+    }
+}
+
+#[test]
+#[ignore = "requires installed Whisper model"]
 fn native_accurate_speech_ambient_no_words_does_not_fill_the_buffer() {
     use phorminx_app::incremental::{ChunkPlan, TimeRange};
     let model = std::env::var_os("PHORMINX_WHISPER_MODEL").unwrap();

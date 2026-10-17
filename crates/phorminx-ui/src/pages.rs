@@ -1681,6 +1681,10 @@ fn models(
     model_system(ui, "01", &snapshot.whisper, true, state, outbox);
     ui.add_space(Space::LG);
     model_system(ui, "02", &snapshot.vosk, false, state, outbox);
+    ui.add_space(Space::SM);
+    if action(ui, "Choose Instant model", ActionTone::Secondary).clicked() {
+        outbox.push(ShellEvent::OpenVoskModels);
+    }
     if let Some(variant) = state.confirm_model_download {
         ui.add_space(Space::MD);
         ui.label(
@@ -2008,8 +2012,8 @@ fn settings(
             }
             setting_row(
                 ui,
-                "Model residency",
-                "How long Ollama remains ready in memory.",
+                "Keep AI ready",
+                "Instant: keep loaded. Balanced: 15 minutes after use. Memory saver: unload after each request. This changes loading delay, not recognition quality.",
                 |ui| {
                     ComboBox::from_id_salt("ollama-lifecycle")
                         .selected_text(lifecycle_label(state.settings.ollama_lifecycle))
@@ -2052,6 +2056,13 @@ fn settings(
         crate::deletion::show(ui,&snapshot.workspace,&mut state.deletion,outbox);
         }
         if route == Route::SettingsAppearance {
+        setting_section(ui, "05", "Software updates", |ui| {
+            setting_row(ui, "Signed releases", "Background downloads. Install after closing, never during recording.", |ui| {
+                if action(ui, "Manage updates", ActionTone::Secondary).clicked() {
+                    outbox.push(ShellEvent::OpenSoftwareUpdates);
+                }
+            });
+        });
         setting_section(ui, "06", "Startup", |ui| {
             setting_row(
                 ui,

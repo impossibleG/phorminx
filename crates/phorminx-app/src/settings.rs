@@ -47,7 +47,12 @@ impl Default for Settings {
             privacy: PrivacySettings::default(),
             startup: StartupSettings::default(),
             appearance: AppearanceSettings::default(),
-            search: SearchSettings::default(),
+            // New installations recommend Nomic. Missing fields in an existing
+            // settings file still deserialize through SearchSettings::default()
+            // so upgrading never silently changes a user's index/model choice.
+            search: SearchSettings {
+                embedding_model: Some("nomic-embed-text:latest".to_owned()),
+            },
         }
     }
 }
@@ -896,6 +901,23 @@ pub enum SettingsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_install_recommends_nomic_without_migrating_existing_search_preferences() {
+        assert_eq!(
+            Settings::default().search.embedding_model.as_deref(),
+            Some("nomic-embed-text:latest")
+        );
+        let existing: Settings = toml::from_str("schema_version = 7\n").unwrap();
+        assert_eq!(existing.search.embedding_model, None);
+        let explicit: Settings =
+            toml::from_str("schema_version = 7\n[search]\nembedding_model = 'my-model:latest'\n")
+                .unwrap();
+        assert_eq!(
+            explicit.search.embedding_model.as_deref(),
+            Some("my-model:latest")
+        );
+    }
 
     #[test]
     fn schema_six_migrates_with_launcher_defaults_without_changing_direct_recording_mode() {
