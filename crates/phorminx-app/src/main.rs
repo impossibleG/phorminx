@@ -252,6 +252,12 @@ fn run() -> Result<()> {
             settings_store.path().display()
         )
     })?;
+    for note in settings.preserved.notes() {
+        record_lifecycle(
+            lifecycle.as_ref(),
+            &format!("event=settings_compatibility note={note:?}"),
+        );
+    }
     if let Some(language) = cli.language {
         settings.recognition.language = language;
     }

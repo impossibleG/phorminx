@@ -17,8 +17,10 @@ pub const MAX_CUSTOM_INSTRUCTIONS_CHARS: usize = 4_096;
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+/// Unknown keys and values are tolerated rather than rejected: a file
+/// written by a newer build must never stop an older build from starting.
+/// They are kept in [`Settings::preserved`] and written back on save.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Settings {
     pub schema_version: u32,
     #[serde(default)]
@@ -35,6 +37,9 @@ pub struct Settings {
     pub appearance: AppearanceSettings,
     #[serde(default)]
     pub search: SearchSettings,
+    /// What this build could not read, kept so a save does not lose it.
+    #[serde(skip)]
+    pub preserved: PreservedSettings,
 }
 
 impl Default for Settings {
@@ -53,6 +58,7 @@ impl Default for Settings {
             search: SearchSettings {
                 embedding_model: Some("nomic-embed-text:latest".to_owned()),
             },
+            preserved: PreservedSettings::default(),
         }
     }
 }
@@ -63,12 +69,9 @@ impl Settings {
             CURRENT_SCHEMA_VERSION => {}
             1..=6 => self.schema_version = CURRENT_SCHEMA_VERSION,
             0 => return Err(SettingsError::MissingOrInvalidVersion),
-            version if version > CURRENT_SCHEMA_VERSION => {
-                return Err(SettingsError::FutureVersion {
-                    found: version,
-                    supported: CURRENT_SCHEMA_VERSION,
-                });
-            }
+            // A newer build wrote this file. Read what this build knows and
+            // keep the version, so saving does not mark it as migrated down.
+            version if version > CURRENT_SCHEMA_VERSION => {}
             version => return Err(SettingsError::UnsupportedOldVersion(version)),
         }
 
@@ -186,8 +189,9 @@ impl Settings {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RecognitionSettings {
+    #[serde(deserialize_with = "lenient")]
     pub mode: RecognitionMode,
     /// Whisper GGML model used by Accurate mode. The field name is retained
     /// so schema 1-3 files migrate without losing their configured path.
@@ -198,7 +202,9 @@ pub struct RecognitionSettings {
     pub instant_runtime_path: PathBuf,
     /// A UI/catalog hint. `model_path` remains authoritative and the runtime
     /// verifies this identity before presenting a pinned variant.
+    #[serde(deserialize_with = "lenient")]
     pub accurate_model: AccurateModelVariant,
+    #[serde(deserialize_with = "lenient")]
     pub accurate_backend: AccurateBackendPreference,
     pub language: String,
     pub minimum_rms: f32,
@@ -283,8 +289,9 @@ pub enum AccurateBackendPreference {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct FormattingSettings {
+    #[serde(deserialize_with = "lenient")]
     pub strength: FormattingStrength,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_instructions: Option<String>,
@@ -296,6 +303,7 @@ pub struct FormattingSettings {
     /// external Ollama clients can still mutate a tag after that boundary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ollama_model_identity: Option<OllamaModelIdentity>,
+    #[serde(deserialize_with = "lenient")]
     pub ollama_lifecycle: OllamaLifecycle,
     /// How many times AI formatting runs, each pass on the previous pass's
     /// validated output. A failed pass keeps the last good text.
@@ -320,7 +328,6 @@ impl Default for FormattingSettings {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OllamaModelIdentity {
     pub manifest_sha256: String,
     pub bytes: u64,
@@ -371,8 +378,9 @@ pub enum OllamaLifecycle {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct InteractionSettings {
+    #[serde(deserialize_with = "lenient")]
     pub recording_mode: RecordingMode,
     pub launcher_shortcut: String,
     pub direct_dictation_shortcut: Option<String>,
@@ -392,7 +400,7 @@ impl Default for InteractionSettings {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct SearchSettings {
     pub embedding_model: Option<String>,
 }
@@ -406,8 +414,9 @@ pub enum RecordingMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct PrivacySettings {
+    #[serde(deserialize_with = "lenient")]
     pub history_retention: HistoryRetention,
 }
 
@@ -431,15 +440,16 @@ pub enum HistoryRetention {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct StartupSettings {
     pub launch_at_login: bool,
     pub onboarding_complete: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct AppearanceSettings {
+    #[serde(deserialize_with = "lenient")]
     pub theme: AppearancePreference,
 }
 
@@ -588,11 +598,12 @@ impl SettingsStore {
             && recognition.is_none_or(|table| !table.contains_key("accurate_model"));
         let missing_accurate_backend = source_version.is_some_and(|version| version <= 4)
             && recognition.is_none_or(|table| !table.contains_key("accurate_backend"));
-        let mut settings =
-            toml::from_str::<Settings>(text).map_err(|source| SettingsError::Parse {
+        let (mut settings, substituted) =
+            parse_lenient(text).map_err(|source| SettingsError::Parse {
                 path: self.path.clone(),
                 source,
             })?;
+        settings.preserved = PreservedSettings::collect(&raw, &settings, &substituted);
         let identified_legacy_model = missing_accurate_model
             .then(|| {
                 crate::model::identify_pinned_model(
@@ -662,10 +673,13 @@ impl SettingsStore {
     fn prepare_locked(&self, settings: &Settings) -> Result<PathBuf, SettingsError> {
         let mut canonical = settings.clone();
         canonical.validate_and_normalize()?;
-        let serialized = toml::to_string_pretty(&canonical).map_err(SettingsError::Serialize)?;
-        let mut reparsed = toml::from_str::<Settings>(&serialized)
+        let mut document = toml::Value::try_from(&canonical).map_err(SettingsError::Serialize)?;
+        canonical.preserved.restore_into(&mut document);
+        let serialized = toml::to_string_pretty(&document).map_err(SettingsError::Serialize)?;
+        let (mut reparsed, _) = parse_lenient(&serialized)
             .map_err(|source| SettingsError::InternalRoundTrip(source.to_string()))?;
         reparsed.validate_and_normalize()?;
+        reparsed.preserved = canonical.preserved.clone();
         if reparsed != canonical {
             return Err(SettingsError::InternalRoundTrip(
                 "serialized settings changed meaning".to_owned(),
@@ -807,6 +821,148 @@ impl SettingsStore {
     }
 }
 
+thread_local! {
+    /// Values `lenient` replaced with a default during the current parse.
+    static SUBSTITUTED: std::cell::RefCell<Vec<toml::Value>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Reads an option value, falling back to its default when the value is one
+/// this build does not know (for example a mode added by a newer build).
+fn lenient<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    match T::deserialize(value.clone()) {
+        Ok(parsed) => Ok(parsed),
+        Err(_) => {
+            SUBSTITUTED.with(|substituted| substituted.borrow_mut().push(value));
+            Ok(T::default())
+        }
+    }
+}
+
+/// Parses settings and returns the unknown option values that were replaced.
+fn parse_lenient(text: &str) -> Result<(Settings, Vec<toml::Value>), toml::de::Error> {
+    SUBSTITUTED.with(|substituted| substituted.borrow_mut().clear());
+    let parsed = toml::from_str::<Settings>(text);
+    let substituted =
+        SUBSTITUTED.with(|substituted| std::mem::take(&mut *substituted.borrow_mut()));
+    parsed.map(|settings| (settings, substituted))
+}
+
+/// Settings this build loaded but could not interpret.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PreservedSettings {
+    entries: Vec<PreservedEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PreservedEntry {
+    path: Vec<String>,
+    original: toml::Value,
+    /// The default used in its place; `None` for a key this build ignores.
+    substituted: Option<toml::Value>,
+}
+
+impl PreservedSettings {
+    fn collect(raw: &toml::Value, settings: &Settings, substituted: &[toml::Value]) -> Self {
+        let mut entries = Vec::new();
+        if let Ok(known) = toml::Value::try_from(settings) {
+            collect_differences(raw, &known, &mut Vec::new(), substituted, &mut entries);
+        }
+        Self { entries }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// One line per preserved key or value, for the log. Values are not
+    /// included because they can contain instructions or paths.
+    pub fn notes(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|entry| match entry.substituted {
+                Some(_) => format!(
+                    "unknown value for {}; using the default",
+                    entry.path.join(".")
+                ),
+                None => format!("unknown setting {} kept as is", entry.path.join(".")),
+            })
+            .collect()
+    }
+
+    /// Writes preserved keys back. A replaced value is restored only while
+    /// the setting still holds the default that stood in for it, so a choice
+    /// the user made in this build wins.
+    fn restore_into(&self, document: &mut toml::Value) {
+        for entry in &self.entries {
+            let Some((key, parents)) = entry.path.split_last() else {
+                continue;
+            };
+            let mut table = document.as_table_mut();
+            for parent in parents {
+                table = table.and_then(|table| {
+                    table
+                        .entry(parent.clone())
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                        .as_table_mut()
+                });
+            }
+            let Some(table) = table else {
+                continue;
+            };
+            match (&entry.substituted, table.get(key)) {
+                (None, None) => {
+                    table.insert(key.clone(), entry.original.clone());
+                }
+                (Some(substituted), Some(current)) if current == substituted => {
+                    table.insert(key.clone(), entry.original.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn collect_differences(
+    raw: &toml::Value,
+    known: &toml::Value,
+    path: &mut Vec<String>,
+    substituted: &[toml::Value],
+    entries: &mut Vec<PreservedEntry>,
+) {
+    let Some(raw_table) = raw.as_table() else {
+        return;
+    };
+    let known_table = known.as_table();
+    for (key, value) in raw_table {
+        path.push(key.clone());
+        match known_table.and_then(|table| table.get(key)) {
+            None => entries.push(PreservedEntry {
+                path: path.clone(),
+                original: value.clone(),
+                substituted: None,
+            }),
+            Some(known_value) if value.is_table() && known_value.is_table() => {
+                collect_differences(value, known_value, path, substituted, entries);
+            }
+            Some(known_value) if known_value != value && substituted.contains(value) => {
+                entries.push(PreservedEntry {
+                    path: path.clone(),
+                    original: value.clone(),
+                    substituted: Some(known_value.clone()),
+                });
+            }
+            Some(_) => {}
+        }
+        path.pop();
+    }
+}
+
 fn migrate_legacy_accurate_fields(
     settings: &mut Settings,
     missing_model: bool,
@@ -836,8 +992,6 @@ pub enum SettingsError {
     InvalidSettingsPath(PathBuf),
     #[error("settings schema_version is missing or invalid")]
     MissingOrInvalidVersion,
-    #[error("settings version {found} is newer than the supported version {supported}")]
-    FutureVersion { found: u32, supported: u32 },
     #[error("settings version {0} has no migration path")]
     UnsupportedOldVersion(u32),
     #[error("recognition.model_path must not be empty")]
@@ -1344,9 +1498,8 @@ language = "pt-BR"
     }
 
     #[test]
-    fn validation_rejects_invalid_values_and_unknown_fields() {
+    fn validation_rejects_invalid_values() {
         assert!(toml::from_str::<Settings>("[recognition]").is_err());
-        assert!(toml::from_str::<Settings>("schema_version = 1\nsurprise = true").is_err());
 
         for minimum_rms in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
             let mut settings = Settings::default();
@@ -1447,5 +1600,158 @@ language = "pt-BR"
             store.resolve_model_path(Path::new("models/base.bin")),
             directory.0.join("models/base.bin")
         );
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    fn store_with(text: &str) -> (tempfile::TempDir, SettingsStore) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        fs::write(&path, text).unwrap();
+        let store = SettingsStore::new(path).unwrap();
+        (directory, store)
+    }
+
+    const NEWER_BUILD: &str = r#"schema_version = 9
+future_top_level = "kept"
+
+[recognition]
+mode = "hybrid"
+language = "pt"
+future_engine_option = 3
+
+[formatting]
+strength = "rewrite_everything"
+ollama_lifecycle = "instant"
+passes = 2
+future_temperature = 0.2
+
+[interaction]
+recording_mode = "toggle"
+show_live_text = false
+future_overlay = { position = "top" }
+
+[appearance]
+theme = "high_contrast"
+
+[future_section]
+enabled = true
+"#;
+
+    #[test]
+    fn settings_from_a_newer_build_load_with_defaults_for_unknown_values() {
+        let (_directory, store) = store_with(NEWER_BUILD);
+        let settings = store.load().unwrap();
+        assert_eq!(
+            settings.schema_version, 9,
+            "a newer version is kept, not downgraded"
+        );
+        assert_eq!(settings.recognition.mode, RecognitionMode::default());
+        assert_eq!(settings.recognition.language, "pt");
+        assert_eq!(settings.formatting.strength, FormattingStrength::default());
+        assert_eq!(
+            settings.formatting.ollama_lifecycle,
+            OllamaLifecycle::Instant
+        );
+        assert_eq!(settings.interaction.recording_mode, RecordingMode::Toggle);
+        assert!(!settings.interaction.show_live_text);
+        assert_eq!(settings.appearance.theme, AppearancePreference::default());
+        let notes = settings.preserved.notes();
+        for expected in [
+            "unknown setting future_top_level kept as is",
+            "unknown setting future_section kept as is",
+            "unknown setting recognition.future_engine_option kept as is",
+            "unknown setting formatting.future_temperature kept as is",
+            "unknown setting interaction.future_overlay kept as is",
+            "unknown value for recognition.mode; using the default",
+            "unknown value for formatting.strength; using the default",
+            "unknown value for appearance.theme; using the default",
+        ] {
+            assert!(
+                notes.iter().any(|note| note == expected),
+                "{expected} in {notes:?}"
+            );
+        }
+        assert_eq!(notes.len(), 8, "{notes:?}");
+    }
+
+    #[test]
+    fn saving_keeps_what_this_build_did_not_understand_unless_the_user_changed_it() {
+        let (_directory, store) = store_with(NEWER_BUILD);
+        let mut settings = store.load().unwrap();
+        settings.recognition.language = "en".to_owned();
+        settings.appearance.theme = AppearancePreference::Dark;
+        store.save(&settings).unwrap();
+
+        let written: toml::Value =
+            toml::from_str(&fs::read_to_string(store.path()).unwrap()).unwrap();
+        assert_eq!(written["schema_version"].as_integer(), Some(9));
+        assert_eq!(written["future_top_level"].as_str(), Some("kept"));
+        assert_eq!(written["future_section"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            written["recognition"]["future_engine_option"].as_integer(),
+            Some(3)
+        );
+        assert_eq!(written["recognition"]["mode"].as_str(), Some("hybrid"));
+        assert_eq!(written["recognition"]["language"].as_str(), Some("en"));
+        assert_eq!(
+            written["formatting"]["strength"].as_str(),
+            Some("rewrite_everything")
+        );
+        assert_eq!(
+            written["interaction"]["future_overlay"]["position"].as_str(),
+            Some("top")
+        );
+        assert_eq!(
+            written["appearance"]["theme"].as_str(),
+            Some("dark"),
+            "the user's new choice wins"
+        );
+
+        let reloaded = store.load().unwrap();
+        assert_eq!(reloaded.recognition.language, "en");
+        assert_eq!(reloaded.appearance.theme, AppearancePreference::Dark);
+        assert_eq!(reloaded.preserved.notes().len(), 7);
+    }
+
+    #[test]
+    fn fields_added_by_this_branch_load_in_isolation_and_older_files_are_unchanged() {
+        // The exact shape 0.2.3-dictation.1 wrote into a real profile.
+        let (_directory, store) = store_with(
+            "schema_version = 7\n[formatting]\nstrength = 'structured'\npasses = 3\n\
+             [interaction]\nshow_live_text = true\n",
+        );
+        let settings = store.load().unwrap();
+        assert!(settings.preserved.is_empty());
+        assert_eq!(settings.formatting.strength, FormattingStrength::Structured);
+        assert_eq!(settings.formatting.passes, 3);
+
+        let older = "schema_version = 7\n\n[recognition]\nmode = \"instant\"\n\n[privacy]\nhistory_retention = \"thirty_days\"\n";
+        let (_directory, store) = store_with(older);
+        let settings = store.load().unwrap();
+        assert!(settings.preserved.is_empty());
+        assert_eq!(settings.recognition.mode, RecognitionMode::Instant);
+        assert_eq!(
+            settings.privacy.history_retention,
+            HistoryRetention::ThirtyDays
+        );
+        let mut expected = Settings {
+            search: SearchSettings::default(),
+            ..Settings::default()
+        };
+        expected.recognition.mode = RecognitionMode::Instant;
+        expected.privacy.history_retention = HistoryRetention::ThirtyDays;
+        assert_eq!(settings, expected);
+    }
+
+    #[test]
+    fn malformed_files_are_still_rejected() {
+        let (_directory, store) = store_with("schema_version = 7\n[formatting\n");
+        assert!(matches!(store.load(), Err(SettingsError::Parse { .. })));
+        let (_directory, store) = store_with("schema_version = 7\n[formatting]\npasses = 'two'\n");
+        assert!(matches!(store.load(), Err(SettingsError::Parse { .. })));
     }
 }
