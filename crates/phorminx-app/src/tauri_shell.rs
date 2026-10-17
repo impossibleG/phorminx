@@ -1435,7 +1435,7 @@ fn now_ms() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn prompts_list(state: State<'_, HostState>) -> Result<Vec<PromptView>, String> {
     let prompts = state
         .bridge
@@ -1456,7 +1456,7 @@ fn prompts_list(state: State<'_, HostState>) -> Result<Vec<PromptView>, String> 
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn prompt_versions(id: i64, state: State<'_, HostState>) -> Result<Vec<PromptVersionView>, String> {
     let versions = state
         .bridge
@@ -1475,7 +1475,7 @@ fn prompt_versions(id: i64, state: State<'_, HostState>) -> Result<Vec<PromptVer
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn prompt_save(
     id: Option<i64>,
     name: String,
@@ -1495,7 +1495,7 @@ fn prompt_save(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn prompt_restore(id: i64, version: i64, state: State<'_, HostState>) -> Result<(), String> {
     state
         .bridge
@@ -1506,7 +1506,7 @@ fn prompt_restore(id: i64, version: i64, state: State<'_, HostState>) -> Result<
 }
 
 /// Every place that refers to the prompt, so deleting it can warn first.
-#[tauri::command]
+#[tauri::command(async)]
 fn prompt_usages(id: i64, state: State<'_, HostState>) -> Result<Vec<String>, String> {
     let mut bridge = state.bridge.lock().map_err(|_| "Prompts are unavailable.")?;
     bridge.reload_settings().map_err(|error| error.to_string())?;
@@ -1527,7 +1527,7 @@ fn prompt_usages(id: i64, state: State<'_, HostState>) -> Result<Vec<String>, St
     Ok(usages)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn prompt_delete(id: i64, state: State<'_, HostState>) -> Result<(), String> {
     state
         .bridge
@@ -1538,7 +1538,7 @@ fn prompt_delete(id: i64, state: State<'_, HostState>) -> Result<(), String> {
 }
 
 /// Opens a prompt in the main window's Prompts page, from any window.
-#[tauri::command]
+#[tauri::command(async)]
 fn prompt_open(id: i64, app: tauri::AppHandle, state: State<'_, HostState>) -> Result<(), String> {
     *state.prompt_focus.lock().map_err(|_| "Prompts are unavailable.")? = Some(id);
     if let Some(window) = app.get_webview_window("main") {
@@ -1549,7 +1549,7 @@ fn prompt_open(id: i64, app: tauri::AppHandle, state: State<'_, HostState>) -> R
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn prompt_take_focus(state: State<'_, HostState>) -> Result<Option<i64>, String> {
     Ok(state
         .prompt_focus

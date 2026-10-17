@@ -2420,7 +2420,9 @@ mod tests {
             ..Default::default()
         };
         config.actions.push(phorminx_assistant::ActionConfig {
+            id: "notes".into(),
             name: "Notes".into(),
+            endpoint: "http://127.0.0.1:9/notes".into(),
             payload_prompt: text.into(),
             ..Default::default()
         });

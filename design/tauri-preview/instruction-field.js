@@ -137,15 +137,19 @@
 
     renderPills() {
       const references = InstructionFieldText.references(valueProperty.get.call(this.textarea));
-      const pills = references.map((reference) => {
+      // An old @{prompt:ID} and a new @[Name] can name the same prompt.
+      const shown = new Set();
+      const pills = references.flatMap((reference) => {
         const prompt = InstructionFieldText.find(prompts, reference);
+        if (prompt && shown.has(prompt.id)) return [];
+        if (prompt) shown.add(prompt.id);
         const label = prompt ? prompt.name : reference.name ?? `#${reference.id}`;
         const pill = element('button', prompt ? 'instruction-pill' : 'instruction-pill missing', prompt ? label : `Missing: ${label}`);
         pill.type = 'button';
         pill.title = prompt ? 'Show this prompt' : 'No prompt has this name';
         pill.setAttribute('aria-expanded', String(this.preview === InstructionFieldText.key(reference)));
         pill.addEventListener('click', () => this.togglePreview(reference, pill));
-        return pill;
+        return [pill];
       });
       this.pills.replaceChildren(...(pills.length ? [element('span', 'instruction-pills-label', 'Uses'), ...pills] : []));
       this.pills.hidden = !pills.length;
