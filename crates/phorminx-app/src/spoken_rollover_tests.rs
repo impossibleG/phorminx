@@ -435,7 +435,9 @@ fn native_quiet_start_survives_production_batching_and_release() {
             )
             .unwrap();
             assert!(
-                output.text.contains("the morning train arrived at the station"),
+                output
+                    .text
+                    .contains("the morning train arrived at the station"),
                 "retained release lost speech after delay={delay_seconds}s noise={noise_amplitude}: {:?}",
                 output.text
             );
@@ -449,7 +451,9 @@ fn native_quiet_start_survives_production_batching_and_release() {
             )
             .unwrap();
             assert!(
-                short.text.contains("the morning train arrived at the station"),
+                short
+                    .text
+                    .contains("the morning train arrived at the station"),
                 "short-clip release lost speech after delay={delay_seconds}s: {:?}",
                 short.text
             );

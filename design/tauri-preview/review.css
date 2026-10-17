@@ -25,7 +25,7 @@ button:hover:not(:disabled){border-color:#c69767}button:disabled{opacity:.55;cur
 :root[data-theme="light"]{background:#f4f1eb;color:#202326}
 :root[data-theme="light"] header,:root[data-theme="light"] .composer{background:#eae7e0;border-color:#b9b7b0}
 :root[data-theme="light"] .composer textarea{color:#202326}
-:root[data-theme="light"] .composer label{color:#815026}
+:root[data-theme="light"] .composer label,:root[data-theme="light"] header small{color:#815026}
 :root[data-theme="light"] .note{color:#5b3d22}
 :root[data-theme="light"] .reformat label,:root[data-theme="light"] .actions p{color:#555b60}
 :root[data-theme="light"] select,:root[data-theme="light"] input,:root[data-theme="light"] button{background:#f7f5f0;color:#202326;border-color:#a5a39d}

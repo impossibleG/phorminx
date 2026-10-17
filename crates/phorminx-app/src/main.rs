@@ -1175,8 +1175,8 @@ fn run() -> Result<()> {
                         // Posted before the result status, so the Inserted
                         // pill is laid out with the note and Expand button.
                         let _ = overlay.set_note(formatting_note);
-                        let _ = overlay
-                            .offer_expand(REVIEW_PANEL_AVAILABLE && product_shell.is_some());
+                        let _ =
+                            overlay.offer_expand(REVIEW_PANEL_AVAILABLE && product_shell.is_some());
                     }
                     let insertion_started_at = Instant::now();
                     let notices = {
@@ -3878,8 +3878,66 @@ struct TranscriptionWorker {
 #[derive(Default)]
 struct InstantPump {
     active_id: Option<DictationId>,
+    /// The worker accepted this dictation's recognizer request.
+    begun: bool,
     degraded: bool,
     submitted_through: u64,
+    /// A batch the worker had no room for yet. The capture keeps every sample
+    /// until the recognizer commits it, so a busy worker only delays the live
+    /// stream; it is retried on the next tick, in order, before new audio.
+    pending: Option<InstantBatch>,
+}
+
+/// One contiguous span of live audio for the Instant recognizer.
+#[derive(Debug, PartialEq)]
+struct InstantBatch {
+    samples: Vec<f32>,
+    sample_rate: u32,
+    dropped_samples: u64,
+}
+
+/// What happened when the pump handed something to the worker.
+#[derive(Debug, PartialEq)]
+enum InstantSend<T> {
+    Sent,
+    /// The worker's queue was full (it can stall for a few hundred ms while
+    /// Vosk finalizes an endpoint); the value comes back for a retry.
+    Busy(T),
+    Unavailable,
+}
+
+impl InstantPump {
+    fn reset_for(&mut self, id: DictationId) -> Option<DictationId> {
+        self.begun = false;
+        self.degraded = false;
+        self.submitted_through = 0;
+        self.pending = None;
+        self.active_id.replace(id)
+    }
+
+    /// Submits `batch` at the current stream position. Returns false when the
+    /// stream should stop for this tick (worker busy) or for good (degraded).
+    fn submit(
+        &mut self,
+        batch: InstantBatch,
+        send: impl FnOnce(u64, InstantBatch) -> InstantSend<InstantBatch>,
+    ) -> bool {
+        let count = batch.samples.len() as u64;
+        match send(self.submitted_through, batch) {
+            InstantSend::Sent => {
+                self.submitted_through = self.submitted_through.saturating_add(count);
+                true
+            }
+            InstantSend::Busy(batch) => {
+                self.pending = Some(batch);
+                false
+            }
+            InstantSend::Unavailable => {
+                self.degraded = true;
+                false
+            }
+        }
+    }
 }
 
 fn poll_instant_transcription(
@@ -3908,39 +3966,48 @@ fn poll_instant_transcription(
     let Some(recording) = runtime.active_recording_mut() else {
         return;
     };
-    if pump.active_id != Some(id) {
-        if let Some(stale) = pump.active_id.replace(id) {
-            let _ = worker.cancel_incremental(stale);
-        }
-        pump.degraded = false;
-        pump.submitted_through = 0;
-        if !worker.instant_begin(
+    if pump.active_id != Some(id)
+        && let Some(stale) = pump.reset_for(id)
+    {
+        let _ = worker.cancel_incremental(stale);
+    }
+    if !pump.begun && !pump.degraded {
+        match worker.instant_begin(
             id,
             recording.sample_rate(),
             recording.ownership_acknowledger(),
         ) {
-            pump.degraded = true;
+            InstantSend::Sent => pump.begun = true,
+            // Retried next tick; nothing is drained until the session exists.
+            InstantSend::Busy(()) => return,
+            InstantSend::Unavailable => pump.degraded = true,
         }
     }
     if pump.degraded {
         return;
     }
+    if let Some(batch) = pump.pending.take()
+        && !pump.submit(batch, |start, batch| worker.instant_audio(id, start, batch))
+    {
+        if pump.degraded {
+            worker.degrade_instant(id);
+        }
+        return;
+    }
     match recording.drain_streaming(16_384) {
         Ok(batch) => {
-            let sample_count = batch.samples.len() as u64;
-            if sample_count != 0 {
-                if worker.instant_audio(
-                    id,
-                    pump.submitted_through,
-                    batch.samples,
-                    batch.sample_rate,
-                    batch.dropped_samples,
-                ) {
-                    pump.submitted_through = pump.submitted_through.saturating_add(sample_count);
-                } else {
-                    pump.degraded = true;
-                    worker.degrade_instant(id);
-                }
+            if !batch.samples.is_empty()
+                && !pump.submit(
+                    InstantBatch {
+                        samples: batch.samples,
+                        sample_rate: batch.sample_rate,
+                        dropped_samples: batch.dropped_samples,
+                    },
+                    |start, batch| worker.instant_audio(id, start, batch),
+                )
+                && pump.degraded
+            {
+                worker.degrade_instant(id);
             }
         }
         Err(error) => {
@@ -3998,10 +4065,17 @@ struct InstantSession {
 #[derive(Default)]
 struct InstantPreview {
     text: String,
-    sent_at: Option<Instant>,
+    checked_at: Option<Instant>,
 }
 
 const INSTANT_PREVIEW_INTERVAL: Duration = Duration::from_millis(150);
+/// Live audio batches queued for the Instant worker. At the pump's ~25 ms
+/// cadence this is well over a second of stall before the pump has to wait.
+const INSTANT_AUDIO_QUEUE: usize = 64;
+const INSTANT_DRAIN_GAP_WARNING: Duration = Duration::from_millis(150);
+/// Single Vosk calls slower than this are logged: the live audio channel holds
+/// only a few hundred milliseconds while the worker is busy.
+const SLOW_INSTANT_STEP: Duration = Duration::from_millis(100);
 
 /// Committed words followed by the decoder's current partial hypothesis.
 fn instant_preview_text(committed: &str, partial: &str) -> String {
@@ -4020,17 +4094,27 @@ fn send_instant_preview(
     if session.degraded
         || session
             .preview
-            .sent_at
-            .is_some_and(|sent| sent.elapsed() < INSTANT_PREVIEW_INTERVAL)
+            .checked_at
+            .is_some_and(|checked| checked.elapsed() < INSTANT_PREVIEW_INTERVAL)
     {
         return;
     }
+    // Throttle every partial-result call, not only the ones that change the
+    // text: in silence nothing changes, and each call costs decoder time.
+    session.preview.checked_at = Some(Instant::now());
+    let started = Instant::now();
     let partial = session.recognizer.partial_text().unwrap_or_default();
+    if started.elapsed() > SLOW_INSTANT_STEP {
+        eprintln!(
+            "dictation_id={} state=Listening event=instant_partial_slow ms={}",
+            id.0,
+            started.elapsed().as_millis()
+        );
+    }
     let text = instant_preview_text(&session.ownership.text, &partial);
     if text.is_empty() || text == session.preview.text {
         return;
     }
-    session.preview.sent_at = Some(Instant::now());
     session.preview.text = text.clone();
     let _ = results.send(WorkerEvent::LivePreview { id, text });
 }
@@ -4110,7 +4194,9 @@ impl TranscriptionWorker {
         let worker_recovery = recovery.clone();
         let (command_tx, command_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
-        let (instant_audio_tx, instant_audio_rx) = mpsc::sync_channel(8);
+        // Vosk can spend a few hundred milliseconds finalizing an endpoint in
+        // silence; the queue absorbs that, and the pump retries when full.
+        let (instant_audio_tx, instant_audio_rx) = mpsc::sync_channel(INSTANT_AUDIO_QUEUE);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let cancellations = Arc::new(CancellationRegistry::default());
         let worker_cancellations = Arc::clone(&cancellations);
@@ -4227,6 +4313,7 @@ impl TranscriptionWorker {
                 // verified, so a result for a replaced model is discarded.
                 let mut recovery_probe: Option<(u64, Receiver<bool>)> = None;
                 let mut formatting_generation = 0_u64;
+                let mut last_instant_drain = Instant::now();
                 let mut last_recovery_attempt: Option<Instant> = None;
                 if formatting.uses_ollama()
                     && let (Some(client), Some(model)) = (&ollama, &formatting.model)
@@ -4290,12 +4377,20 @@ impl TranscriptionWorker {
                             recovery_probe = Some((formatting_generation, rx));
                         }
                     }
+                    let drain_gap = last_instant_drain.elapsed();
+                    if drain_gap > INSTANT_DRAIN_GAP_WARNING && !instant_sessions.is_empty() {
+                        eprintln!(
+                            "dictation_id=0 state=Listening event=instant_drain_gap ms={}",
+                            drain_gap.as_millis()
+                        );
+                    }
                     drain_instant_audio(
                         &recognizer,
                         &instant_audio_rx,
                         &mut instant_sessions,
                         &result_tx,
                     );
+                    last_instant_drain = Instant::now();
                     for (id, session) in &instant_sessions {
                         worker_recovery.checkpoint(&mut checkpoint_clock, id.0, &session.ownership.text, false);
                     }
@@ -4713,20 +4808,18 @@ impl TranscriptionWorker {
         id: DictationId,
         sample_rate: u32,
         ownership_acknowledger: OwnershipAcknowledger,
-    ) -> bool {
-        if self
-            .instant_audio
-            .try_send(InstantAudioCommand::Begin {
-                id,
-                sample_rate,
-                ownership_acknowledger,
-            })
-            .is_err()
-        {
-            let _ = self.commands.send(WorkerCommand::DegradeInstant { id });
-            false
-        } else {
-            true
+    ) -> InstantSend<()> {
+        match self.instant_audio.try_send(InstantAudioCommand::Begin {
+            id,
+            sample_rate,
+            ownership_acknowledger,
+        }) {
+            Ok(()) => InstantSend::Sent,
+            Err(mpsc::TrySendError::Full(_)) => InstantSend::Busy(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                let _ = self.commands.send(WorkerCommand::DegradeInstant { id });
+                InstantSend::Unavailable
+            }
         }
     }
 
@@ -4734,28 +4827,33 @@ impl TranscriptionWorker {
         &self,
         id: DictationId,
         start_sample: u64,
-        samples: Vec<f32>,
-        sample_rate: u32,
-        dropped_samples: u64,
-    ) -> bool {
-        if samples.is_empty() {
-            return true;
+        batch: InstantBatch,
+    ) -> InstantSend<InstantBatch> {
+        if batch.samples.is_empty() {
+            return InstantSend::Sent;
         }
-        if self
-            .instant_audio
-            .try_send(InstantAudioCommand::Audio {
-                id,
-                start_sample,
+        match self.instant_audio.try_send(InstantAudioCommand::Audio {
+            id,
+            start_sample,
+            samples: batch.samples,
+            sample_rate: batch.sample_rate,
+            dropped_samples: batch.dropped_samples,
+        }) {
+            Ok(()) => InstantSend::Sent,
+            Err(mpsc::TrySendError::Full(InstantAudioCommand::Audio {
                 samples,
                 sample_rate,
                 dropped_samples,
-            })
-            .is_err()
-        {
-            let _ = self.commands.send(WorkerCommand::DegradeInstant { id });
-            false
-        } else {
-            true
+                ..
+            })) => InstantSend::Busy(InstantBatch {
+                samples,
+                sample_rate,
+                dropped_samples,
+            }),
+            Err(_) => {
+                let _ = self.commands.send(WorkerCommand::DegradeInstant { id });
+                InstantSend::Unavailable
+            }
         }
     }
 
@@ -5098,7 +5196,14 @@ fn drain_instant_audio(
                 if sessions.contains_key(&id) {
                     continue;
                 }
-                match model.session(sample_rate) {
+                let created_at = Instant::now();
+                let created = model.session(sample_rate);
+                eprintln!(
+                    "dictation_id={} state=Listening event=instant_session_created ms={}",
+                    id.0,
+                    created_at.elapsed().as_millis()
+                );
+                match created {
                     Ok(recognizer) => {
                         sessions.insert(
                             id,
@@ -5152,7 +5257,16 @@ fn drain_instant_audio(
                 }
                 let started = Instant::now();
                 let accepted = session.recognizer.accept_f32(&samples);
-                session.inference_time += started.elapsed();
+                let accept_time = started.elapsed();
+                session.inference_time += accept_time;
+                if accept_time > SLOW_INSTANT_STEP {
+                    eprintln!(
+                        "dictation_id={} state=Listening event=instant_accept_slow ms={} samples={}",
+                        id.0,
+                        accept_time.as_millis(),
+                        samples.len()
+                    );
+                }
                 match accepted {
                     Ok(outcome) => {
                         let absolute_accepted = session
@@ -10298,6 +10412,48 @@ mod composition_tests {
         let rendered = user_safe_settings_error(&error);
         assert_eq!(rendered, "Settings could not be saved.");
         assert!(!rendered.contains(&private.display().to_string()));
+    }
+
+    #[test]
+    fn busy_instant_worker_delays_live_audio_without_degrading() {
+        fn batch(value: f32, len: usize) -> InstantBatch {
+            InstantBatch {
+                samples: vec![value; len],
+                sample_rate: 16_000,
+                dropped_samples: 0,
+            }
+        }
+        let mut pump = InstantPump::default();
+        let mut delivered = Vec::new();
+        assert!(pump.submit(batch(1.0, 400), |start, sent| {
+            delivered.push((start, sent.samples.len()));
+            InstantSend::Sent
+        }));
+        // Vosk is finalizing an endpoint and the queue is full: the batch
+        // comes back and waits for the next tick instead of ending the
+        // dictation, which is what made quiet starts report "no speech".
+        assert!(!pump.submit(batch(2.0, 300), |_, held| InstantSend::Busy(held)));
+        assert!(!pump.degraded);
+        let held = pump.pending.take().unwrap();
+        assert_eq!(held.samples, vec![2.0; 300]);
+        assert!(pump.submit(held, |start, sent| {
+            delivered.push((start, sent.samples.len()));
+            InstantSend::Sent
+        }));
+        assert!(pump.submit(batch(3.0, 200), |start, sent| {
+            delivered.push((start, sent.samples.len()));
+            InstantSend::Sent
+        }));
+        assert_eq!(delivered, [(0, 400), (400, 300), (700, 200)]);
+
+        // A new dictation starts from a clean stream.
+        pump.pending = Some(batch(9.0, 5));
+        assert_eq!(pump.reset_for(DictationId(2)), None);
+        assert!(pump.pending.is_none() && !pump.begun && pump.submitted_through == 0);
+
+        // Only a worker that is gone ends the live stream.
+        assert!(!pump.submit(batch(4.0, 10), |_, _| InstantSend::Unavailable));
+        assert!(pump.degraded);
     }
 
     #[test]

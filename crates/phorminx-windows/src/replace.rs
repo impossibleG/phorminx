@@ -36,7 +36,14 @@ pub fn replace_inserted_text(
     inserted: &str,
     replacement: &str,
 ) -> ReplaceOutcome {
-    let control = HWND(target.focus_bits() as *mut core::ffi::c_void);
+    replace_in_control(
+        HWND(target.focus_bits() as *mut core::ffi::c_void),
+        inserted,
+        replacement,
+    )
+}
+
+fn replace_in_control(control: HWND, inserted: &str, replacement: &str) -> ReplaceOutcome {
     if !unsafe { IsWindow(Some(control)) }.as_bool() || !is_writable_edit(control) {
         return ReplaceOutcome::TargetUnavailable;
     }
@@ -210,6 +217,49 @@ mod tests {
         );
         assert_eq!(locate_inserted(&text, "edited away", Some(0)), None);
         assert_eq!(locate_inserted(&text, "", Some(0)), None);
+    }
+
+    /// Drives a real classic Edit control in another process (a minimized
+    /// Notepad) to prove the cross-process selection and replacement work.
+    #[test]
+    #[ignore = "opens Notepad on the desktop"]
+    fn replaces_only_the_inserted_passage_in_a_real_edit_control() {
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, WM_SETTEXT};
+        use windows::core::w;
+
+        let mut notepad = std::process::Command::new("notepad.exe").spawn().unwrap();
+        let control = (0..100)
+            .find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let frame = unsafe { FindWindowExW(None, None, w!("Notepad"), None) }.ok()?;
+                unsafe { FindWindowExW(Some(frame), None, w!("Edit"), None) }.ok()
+            })
+            .expect("Notepad's Edit control");
+        let mut original = utf16("Dear team,\r\nthe launch moved to Friday.\r\nThanks");
+        original.push(0);
+        send(
+            control,
+            WM_SETTEXT,
+            WPARAM(0),
+            LPARAM(original.as_ptr() as isize),
+        )
+        .unwrap();
+
+        let outcome = replace_in_control(
+            control,
+            "the launch moved to Friday.",
+            "The launch moved to Friday.\n- Ana sends the agenda",
+        );
+        let after = String::from_utf16(&read_text(control).unwrap()).unwrap();
+        let unchanged = replace_in_control(control, "not in the document", "x");
+        let _ = notepad.kill();
+        let _ = notepad.wait();
+        assert_eq!(outcome, ReplaceOutcome::Replaced);
+        assert_eq!(
+            after,
+            "Dear team,\r\nThe launch moved to Friday.\r\n- Ana sends the agenda\r\nThanks"
+        );
+        assert_eq!(unchanged, ReplaceOutcome::TextChanged);
     }
 
     #[test]

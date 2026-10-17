@@ -583,7 +583,7 @@ unsafe fn relayout_window(hwnd: HWND, state: &mut WindowState, restart_timer: bo
                 .unwrap_or_else(|e| e.into_inner()),
         );
     }
-    let pill = pill_size(status, &visible_extras(status, &state.shown));
+    let pill = pill_size(&visible_extras(status, &state.shown));
     let width = scale(if launcher { 360 } else { pill.0 });
     let margin = scale(48);
     let work = monitor_info.rcWork;
@@ -757,7 +757,7 @@ unsafe fn paint_pill(
     }
 
     let right = if extras.expand {
-        let button = scaled(expand_button_rect(pill_size(status, extras)), scale);
+        let button = scaled(expand_button_rect(pill_size(extras)), scale);
         // Brand accent #c69767 with the app's near-black text (COLORREF is BGR).
         let brush = unsafe { CreateSolidBrush(COLORREF(0x0067_97C6)) };
         unsafe {
@@ -892,10 +892,9 @@ unsafe fn expand_hit_client(hwnd: HWND, state: &WindowState, point: POINT) -> bo
         return false;
     }
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
-    let button = scaled(
-        expand_button_rect(pill_size(state.status, &extras)),
-        |value| value * dpi as i32 / 96,
-    );
+    let button = scaled(expand_button_rect(pill_size(&extras)), |value| {
+        value * dpi as i32 / 96
+    });
     (button.left..button.right).contains(&point.x) && (button.top..button.bottom).contains(&point.y)
 }
 
@@ -929,17 +928,19 @@ fn visible_extras(status: OverlayStatus, extras: &OverlayExtras) -> OverlayExtra
 }
 
 /// Logical pill size for a status and the extras it shows.
-fn pill_size(status: OverlayStatus, extras: &OverlayExtras) -> (i32, i32) {
-    let _ = status;
-    if !extras.live_text.is_empty() {
-        (440, 96)
-    } else if extras.expand || extras.note.is_some() {
-        (
-            if extras.expand { 380 } else { 360 },
-            if extras.note.is_some() { 60 } else { 52 },
-        )
-    } else {
-        (300, 52)
+/// Live text gets room for two lines; a note gets room for about sixty
+/// characters beside the Expand button.
+fn pill_size(extras: &OverlayExtras) -> (i32, i32) {
+    match (
+        !extras.live_text.is_empty(),
+        extras.note.is_some(),
+        extras.expand,
+    ) {
+        (true, _, _) => (440, 82),
+        (false, true, true) => (480, 60),
+        (false, true, false) => (420, 60),
+        (false, false, true) => (380, 52),
+        (false, false, false) => (300, 52),
     }
 }
 
@@ -1303,18 +1304,18 @@ mod tests {
     #[test]
     fn pill_grows_for_extras_and_expand_button_fits_inside() {
         let plain = OverlayExtras::default();
-        assert_eq!(pill_size(OverlayStatus::Inserted, &plain), (300, 52));
+        assert_eq!(pill_size(&plain), (300, 52));
         let live = OverlayExtras {
             live_text: "hello".into(),
             ..OverlayExtras::default()
         };
-        assert_eq!(pill_size(OverlayStatus::Listening, &live), (440, 96));
+        assert_eq!(pill_size(&live), (440, 82));
         let offer = OverlayExtras {
             expand: true,
             note: Some("note".into()),
             ..OverlayExtras::default()
         };
-        let size = pill_size(OverlayStatus::Inserted, &offer);
+        let size = pill_size(&offer);
         let button = expand_button_rect(size);
         assert!(button.left > 150 && button.right < size.0 && button.top > 0);
         assert!(button.bottom < size.1);
