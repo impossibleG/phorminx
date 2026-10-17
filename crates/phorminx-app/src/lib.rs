@@ -14,6 +14,7 @@ pub mod ollama_recovery;
 pub mod performance;
 pub mod performance_runtime;
 pub mod product_shell;
+pub mod review;
 pub mod runtime;
 pub mod settings;
 pub mod setup_center;

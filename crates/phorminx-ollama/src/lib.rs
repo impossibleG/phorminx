@@ -12,8 +12,8 @@ mod prompt;
 mod validation;
 
 pub use client::{
-    CancellationToken, ClientError, ClientTimeouts, FallbackReason, FormatResult, KeepAlive,
-    OllamaClient, OllamaEndpoint,
+    CancellationToken, ClientError, ClientTimeouts, FallbackReason, FormatAttempt, FormatResult,
+    KeepAlive, OllamaClient, OllamaEndpoint,
 };
 pub use document::{
     DocumentChunk, DocumentChunkError, DocumentChunkOutcome, DocumentChunkPolicy,
@@ -29,7 +29,9 @@ pub use onboarding::{
     ModelPullReview, OllamaOnboarding, OllamaOnboardingTransport, OllamaVersion, PullFailure,
     PullFailureKind, PullPhase, PullResidue, TransportError, UreqOnboardingTransport,
 };
-pub use prompt::{FormatProfile, FormatPrompt, PromptError, PromptPlan, build_prompt};
+pub use prompt::{
+    FormatProfile, FormatPrompt, PromptError, PromptPlan, build_prompt, restructures,
+};
 pub use validation::{
     OutputValidator, ProtectedToken, ProtectedTokens, ValidationError, ValidationPolicy,
 };

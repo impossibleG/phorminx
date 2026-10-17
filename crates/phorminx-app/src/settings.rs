@@ -364,6 +364,8 @@ pub struct InteractionSettings {
     pub recording_mode: RecordingMode,
     pub launcher_shortcut: String,
     pub direct_dictation_shortcut: Option<String>,
+    /// Shows the last line or two of recognized speech in the status pill.
+    pub show_live_text: bool,
 }
 
 impl Default for InteractionSettings {
@@ -372,6 +374,7 @@ impl Default for InteractionSettings {
             recording_mode: RecordingMode::default(),
             launcher_shortcut: DEFAULT_LAUNCHER_SHORTCUT.to_owned(),
             direct_dictation_shortcut: None,
+            show_live_text: true,
         }
     }
 }
@@ -445,6 +448,7 @@ pub enum FormattingStrength {
     Light,
     Balanced,
     Strong,
+    Structured,
     Custom,
 }
 
@@ -455,6 +459,7 @@ impl std::fmt::Display for FormattingStrength {
             Self::Light => "light",
             Self::Balanced => "balanced",
             Self::Strong => "strong",
+            Self::Structured => "structured",
             Self::Custom => "custom",
         };
         formatter.write_str(name)
@@ -467,6 +472,7 @@ pub enum RuntimeFormatting {
     Light,
     Balanced,
     Strong,
+    Structured,
     Custom,
 }
 
@@ -479,6 +485,7 @@ impl TryFrom<FormattingStrength> for RuntimeFormatting {
             FormattingStrength::Light => Ok(Self::Light),
             FormattingStrength::Balanced => Ok(Self::Balanced),
             FormattingStrength::Strong => Ok(Self::Strong),
+            FormattingStrength::Structured => Ok(Self::Structured),
             FormattingStrength::Custom => Ok(Self::Custom),
         }
     }
@@ -1024,6 +1031,7 @@ mod tests {
             FormattingStrength::Light,
             FormattingStrength::Balanced,
             FormattingStrength::Strong,
+            FormattingStrength::Structured,
             FormattingStrength::Custom,
         ] {
             let mut settings = Settings::default();
@@ -1223,6 +1231,7 @@ language = "pt-BR"
         for strength in [
             FormattingStrength::Balanced,
             FormattingStrength::Strong,
+            FormattingStrength::Structured,
             FormattingStrength::Custom,
         ] {
             let mut settings = Settings::default();

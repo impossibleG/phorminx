@@ -135,6 +135,8 @@ pub struct HistoryItemView {
     pub language: Option<String>,
     pub target_app: Option<String>,
     pub duration_ms: Option<u64>,
+    /// Why AI formatting did not apply, when it did not.
+    pub formatting_note: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -185,6 +187,7 @@ impl From<&crate::ui_bridge::UiProfileItem> for ProfileDetailView {
                 phorminx_persistence::FormattingStyle::Light => "light",
                 phorminx_persistence::FormattingStyle::Balanced => "balanced",
                 phorminx_persistence::FormattingStyle::Strong => "strong",
+                phorminx_persistence::FormattingStyle::Structured => "structured",
                 phorminx_persistence::FormattingStyle::Custom => "custom",
             },
             custom_instructions: value.custom_instructions.clone(),
@@ -213,6 +216,7 @@ pub struct AppSettingsView {
     pub model_residency: String,
     pub recording_mode: String,
     pub launcher_shortcut: String,
+    pub show_live_text: bool,
     pub direct_shortcut: Option<String>,
     pub theme: String,
     pub history_retention: String,
@@ -295,6 +299,8 @@ impl From<&UiSnapshot> for AppView {
                     language: item.language.clone(),
                     target_app: item.target_executable.clone(),
                     duration_ms: item.audio_duration_ms,
+                    formatting_note: crate::review::formatting_fallback_note(&item.warnings)
+                        .map(str::to_owned),
                 })
                 .collect(),
             lexicon: value
@@ -337,6 +343,7 @@ impl From<&UiSnapshot> for AppView {
                     .to_lowercase(),
                 recording_mode: format!("{:?}", settings.interaction.recording_mode).to_lowercase(),
                 launcher_shortcut: settings.interaction.launcher_shortcut.clone(),
+                show_live_text: settings.interaction.show_live_text,
                 direct_shortcut: settings.interaction.direct_dictation_shortcut.clone(),
                 theme: format!("{:?}", settings.appearance.theme).to_lowercase(),
                 history_retention: match settings.privacy.history_retention {

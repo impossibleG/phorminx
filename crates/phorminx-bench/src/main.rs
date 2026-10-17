@@ -10,6 +10,8 @@ use phorminx_audio::{
 use phorminx_core::{SpeechRecognizer, TranscriptionOptions};
 use phorminx_whisper::WhisperRecognizer;
 
+mod format_bench;
+
 #[derive(Debug, Parser)]
 #[command(name = "phorminx-bench")]
 #[command(about = "Phase 0 microphone and local Whisper benchmark")]
@@ -58,6 +60,29 @@ enum Command {
         audio_context: Option<u32>,
         #[arg(long)]
         save_wav: Option<PathBuf>,
+    },
+    /// Run synthetic transcripts through each formatting profile on a local
+    /// Ollama model and report raw output, validator verdict and final text.
+    FormatBench {
+        #[arg(long)]
+        model: String,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "light,balanced,strong,structured,custom"
+        )]
+        profiles: Vec<String>,
+        /// Instructions for the custom profile.
+        #[arg(long)]
+        custom: Option<String>,
+        /// Only run these samples (comma separated names).
+        #[arg(long, value_delimiter = ',')]
+        samples: Option<Vec<String>>,
+        /// Write the Markdown report here instead of standard output.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value_t = 120)]
+        timeout_seconds: u64,
     },
     /// Repeatedly exercise real default-microphone capture without retaining audio.
     #[command(hide = true)]
@@ -126,6 +151,21 @@ fn main() -> Result<()> {
             pause_ms,
             cancel_iterations,
         } => capture_soak(iterations, hold_ms, pause_ms, cancel_iterations)?,
+        Command::FormatBench {
+            model,
+            profiles,
+            custom,
+            samples,
+            output,
+            timeout_seconds,
+        } => format_bench::run(format_bench::BenchConfig {
+            model,
+            profiles,
+            custom,
+            samples,
+            output,
+            timeout_seconds,
+        })?,
     }
 
     Ok(())

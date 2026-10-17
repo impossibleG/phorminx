@@ -11,11 +11,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
-use phorminx_app::lifecycle::{LifecycleLog, error_chain, profile_instance_scope};
 use phorminx_app::incremental::{
     BoundaryKind, CHUNK_OVERLAP, IncrementalPlanner, MergeExpectation, SILENCE_PROBE_DURATION,
     merge_overlapping, strip_known_non_speech_annotations,
 };
+use phorminx_app::lifecycle::{LifecycleLog, error_chain, profile_instance_scope};
 use phorminx_app::model::{
     ModelDownload, ModelDownloadEvent, identify_pinned_model, model_for_variant,
 };
@@ -25,6 +25,8 @@ use phorminx_app::performance_runtime::{
 #[cfg(not(feature = "tauri-shell"))]
 use phorminx_app::product_shell::ProductShell;
 use phorminx_app::product_shell::{ProductShellControl, ProductShellEvent};
+use phorminx_app::review::{ReviewSeed, formatting_fallback_note};
+use phorminx_app::runtime::text_for_insertion;
 use phorminx_app::runtime::{
     AppIo, AppRuntime, FinishedAudio, InsertDisposition, ReleaseTiming, RuntimeNotice, UiStatus,
 };
@@ -67,13 +69,13 @@ use phorminx_whisper::{
 use phorminx_windows::{
     ClipboardOnlyReason, GlobalHoldHotkey, HistoryItem, HistoryWindow, HistoryWindowEvent,
     HoldEvent, InsertionOutcome, LexiconCasePolicy, LexiconDraft, LexiconItem, LexiconWindow,
-    LexiconWindowEvent, OverlayStatus, ProfileFormatting, ProfileInsertion, ProfileItem,
-    ProfileWindow, ProfileWindowEvent, SettingsAccurateBackend, SettingsAccurateModel,
-    SettingsForm, SettingsFormatting, SettingsHistoryRetention, SettingsOllamaLifecycle,
-    SettingsRecognitionMode, SettingsRecordingMode, SettingsWindow, SettingsWindowEvent,
-    SingleInstance, SingleInstanceError, StatusOverlay, SystemTray, TargetSnapshot, TrayEvent,
-    TrayStatus, activate_existing_window, choose_zip_archive, copy_and_maybe_paste,
-    set_launch_at_login,
+    LexiconWindowEvent, OverlayEvent, OverlayStatus, ProfileFormatting, ProfileInsertion,
+    ProfileItem, ProfileWindow, ProfileWindowEvent, ReplaceOutcome, SettingsAccurateBackend,
+    SettingsAccurateModel, SettingsForm, SettingsFormatting, SettingsHistoryRetention,
+    SettingsOllamaLifecycle, SettingsRecognitionMode, SettingsRecordingMode, SettingsWindow,
+    SettingsWindowEvent, SingleInstance, SingleInstanceError, StatusOverlay, SystemTray,
+    TargetSnapshot, TrayEvent, TrayStatus, activate_existing_window, choose_zip_archive,
+    copy_and_maybe_paste, replace_inserted_text, set_launch_at_login,
 };
 
 #[cfg(feature = "desktop")]
@@ -118,6 +120,8 @@ struct Cli {
 const RESTART_SLOT_WAIT: Duration = Duration::from_secs(30);
 /// Cleanup after the event loop must not strand a requested restart.
 const SHUTDOWN_WATCHDOG: Duration = Duration::from_secs(12);
+/// The review panel behind the pill's Expand button lives in the Tauri shell.
+const REVIEW_PANEL_AVAILABLE: bool = cfg!(feature = "tauri-shell");
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum FormattingCli {
@@ -479,6 +483,7 @@ fn run() -> Result<()> {
     let mut profile_window = None;
     let mut model_download = None;
     let mut restart_requested = false;
+    let mut last_dictation: Option<LastDictation> = None;
     let mut last_shell_status = UiRuntimeStatus::Ready;
     let workloads = production_workload_coordinator();
     let mut active_dictation_activity: Option<RuntimeActivityLease> = None;
@@ -549,6 +554,9 @@ fn run() -> Result<()> {
                         .list()
                         .context("failed to reload the personal lexicon")?,
                 )?;
+            }
+            Ok(ShellAction::ReviewReplace(text)) => {
+                handle_review_replace(last_dictation.as_mut(), &text, product_shell.as_ref());
             }
             Ok(ShellAction::LiveSettings { formatting }) => {
                 effective_microphone = resolve_effective_microphone(&settings);
@@ -653,6 +661,9 @@ fn run() -> Result<()> {
                         .list()
                         .context("failed to reload the personal lexicon")?,
                 )?;
+            }
+            Ok(ShellAction::ReviewReplace(text)) => {
+                handle_review_replace(last_dictation.as_mut(), &text, product_shell.as_ref());
             }
             Ok(ShellAction::LiveSettings { formatting }) => {
                 effective_microphone = resolve_effective_microphone(&settings);
@@ -968,6 +979,9 @@ fn run() -> Result<()> {
                         .context("failed to reload the personal lexicon")?,
                 )?;
             }
+            Ok(ShellAction::ReviewReplace(text)) => {
+                handle_review_replace(last_dictation.as_mut(), &text, product_shell.as_ref());
+            }
             Ok(ShellAction::LiveSettings { formatting }) => {
                 effective_microphone = resolve_effective_microphone(&settings);
                 if formatting
@@ -1043,6 +1057,17 @@ fn run() -> Result<()> {
                         audio_duration.as_millis(),
                         compute_time.as_millis()
                     );
+                }
+                Ok(WorkerEvent::LivePreview { id, text }) => {
+                    if settings.interaction.show_live_text
+                        && runtime.active_id() == Some(id)
+                        && matches!(
+                            runtime.state(),
+                            RuntimeState::Listening | RuntimeState::FinalizingAudio
+                        )
+                    {
+                        let _ = overlay.set_live_text(Some(&text));
+                    }
                 }
                 Ok(WorkerEvent::InstantCommitted {
                     id,
@@ -1142,6 +1167,17 @@ fn run() -> Result<()> {
                             processed.transcript
                         }
                     });
+                    let insertion_target = runtime.active_target().copied();
+                    let formatting_note = processed_for_history
+                        .as_ref()
+                        .and_then(|processed| formatting_fallback_note(&processed.warnings));
+                    if processed_for_history.is_some() {
+                        // Posted before the result status, so the Inserted
+                        // pill is laid out with the note and Expand button.
+                        let _ = overlay.set_note(formatting_note);
+                        let _ = overlay
+                            .offer_expand(REVIEW_PANEL_AVAILABLE && product_shell.is_some());
+                    }
                     let insertion_started_at = Instant::now();
                     let notices = {
                         let mut io = ProductionIo {
@@ -1162,6 +1198,20 @@ fn run() -> Result<()> {
                     if is_current && let Some(processed) = processed_for_history.as_ref() {
                         let outcome = terminal_outcome(&notices);
                         if outcome.is_success() {
+                            last_dictation = Some(LastDictation {
+                                text: text_for_insertion(
+                                    dictation_context.runtime_formatting,
+                                    &processed.transcript.text,
+                                ),
+                                target: insertion_target
+                                    .filter(|_| outcome == TerminalOutcome::Inserted),
+                                strength: settings.formatting.strength,
+                                custom_instructions: settings
+                                    .formatting
+                                    .custom_instructions
+                                    .clone(),
+                                formatting_note: formatting_note.map(str::to_owned),
+                            });
                             worker.recovery.discard(completed.id.0);
                             if let Some(lifecycle) = processed.lifecycle {
                                 eprintln!(
@@ -1222,6 +1272,18 @@ fn run() -> Result<()> {
                     break 'event_loop Err(anyhow!(
                         "the transcription worker stopped unexpectedly"
                     ));
+                }
+            }
+        }
+
+        while let Ok(event) = overlay.events().try_recv() {
+            match event {
+                OverlayEvent::ExpandRequested => {
+                    if let (Some(last), Some(shell)) =
+                        (last_dictation.as_ref(), product_shell.as_ref())
+                    {
+                        let _ = shell.send(ProductShellControl::OpenReview(Box::new(last.seed())));
+                    }
                 }
             }
         }
@@ -1513,6 +1575,81 @@ fn record_lifecycle(lifecycle: Option<&LifecycleLog>, event: &str) {
     }
 }
 
+/// The last successful dictation, kept for the review panel.
+struct LastDictation {
+    /// Exactly what was inserted or put on the clipboard.
+    text: String,
+    /// Set only when the text was pasted into a control Replace can update.
+    target: Option<TargetSnapshot>,
+    strength: FormattingStrength,
+    custom_instructions: Option<String>,
+    formatting_note: Option<String>,
+}
+
+impl LastDictation {
+    fn seed(&self) -> ReviewSeed {
+        ReviewSeed {
+            text: self.text.clone(),
+            can_replace: self.target.is_some(),
+            strength: self.strength,
+            custom_instructions: self.custom_instructions.clone(),
+            formatting_note: self.formatting_note.clone(),
+        }
+    }
+}
+
+/// Replaces the last pasted text only when it is still there, unchanged and
+/// unambiguous; otherwise the new text goes to the clipboard instead.
+fn handle_review_replace(
+    last: Option<&mut LastDictation>,
+    replacement: &str,
+    shell: Option<&ProductShell>,
+) {
+    let (notice, replaced) = match last {
+        None => ("There is no recent dictation to replace.".to_owned(), false),
+        Some(last) => match last.target {
+            None => (
+                copy_instead(
+                    replacement,
+                    "This dictation was not pasted into an editable field.",
+                ),
+                false,
+            ),
+            Some(target) => match replace_inserted_text(target, &last.text, replacement) {
+                ReplaceOutcome::Replaced => {
+                    last.text = replacement.to_owned();
+                    ("Replaced the pasted text.".to_owned(), true)
+                }
+                ReplaceOutcome::TextChanged => (
+                    copy_instead(
+                        replacement,
+                        "The pasted text was edited since, so it was left alone.",
+                    ),
+                    false,
+                ),
+                ReplaceOutcome::TargetUnavailable => (
+                    copy_instead(replacement, "That window is no longer available."),
+                    false,
+                ),
+            },
+        },
+    };
+    eprintln!("dictation_id=0 state=Idle event=review_replace replaced={replaced}");
+    if let Some(shell) = shell {
+        let _ = shell.send(ProductShellControl::ReviewResult {
+            notice,
+            replaced_text: replaced.then(|| replacement.to_owned()),
+        });
+    }
+}
+
+fn copy_instead(text: &str, reason: &str) -> String {
+    match copy_and_maybe_paste(None, text) {
+        Ok(_) => format!("{reason} The new text was copied instead."),
+        Err(_) => format!("{reason} Copy the new text manually."),
+    }
+}
+
 fn resolve_effective_microphone(settings: &Settings) -> Option<String> {
     match settings.recognition.microphone.as_deref() {
         Some(selected)
@@ -1678,7 +1815,8 @@ fn run_setup_mode(
                 | ShellAction::Resume
                 | ShellAction::TestDictation
                 | ShellAction::ReloadAliases
-                | ShellAction::LiveSettings { .. },
+                | ShellAction::LiveSettings { .. }
+                | ShellAction::ReviewReplace(_),
             ) => {
                 thread::sleep(Duration::from_millis(25));
             }
@@ -1756,7 +1894,7 @@ fn run_setup_mode(
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ShellAction {
     Continue,
     Quit,
@@ -1768,6 +1906,8 @@ enum ShellAction {
     LiveSettings {
         formatting: bool,
     },
+    /// The review panel asked to replace the last pasted text.
+    ReviewReplace(String),
 }
 
 fn launcher_overlay_status(settings: &Settings) -> OverlayStatus {
@@ -2058,6 +2198,9 @@ fn poll_shell_events(
                     }
                 }
                 Ok(ProductShellEvent::QuitRequested) => return Ok(ShellAction::Quit),
+                Ok(ProductShellEvent::ReviewReplace(text)) => {
+                    return Ok(ShellAction::ReviewReplace(text));
+                }
                 Ok(ProductShellEvent::Hidden) => {}
                 Ok(ProductShellEvent::Failed(message)) => {
                     eprintln!("product_shell_failed error={message}");
@@ -2572,6 +2715,7 @@ fn settings_form(
             FormattingStrength::Light => SettingsFormatting::Light,
             FormattingStrength::Balanced => SettingsFormatting::Balanced,
             FormattingStrength::Strong => SettingsFormatting::Strong,
+            FormattingStrength::Structured => SettingsFormatting::Structured,
             FormattingStrength::Custom => SettingsFormatting::Custom,
         },
         custom_instructions: settings
@@ -2684,6 +2828,7 @@ fn profile_item(profile: AppProfile) -> ProfileItem {
             FormattingStyle::Light => ProfileFormatting::Light,
             FormattingStyle::Balanced => ProfileFormatting::Balanced,
             FormattingStyle::Strong => ProfileFormatting::Strong,
+            FormattingStyle::Structured => ProfileFormatting::Structured,
             FormattingStyle::Custom => ProfileFormatting::Custom,
         },
         custom_instructions: profile.custom_instructions,
@@ -2706,6 +2851,7 @@ fn app_profile(item: ProfileItem) -> Result<AppProfile> {
             ProfileFormatting::Light => FormattingStyle::Light,
             ProfileFormatting::Balanced => FormattingStyle::Balanced,
             ProfileFormatting::Strong => FormattingStyle::Strong,
+            ProfileFormatting::Structured => FormattingStyle::Structured,
             ProfileFormatting::Custom => FormattingStyle::Custom,
         },
         custom_instructions: item.custom_instructions,
@@ -2750,6 +2896,7 @@ fn apply_settings_form(
         SettingsFormatting::Light => FormattingStrength::Light,
         SettingsFormatting::Balanced => FormattingStrength::Balanced,
         SettingsFormatting::Strong => FormattingStrength::Strong,
+        SettingsFormatting::Structured => FormattingStrength::Structured,
         SettingsFormatting::Custom => FormattingStrength::Custom,
     };
     candidate.formatting.custom_instructions = if form.custom_instructions.trim().is_empty() {
@@ -2820,7 +2967,10 @@ fn verify_settings_model_selection(
 ) -> Result<()> {
     if matches!(
         candidate.formatting.strength,
-        FormattingStrength::Balanced | FormattingStrength::Strong | FormattingStrength::Custom
+        FormattingStrength::Balanced
+            | FormattingStrength::Strong
+            | FormattingStrength::Structured
+            | FormattingStrength::Custom
     ) && candidate.formatting.ollama_model_identity.is_none()
     {
         let selected = candidate
@@ -3175,6 +3325,12 @@ impl AppIo for ProductionIo<'_> {
     }
 
     fn show_status(&mut self, status: UiStatus) -> Result<(), String> {
+        if status == UiStatus::Listening {
+            // A new dictation: drop the previous live text, note and Expand.
+            let _ = self.overlay.set_live_text(None);
+            let _ = self.overlay.set_note(None);
+            let _ = self.overlay.offer_expand(false);
+        }
         let (overlay_status, tray_status) = match status {
             UiStatus::Ready => (OverlayStatus::Ready, TrayStatus::Ready),
             UiStatus::Listening => (OverlayStatus::Listening, TrayStatus::Listening),
@@ -3834,6 +3990,49 @@ struct InstantSession {
     /// decoder can re-read the lexical boundary at a forced rollover.
     uncommitted_audio: Vec<f32>,
     ownership_acknowledger: Option<OwnershipAcknowledger>,
+    /// Last live text sent to the overlay and when, to send only changes at
+    /// a bounded rate.
+    preview: InstantPreview,
+}
+
+#[derive(Default)]
+struct InstantPreview {
+    text: String,
+    sent_at: Option<Instant>,
+}
+
+const INSTANT_PREVIEW_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Committed words followed by the decoder's current partial hypothesis.
+fn instant_preview_text(committed: &str, partial: &str) -> String {
+    match (committed.trim(), partial.trim()) {
+        ("", partial) => partial.to_owned(),
+        (committed, "") => committed.to_owned(),
+        (committed, partial) => format!("{committed} {partial}"),
+    }
+}
+
+fn send_instant_preview(
+    session: &mut InstantSession,
+    id: DictationId,
+    results: &Sender<WorkerEvent>,
+) {
+    if session.degraded
+        || session
+            .preview
+            .sent_at
+            .is_some_and(|sent| sent.elapsed() < INSTANT_PREVIEW_INTERVAL)
+    {
+        return;
+    }
+    let partial = session.recognizer.partial_text().unwrap_or_default();
+    let text = instant_preview_text(&session.ownership.text, &partial);
+    if text.is_empty() || text == session.preview.text {
+        return;
+    }
+    session.preview.sent_at = Some(Instant::now());
+    session.preview.text = text.clone();
+    let _ = results.send(WorkerEvent::LivePreview { id, text });
 }
 
 #[derive(Default)]
@@ -3973,7 +4172,7 @@ impl TranscriptionWorker {
                     }
                 };
                 let mut formatting = formatting;
-                let mut ollama = formatting.model.as_ref().map(|_| production_ollama_client());
+                let mut ollama = formatting.model.as_ref().map(|_| formatting_ollama_client());
                 let ollama_activity = if formatting.uses_ollama() {
                     production_workload_coordinator()
                         .try_begin(RuntimeActivityKind::OllamaModelPin)
@@ -3992,9 +4191,9 @@ impl TranscriptionWorker {
                         formatting.model_identity.as_ref(),
                         ollama_activity.as_ref(),
                     ) {
-                        (Some(client), Some(model), Some(identity), Some(_activity)) => {
+                        (Some(_), Some(model), Some(identity), Some(_activity)) => {
                             installed_ollama_identity_matches(
-                                client,
+                                &production_ollama_client(),
                                 model,
                                 identity,
                                 &CancellationToken::new(),
@@ -4065,7 +4264,7 @@ impl TranscriptionWorker {
                         match probe.try_recv() {
                             Ok(verified) => {
                                 if verified && *generation == formatting_generation {
-                                    ollama = Some(production_ollama_client());
+                                    ollama = Some(formatting_ollama_client());
                                     eprintln!("dictation_id=0 event=ollama_recovery_ready");
                                 }
                                 recovery_probe = None;
@@ -4164,6 +4363,12 @@ impl TranscriptionWorker {
                             worker_cancellations.end_partial(partial_id);
                             if let Some(session) = incremental_sessions.get(&partial_id) {
                                 worker_recovery.checkpoint(&mut checkpoint_clock, partial_id.0, &session.text, false);
+                                if !session.text.trim().is_empty() {
+                                    let _ = result_tx.send(WorkerEvent::LivePreview {
+                                        id: partial_id,
+                                        text: session.text.clone(),
+                                    });
+                                }
                             }
                             if let WorkerEvent::PartialCompleted {
                                 committed_through: Some(frontier),
@@ -4385,6 +4590,7 @@ impl TranscriptionWorker {
                                             ownership: InstantTranscriptOwnership::default(),
                                             uncommitted_audio: Vec::new(),
                                             ownership_acknowledger: None,
+                                            preview: InstantPreview::default(),
                                         },
                                     );
                                 }
@@ -4822,6 +5028,11 @@ enum WorkerEvent {
     },
     /// Vosk has transferred ownership of every finalized endpoint through this
     /// absolute canonical sample. The main loop may now evict that audio.
+    /// Recognized text so far for the overlay; never persisted.
+    LivePreview {
+        id: DictationId,
+        text: String,
+    },
     InstantCommitted {
         id: DictationId,
         committed_through: u64,
@@ -4903,6 +5114,7 @@ fn drain_instant_audio(
                                 ownership: InstantTranscriptOwnership::default(),
                                 uncommitted_audio: Vec::new(),
                                 ownership_acknowledger: Some(ownership_acknowledger),
+                                preview: InstantPreview::default(),
                             },
                         );
                     }
@@ -4982,6 +5194,7 @@ fn drain_instant_audio(
                         {
                             mark_instant_degraded(session, id, "rollover_failed", results);
                         }
+                        send_instant_preview(session, id, results);
                     }
                     Err(_) => {
                         mark_instant_degraded(session, id, "decoder_failed", results);
@@ -6853,6 +7066,7 @@ impl DictationContext {
             FormattingStyle::Light => RuntimeFormatting::Light,
             FormattingStyle::Balanced => RuntimeFormatting::Balanced,
             FormattingStyle::Strong => RuntimeFormatting::Strong,
+            FormattingStyle::Structured => RuntimeFormatting::Structured,
             FormattingStyle::Custom => RuntimeFormatting::Custom,
         };
         context.formatting.profile = match profile.formatting_style {
@@ -6860,6 +7074,7 @@ impl DictationContext {
             FormattingStyle::Light => FormatProfile::Light,
             FormattingStyle::Balanced => FormatProfile::Balanced,
             FormattingStyle::Strong => FormatProfile::Strong,
+            FormattingStyle::Structured => FormatProfile::Structured,
             FormattingStyle::Custom => FormatProfile::Custom(
                 profile
                     .custom_instructions
@@ -6893,6 +7108,7 @@ impl WorkerFormatting {
             FormattingStrength::Light => FormatProfile::Light,
             FormattingStrength::Balanced => FormatProfile::Balanced,
             FormattingStrength::Strong => FormatProfile::Strong,
+            FormattingStrength::Structured => FormatProfile::Structured,
             FormattingStrength::Custom => FormatProfile::Custom(
                 settings
                     .formatting
@@ -6911,7 +7127,10 @@ impl WorkerFormatting {
         let model_identity = settings.formatting.ollama_model_identity.clone();
         if matches!(
             &profile,
-            FormatProfile::Balanced | FormatProfile::Strong | FormatProfile::Custom(_)
+            FormatProfile::Balanced
+                | FormatProfile::Strong
+                | FormatProfile::Structured
+                | FormatProfile::Custom(_)
         ) && (model.is_none() || model_identity.is_none())
         {
             return Err(anyhow!(
@@ -6934,7 +7153,10 @@ impl WorkerFormatting {
     fn uses_ollama(&self) -> bool {
         matches!(
             &self.profile,
-            FormatProfile::Balanced | FormatProfile::Strong | FormatProfile::Custom(_)
+            FormatProfile::Balanced
+                | FormatProfile::Strong
+                | FormatProfile::Structured
+                | FormatProfile::Custom(_)
         )
     }
 }
@@ -6993,7 +7215,10 @@ fn process_transcript(
     let (selected, cleaned_text) = match &formatting.profile {
         FormatProfile::Raw => (raw_text.clone(), None),
         FormatProfile::Light => (normalized_text.clone(), None),
-        FormatProfile::Balanced | FormatProfile::Strong | FormatProfile::Custom(_) => {
+        FormatProfile::Balanced
+        | FormatProfile::Strong
+        | FormatProfile::Structured
+        | FormatProfile::Custom(_) => {
             match (
                 ollama.filter(|_| _ollama_compute.is_some()),
                 formatting.model.as_ref(),
@@ -7099,7 +7324,16 @@ fn fallback_reason(reason: &phorminx_ollama::FallbackReason) -> &'static str {
         phorminx_ollama::FallbackReason::PromptRejected(_) => "prompt_rejected",
         phorminx_ollama::FallbackReason::Cancelled => "cancelled",
         phorminx_ollama::FallbackReason::ServiceUnavailable(_) => "service_unavailable",
-        phorminx_ollama::FallbackReason::OutputRejected(_) => "output_rejected",
+        phorminx_ollama::FallbackReason::OutputRejected(error) => match error {
+            phorminx_ollama::ValidationError::ProtectedTokenChanged { .. } => {
+                "output_rejected_protected"
+            }
+            phorminx_ollama::ValidationError::ModelCommentary => "output_rejected_commentary",
+            phorminx_ollama::ValidationError::OutputTooLarge { .. } => "output_rejected_size",
+            phorminx_ollama::ValidationError::EmptyOutput => "output_rejected_empty",
+            phorminx_ollama::ValidationError::UnexpectedOutputForEmptyInput
+            | phorminx_ollama::ValidationError::ControlCharacter => "output_rejected",
+        },
     }
 }
 
@@ -7250,6 +7484,25 @@ fn retention_policy(retention: HistoryRetention) -> RetentionPolicy {
     }
 }
 
+/// Generation is not streamed, so response headers arrive only after the
+/// whole answer, and a cold model load (about ten seconds for a 7B model)
+/// comes first. The old five-second limit made most restructuring requests
+/// time out and fall back to unformatted text. Cancellation is observed while
+/// waiting, so a long limit does not delay Quit.
+fn formatting_ollama_client() -> OllamaClient {
+    OllamaClient::new(
+        OllamaEndpoint::default(),
+        ClientTimeouts {
+            connect: Duration::from_secs(1),
+            response_headers: Duration::from_secs(45),
+            response_body: Duration::from_secs(10),
+            overall: Duration::from_secs(60),
+        },
+    )
+    .expect("the fixed formatting Ollama timeout policy is valid")
+}
+
+/// Short limits for discovery and identity probes, which never generate.
 fn production_ollama_client() -> OllamaClient {
     OllamaClient::new(
         OllamaEndpoint::default(),
@@ -10060,12 +10313,18 @@ mod composition_tests {
             Some(anyhow!("failed to stop the global hotkey")),
             || released.set(true),
             || {
-                assert!(released.get(), "the instance slot is released before spawning");
+                assert!(
+                    released.get(),
+                    "the instance slot is released before spawning"
+                );
                 spawned.set(true);
                 Ok(4242)
             },
         );
-        assert!(result.is_ok(), "a reopening app must not raise the fatal dialog");
+        assert!(
+            result.is_ok(),
+            "a reopening app must not raise the fatal dialog"
+        );
         assert!(spawned.get());
         let text = std::fs::read_to_string(log.path()).unwrap();
         assert!(text.contains("event=runtime_exit restart_requested=true cleanup_error=true"));
@@ -10133,32 +10392,27 @@ mod composition_tests {
         )
         .unwrap();
         assert!(cli.restarted);
-        assert_eq!(cli.config.as_deref(), Some(Path::new(r"C:\QA\settings.toml")));
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(Path::new(r"C:\QA\settings.toml"))
+        );
     }
 
     #[test]
     fn shutdown_watchdog_exits_only_when_cleanup_hangs() {
         let (exited_tx, exited_rx) = mpsc::channel();
-        let watchdog = ShutdownWatchdog::arm_with(
-            Duration::from_millis(50),
-            None,
-            None,
-            move |code| {
+        let watchdog =
+            ShutdownWatchdog::arm_with(Duration::from_millis(50), None, None, move |code| {
                 let _ = exited_tx.send(code);
-            },
-        );
+            });
         assert_eq!(exited_rx.recv_timeout(Duration::from_secs(5)), Ok(1));
         watchdog.disarm();
 
         let (exited_tx, exited_rx) = mpsc::channel();
-        let watchdog = ShutdownWatchdog::arm_with(
-            Duration::from_millis(200),
-            None,
-            None,
-            move |code| {
+        let watchdog =
+            ShutdownWatchdog::arm_with(Duration::from_millis(200), None, None, move |code| {
                 let _ = exited_tx.send(code);
-            },
-        );
+            });
         watchdog.disarm();
         assert!(exited_rx.recv_timeout(Duration::from_millis(500)).is_err());
     }

@@ -42,9 +42,7 @@ fn comparable_path(path: &Path) -> String {
         _ => path.to_path_buf(),
     };
     let text = resolved.to_string_lossy().replace('/', "\\");
-    text.strip_prefix(r"\\?\")
-        .unwrap_or(&text)
-        .to_lowercase()
+    text.strip_prefix(r"\\?\").unwrap_or(&text).to_lowercase()
 }
 
 #[derive(Clone, Debug)]
@@ -157,13 +155,21 @@ mod tests {
         fs::write(log.path(), vec![b'x'; MAX_LOG_BYTES as usize]).unwrap();
         log.record("event=after_rotation");
         assert!(log.path().with_file_name(ROTATED_FILE).is_file());
-        assert!(fs::read_to_string(log.path()).unwrap().contains("event=after_rotation"));
+        assert!(
+            fs::read_to_string(log.path())
+                .unwrap()
+                .contains("event=after_rotation")
+        );
     }
 
     #[test]
     fn profile_paths_are_redacted_case_insensitively() {
         assert_eq!(
-            redact(r"failed at C:\Users\Mau\x and c:\users\mau\y", r"C:\Users\Mau", "%USERPROFILE%"),
+            redact(
+                r"failed at C:\Users\Mau\x and c:\users\mau\y",
+                r"C:\Users\Mau",
+                "%USERPROFILE%"
+            ),
             r"failed at %USERPROFILE%\x and %USERPROFILE%\y"
         );
         assert_eq!(redact("unchanged", "", "x"), "unchanged");

@@ -26,8 +26,23 @@ cargo run --release -p phorminx-app --features vulkan
 Omit `-Vulkan` and `--features vulkan` for a CPU-only development build.
 Configure speech models in the application's setup screens. Use a separate
 `--config PATH` when testing settings rather than overwriting a normal profile.
-Do not run two app instances with the same shortcut or test against personal
-transcripts. Quit the app through the tray before replacing its executable.
+A `--config` profile other than the default gets its own single-instance
+slot, so it can run beside an installed Phorminx; give it different
+shortcuts, because two instances cannot register the same ones. Do not test
+against personal transcripts. Quit the app through the tray before replacing
+its executable.
+
+Each profile keeps a small `logs/lifecycle.log` next to its settings file:
+start, exit, settings restarts and cleanup errors, with the user profile path
+redacted. Check it first when the app closed or did not come back.
+
+To compare formatting prompts and local models, run the formatting bench
+against an installed Ollama model. It uses synthetic dictations only:
+
+```powershell
+cargo run -p phorminx-bench -- format-bench --model qwen2.5:7b-instruct `
+    --custom "Use short bullet points." --output format-bench.md
+```
 
 ## Automated checks
 

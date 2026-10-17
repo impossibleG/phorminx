@@ -22,6 +22,7 @@ use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder};
 use crate::feedback::{FeedbackPanel, FeedbackView};
 use crate::library_search::{LibrarySearchConfig, LibrarySearchWorker, embedding_identity};
 use crate::product_shell::{ProductShellControl, ProductShellEvent};
+use crate::review::ReviewPanel;
 use crate::settings::{
     AccurateBackendPreference, AccurateModelVariant, AppearancePreference, FormattingStrength,
     HistoryRetention, OllamaLifecycle, OllamaModelIdentity, RecognitionMode, RecordingMode,
@@ -59,6 +60,7 @@ struct HostState {
     route: Mutex<UiRoute>,
     status: Mutex<UiRuntimeStatus>,
     notice: Mutex<String>,
+    review: Mutex<ReviewPanel>,
     events: Sender<ProductShellEvent>,
 }
 
@@ -297,6 +299,7 @@ fn host_save_preferences(
     theme: String,
     recording_mode: String,
     launcher_shortcut: String,
+    show_live_text: Option<bool>,
     state: State<'_, HostState>,
 ) -> Result<(), String> {
     let theme = match theme.as_str() {
@@ -321,6 +324,9 @@ fn host_save_preferences(
     candidate.appearance.theme = theme;
     candidate.interaction.recording_mode = recording_mode;
     candidate.interaction.launcher_shortcut = launcher_shortcut;
+    if let Some(show_live_text) = show_live_text {
+        candidate.interaction.show_live_text = show_live_text;
+    }
     let readiness = state
         .readiness
         .lock()
@@ -381,6 +387,7 @@ fn host_save_dictation_settings(
         "light" => FormattingStrength::Light,
         "balanced" => FormattingStrength::Balanced,
         "strong" => FormattingStrength::Strong,
+        "structured" => FormattingStrength::Structured,
         "custom" => FormattingStrength::Custom,
         _ => return Err("Choose a supported formatting strength.".into()),
     };
@@ -640,6 +647,7 @@ fn host_save_profile(
         "light" => FormattingStyle::Light,
         "balanced" => FormattingStyle::Balanced,
         "strong" => FormattingStyle::Strong,
+        "structured" => FormattingStyle::Structured,
         "custom" => FormattingStyle::Custom,
         _ => return Err("Choose a supported formatting style.".into()),
     };
@@ -1079,6 +1087,7 @@ fn run_shell(
         route: Mutex::new(initial_route),
         status: Mutex::new(initial_status),
         notice: Mutex::new(String::new()),
+        review: Mutex::new(ReviewPanel::default()),
         events: events.clone(),
     };
     let stopping = Arc::new(AtomicBool::new(false));
@@ -1133,6 +1142,11 @@ fn run_shell(
             feedback_update,
             feedback_action,
             host_open_feedback,
+            review_snapshot,
+            review_reformat,
+            review_copy,
+            review_replace,
+            review_close,
         ])
         .setup(move |app| {
             if !initially_visible {
@@ -1165,6 +1179,10 @@ fn run_shell(
                         window.app_handle().state::<HostState>().feedback.lock()
                     {
                         feedback.close_window();
+                    }
+                } else if window.label() == REVIEW_WINDOW {
+                    if let Ok(mut review) = window.app_handle().state::<HostState>().review.lock() {
+                        review.close();
                     }
                 } else {
                     api.prevent_close();
@@ -1337,6 +1355,25 @@ fn control_loop(
             ProductShellControl::ActivationBlocked(_) => {
                 host.notice("That action is unavailable right now.")
             }
+            ProductShellControl::OpenReview(seed) => {
+                if let Ok(mut review) = host.review.lock() {
+                    review.open(*seed);
+                }
+                if open_review(&app).is_err() {
+                    host.notice("The review panel could not be opened.");
+                }
+            }
+            ProductShellControl::ReviewResult {
+                notice,
+                replaced_text,
+            } => {
+                if let Ok(mut review) = host.review.lock() {
+                    if let Some(text) = replaced_text.as_deref() {
+                        review.replaced(text);
+                    }
+                    review.set_notice(notice);
+                }
+            }
             ProductShellControl::Quit => {
                 app.exit(0);
                 break;
@@ -1353,6 +1390,139 @@ fn focus_route(app: &tauri::AppHandle, host: &HostState, route: UiRoute) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+const REVIEW_WINDOW: &str = "review";
+
+fn open_review(app: &tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(REVIEW_WINDOW) {
+        window.show().map_err(|_| "Review could not be shown.")?;
+        window
+            .set_focus()
+            .map_err(|_| "Review could not be focused.")?;
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(
+        app,
+        REVIEW_WINDOW,
+        WebviewUrl::App("tauri-preview/review.html".into()),
+    )
+    .title("Phorminx · Review")
+    .inner_size(560.0, 460.0)
+    .min_inner_size(400.0, 340.0)
+    .resizable(true)
+    .always_on_top(true)
+    .focused(true)
+    .build()
+    .map_err(|_| "Review could not be opened.")?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewWindowView {
+    revision: u64,
+    text: String,
+    strength: &'static str,
+    can_replace: bool,
+    busy: bool,
+    formatting_note: Option<String>,
+    notice: String,
+}
+
+fn strength_name(strength: FormattingStrength) -> &'static str {
+    match strength {
+        FormattingStrength::Raw => "raw",
+        FormattingStrength::Light => "light",
+        FormattingStrength::Balanced => "balanced",
+        FormattingStrength::Strong => "strong",
+        FormattingStrength::Structured => "structured",
+        FormattingStrength::Custom => "custom",
+    }
+}
+
+#[tauri::command]
+fn review_snapshot(state: State<'_, HostState>) -> Result<ReviewWindowView, String> {
+    let view = state
+        .review
+        .lock()
+        .map_err(|_| "Review is unavailable.")?
+        .snapshot();
+    Ok(ReviewWindowView {
+        revision: view.revision,
+        text: view.text,
+        strength: strength_name(view.strength),
+        can_replace: view.can_replace,
+        busy: view.busy,
+        formatting_note: view.formatting_note,
+        notice: view.notice,
+    })
+}
+
+#[tauri::command]
+fn review_reformat(
+    text: String,
+    strength: String,
+    instruction: Option<String>,
+    state: State<'_, HostState>,
+) -> Result<Option<String>, String> {
+    let strength = match strength.as_str() {
+        "light" => FormattingStrength::Light,
+        "balanced" => FormattingStrength::Balanced,
+        "strong" => FormattingStrength::Strong,
+        "structured" => FormattingStrength::Structured,
+        "custom" => FormattingStrength::Custom,
+        _ => return Err("Choose a supported formatting.".into()),
+    };
+    let settings = state.store.load().map_err(|error| error.to_string())?;
+    state
+        .review
+        .lock()
+        .map_err(|_| "Review is unavailable.")?
+        .start_reformat(
+            &text,
+            strength,
+            instruction.as_deref(),
+            move |profile, text| crate::review::reformat_with_local_model(&settings, profile, text),
+        )?;
+    Ok(None)
+}
+
+#[tauri::command]
+fn review_copy(text: String, state: State<'_, HostState>) -> Result<Option<String>, String> {
+    if text.trim().is_empty() {
+        return Err("There is no text to copy.".into());
+    }
+    phorminx_windows::copy_and_maybe_paste(None, &text)
+        .map_err(|_| "The clipboard is unavailable. Try again.")?;
+    let notice = "Copied. Paste it wherever you need it.".to_owned();
+    if let Ok(mut review) = state.review.lock() {
+        review.set_notice(notice.clone());
+    }
+    Ok(Some(notice))
+}
+
+#[tauri::command]
+fn review_replace(text: String, state: State<'_, HostState>) -> Result<Option<String>, String> {
+    if text.trim().is_empty() {
+        return Err("There is no text to insert.".into());
+    }
+    state
+        .events
+        .send(ProductShellEvent::ReviewReplace(text))
+        .map_err(|_| "Phorminx could not reach the pasted text.")?;
+    Ok(None)
+}
+
+#[tauri::command]
+fn review_close(app: tauri::AppHandle, state: State<'_, HostState>) -> Result<(), String> {
+    if let Ok(mut review) = state.review.lock() {
+        review.close();
+    }
+    if let Some(window) = app.get_webview_window(REVIEW_WINDOW) {
+        let _ = window.destroy();
+    }
+    Ok(())
 }
 
 fn open_feedback(app: &tauri::AppHandle) -> Result<(), String> {

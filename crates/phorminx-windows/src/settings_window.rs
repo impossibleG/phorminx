@@ -64,6 +64,7 @@ pub enum SettingsFormatting {
     Light,
     Balanced,
     Strong,
+    Structured,
     Custom,
 }
 
@@ -118,7 +119,8 @@ impl SettingsFormatting {
             Self::Light => 1,
             Self::Balanced => 2,
             Self::Strong => 3,
-            Self::Custom => 4,
+            Self::Structured => 4,
+            Self::Custom => 5,
         }
     }
 
@@ -128,7 +130,8 @@ impl SettingsFormatting {
             1 => Some(Self::Light),
             2 => Some(Self::Balanced),
             3 => Some(Self::Strong),
-            4 => Some(Self::Custom),
+            4 => Some(Self::Structured),
+            5 => Some(Self::Custom),
             _ => None,
         }
     }
@@ -1109,6 +1112,7 @@ unsafe fn create_combo(
         "Light - spacing and punctuation cleanup",
         "Balanced - local AI cleanup",
         "Strong - local AI rewrite",
+        "Structured - Markdown lists and headings",
         "Custom - your instructions",
     ] {
         let label = wide(label);
@@ -1432,6 +1436,7 @@ mod tests {
             SettingsFormatting::Light,
             SettingsFormatting::Balanced,
             SettingsFormatting::Strong,
+            SettingsFormatting::Structured,
             SettingsFormatting::Custom,
         ]
         .into_iter()

@@ -569,6 +569,7 @@ impl UiProfileItem {
             FormattingStyle::Light => "Light",
             FormattingStyle::Balanced => "Balanced",
             FormattingStyle::Strong => "Strong",
+            FormattingStyle::Structured => "Structured",
             FormattingStyle::Custom => "Custom",
         };
         let language = self.language.as_deref().unwrap_or("Default language");
@@ -1222,7 +1223,10 @@ fn same_recognizer(candidate: &Settings, current: &Settings) -> bool {
 fn requires_ollama(strength: FormattingStrength) -> bool {
     matches!(
         strength,
-        FormattingStrength::Balanced | FormattingStrength::Strong | FormattingStrength::Custom
+        FormattingStrength::Balanced
+            | FormattingStrength::Strong
+            | FormattingStrength::Structured
+            | FormattingStrength::Custom
     )
 }
 
@@ -2118,7 +2122,13 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.mutation, UiMutation::SearchSaved);
         assert_eq!(
-            test.bridge.store.load().unwrap().recognition.microphone.as_deref(),
+            test.bridge
+                .store
+                .load()
+                .unwrap()
+                .recognition
+                .microphone
+                .as_deref(),
             Some("USB headset")
         );
     }

@@ -80,6 +80,7 @@ fn native_spoken_audio_after_initial_silence_and_ambient_noise() {
                 ownership: InstantTranscriptOwnership::default(),
                 uncommitted_audio: Vec::new(),
                 ownership_acknowledger: None,
+                preview: InstantPreview::default(),
             };
             // A reproducible mixture of low fan hum and broadband room noise,
             // followed by the same neutral spoken sentence in every case.
@@ -209,6 +210,7 @@ fn native_spoken_audio_long_extended_release_preserves_text_after_ambient_noise(
             ownership: InstantTranscriptOwnership::default(),
             uncommitted_audio: Vec::new(),
             ownership_acknowledger: None,
+            preview: InstantPreview::default(),
         };
         let mut sessions = HashMap::from([(id, session)]);
         let (commands, incoming) = mpsc::channel();
@@ -326,6 +328,140 @@ fn native_spoken_audio_long_extended_release_preserves_text_after_ambient_noise(
     }
 }
 
+/// Quiet starts through the whole Instant path: the live stream fed in the
+/// uneven batch sizes the capture pump produces, then the release-time
+/// finalizers on both the short-clip and the retained-audio paths.
+#[test]
+#[ignore = "requires installed Vosk and the generated neutral spoken fixture"]
+fn native_quiet_start_survives_production_batching_and_release() {
+    let runtime = std::env::var_os("PHORMINX_VOSK_RUNTIME").unwrap();
+    let model_path = std::env::var_os("PHORMINX_VOSK_MODEL").unwrap();
+    let fixture = std::env::var_os("PHORMINX_SPOKEN_ROLLOVER_WAV").unwrap();
+    let clip = phorminx_audio::read_wav(Path::new(&fixture)).unwrap();
+    let model = VoskModel::load(Path::new(&runtime), Path::new(&model_path), "en").unwrap();
+    let loaded = LoadedRecognizer::Instant {
+        model,
+        minimum_rms: 0.003,
+    };
+    // The pump drains whatever accumulated since the last main-loop tick,
+    // so batches range from a few milliseconds to a full second.
+    let batch_sizes = [160_usize, 480, 1_600, 3_200, 7_000, 16_384, 800];
+    for delay_seconds in [1_usize, 3, 5, 8, 15] {
+        for noise_amplitude in [0.0_f32, 0.003] {
+            let LoadedRecognizer::Instant { model, .. } = &loaded else {
+                unreachable!()
+            };
+            let id = DictationId(912);
+            let mut random = 0x5bd1_e995u32;
+            let mut audio = (0..delay_seconds * WHISPER_SAMPLE_RATE as usize)
+                .map(|_| {
+                    random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    noise_amplitude * (random as f64 / u32::MAX as f64 * 2.0 - 1.0) as f32
+                })
+                .collect::<Vec<_>>();
+            audio.extend_from_slice(&clip.samples[..8 * WHISPER_SAMPLE_RATE as usize]);
+            audio.extend(vec![0.0; WHISPER_SAMPLE_RATE as usize * 3 / 2]);
+
+            let session = InstantSession {
+                recognizer: model.session(WHISPER_SAMPLE_RATE).unwrap(),
+                sample_rate: WHISPER_SAMPLE_RATE,
+                accepted_through: 0,
+                decoder_origin: 0,
+                inference_time: Duration::ZERO,
+                degraded: false,
+                continuity_prefix: Vec::new(),
+                checkpoint_count: 0,
+                ownership: InstantTranscriptOwnership::default(),
+                uncommitted_audio: Vec::new(),
+                ownership_acknowledger: None,
+                preview: InstantPreview::default(),
+            };
+            let mut sessions = HashMap::from([(id, session)]);
+            let (commands, incoming) = mpsc::channel();
+            let (events, received) = mpsc::channel();
+            // Hold back the last half second as audio the stream never saw,
+            // as when the user stops between two pump ticks.
+            let streamed_length = audio.len() - WHISPER_SAMPLE_RATE as usize / 2;
+            let mut cursor = 0_usize;
+            let mut batch = 0;
+            let mut previews = 0;
+            while cursor < streamed_length {
+                let size = batch_sizes[batch % batch_sizes.len()].min(streamed_length - cursor);
+                batch += 1;
+                commands
+                    .send(InstantAudioCommand::Audio {
+                        id,
+                        start_sample: cursor as u64,
+                        samples: audio[cursor..cursor + size].to_vec(),
+                        sample_rate: WHISPER_SAMPLE_RATE,
+                        dropped_samples: 0,
+                    })
+                    .unwrap();
+                cursor += size;
+                drain_instant_audio(&loaded, &incoming, &mut sessions, &events);
+                for event in received.try_iter() {
+                    match event {
+                        WorkerEvent::InstantDegraded { reason, .. } => panic!(
+                            "delay={delay_seconds}s noise={noise_amplitude} degraded at {:.2}s: {reason}",
+                            cursor as f64 / 16_000.0
+                        ),
+                        WorkerEvent::LivePreview { .. } => previews += 1,
+                        _ => {}
+                    }
+                }
+            }
+            assert!(previews > 0, "live text must reach the overlay");
+            let session = sessions.remove(&id).unwrap();
+            let retained_from = session.ownership.committed_through;
+            let total = audio.len() as u64;
+            let output = transcribe_extended_instant_with_source(
+                model,
+                Some(session),
+                retained_from,
+                FinalAudioStats {
+                    total_samples: total,
+                    peak_retained_samples: total - retained_from,
+                    auto_stopped: false,
+                },
+                id,
+                0.003,
+                |range| {
+                    phorminx_session::AudioSpan::new(
+                        range.start(),
+                        audio[range.start() as usize..range.end() as usize].to_vec(),
+                    )
+                    .map_err(|error| error.to_string())
+                },
+            )
+            .unwrap();
+            assert!(
+                output.text.contains("the morning train arrived at the station"),
+                "retained release lost speech after delay={delay_seconds}s noise={noise_amplitude}: {:?}",
+                output.text
+            );
+            let short = transcribe_instant_full_clip(
+                model,
+                &AudioClip {
+                    samples: audio.clone(),
+                    sample_rate: WHISPER_SAMPLE_RATE,
+                },
+                0.003,
+            )
+            .unwrap();
+            assert!(
+                short.text.contains("the morning train arrived at the station"),
+                "short-clip release lost speech after delay={delay_seconds}s: {:?}",
+                short.text
+            );
+            eprintln!(
+                "quiet start delay={delay_seconds}s noise={noise_amplitude}: retained_from={:.1}s text={:?}",
+                retained_from as f64 / 16_000.0,
+                output.text
+            );
+        }
+    }
+}
+
 /// Opt-in integration test: the fixture is neutral synthesized speech generated
 /// by scripts/Test-InstantSpokenRollover.ps1, never a user's recorded dictation.
 #[test]
@@ -359,6 +495,7 @@ fn check_native_spoken_stream(force_rollover: bool) {
         ownership: InstantTranscriptOwnership::default(),
         uncommitted_audio: Vec::new(),
         ownership_acknowledger: None,
+        preview: InstantPreview::default(),
     };
     let loaded = LoadedRecognizer::Instant {
         model,
@@ -439,6 +576,7 @@ fn check_native_spoken_stream(force_rollover: bool) {
                     last_ack = committed_through;
                 }
                 WorkerEvent::InstantDegraded { reason, .. } => panic!("degraded: {reason}"),
+                WorkerEvent::LivePreview { .. } => {}
                 _ => panic!("unexpected worker event"),
             }
         }
