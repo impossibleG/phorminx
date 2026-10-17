@@ -47,7 +47,9 @@ function showRoute(route, persist = true) {
   if (route === 'setup') { void refreshSetup(); void refreshUpdates(); }
   if (route === 'history' && node('history-query').value.trim()) void startHistorySearch();
   if (route === 'meeting-settings') void refreshProvider();
-  if (persist && hostInvoke) {
+  document.dispatchEvent(new CustomEvent('phorminx:route', {detail: route}));
+  // Investigations are window-only: the host keeps the previous route.
+  if (persist && hostInvoke && route !== 'investigations') {
     const hostRoute = ['live', 'saved', 'meeting-settings'].includes(route) ? 'meetings' : route === 'action-editor' ? 'actions' : route === 'lexicon-editor' ? 'lexicon' : route === 'profile-editor' ? 'profiles' : route;
     lastHostRoute = hostRoute;
     void hostInvoke('plugin:phorminx-host|host_select_route', {route: hostRoute}).catch((error) => { node('status').textContent = String(error); });

@@ -3,6 +3,10 @@
 pub mod feedback;
 mod history_loader;
 pub mod incremental;
+pub mod investigation_assistant;
+pub mod investigation_links;
+pub mod investigation_ocr;
+pub mod investigations;
 mod library_search;
 pub mod meeting_audio;
 pub mod meeting_memory;
@@ -19,6 +23,8 @@ pub mod setup_center;
 pub mod setup_features;
 pub mod setup_host;
 pub mod tauri_contract;
+#[cfg(feature = "tauri-shell")]
+pub mod tauri_investigations;
 #[cfg(feature = "tauri-preview")]
 pub mod tauri_meetings;
 #[cfg(feature = "tauri-shell")]

@@ -29,6 +29,7 @@ use crate::settings::{
 };
 use crate::setup_center::{BenchmarkUnavailable, SetupCenter};
 use crate::tauri_contract::{AppView, LibrarySearchView, ProfileDetailView, SetupView};
+use crate::tauri_investigations::InvestigationTauriState;
 use crate::tauri_meetings::{MeetingTauriState, open_companion};
 use crate::update_center::{UpdateCenter, UpdateView};
 use crate::ui_bridge::{
@@ -1065,6 +1066,7 @@ fn run_shell(
     let bootstrap = BootstrapCenter::new(
         store.resolve_asset_path(std::path::Path::new("setup-status.json")), bootstrap_allowed);
     let meeting = MeetingTauriState::start(store.clone())?;
+    let investigations = InvestigationTauriState::start(store.clone());
     let host = HostState {
         bridge: Mutex::new(bridge),
         store,
@@ -1089,6 +1091,7 @@ fn run_shell(
     let result = tauri::Builder::default()
         .any_thread()
         .manage(meeting)
+        .manage(investigations)
         .manage(host)
         .invoke_handler(tauri::generate_handler![
             crate::tauri_meetings::meeting_snapshot,
@@ -1102,6 +1105,28 @@ fn run_shell(
             crate::tauri_meetings::meeting_save_translation,
             crate::tauri_meetings::meeting_save_devices,
             crate::tauri_meetings::meeting_theme,
+            crate::tauri_investigations::investigation_overview,
+            crate::tauri_investigations::investigation_create,
+            crate::tauri_investigations::investigation_rename,
+            crate::tauri_investigations::investigation_delete,
+            crate::tauri_investigations::investigation_set_active,
+            crate::tauri_investigations::investigation_detail,
+            crate::tauri_investigations::investigation_search,
+            crate::tauri_investigations::investigation_add_text,
+            crate::tauri_investigations::investigation_add_image,
+            crate::tauri_investigations::investigation_update_item,
+            crate::tauri_investigations::investigation_delete_item,
+            crate::tauri_investigations::investigation_retry,
+            crate::tauri_investigations::investigation_image,
+            crate::tauri_investigations::investigation_ocr_lines,
+            crate::tauri_investigations::investigation_diagram,
+            crate::tauri_investigations::investigation_save_layout,
+            crate::tauri_investigations::investigation_export,
+            crate::tauri_investigations::investigation_models,
+            crate::tauri_investigations::investigation_capture_shortcut,
+            crate::tauri_investigations::investigation_capture_clipboard,
+            crate::tauri_investigations::investigation_voice,
+            crate::tauri_investigations::investigation_assistant,
             host_snapshot,
             host_app_snapshot,
             host_input_devices,
@@ -1141,6 +1166,7 @@ fn run_shell(
                 }
             }
             let handle = app.handle().clone();
+            crate::tauri_investigations::install_quick_capture(&handle);
             spawn_readiness_probe(handle.clone(), loaded_whisper, initial_vosk_probe)
                 .map_err(|error| tauri::Error::Anyhow(anyhow::anyhow!(error)))?;
             let stopping = stopping_for_setup.clone();
@@ -1289,6 +1315,15 @@ fn control_loop(
                 if let Ok(mut current) = host.status.lock() {
                     *current = status;
                 }
+                crate::tauri_investigations::set_runtime_busy(
+                    &app,
+                    matches!(
+                        status,
+                        UiRuntimeStatus::Listening
+                            | UiRuntimeStatus::Transcribing
+                            | UiRuntimeStatus::Refining
+                    ),
+                );
                 if let Ok(library) = host.library.lock()
                     && let Some(worker) = library.as_ref()
                 {

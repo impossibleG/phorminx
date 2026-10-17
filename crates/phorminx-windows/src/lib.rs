@@ -29,6 +29,8 @@ mod performance;
 #[cfg(windows)]
 mod profile_window;
 #[cfg(windows)]
+mod registered_hotkey;
+#[cfg(windows)]
 mod settings_window;
 #[cfg(windows)]
 mod setup_lock;
@@ -88,6 +90,8 @@ pub use profile_window::{
     ProfileFormatting, ProfileInsertion, ProfileItem, ProfileWindow, ProfileWindowError,
     ProfileWindowEvent,
 };
+#[cfg(windows)]
+pub use registered_hotkey::RegisteredHotkey;
 #[cfg(windows)]
 pub use settings_window::{
     SettingsAccurateBackend, SettingsAccurateModel, SettingsForm, SettingsFormatting,

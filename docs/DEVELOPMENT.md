@@ -40,6 +40,17 @@ cargo clippy --workspace --all-targets --features phorminx-app/desktop -- -D war
 .\scripts\Test-ReleaseAssets.ps1
 .\scripts\Test-PhorminxBootstrap.ps1
 python .\scripts\build-brand-assets.py --check
+node .\design\tauri-preview\markdown.test.js
+node .\design\tauri-preview\investigation-model.test.js
+```
+
+To measure OCR accuracy and speed after changing `phorminx-ocr`, download the
+pinned models (Models → Screenshot text recognition, or the URLs in
+`investigation_ocr.rs`) and run the spike against synthetic screenshots, each
+`name.png` beside its expected `name.txt`:
+
+```powershell
+cargo run --release -p phorminx-ocr --example ocr_spike -- det.onnx rec-latin.onnx latin-dict.txt .\fixtures
 ```
 
 Tests requiring a microphone, installed model, native recognition runtime, or

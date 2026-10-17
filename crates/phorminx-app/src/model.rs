@@ -260,7 +260,7 @@ fn download_model(
     result
 }
 
-fn stream_and_verify(
+pub(crate) fn stream_and_verify(
     reader: &mut impl Read,
     writer: &mut impl Write,
     expected_bytes: u64,
@@ -319,7 +319,7 @@ fn stream_and_verify(
     Ok(())
 }
 
-fn create_temporary_file(directory: &Path) -> Result<(PathBuf, File), ModelError> {
+pub(crate) fn create_temporary_file(directory: &Path) -> Result<(PathBuf, File), ModelError> {
     for _ in 0..100 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = directory.join(format!(

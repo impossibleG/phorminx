@@ -6,9 +6,12 @@
   <title>Phorminx</title>
   <link rel="stylesheet" href="preview.css">
   <link rel="stylesheet" href="product.css">
+  <link rel="stylesheet" href="investigations.css">
   <script src="markdown.js" defer></script>
   <script src="preview.js" defer></script>
   <script src="product.js" defer></script>
+  <script src="investigation-model.js" defer></script>
+  <script src="investigations.js" defer></script>
 </head>
 <body data-shell="product">
   <div class="shell">
@@ -17,6 +20,7 @@
       <nav class="side" aria-label="Phorminx sections">
         <button class="active" type="button" data-route="home">Home</button>
         <button type="button" data-route="live">Meetings</button>
+        <button type="button" data-route="investigations">Investigations</button>
         <button type="button" data-route="history">History</button>
         <button type="button" data-route="lexicon">Lexicon</button>
         <button type="button" data-route="profiles">Profiles</button>
@@ -72,6 +76,7 @@
         <section id="models" class="page" hidden>
           <div class="page-head"><div><small>LOCAL COMPUTE</small><h1>Models</h1></div></div>
           <div class="model-grid"><div class="setting-card"><small>SPEECH / ACCURATE</small><h2>Whisper</h2><p id="selected-whisper">Checking selection…</p><div class="model-choices"><button type="button" data-whisper-model="whisper-tiny-en-f16">Tiny · English</button><button type="button" data-whisper-model="whisper-base-en-f16">Base · English</button><button type="button" data-whisper-model="whisper-tiny-multilingual-f16">Tiny · Multilingual</button><button type="button" data-whisper-model="whisper-base-multilingual-f16">Base · Multilingual</button></div></div><div class="setting-card"><small>SPEECH / INSTANT</small><h2>Vosk</h2><p id="vosk-state">Checking assets…</p><button id="install-vosk" type="button">Install verified assets</button></div></div>
+          <div class="setting-card inv-ocr-card" data-ocr-card><small>SCREENSHOTS / TEXT</small><h2>Screenshot text recognition</h2><p data-ocr-message>Checking local text models…</p><div class="inv-ocr-progress" hidden><span></span></div><div class="inv-ocr-actions"><button type="button" class="primary" data-ocr-install>Download verified models</button><button type="button" data-ocr-remove hidden>Remove</button></div><p class="inv-ocr-fineprint">PaddleOCR PP-OCRv4 detection and PP-OCRv5 Latin recognition (English, Spanish and 30 more), Apache-2.0, run on this computer. Pinned files are verified by SHA-256 before use.</p></div>
           <div class="setting-card model-ollama"><small>LOCAL LANGUAGE MODELS</small><h2>Ollama</h2><div id="ollama-models"></div></div>
           <p id="model-result" role="status"></p>
         </section>
@@ -97,6 +102,7 @@
           <div class="page-head"><div><small>CARE</small><h1>Setup &amp; repair</h1></div><button id="setup-start" type="button" class="primary" hidden>Start Phorminx</button></div>
           <div id="bootstrap-card" class="setting-card"><small>RECOMMENDED STARTER</small><h2>Ready in one guided run</h2><p>Prepare instant and accurate recognition, local formatting, and semantic search. Downloads stay on this computer.</p><div class="bootstrap-control"><button id="bootstrap-start" type="button" class="primary">Prepare everything</button><button id="bootstrap-cancel" type="button" hidden>Stop after this step</button><span id="bootstrap-progress" role="status"></span></div><p id="bootstrap-message"></p></div>
           <div id="setup-updates-card" class="setting-card"><small>NEW FEATURES</small><h2>Keep Phorminx current</h2><label class="check-row"><input id="setup-auto-updates" type="checkbox" checked>Keep getting tested new features automatically</label><p>Phorminx checks signed GitHub Releases daily and installs a verified update when Phorminx restarts, or after you have been away for 30 minutes with nothing recording. Turn this off here or later in Settings → Updates.</p><p id="setup-update-note" role="status"></p></div>
+          <div class="setting-card inv-ocr-card" data-ocr-card><small>OPTIONAL / INVESTIGATIONS</small><h2>Screenshot text recognition</h2><p data-ocr-message>Checking local text models…</p><div class="inv-ocr-progress" hidden><span></span></div><div class="inv-ocr-actions"><button type="button" data-ocr-install>Download verified models</button><button type="button" data-ocr-remove hidden>Remove</button></div></div>
           <small id="repair-label">INDIVIDUAL REPAIR</small><div class="setup-intro"><strong id="setup-stage">Inspecting this machine</strong><p id="setup-summary">Reading local capabilities…</p></div><div id="setup-list" class="record-list single-list"></div>
         </section>
         <section id="app-settings" class="page" hidden>
@@ -135,6 +141,88 @@
             <p id="update-notice" role="status"></p>
           </div>
         </section>
+        <section id="investigations" class="page" hidden>
+          <div class="page-head inv-head">
+            <div class="inv-head-title"><small>INVESTIGATIONS</small><h1 id="inv-title">Investigations</h1></div>
+            <div class="head-actions">
+              <select id="inv-picker" aria-label="Open an investigation"></select>
+              <button id="inv-new" type="button">New</button>
+              <button id="inv-active" type="button" aria-pressed="false" title="Quick capture sends the clipboard to this investigation">Capture here</button>
+              <div class="inv-menu-wrap"><button id="inv-more" type="button" aria-haspopup="menu" aria-expanded="false">More</button>
+                <div id="inv-more-menu" class="inv-menu" role="menu" hidden>
+                  <button type="button" role="menuitem" data-inv-menu="rename">Rename</button>
+                  <button type="button" role="menuitem" data-inv-menu="export">Export as Markdown</button>
+                  <button type="button" role="menuitem" data-inv-menu="capture-settings">Quick-capture shortcut</button>
+                  <button type="button" role="menuitem" data-inv-menu="delete" class="danger">Delete investigation</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="meeting-tabs inv-tabs" role="tablist" aria-label="Investigation views">
+            <button class="active" type="button" role="tab" aria-selected="true" data-inv-view="chronology">Chronology</button>
+            <button type="button" role="tab" aria-selected="false" data-inv-view="diagram">Diagram</button>
+            <span class="inv-tab-spacer"></span>
+            <button id="inv-assistant-toggle" type="button" class="inv-assistant-toggle" aria-pressed="true">Assistant</button>
+          </div>
+          <div id="inv-empty" class="inv-empty" hidden>
+            <div class="inv-empty-card"><small>START</small><h2>Collect everything about one question in one place.</h2><p>Paste screenshots, links and text, add voice notes, and connect them on a diagram. Everything stays on this computer.</p>
+              <form id="inv-start" class="inv-start"><input id="inv-start-title" maxlength="200" placeholder="Name it, e.g. Supplier contract review" aria-label="Investigation name"><button type="submit" class="primary">Start investigation</button></form>
+            </div>
+          </div>
+          <div id="inv-body" class="inv-body" hidden>
+            <div class="inv-main">
+              <div id="inv-chronology" class="inv-chronology">
+                <form id="inv-capture" class="inv-capture">
+                  <textarea id="inv-capture-text" rows="2" maxlength="262144" placeholder="Type a note or paste a link… Paste or drop screenshots anywhere on this page." aria-label="New note"></textarea>
+                  <div class="inv-capture-actions">
+                    <button type="submit" class="primary">Add note</button>
+                    <button id="inv-voice" type="button" class="inv-voice" aria-pressed="false"><span class="inv-mic" aria-hidden="true"></span><span id="inv-voice-label">Voice note</span></button>
+                    <button id="inv-paste" type="button">Add clipboard</button>
+                    <button id="inv-file" type="button">Add image…</button>
+                    <input id="inv-file-input" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" multiple hidden>
+                    <span id="inv-capture-hint" class="inv-capture-hint"></span>
+                  </div>
+                  <div id="inv-voice-live" class="inv-voice-live" hidden><span class="inv-rec-dot" aria-hidden="true"></span><span id="inv-voice-text">Listening…</span></div>
+                </form>
+                <div class="inv-filters">
+                  <div class="inv-chips" role="group" aria-label="Show cards of type">
+                    <button type="button" class="active" aria-pressed="true" data-inv-filter="all">All</button><button type="button" aria-pressed="false" data-inv-filter="note">Notes</button><button type="button" aria-pressed="false" data-inv-filter="text">Text</button><button type="button" aria-pressed="false" data-inv-filter="image">Screenshots</button><button type="button" aria-pressed="false" data-inv-filter="link">Links</button><button type="button" aria-pressed="false" data-inv-filter="voice">Voice</button><button type="button" aria-pressed="false" data-inv-filter="answer">Answers</button>
+                  </div>
+                  <input id="inv-search" type="search" maxlength="300" placeholder="Find exact words…" aria-label="Search this investigation">
+                </div>
+                <div id="inv-timeline" class="inv-timeline" role="list" aria-label="Chronology"></div>
+              </div>
+              <div id="inv-diagram" class="inv-diagram" hidden>
+                <aside class="inv-tray" aria-label="Unplaced cards"><div class="inv-tray-head"><small>UNPLACED</small><span id="inv-tray-count"></span></div><p class="inv-tray-hint">New cards wait here. Drag one onto the canvas, or choose Place.</p><div id="inv-tray-list" class="inv-tray-list"></div></aside>
+                <div id="inv-canvas-wrap" class="inv-canvas-wrap">
+                  <div class="inv-canvas-toolbar">
+                    <button id="inv-add-concept" type="button">Add concept</button>
+                    <button id="inv-suggest" type="button" title="Ask the assistant to propose connections. Nothing is connected until you accept.">Suggest connections</button>
+                    <button id="inv-dismiss-suggestions" type="button" hidden>Dismiss suggestions</button>
+                    <span class="inv-tab-spacer"></span>
+                    <button id="inv-zoom-out" type="button" aria-label="Zoom out">−</button><button id="inv-zoom-fit" type="button">Fit</button><button id="inv-zoom-in" type="button" aria-label="Zoom in">+</button>
+                  </div>
+                  <svg id="inv-canvas" class="inv-canvas" role="application" aria-label="Investigation diagram"><defs><pattern id="inv-grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" class="inv-grid-dot"></circle></pattern></defs><rect id="inv-canvas-bg" class="inv-canvas-bg" width="100%" height="100%"></rect><g id="inv-viewport"><g id="inv-edges"></g><path id="inv-link-preview" class="inv-edge inv-edge-draft" d=""></path><g id="inv-nodes"></g></g></svg>
+                  <div id="inv-node-menu" class="inv-menu inv-node-menu" role="menu" hidden>
+                    <button type="button" role="menuitem" data-node-add="note">Note</button>
+                    <button type="button" role="menuitem" data-node-add="link">Link</button>
+                    <button type="button" role="menuitem" data-node-add="image">Image…</button>
+                    <button type="button" role="menuitem" data-node-add="voice">Voice note</button>
+                    <button type="button" role="menuitem" data-node-add="concept">Concept</button>
+                  </div>
+                  <p class="inv-canvas-hint">Drag the background to pan and scroll to zoom. Drag from a node’s lower dot onto another node to connect them. Delete removes the selection.</p>
+                </div>
+              </div>
+            </div>
+            <aside id="inv-assistant" class="inv-assistant" aria-label="Investigation assistant">
+              <div class="inv-assistant-head"><div><small>ASSISTANT</small><span id="inv-provider"></span></div><button id="inv-clear-chat" type="button" title="Clear this conversation">Clear</button></div>
+              <div id="inv-messages" class="inv-messages" role="log"></div>
+              <p id="inv-assistant-notice" class="inv-assistant-notice" role="status"></p>
+              <form id="inv-ask" class="inv-ask"><textarea id="inv-question" rows="2" maxlength="4000" placeholder="Ask about this investigation…" aria-label="Ask about this investigation"></textarea><div class="inv-ask-actions"><span class="inv-ask-hint">Answers cite cards like [#12].</span><button id="inv-stop-answer" type="button" hidden>Stop</button><button type="submit" class="primary">Ask</button></div></form>
+            </aside>
+          </div>
+          <p id="inv-status" class="inv-status" role="status"></p>
+        </section>
         <section id="live" class="page" hidden>
           <div class="page-head"><div><small>MEETINGS / LIVE</small><h1>Live session</h1></div><div class="head-actions"><button id="start" type="button" class="primary">Start meeting</button><button id="stop" type="button">Finish</button><button id="companion" type="button">Open companion</button></div></div>
           <div class="meeting-tabs" role="tablist" aria-label="Meetings"><button class="active" type="button" role="tab" aria-selected="true" data-route="live">Live session</button><button type="button" role="tab" aria-selected="false" data-route="saved">Saved sessions</button><button type="button" role="tab" aria-selected="false" data-route="meeting-settings">Meeting settings</button></div>
@@ -153,6 +241,10 @@
       </main>
     </div>
   </div>
+  <dialog id="inv-detail" class="inv-dialog inv-detail-dialog"><form method="dialog" id="inv-detail-form"><div class="inv-detail-head"><small id="inv-detail-kind">CARD</small><input id="inv-detail-title" maxlength="300" placeholder="Title (optional)" aria-label="Card title"></div><div id="inv-detail-media" class="inv-detail-media"></div><label id="inv-detail-body-label" for="inv-detail-body">Text</label><textarea id="inv-detail-body" rows="7"></textarea><p id="inv-detail-meta" class="inv-detail-meta"></p><div class="dialog-actions"><button type="button" id="inv-detail-delete" class="danger">Delete card</button><button type="button" id="inv-detail-place">Show on diagram</button><span class="inv-tab-spacer"></span><button value="cancel" formnovalidate>Close</button><button value="save" class="primary">Save</button></div></form></dialog>
+  <dialog id="inv-prompt" class="inv-dialog"><form method="dialog"><small id="inv-prompt-kicker">INVESTIGATION</small><h2 id="inv-prompt-title">Name</h2><textarea id="inv-prompt-input" rows="1"></textarea><p id="inv-prompt-error" class="inv-prompt-error" role="alert"></p><div class="dialog-actions"><button value="cancel" formnovalidate>Cancel</button><button value="confirm" class="primary" id="inv-prompt-confirm">Save</button></div></form></dialog>
+  <dialog id="inv-export" class="inv-dialog inv-export-dialog"><form method="dialog"><small>EXPORT</small><h2>Markdown</h2><textarea id="inv-export-text" rows="16" readonly aria-label="Exported Markdown"></textarea><div class="dialog-actions"><span id="inv-export-result" role="status"></span><span class="inv-tab-spacer"></span><button type="button" id="inv-export-save">Save .md file</button><button type="button" id="inv-export-copy" class="primary">Copy</button><button value="cancel">Close</button></div></form></dialog>
+  <dialog id="inv-shortcut" class="inv-dialog"><form method="dialog" id="inv-shortcut-form"><small>QUICK CAPTURE</small><h2>Send the clipboard here from anywhere</h2><p>Press the shortcut in any app. The clipboard’s text, link or image goes into the active investigation, and a small confirmation appears.</p><input id="inv-shortcut-input" readonly placeholder="Click here, then press the keys" aria-label="Quick-capture shortcut"><p id="inv-shortcut-status" class="inv-prompt-error" role="status"></p><div class="dialog-actions"><button type="button" id="inv-shortcut-off">Turn off</button><span class="inv-tab-spacer"></span><button value="cancel" formnovalidate>Cancel</button><button value="save" class="primary">Save shortcut</button></div></form></dialog>
   <dialog id="setup-consent"><form method="dialog"><small>BEFORE CONTINUING</small><h2 id="setup-consent-title">Confirm setup</h2><div id="setup-consent-details"></div><div class="dialog-actions"><button value="cancel">Cancel</button><button id="setup-consent-confirm" value="confirm" class="primary">Confirm changes</button></div></form></dialog>
   <dialog id="bootstrap-consent"><form method="dialog"><small>BEFORE CONTINUING</small><h2>Prepare your local starter</h2><p>Phorminx will download verified speech assets, install Ollama and a small local language model, and install Vulkan if Windows needs it. Windows may ask for administrator approval for Vulkan. Existing text and settings are preserved; this can take several minutes and use substantial disk space.</p><div class="dialog-actions"><button value="cancel">Not now</button><button value="confirm" class="primary">Install starter</button></div></form></dialog>
 </body>
