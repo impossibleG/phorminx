@@ -74,6 +74,8 @@ pub enum MessagingError {
     Blocked,
     #[error("invalid key slot")]
     InvalidSlot,
+    #[error("too many open invites; wait for one to be used or expire")]
+    TooManyInvites,
 }
 
 /// Protects the identity key at rest (DPAPI in the app).

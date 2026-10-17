@@ -27,6 +27,10 @@ use crate::{
 const CONTACTS_SERVICE: &str = "contacts";
 const INVITE_PREFIX: &str = "invite-";
 const OUTBOX_BATCH: usize = 100;
+/// Inbound connections served at once; more are dropped unanswered.
+const MAX_INBOUND: usize = 64;
+/// Live invites (each one is an onion service) at once.
+const MAX_INVITES: usize = 20;
 
 pub(crate) type Reply<T> = std::sync::mpsc::SyncSender<Result<T, MessagingError>>;
 
@@ -192,6 +196,7 @@ pub(crate) struct Engine<T: Transport> {
     dialing: HashSet<i64>,
     backoff: HashMap<i64, Backoff>,
     rates: HashMap<i64, RateLimit>,
+    inbound_active: Arc<std::sync::atomic::AtomicUsize>,
     next_session_id: u64,
 }
 
@@ -234,6 +239,7 @@ impl<T: Transport> Engine<T> {
             dialing: HashSet::new(),
             backoff: HashMap::new(),
             rates: HashMap::new(),
+            inbound_active: Arc::default(),
             next_session_id: 1,
         }
     }
@@ -819,26 +825,49 @@ impl<T: Transport> Engine<T> {
     }
 
     fn inbound(&mut self, kind: ServiceKind, stream: BoxStream) {
+        use std::sync::atomic::Ordering;
         let Some(ctx) = self.ctx() else {
             return;
+        };
+        let active = self.inbound_active.clone();
+        if active.fetch_add(1, Ordering::AcqRel) >= MAX_INBOUND {
+            // A flood of callers: drop the newest without answering.
+            active.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        let release = move || {
+            active.fetch_sub(1, Ordering::AcqRel);
         };
         match kind {
             ServiceKind::Contacts => {
                 if let Some(address) = self.contacts_address.clone() {
-                    tokio::spawn(session::accept_contact(stream, ctx, address));
+                    tokio::spawn(async move {
+                        session::accept_contact(stream, ctx, address).await;
+                        release();
+                    });
+                    return;
                 }
             }
             ServiceKind::Invite(id) => {
                 if let Some((address, _)) = self.invite_services.get(&id) {
-                    tokio::spawn(session::accept_invite(stream, ctx, id, address.clone()));
+                    let address = address.clone();
+                    tokio::spawn(async move {
+                        session::accept_invite(stream, ctx, id, address).await;
+                        release();
+                    });
+                    return;
                 }
             }
         }
+        release();
     }
 
     fn create_invite(&mut self) -> Result<String, MessagingError> {
         if !self.online() {
             return Err(MessagingError::NotOnline);
+        }
+        if self.invite_services.len() >= MAX_INVITES {
+            return Err(MessagingError::TooManyInvites);
         }
         let id = random_bytes::<8>()?
             .iter()

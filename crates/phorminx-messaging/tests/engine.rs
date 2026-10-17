@@ -465,3 +465,17 @@ fn returning_contact_collects_queued_messages_without_waiting_for_backoff() {
     wait(|| ana.texts(bob_id)[1].2 == MessageState::Delivered);
     assert_eq!(bob.texts(ana_id).last().unwrap().1, "queued");
 }
+
+#[test]
+fn open_invites_are_capped() {
+    let network = MemoryNetwork::new();
+    let ana = Peer::new(&network, 1, fast());
+    ana.enable("Ana");
+    for _ in 0..20 {
+        ana.m().create_invite().unwrap();
+    }
+    assert!(matches!(
+        ana.m().create_invite(),
+        Err(MessagingError::TooManyInvites)
+    ));
+}
