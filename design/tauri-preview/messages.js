@@ -282,7 +282,7 @@
 
   $('messaging-settings-open').addEventListener('click', () => {
     $('messaging-self-name').value = snapshot?.status.displayName || '';
-    keyOptions($('messaging-launcher-key'), snapshot?.freeMainKeys || [], snapshot?.launcherSlot, 'None');
+    keyOptions($('messaging-launcher-key'), snapshot?.freeMainKeys || [], snapshot?.launcherSlot, 'Automatic (first free key)');
     $('messaging-settings-result').textContent = '';
     $('messaging-settings-dialog').showModal();
   });
