@@ -197,7 +197,7 @@
     if (!invite) return;
     const button = $('messaging-add-confirm');
     button.disabled = true;
-    $('messaging-add-result').textContent = 'Connecting over Tor… this can take up to a minute.';
+    $('messaging-add-result').textContent = 'Connecting over Tor… this can take a few minutes.';
     try {
       const contact = await invoke('host_messaging_redeem', {invite});
       $('messaging-add-dialog').close();

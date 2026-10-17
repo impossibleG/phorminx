@@ -28,8 +28,13 @@ it on, no Tor connection or listener exists.
   the invite exchange each side generates an x25519 client key for the other
   and authorizes its public half, so only current contacts can even fetch
   the service descriptor. Blocking or removing a contact withdraws the key.
-  Each *Copy my invite* creates a fresh invite onion service that is
-  destroyed, keys included, once it is used or after 24 hours.
+  Each *Copy my invite* hands out a fresh invite onion service that is
+  destroyed, keys included, once it is used or after 24 hours. A new onion
+  service can take from under a minute to several minutes to become
+  reachable, so one spare invite service is published ahead of time while
+  messaging is on (its stored secret is random and never shared) and is
+  handed out on the next copy. Redeeming keeps retrying an unreachable
+  invite for up to five minutes.
 - **Invite string.** `name#` + lowercase base32 of
   `{version 1, onion address (35 bytes), 16-byte secret, expiry (u64 UTC
   seconds), 4-byte SHA-256 check}`. The name is only a hint; the real display
@@ -80,6 +85,7 @@ it on, no Tor connection or listener exists.
   while parsing the consensus, because Windows `SystemTime` has 100 ns
   resolution. See `vendor/README.md`. Restricted discovery is an experimental
   Arti feature, so Arti crates are pinned to exact versions.
+- Live invites are capped at 20 and concurrent inbound connections at 64.
 - Tearing down an onion service destroys its circuits, and Tor drops cells
   still queued on them. Invite services therefore wait for the redeemer to
   hang up (bounded) before they are destroyed.
@@ -92,7 +98,7 @@ it on, no Tor connection or listener exists.
 | --- | --- |
 | Cold bootstrap to online | 8–11 s |
 | Warm bootstrap | 1.4 s |
-| Invite redeemed (new invite, including descriptor publication) | 55 s |
+| Invite redeemed right after creation (cold descriptor publication) | 55 s, and 578 s in one run |
 | First message, cold dial with restricted discovery | 32 s |
 | Message over an open session (send to delivered) | 0.7–0.8 s |
 | Contact restarts, then receives a queued message | 15 s |
