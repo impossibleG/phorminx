@@ -1175,7 +1175,14 @@ fn run_shell(
                 }
             }
         })
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!())
+        // `Builder::run` ends in tao's `EventLoop::run`, which calls
+        // `process::exit` when the loop stops. That killed the whole process
+        // on Quit, before the runtime could clean up or relaunch after a
+        // settings save. `run_return` hands control back to the caller.
+        .map(|app| {
+            app.run_return(|_, _| {});
+        });
     stopping.store(true, Ordering::Release);
     if let Some(pump) = pump.lock().map_err(|_| "Control slot unavailable.")?.take() {
         let _ = pump.join();

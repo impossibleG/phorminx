@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
+use phorminx_app::lifecycle::{LifecycleLog, error_chain, profile_instance_scope};
 use phorminx_app::incremental::{
     BoundaryKind, CHUNK_OVERLAP, IncrementalPlanner, MergeExpectation, SILENCE_PROBE_DURATION,
     merge_overlapping, strip_known_non_speech_annotations,
@@ -107,7 +108,16 @@ struct Cli {
     /// Open the branded setup experience without starting a recording engine.
     #[arg(long, conflicts_with = "smoke_test")]
     setup: bool,
+    /// Set by a settings restart: wait for the previous process to release
+    /// its instance slot instead of focusing it and exiting.
+    #[arg(long, hide = true)]
+    restarted: bool,
 }
+
+/// How long a restarted process waits for its predecessor to finish cleanup.
+const RESTART_SLOT_WAIT: Duration = Duration::from_secs(30);
+/// Cleanup after the event loop must not strand a requested restart.
+const SHUTDOWN_WATCHDOG: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum FormattingCli {
@@ -152,9 +162,47 @@ fn report_fatal_error(error: &anyhow::Error) {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let instance = match SingleInstance::acquire() {
+    let default_settings_path = SettingsStore::default_for_current_user()
+        .ok()
+        .map(|store| store.path().to_path_buf());
+    let requested_settings_path = match cli.config.as_ref() {
+        Some(path) => SettingsStore::new(path.clone())
+            .ok()
+            .map(|store| store.path().to_path_buf()),
+        None => default_settings_path.clone(),
+    };
+    let lifecycle = requested_settings_path
+        .as_deref()
+        .and_then(LifecycleLog::for_settings);
+    let instance_scope = match (&requested_settings_path, &default_settings_path) {
+        (Some(requested), Some(default)) => profile_instance_scope(requested, default),
+        (Some(requested), None) => profile_instance_scope(requested, Path::new("")),
+        (None, _) => None,
+    };
+    record_lifecycle(
+        lifecycle.as_ref(),
+        &format!(
+            "event=runtime_start version={} restarted={} isolated_profile={}",
+            phorminx_app::updates::current_version(),
+            cli.restarted,
+            instance_scope.is_some()
+        ),
+    );
+    let acquired = if cli.restarted {
+        SingleInstance::acquire_waiting(instance_scope.as_deref(), RESTART_SLOT_WAIT)
+    } else {
+        SingleInstance::acquire_for_profile(instance_scope.as_deref())
+    };
+    let instance = match acquired {
         Ok(instance) => instance,
         Err(SingleInstanceError::AlreadyRunning) => {
+            record_lifecycle(
+                lifecycle.as_ref(),
+                &format!(
+                    "event=runtime_start_deferred reason=already_running restarted={}",
+                    cli.restarted
+                ),
+            );
             for _ in 0..20 {
                 if activate_existing_window() {
                     return Ok(());
@@ -266,6 +314,7 @@ fn run() -> Result<()> {
             model,
             shutting_down,
             instance,
+            lifecycle,
         );
     }
     let verified_variant = if settings.recognition.mode == RecognitionMode::Accurate {
@@ -293,22 +342,7 @@ fn run() -> Result<()> {
         None
     };
 
-    let effective_microphone = match settings.recognition.microphone.as_deref() {
-        Some(selected)
-            if input_devices()
-                .map(|devices| devices.iter().any(|device| device.name == selected))
-                .unwrap_or(false) =>
-        {
-            Some(selected.to_owned())
-        }
-        Some(_) => {
-            eprintln!(
-                "dictation_id=0 state=Starting event=saved_microphone_unavailable recovery=windows_default"
-            );
-            None
-        }
-        None => None,
-    };
+    let mut effective_microphone = resolve_effective_microphone(&settings);
 
     let database_path = settings_store
         .path()
@@ -363,6 +397,7 @@ fn run() -> Result<()> {
                 model,
                 shutting_down,
                 instance,
+                lifecycle,
             )
             .with_context(|| format!("Instant recovery setup failed after: {error}"));
         }
@@ -515,6 +550,28 @@ fn run() -> Result<()> {
                         .context("failed to reload the personal lexicon")?,
                 )?;
             }
+            Ok(ShellAction::LiveSettings { formatting }) => {
+                effective_microphone = resolve_effective_microphone(&settings);
+                if formatting
+                    && let Err(error) = apply_live_formatting(
+                        &settings,
+                        &worker,
+                        &runtime,
+                        &mut dictation_context,
+                        verified_variant,
+                    )
+                {
+                    record_lifecycle(
+                        lifecycle.as_ref(),
+                        &format!(
+                            "event=live_formatting_failed recovery=restart error=\"{}\"",
+                            error_chain(&error)
+                        ),
+                    );
+                    restart_requested = true;
+                    break Ok(());
+                }
+            }
             Ok(ShellAction::Continue) => {}
             Err(error) => break Err(error),
         }
@@ -596,6 +653,28 @@ fn run() -> Result<()> {
                         .list()
                         .context("failed to reload the personal lexicon")?,
                 )?;
+            }
+            Ok(ShellAction::LiveSettings { formatting }) => {
+                effective_microphone = resolve_effective_microphone(&settings);
+                if formatting
+                    && let Err(error) = apply_live_formatting(
+                        &settings,
+                        &worker,
+                        &runtime,
+                        &mut dictation_context,
+                        verified_variant,
+                    )
+                {
+                    record_lifecycle(
+                        lifecycle.as_ref(),
+                        &format!(
+                            "event=live_formatting_failed recovery=restart error=\"{}\"",
+                            error_chain(&error)
+                        ),
+                    );
+                    restart_requested = true;
+                    break Ok(());
+                }
             }
             Ok(ShellAction::Continue) => {}
             Err(error) => break Err(error),
@@ -889,6 +968,28 @@ fn run() -> Result<()> {
                         .context("failed to reload the personal lexicon")?,
                 )?;
             }
+            Ok(ShellAction::LiveSettings { formatting }) => {
+                effective_microphone = resolve_effective_microphone(&settings);
+                if formatting
+                    && let Err(error) = apply_live_formatting(
+                        &settings,
+                        &worker,
+                        &runtime,
+                        &mut dictation_context,
+                        verified_variant,
+                    )
+                {
+                    record_lifecycle(
+                        lifecycle.as_ref(),
+                        &format!(
+                            "event=live_formatting_failed recovery=restart error=\"{}\"",
+                            error_chain(&error)
+                        ),
+                    );
+                    restart_requested = true;
+                    break Ok(());
+                }
+            }
             Ok(ShellAction::Continue) => {}
             Err(error) => break Err(error),
         }
@@ -1165,6 +1266,11 @@ fn run() -> Result<()> {
 
     println!("Shutting down Phorminx.");
     let mut final_error = run_result.err();
+    let restart = RestartClaim::default();
+    let watchdog = ShutdownWatchdog::arm(
+        lifecycle.clone(),
+        restart_requested.then(|| (settings_store.path().to_path_buf(), restart.clone())),
+    );
     drop(runtime);
     if let Some(shell) = product_shell.take() {
         preserve_first_error(
@@ -1232,24 +1338,232 @@ fn run() -> Result<()> {
             .shutdown()
             .context("failed to stop the status overlay"),
     );
-    eprintln!(
-        "event=runtime_exit restart_requested={} cleanup_error={}",
-        restart_requested,
-        final_error.is_some()
+    watchdog.disarm();
+    finish_runtime_exit(
+        lifecycle.as_ref(),
+        restart_requested.then_some(&restart),
+        final_error,
+        instance,
+        settings_store.path(),
+    )
+}
+
+/// Ensures at most one replacement process is spawned, whether by the normal
+/// exit path or by the shutdown watchdog.
+#[derive(Clone, Default)]
+struct RestartClaim(Arc<AtomicBool>);
+
+impl RestartClaim {
+    fn claim(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+}
+
+/// Bounds post-loop cleanup. If a component hangs while stopping, a
+/// requested restart is still spawned and this process exits.
+struct ShutdownWatchdog {
+    disarm: Option<Sender<()>>,
+}
+
+impl ShutdownWatchdog {
+    fn arm(lifecycle: Option<LifecycleLog>, restart: Option<(PathBuf, RestartClaim)>) -> Self {
+        Self::arm_with(SHUTDOWN_WATCHDOG, lifecycle, restart, |code| {
+            std::process::exit(code)
+        })
+    }
+
+    fn arm_with(
+        timeout: Duration,
+        lifecycle: Option<LifecycleLog>,
+        restart: Option<(PathBuf, RestartClaim)>,
+        exit: impl FnOnce(i32) + Send + 'static,
+    ) -> Self {
+        let (disarm, disarmed) = mpsc::channel::<()>();
+        let spawned = thread::Builder::new()
+            .name("phorminx-shutdown-watchdog".to_owned())
+            .spawn(move || {
+                if !matches!(
+                    disarmed.recv_timeout(timeout),
+                    Err(RecvTimeoutError::Timeout)
+                ) {
+                    return;
+                }
+                record_lifecycle(
+                    lifecycle.as_ref(),
+                    &format!(
+                        "event=runtime_cleanup_timeout timeout_ms={} restart_requested={}",
+                        timeout.as_millis(),
+                        restart.is_some()
+                    ),
+                );
+                let mut code = 1;
+                if let Some((settings_path, claim)) = restart
+                    && claim.claim()
+                {
+                    // The replacement waits for this process's instance slot,
+                    // which Windows releases when the process exits below.
+                    match restart_with_settings(&settings_path) {
+                        Ok(pid) => {
+                            code = 0;
+                            record_lifecycle(
+                                lifecycle.as_ref(),
+                                &format!("event=runtime_restart_spawned pid={pid} by=watchdog"),
+                            );
+                        }
+                        Err(error) => record_lifecycle(
+                            lifecycle.as_ref(),
+                            &format!(
+                                "event=runtime_restart_failed by=watchdog error=\"{}\"",
+                                error_chain(&error)
+                            ),
+                        ),
+                    }
+                }
+                exit(code);
+            });
+        Self {
+            disarm: spawned.ok().map(|_| disarm),
+        }
+    }
+
+    fn disarm(mut self) {
+        if let Some(disarm) = self.disarm.take() {
+            let _ = disarm.send(());
+        }
+    }
+}
+
+/// Final step of every runtime exit. A requested restart is honoured even
+/// when cleanup reported an error: that error is logged locally, and the user
+/// gets their app back instead of a closed tray icon with no explanation.
+fn finish_runtime_exit(
+    lifecycle: Option<&LifecycleLog>,
+    restart: Option<&RestartClaim>,
+    final_error: Option<anyhow::Error>,
+    instance: SingleInstance,
+    settings_path: &Path,
+) -> Result<()> {
+    finish_runtime_exit_with(
+        lifecycle,
+        restart,
+        final_error,
+        move || drop(instance),
+        || restart_with_settings(settings_path),
+    )
+}
+
+fn finish_runtime_exit_with(
+    lifecycle: Option<&LifecycleLog>,
+    restart: Option<&RestartClaim>,
+    mut final_error: Option<anyhow::Error>,
+    release_instance: impl FnOnce(),
+    spawn_replacement: impl FnOnce() -> Result<u32>,
+) -> Result<()> {
+    record_lifecycle(
+        lifecycle,
+        &format!(
+            "event=runtime_exit restart_requested={} cleanup_error={}",
+            restart.is_some(),
+            final_error.is_some()
+        ),
     );
-    if final_error.is_none() && restart_requested {
-        // The replacement process acquires this same mutex during startup. Release
-        // our guard before spawning it so a settings restart cannot reject itself.
-        drop(instance);
-        preserve_first_error(
-            &mut final_error,
-            restart_with_settings(settings_store.path()),
+    if let Some(error) = final_error.as_ref() {
+        record_lifecycle(
+            lifecycle,
+            &format!("event=runtime_exit_error error=\"{}\"", error_chain(error)),
         );
     }
-    match final_error {
-        Some(error) => Err(error),
-        None => Ok(()),
+    let Some(restart) = restart else {
+        return final_error.map_or(Ok(()), Err);
+    };
+    // The replacement process acquires this same mutex during startup. Release
+    // our guard before spawning it so a settings restart cannot reject itself.
+    release_instance();
+    if !restart.claim() {
+        return Ok(());
     }
+    match spawn_replacement() {
+        Ok(pid) => {
+            record_lifecycle(
+                lifecycle,
+                &format!("event=runtime_restart_spawned pid={pid} by=exit"),
+            );
+            // The cleanup error is in the lifecycle log. Reporting it as a
+            // fatal startup failure would cover the app that is reopening.
+            Ok(())
+        }
+        Err(error) => {
+            record_lifecycle(
+                lifecycle,
+                &format!(
+                    "event=runtime_restart_failed by=exit error=\"{}\"",
+                    error_chain(&error)
+                ),
+            );
+            preserve_first_error(&mut final_error, Err(error));
+            final_error.map_or(Ok(()), Err)
+        }
+    }
+}
+
+fn record_lifecycle(lifecycle: Option<&LifecycleLog>, event: &str) {
+    eprintln!("{event}");
+    if let Some(log) = lifecycle {
+        log.record(event);
+    }
+}
+
+fn resolve_effective_microphone(settings: &Settings) -> Option<String> {
+    match settings.recognition.microphone.as_deref() {
+        Some(selected)
+            if input_devices()
+                .map(|devices| devices.iter().any(|device| device.name == selected))
+                .unwrap_or(false) =>
+        {
+            Some(selected.to_owned())
+        }
+        Some(_) => {
+            eprintln!(
+                "dictation_id=0 state=Starting event=saved_microphone_unavailable recovery=windows_default"
+            );
+            None
+        }
+        None => None,
+    }
+}
+
+/// Copies the saved fields that the running process reads live. Recognition
+/// fields other than speech level and microphone need a restart and are
+/// deliberately left untouched here.
+fn apply_live_preferences(settings: &mut Settings, persisted: Settings, formatting: bool) {
+    settings.interaction = persisted.interaction;
+    settings.search = persisted.search;
+    settings.appearance = persisted.appearance;
+    settings.privacy = persisted.privacy;
+    settings.startup = persisted.startup;
+    settings.recognition.minimum_rms = persisted.recognition.minimum_rms;
+    settings.recognition.microphone = persisted.recognition.microphone;
+    if formatting {
+        settings.formatting = persisted.formatting;
+    }
+}
+
+/// Swaps AI formatting in the running worker. The next dictation picks up the
+/// new settings; one already in flight finishes with the formatting it began.
+fn apply_live_formatting(
+    settings: &Settings,
+    worker: &TranscriptionWorker,
+    runtime: &AppRuntime<TargetSnapshot, ExtendedRecording>,
+    dictation_context: &mut DictationContext,
+    verified_variant: Option<AccurateModelVariant>,
+) -> Result<()> {
+    let formatting = WorkerFormatting::from_settings(settings)?;
+    let context = DictationContext::global(settings, verified_variant)?;
+    worker.reconfigure_formatting(formatting)?;
+    if runtime.is_clean_idle() {
+        *dictation_context = context;
+    }
+    Ok(())
 }
 
 fn prepare_effective_settings(settings: &mut Settings) -> Result<()> {
@@ -1306,6 +1620,7 @@ fn run_setup_mode(
     model: PathBuf,
     shutting_down: Arc<AtomicBool>,
     instance: SingleInstance,
+    lifecycle: Option<LifecycleLog>,
 ) -> Result<()> {
     show_shell_status(&overlay, &tray, OverlayStatus::Error, TrayStatus::Error);
     let database_path = settings_store
@@ -1362,7 +1677,8 @@ fn run_setup_mode(
                 ShellAction::Continue
                 | ShellAction::Resume
                 | ShellAction::TestDictation
-                | ShellAction::ReloadAliases,
+                | ShellAction::ReloadAliases
+                | ShellAction::LiveSettings { .. },
             ) => {
                 thread::sleep(Duration::from_millis(25));
             }
@@ -1371,6 +1687,11 @@ fn run_setup_mode(
     };
 
     let mut final_error = run_result.err();
+    let restart = RestartClaim::default();
+    let watchdog = ShutdownWatchdog::arm(
+        lifecycle.clone(),
+        restart_requested.then(|| (settings_store.path().to_path_buf(), restart.clone())),
+    );
     if let Some(shell) = product_shell.take() {
         preserve_first_error(
             &mut final_error,
@@ -1425,17 +1746,14 @@ fn run_setup_mode(
             .shutdown()
             .context("failed to stop the status overlay"),
     );
-    if final_error.is_none() && restart_requested {
-        drop(instance);
-        preserve_first_error(
-            &mut final_error,
-            restart_with_settings(settings_store.path()),
-        );
-    }
-    match final_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    watchdog.disarm();
+    finish_runtime_exit(
+        lifecycle.as_ref(),
+        restart_requested.then_some(&restart),
+        final_error,
+        instance,
+        settings_store.path(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1446,6 +1764,10 @@ enum ShellAction {
     Resume,
     TestDictation,
     ReloadAliases,
+    /// Saved settings that the running process applies without a restart.
+    LiveSettings {
+        formatting: bool,
+    },
 }
 
 fn launcher_overlay_status(settings: &Settings) -> OverlayStatus {
@@ -1693,16 +2015,19 @@ fn poll_shell_events(
                 }
                 Ok(ProductShellEvent::RuntimeReloadRequested(mutation)) => match mutation {
                     UiMutation::SettingsSaved => return Ok(ShellAction::Restart),
+                    UiMutation::FormattingSaved => {
+                        let persisted = settings_store
+                            .load()
+                            .context("failed to reload formatting preferences")?;
+                        apply_live_preferences(settings, persisted, true);
+                        return Ok(ShellAction::LiveSettings { formatting: true });
+                    }
                     UiMutation::ShortcutsSaved | UiMutation::SearchSaved => {
                         let persisted = settings_store
                             .load()
                             .context("failed to reload shortcut preferences")?;
-                        settings.interaction = persisted.interaction;
-                        settings.search = persisted.search;
-                        settings.appearance = persisted.appearance;
-                        settings.privacy = persisted.privacy;
-                        settings.startup = persisted.startup;
-                        settings.recognition.minimum_rms = persisted.recognition.minimum_rms;
+                        apply_live_preferences(settings, persisted, false);
+                        return Ok(ShellAction::LiveSettings { formatting: false });
                     }
                     UiMutation::LexiconSaved { .. }
                     | UiMutation::LexiconDeleted { .. }
@@ -2536,15 +2861,21 @@ fn user_safe_settings_error(error: &anyhow::Error) -> String {
     error.to_string()
 }
 
-fn restart_with_settings(settings_path: &Path) -> Result<()> {
+fn restart_with_settings(settings_path: &Path) -> Result<u32> {
     let executable = std::env::current_exe().context("failed to locate the Phorminx executable")?;
     let child = Command::new(executable)
-        .arg("--config")
-        .arg(settings_path)
+        .args(restart_arguments(settings_path))
         .spawn()
         .context("failed to restart Phorminx")?;
-    eprintln!("event=runtime_restart_spawned pid={}", child.id());
-    Ok(())
+    Ok(child.id())
+}
+
+fn restart_arguments(settings_path: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        "--config".into(),
+        settings_path.as_os_str().to_owned(),
+        "--restarted".into(),
+    ]
 }
 
 fn preserve_first_error(first: &mut Option<anyhow::Error>, result: Result<()>) {
@@ -3641,7 +3972,7 @@ impl TranscriptionWorker {
                         None
                     }
                 };
-                let formatting = formatting;
+                let mut formatting = formatting;
                 let mut ollama = formatting.model.as_ref().map(|_| production_ollama_client());
                 let ollama_activity = if formatting.uses_ollama() {
                     production_workload_coordinator()
@@ -3687,12 +4018,16 @@ impl TranscriptionWorker {
                 // this verified resident formatting session is active. An
                 // external Ollama client can still mutate the tag; a restart
                 // re-runs the identity probe before formatting is enabled.
-                let _ollama_activity = ollama_activity;
+                // A live formatting change replaces the lease and re-probes.
+                let mut ollama_lease = ollama_activity;
                 let mut aliases = aliases;
                 let mut incremental_sessions: HashMap<DictationId, PartialAccumulator> = HashMap::new();
                 let mut instant_sessions: HashMap<DictationId, InstantSession> = HashMap::new();
                 let mut checkpoint_clock = phorminx_app::text_recovery::CheckpointClock::default();
-                let mut recovery_probe: Option<Receiver<bool>> = None;
+                // Each probe is tagged with the formatting generation it
+                // verified, so a result for a replaced model is discarded.
+                let mut recovery_probe: Option<(u64, Receiver<bool>)> = None;
+                let mut formatting_generation = 0_u64;
                 let mut last_recovery_attempt: Option<Instant> = None;
                 if formatting.uses_ollama()
                     && let (Some(client), Some(model)) = (&ollama, &formatting.model)
@@ -3726,10 +4061,10 @@ impl TranscriptionWorker {
                     // A daemon missing at launch or stopped later must not
                     // disable AI formatting until Phorminx restarts. Recovery
                     // runs off-thread so it cannot stall live audio draining.
-                    if let Some(probe) = recovery_probe.as_ref() {
+                    if let Some((generation, probe)) = recovery_probe.as_ref() {
                         match probe.try_recv() {
                             Ok(verified) => {
-                                if verified {
+                                if verified && *generation == formatting_generation {
                                     ollama = Some(production_ollama_client());
                                     eprintln!("dictation_id=0 event=ollama_recovery_ready");
                                 }
@@ -3740,7 +4075,7 @@ impl TranscriptionWorker {
                         }
                     }
                     if ollama.is_none() && formatting.uses_ollama()
-                        && _ollama_activity.is_some() && recovery_probe.is_none()
+                        && ollama_lease.is_some() && recovery_probe.is_none()
                         && last_recovery_attempt.is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
                         && let (Some(model), Some(identity)) = (formatting.model.clone(), formatting.model_identity.clone())
                     {
@@ -3753,7 +4088,7 @@ impl TranscriptionWorker {
                                 && installed_ollama_identity_matches(&production_ollama_client(), &model, &identity, &CancellationToken::new());
                             let _ = tx.send(verified);
                         }).is_ok() {
-                            recovery_probe = Some(rx);
+                            recovery_probe = Some((formatting_generation, rx));
                         }
                     }
                     drain_instant_audio(
@@ -4060,6 +4395,26 @@ impl TranscriptionWorker {
                             }
                         }
                         WorkerCommand::ReloadAliases(updated) => aliases = updated,
+                        WorkerCommand::ReconfigureFormatting(updated) => {
+                            // No model is trusted until the off-thread probe
+                            // above re-verifies the exact saved identity.
+                            // Dictations in that window keep deterministic text.
+                            formatting_generation = formatting_generation.wrapping_add(1);
+                            ollama = None;
+                            recovery_probe = None;
+                            last_recovery_attempt = None;
+                            ollama_lease = None;
+                            if updated.uses_ollama() {
+                                ollama_lease = production_workload_coordinator()
+                                    .try_begin(RuntimeActivityKind::OllamaModelPin)
+                                    .ok();
+                            }
+                            eprintln!(
+                                "dictation_id=0 state=Idle event=formatting_reconfigured uses_ollama={}",
+                                updated.uses_ollama()
+                            );
+                            formatting = *updated;
+                        }
                         WorkerCommand::Shutdown => break,
                     }
                 }
@@ -4217,6 +4572,12 @@ impl TranscriptionWorker {
 
     fn shutdown(mut self) -> Result<()> {
         self.stop()
+    }
+
+    fn reconfigure_formatting(&self, formatting: WorkerFormatting) -> Result<()> {
+        self.commands
+            .send(WorkerCommand::ReconfigureFormatting(Box::new(formatting)))
+            .map_err(|_| anyhow!("transcription worker is unavailable"))
     }
 
     fn reload_aliases(&self, aliases: Vec<LexiconEntry>) -> Result<()> {
@@ -4433,6 +4794,7 @@ enum WorkerCommand {
         id: DictationId,
     },
     ReloadAliases(Vec<LexiconEntry>),
+    ReconfigureFormatting(Box<WorkerFormatting>),
     Shutdown,
 }
 
@@ -9683,5 +10045,121 @@ mod composition_tests {
         let rendered = user_safe_settings_error(&error);
         assert_eq!(rendered, "Settings could not be saved.");
         assert!(!rendered.contains(&private.display().to_string()));
+    }
+
+    #[test]
+    fn requested_restart_survives_a_cleanup_error_and_is_logged() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = LifecycleLog::for_settings(&directory.path().join("settings.toml")).unwrap();
+        let released = Cell::new(false);
+        let spawned = Cell::new(false);
+        let claim = RestartClaim::default();
+        let result = finish_runtime_exit_with(
+            Some(&log),
+            Some(&claim),
+            Some(anyhow!("failed to stop the global hotkey")),
+            || released.set(true),
+            || {
+                assert!(released.get(), "the instance slot is released before spawning");
+                spawned.set(true);
+                Ok(4242)
+            },
+        );
+        assert!(result.is_ok(), "a reopening app must not raise the fatal dialog");
+        assert!(spawned.get());
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert!(text.contains("event=runtime_exit restart_requested=true cleanup_error=true"));
+        assert!(text.contains("failed to stop the global hotkey"));
+        assert!(text.contains("event=runtime_restart_spawned pid=4242 by=exit"));
+    }
+
+    #[test]
+    fn quit_without_restart_keeps_reporting_cleanup_errors() {
+        let spawned = Cell::new(false);
+        let result = finish_runtime_exit_with(
+            None,
+            None,
+            Some(anyhow!("cleanup failed")),
+            || {},
+            || {
+                spawned.set(true);
+                Ok(1)
+            },
+        );
+        assert!(result.is_err());
+        assert!(!spawned.get());
+        assert!(finish_runtime_exit_with(None, None, None, || {}, || Ok(1)).is_ok());
+    }
+
+    #[test]
+    fn failed_restart_spawn_is_reported_and_only_claimed_once() {
+        let claim = RestartClaim::default();
+        let result =
+            finish_runtime_exit_with(None, Some(&claim), None, || {}, || Err(anyhow!("denied")));
+        assert!(result.unwrap_err().to_string().contains("denied"));
+
+        // The watchdog already spawned a replacement: the exit path must not
+        // start a second one.
+        let claim = RestartClaim::default();
+        assert!(claim.claim());
+        let spawned = Cell::new(false);
+        finish_runtime_exit_with(
+            None,
+            Some(&claim),
+            None,
+            || {},
+            || {
+                spawned.set(true);
+                Ok(1)
+            },
+        )
+        .unwrap();
+        assert!(!spawned.get());
+    }
+
+    #[test]
+    fn restarted_process_waits_for_the_same_profile() {
+        let arguments = restart_arguments(Path::new(r"C:\QA\settings.toml"));
+        assert_eq!(
+            arguments,
+            [
+                std::ffi::OsString::from("--config"),
+                r"C:\QA\settings.toml".into(),
+                "--restarted".into()
+            ]
+        );
+        let cli = Cli::try_parse_from(
+            std::iter::once(std::ffi::OsString::from("phorminx")).chain(arguments),
+        )
+        .unwrap();
+        assert!(cli.restarted);
+        assert_eq!(cli.config.as_deref(), Some(Path::new(r"C:\QA\settings.toml")));
+    }
+
+    #[test]
+    fn shutdown_watchdog_exits_only_when_cleanup_hangs() {
+        let (exited_tx, exited_rx) = mpsc::channel();
+        let watchdog = ShutdownWatchdog::arm_with(
+            Duration::from_millis(50),
+            None,
+            None,
+            move |code| {
+                let _ = exited_tx.send(code);
+            },
+        );
+        assert_eq!(exited_rx.recv_timeout(Duration::from_secs(5)), Ok(1));
+        watchdog.disarm();
+
+        let (exited_tx, exited_rx) = mpsc::channel();
+        let watchdog = ShutdownWatchdog::arm_with(
+            Duration::from_millis(200),
+            None,
+            None,
+            move |code| {
+                let _ = exited_tx.send(code);
+            },
+        );
+        watchdog.disarm();
+        assert!(exited_rx.recv_timeout(Duration::from_millis(500)).is_err());
     }
 }
