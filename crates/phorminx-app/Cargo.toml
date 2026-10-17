@@ -12,7 +12,7 @@ default = []
 desktop = []
 vulkan = ["phorminx-whisper/vulkan"]
 tauri-preview = ["dep:tauri", "dep:tauri-build"]
-tauri-shell = ["tauri-preview"]
+tauri-shell = ["tauri-preview", "dep:phorminx-messaging"]
 release-tools = []
 
 [dependencies]
@@ -28,6 +28,7 @@ tauri = { version = "=2.12.1", optional = true, default-features = false, featur
 phorminx-audio = { path = "../phorminx-audio" }
 phorminx-core = { path = "../phorminx-core" }
 phorminx-ollama = { path = "../phorminx-ollama" }
+phorminx-messaging = { path = "../phorminx-messaging", optional = true, features = ["tor"] }
 phorminx-persistence = { path = "../phorminx-persistence" }
 phorminx-session = { path = "../phorminx-session" }
 phorminx-setup = { path = "../phorminx-setup" }

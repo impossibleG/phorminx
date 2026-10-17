@@ -30,6 +30,7 @@ use crate::settings::{
 use crate::setup_center::{BenchmarkUnavailable, SetupCenter};
 use crate::tauri_contract::{AppView, LibrarySearchView, ProfileDetailView, SetupView};
 use crate::tauri_meetings::{MeetingTauriState, open_companion};
+use crate::tauri_messaging::MessagingHost;
 use crate::update_center::{UpdateCenter, UpdateView};
 use crate::ui_bridge::{
     DEFAULT_HISTORY_LIMIT, UiBridge, UiCommand, UiCommandOutcome, UiEffect, UiHistoryVariant,
@@ -1057,6 +1058,8 @@ fn run_shell(
 ) -> Result<(), String> {
     let bridge =
         UiBridge::open(store.clone(), &database_path).map_err(|error| error.to_string())?;
+    // Starts the engine only; Tor stays off until the user enables messaging.
+    let messaging = MessagingHost::start(&store, &database_path);
     let library = LibrarySearchWorker::spawn(database_path).ok();
     let initial_readiness = UiReadinessSnapshot::checking(bridge.settings(), &store);
     let setup = SetupCenter::open(store.clone(), Arc::new(BenchmarkUnavailable)).ok();
@@ -1090,6 +1093,7 @@ fn run_shell(
         .any_thread()
         .manage(meeting)
         .manage(host)
+        .manage(messaging)
         .invoke_handler(tauri::generate_handler![
             crate::tauri_meetings::meeting_snapshot,
             crate::tauri_meetings::meeting_actions,
@@ -1133,6 +1137,20 @@ fn run_shell(
             feedback_update,
             feedback_action,
             host_open_feedback,
+            crate::tauri_messaging::host_messaging_snapshot,
+            crate::tauri_messaging::host_messaging_enable,
+            crate::tauri_messaging::host_messaging_disable,
+            crate::tauri_messaging::host_messaging_set_name,
+            crate::tauri_messaging::host_messaging_invite,
+            crate::tauri_messaging::host_messaging_redeem,
+            crate::tauri_messaging::host_messaging_conversation,
+            crate::tauri_messaging::host_messaging_send,
+            crate::tauri_messaging::host_messaging_focus,
+            crate::tauri_messaging::host_messaging_contact,
+            crate::tauri_messaging::host_messaging_launcher_key,
+            crate::tauri_messaging::host_messaging_dictate,
+            crate::tauri_messaging::host_messaging_draft,
+            crate::tauri_messaging::host_messaging_draft_action,
         ])
         .setup(move |app| {
             if !initially_visible {
@@ -1141,6 +1159,8 @@ fn run_shell(
                 }
             }
             let handle = app.handle().clone();
+            app.state::<MessagingHost>()
+                .spawn_draft_listener(handle.clone());
             spawn_readiness_probe(handle.clone(), loaded_whisper, initial_vosk_probe)
                 .map_err(|error| tauri::Error::Anyhow(anyhow::anyhow!(error)))?;
             let stopping = stopping_for_setup.clone();
@@ -1329,6 +1349,11 @@ fn control_loop(
             ProductShellControl::VoskInstallFailed(_) => host.notice("Vosk installation failed."),
             ProductShellControl::ActivationBlocked(_) => {
                 host.notice("That action is unavailable right now.")
+            }
+            ProductShellControl::MessageContact { contact_id } => {
+                if let Err(error) = app.state::<MessagingHost>().dictate(&app, contact_id) {
+                    host.notice(&error);
+                }
             }
             ProductShellControl::Quit => {
                 app.exit(0);

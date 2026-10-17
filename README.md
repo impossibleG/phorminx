@@ -127,6 +127,14 @@ remain available even if translation is unavailable or cannot keep up. Fresh
 settings recommend `nomic-embed-text:latest`; existing embedding selections and
 indexes are not silently replaced.
 
+**Messages** (off by default) sends text directly to people you add with a
+one-time invite. Turning it on connects Phorminx to the Tor network through
+the embedded Arti client; there is no Phorminx server, and neither side learns
+the other's IP address. Contacts can see when you are online, and a message
+only moves while both of you have Phorminx running. History stays on this
+computer and can be deleted per contact. See
+[ADR-018](docs/ADR-018-P2P-MESSAGING.md).
+
 Launcher **0 · Give feedback** records a draft locally. Only clicking **Send**
 submits its reviewed text to `phorminx.net`; optional diagnostics are shown
 separately. Audio and logs are not attached automatically. Release-enabled

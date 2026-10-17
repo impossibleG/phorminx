@@ -1,0 +1,17 @@
+body{background:#101416}
+.review{display:flex;flex-direction:column;gap:12px;height:100%;padding:20px 22px}
+.review header small{font-size:9px;letter-spacing:.12em;color:#c69767}
+.review h1{font-size:19px;font-weight:500;margin:6px 0 0}
+#review-status{margin:0;font-size:12px;color:#a8adb0;min-height:16px}
+#review-text{flex:1;min-height:80px;resize:none;width:100%;border:1px solid #394046;border-radius:4px;background:#171b1e;color:#e8e5dd;padding:10px 11px;font:13px/1.5 "Segoe UI",Arial,sans-serif}
+#review-text:focus-visible{outline:2px solid #c69767;outline-offset:1px}
+.review footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:auto}
+.review footer span{font-size:10px;color:#858c90}
+.review footer div{display:flex;gap:8px}
+.review .primary{background:#c69767;color:#0e1113;border-color:#c69767}
+@media (prefers-color-scheme:light){
+  body{background:#f4f1eb;color:#202326}
+  #review-status{color:#555b60}
+  #review-text,.review button{background:#f7f5f0;color:#202326;border-color:#a5a39d}
+  .review .primary{background:#815026;border-color:#815026;color:#fff}
+}

@@ -1,5 +1,6 @@
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
@@ -7,9 +8,9 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
-    NIN_SELECT, NOTIFY_ICON_DATA_FLAGS, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, NOTIFYICONDATAW_0,
-    Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIIF_RESPECT_QUIET_TIME,
+    NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFY_ICON_DATA_FLAGS,
+    NOTIFYICON_VERSION_4, NOTIFYICONDATAW, NOTIFYICONDATAW_0, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
@@ -25,11 +26,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, w};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The running tray's window, so other threads can raise a notification.
+static TRAY_WINDOW: AtomicUsize = AtomicUsize::new(0);
+static PENDING_NOTIFICATION: Mutex<Option<(String, String)>> = Mutex::new(None);
 
 const CLASS_NAME: PCWSTR = w!("PhorminxSystemTray");
 const ICON_ID: u32 = 1;
 const WM_TRAY: u32 = WM_APP + 20;
 const WM_STATUS: u32 = WM_APP + 21;
+const WM_SHOW_NOTIFICATION: u32 = WM_APP + 22;
 const RETRY_TIMER_ID: usize = 1;
 const RETRY_INTERVAL_MS: u32 = 2_000;
 const COMMAND_SETTINGS: usize = 1;
@@ -150,7 +155,31 @@ impl SystemTray {
     pub fn shutdown(mut self) -> Result<(), TrayError> {
         self.stop()
     }
+}
 
+/// Shows a Windows notification from the tray icon, from any thread. Returns
+/// false when the tray is not running. Windows suppresses it during quiet
+/// hours and focus assist. Only the latest pending notification is shown.
+pub fn show_tray_notification(title: &str, body: &str) -> bool {
+    let bits = TRAY_WINDOW.load(Ordering::Acquire);
+    if bits == 0 {
+        return false;
+    }
+    if let Ok(mut pending) = PENDING_NOTIFICATION.lock() {
+        *pending = Some((title.to_owned(), body.to_owned()));
+    }
+    unsafe {
+        PostMessageW(
+            Some(window(bits)),
+            WM_SHOW_NOTIFICATION,
+            WPARAM(0),
+            LPARAM(0),
+        )
+    }
+    .is_ok()
+}
+
+impl SystemTray {
     fn stop(&mut self) -> Result<(), TrayError> {
         if self.thread.is_none() {
             return Ok(());
@@ -272,7 +301,9 @@ unsafe fn create_and_run(
     }
 
     let thread_id = unsafe { GetCurrentThreadId() };
+    TRAY_WINDOW.store(hwnd.0 as usize, Ordering::Release);
     if ready_tx.send(Ok((hwnd.0 as usize, thread_id))).is_err() {
+        TRAY_WINDOW.store(0, Ordering::Release);
         unsafe { remove_icon(hwnd, &mut state) };
         let _ = unsafe { DestroyWindow(hwnd) };
         let _ = unsafe { UnregisterClassW(CLASS_NAME, Some(instance)) };
@@ -294,6 +325,7 @@ unsafe fn create_and_run(
         }
     };
 
+    TRAY_WINDOW.store(0, Ordering::Release);
     unsafe { remove_icon(hwnd, &mut state) };
     if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         let _ = unsafe { DestroyWindow(hwnd) };
@@ -339,6 +371,19 @@ unsafe extern "system" fn window_procedure(
             {
                 state.status = status;
                 unsafe { update_tooltip(hwnd, state) };
+            }
+            LRESULT(0)
+        }
+        WM_SHOW_NOTIFICATION => {
+            let pending = PENDING_NOTIFICATION.lock().ok().and_then(|mut p| p.take());
+            if let (Some((title, body)), Some(state)) = (pending, unsafe { window_state(hwnd) })
+                && state.icon_added
+            {
+                let mut data = notify_data(hwnd, state.icon, state.status, NIF_INFO);
+                data.szInfoTitle = fixed_utf16(&title);
+                data.szInfo = fixed_utf16(&body);
+                data.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
+                let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
             }
             LRESULT(0)
         }

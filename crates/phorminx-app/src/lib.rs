@@ -3,6 +3,7 @@
 pub mod feedback;
 mod history_loader;
 pub mod incremental;
+pub mod launcher_messaging;
 mod library_search;
 pub mod meeting_audio;
 pub mod meeting_memory;
@@ -21,6 +22,8 @@ pub mod setup_host;
 pub mod tauri_contract;
 #[cfg(feature = "tauri-preview")]
 pub mod tauri_meetings;
+#[cfg(feature = "tauri-shell")]
+mod tauri_messaging;
 #[cfg(feature = "tauri-shell")]
 pub mod tauri_shell;
 pub mod text_recovery;

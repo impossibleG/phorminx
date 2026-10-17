@@ -1,7 +1,7 @@
 use crate::shortcut::{ALT, CTRL, SHIFT, WIN};
 use crate::{Shortcut, ShortcutBindings, TargetSnapshot};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
@@ -18,6 +18,8 @@ static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static ACTIVATION_KEYS: AtomicU32 = AtomicU32::new(0x20);
 static DICTATION_BUSY: AtomicBool = AtomicBool::new(false);
 static CAPTURE_SUSPENDED: AtomicBool = AtomicBool::new(false);
+/// Launcher key (3-9) that opens the messaging contacts panel; 0 when unset.
+static MESSAGING_SLOT: AtomicU8 = AtomicU8::new(0);
 const WM_COMMAND: u32 = WM_APP + 1;
 const WM_CHOOSE: u32 = WM_APP + 2;
 const WM_STOP: u32 = WM_APP + 3;
@@ -25,12 +27,22 @@ thread_local! { static HOOK: RefCell<Option<HookState>> = const { RefCell::new(N
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HoldEvent {
-    Started { target: Option<TargetSnapshot> },
+    Started {
+        target: Option<TargetSnapshot>,
+    },
     Ended,
-    LauncherRequested { target: Option<TargetSnapshot> },
-    LauncherDictate { target: Option<TargetSnapshot> },
+    LauncherRequested {
+        target: Option<TargetSnapshot>,
+    },
+    LauncherDictate {
+        target: Option<TargetSnapshot>,
+    },
     LauncherMeetings,
     LauncherAction(u8),
+    /// The messaging key was chosen; the launcher stays open as the contacts
+    /// panel, where 1-9 pick a contact.
+    LauncherContacts,
+    LauncherContact(u8),
     LauncherDismissed,
 }
 enum Command {
@@ -110,6 +122,14 @@ impl GlobalHoldHotkey {
     }
     pub fn set_dictation_busy(&self, busy: bool) {
         DICTATION_BUSY.store(busy, Ordering::Release);
+    }
+    /// Sets the launcher key (3-9) that opens the messaging contacts panel.
+    /// The hook switches panels itself, so a fast key sequence never leaks.
+    pub fn set_messaging_slot(&self, slot: Option<u8>) {
+        MESSAGING_SLOT.store(
+            slot.filter(|s| (3..=9).contains(s)).unwrap_or(0),
+            Ordering::Release,
+        );
     }
     fn command(&self, command: Command) -> Result<(), HotkeyError> {
         self.commands
@@ -199,6 +219,14 @@ impl HookState {
                 self.launcher_target = None;
                 HoldEvent::LauncherAction(slot)
             }
+            KeyAction::Contacts => {
+                self.launcher_target = None;
+                HoldEvent::LauncherContacts
+            }
+            KeyAction::Contact(slot) => {
+                self.launcher_target = None;
+                HoldEvent::LauncherContact(slot)
+            }
             KeyAction::Dismiss => {
                 self.launcher_target = None;
                 HoldEvent::LauncherDismissed
@@ -278,7 +306,12 @@ unsafe fn install_and_run(
                 let target_current = state
                     .launcher_target
                     .is_none_or(|target| target.is_current());
+                state.keyboard.messaging_slot = MESSAGING_SLOT.load(Ordering::Acquire);
                 let choice = match message.wParam.0 {
+                    1..=9 if state.keyboard.contacts_mode => {
+                        KeyAction::Contact(message.wParam.0 as u8)
+                    }
+                    _ if state.keyboard.contacts_mode => return,
                     0 => KeyAction::Action(0),
                     1 => KeyAction::Choose,
                     2 => KeyAction::Meetings,
@@ -307,6 +340,7 @@ unsafe extern "system" fn keyboard_callback(code: i32, wparam: WPARAM, lparam: L
                 };
                 state.keyboard.busy = DICTATION_BUSY.load(Ordering::Acquire);
                 state.keyboard.suspended = CAPTURE_SUSPENDED.load(Ordering::Acquire);
+                state.keyboard.messaging_slot = MESSAGING_SLOT.load(Ordering::Acquire);
                 if state.keyboard.suspended {
                     state.keyboard.close_launcher();
                 }
@@ -341,6 +375,8 @@ enum KeyAction {
     Choose,
     Meetings,
     Action(u8),
+    Contacts,
+    Contact(u8),
     Dismiss,
 }
 struct KeyboardState {
@@ -352,6 +388,8 @@ struct KeyboardState {
     pending_choice: Option<KeyAction>,
     busy: bool,
     suspended: bool,
+    contacts_mode: bool,
+    messaging_slot: u8,
 }
 impl KeyboardState {
     fn new(bindings: ShortcutBindings) -> Self {
@@ -364,24 +402,50 @@ impl KeyboardState {
             pending_choice: None,
             busy: false,
             suspended: false,
+            contacts_mode: false,
+            messaging_slot: 0,
         }
     }
     fn close_launcher(&mut self) {
         self.launcher_open = false;
         self.pending_choice = None;
+        self.contacts_mode = false;
+    }
+    /// The messaging key turns the open launcher into the contacts panel
+    /// instead of closing it.
+    fn panel_choice(&self, choice: KeyAction) -> KeyAction {
+        match choice {
+            KeyAction::Action(slot)
+                if !self.contacts_mode && slot != 0 && slot == self.messaging_slot =>
+            {
+                KeyAction::Contacts
+            }
+            other => other,
+        }
+    }
+    /// Applies a chosen launcher entry: the contacts panel keeps the launcher
+    /// open, everything else closes it.
+    fn finish_choice(&mut self, choice: KeyAction) {
+        if choice == KeyAction::Contacts {
+            self.pending_choice = None;
+            self.contacts_mode = true;
+        } else {
+            self.close_launcher();
+            self.busy = choice == KeyAction::Choose;
+        }
     }
     fn click_choice(&mut self, target_current: bool, choice: KeyAction) -> Option<KeyAction> {
         if !self.launcher_open || self.suspended {
             self.close_launcher();
             return None;
         }
-        self.close_launcher();
-        self.busy = target_current && choice == KeyAction::Choose;
-        Some(if target_current {
-            choice
-        } else {
-            KeyAction::Dismiss
-        })
+        let choice = self.panel_choice(choice);
+        if !target_current {
+            self.close_launcher();
+            return Some(KeyAction::Dismiss);
+        }
+        self.finish_choice(choice);
+        Some(choice)
     }
     fn modifiers(&self) -> u8 {
         let any = |keys: &[usize]| keys.iter().any(|key| self.down[*key]);
@@ -406,8 +470,7 @@ impl KeyboardState {
         if let Some(choice) = self.pending_choice
             && self.modifiers() == 0
         {
-            self.close_launcher();
-            self.busy = choice == KeyAction::Choose;
+            self.finish_choice(choice);
             return (consumed, Some(choice));
         }
         if !pressed
@@ -422,6 +485,26 @@ impl KeyboardState {
             return (consumed, None);
         }
         let modifiers = self.modifiers();
+        if self.launcher_open
+            && self.contacts_mode
+            && matches!(key, 0x30..=0x39 | 0x60..=0x69 | 0x0d | 0x1b)
+        {
+            self.consumed[index] = true;
+            let choice = match key {
+                0x1b => KeyAction::Dismiss,
+                0x31..=0x39 => KeyAction::Contact((key - 0x30) as u8),
+                0x61..=0x69 => KeyAction::Contact((key - 0x60) as u8),
+                // Zero and Enter pick no contact; swallow them so they never
+                // reach the focused window.
+                _ => return (true, None),
+            };
+            if modifiers != 0 && key != 0x1b {
+                self.pending_choice = Some(choice);
+                return (true, None);
+            }
+            self.close_launcher();
+            return (true, Some(choice));
+        }
         if self.launcher_open && matches!(key, 0x30..=0x39 | 0x60..=0x69 | 0x0d | 0x1b) {
             let choice = match key {
                 0x1b => KeyAction::Dismiss,
@@ -432,13 +515,13 @@ impl KeyboardState {
                 0x63..=0x69 => KeyAction::Action((key - 0x60) as u8),
                 _ => KeyAction::Choose,
             };
+            let choice = self.panel_choice(choice);
             self.consumed[index] = true;
             if modifiers != 0 && key != 0x1b {
                 self.pending_choice = Some(choice);
                 return (true, None);
             }
-            self.close_launcher();
-            self.busy = choice == KeyAction::Choose;
+            self.finish_choice(choice);
             return (true, Some(choice));
         }
         if key == u32::from(self.bindings.launcher.key)
@@ -749,5 +832,72 @@ mod tests {
             state.suspended = true;
             assert_eq!(state.click_choice(true, choice), None);
         }
+    }
+
+    fn messaging_state(slot: u8) -> KeyboardState {
+        let mut state = KeyboardState::new(ShortcutBindings::default());
+        state.messaging_slot = slot;
+        state.launcher_open = true;
+        state
+    }
+
+    #[test]
+    fn messaging_key_turns_the_launcher_into_the_contacts_panel() {
+        let mut state = messaging_state(5);
+        assert_eq!(state.input(0x35, true), (true, Some(KeyAction::Contacts)));
+        assert!(state.launcher_open && state.contacts_mode);
+        assert_eq!(state.input(0x35, false), (true, None));
+        // In the contacts panel 1 and 2 pick contacts, not dictation or meetings.
+        assert_eq!(state.input(0x31, true), (true, Some(KeyAction::Contact(1))));
+        assert!(!state.launcher_open && !state.contacts_mode);
+        assert_eq!(state.input(0x31, false), (true, None));
+        let mut state = messaging_state(5);
+        state.input(0x35, true);
+        assert_eq!(state.input(0x62, true), (true, Some(KeyAction::Contact(2))));
+    }
+
+    #[test]
+    fn contacts_panel_swallows_zero_and_enter_and_escape_closes_it() {
+        let mut state = messaging_state(9);
+        state.input(0x39, true);
+        state.input(0x39, false);
+        assert_eq!(state.input(0x30, true), (true, None));
+        assert_eq!(state.input(0x0d, true), (true, None));
+        assert!(state.contacts_mode);
+        assert_eq!(state.input(0x1b, true), (true, Some(KeyAction::Dismiss)));
+        assert!(!state.launcher_open && !state.contacts_mode);
+    }
+
+    #[test]
+    fn other_slots_keep_running_actions_when_messaging_has_a_key() {
+        let mut state = messaging_state(5);
+        assert_eq!(state.input(0x34, true), (true, Some(KeyAction::Action(4))));
+        assert!(!state.contacts_mode);
+        let mut state = messaging_state(0);
+        assert_eq!(state.input(0x35, true), (true, Some(KeyAction::Action(5))));
+    }
+
+    #[test]
+    fn messaging_key_with_modifiers_opens_contacts_on_release() {
+        let mut state = messaging_state(6);
+        state.input(0x11, true);
+        assert_eq!(state.input(0x36, true), (true, None));
+        assert_eq!(state.input(0x11, false), (false, Some(KeyAction::Contacts)));
+        assert!(state.launcher_open && state.contacts_mode);
+    }
+
+    #[test]
+    fn clicking_in_the_contacts_panel_picks_a_contact() {
+        let mut state = messaging_state(7);
+        assert_eq!(
+            state.click_choice(true, KeyAction::Action(7)),
+            Some(KeyAction::Contacts)
+        );
+        assert!(state.launcher_open && state.contacts_mode);
+        assert_eq!(
+            state.click_choice(true, KeyAction::Contact(3)),
+            Some(KeyAction::Contact(3))
+        );
+        assert!(!state.launcher_open);
     }
 }

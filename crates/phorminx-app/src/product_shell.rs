@@ -64,6 +64,10 @@ pub enum ProductShellControl {
     ModelDownloadFailed,
     VoskInstallFailed(String),
     ActivationBlocked(String),
+    /// Dictate a message to a messaging contact (launcher contacts panel).
+    MessageContact {
+        contact_id: i64,
+    },
     Quit,
 }
 
@@ -2139,6 +2143,10 @@ impl eframe::App for ProductShellApp {
                 }
                 ProductShellControl::ActivationBlocked(message) => {
                     self.set_error(message);
+                    self.refresh();
+                }
+                ProductShellControl::MessageContact { .. } => {
+                    self.set_error("Messaging is available in the new Phorminx window.".into());
                     self.refresh();
                 }
                 ProductShellControl::Quit => {

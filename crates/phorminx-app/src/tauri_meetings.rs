@@ -36,6 +36,17 @@ impl MeetingTauriState {
             .send(event)
     }
 
+    /// Starts (or stops) dictating a message for a messaging contact.
+    pub fn capture_message(
+        &self,
+        capture: crate::meeting_workspace::MessageCapture,
+    ) -> Result<(), String> {
+        self.meeting
+            .lock()
+            .map_err(|_| "Meeting state is unavailable.")?
+            .capture_message(capture)
+    }
+
     pub fn snapshot(&self, since: u64) -> Result<Option<MeetingView>, String> {
         let meeting = self
             .meeting
