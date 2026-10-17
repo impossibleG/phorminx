@@ -43,14 +43,14 @@ impl ProtectedSecret {
             return Err(AssistantError::Credential);
         }
         Ok(Self {
-            ciphertext: transform(plaintext.as_bytes(), true)?,
+            ciphertext: transform(plaintext.as_bytes(), true, ASSISTANT_ENTROPY)?,
         })
     }
     pub fn expose(&self) -> Result<ExposedSecret, AssistantError> {
         if self.ciphertext.is_empty() || self.ciphertext.len() > 65_536 {
             return Err(AssistantError::Credential);
         }
-        let plain = ExposedSecret(transform(&self.ciphertext, false)?);
+        let plain = ExposedSecret(transform(&self.ciphertext, false, ASSISTANT_ENTROPY)?);
         let text = std::str::from_utf8(&plain.0).map_err(|_| AssistantError::Credential)?;
         if text.is_empty() || text.len() > 16_384 || text.chars().any(|c| c.is_control()) {
             return Err(AssistantError::Credential);
@@ -59,8 +59,56 @@ impl ProtectedSecret {
     }
 }
 
+const ASSISTANT_ENTROPY: &[u8] = b"Phorminx/user-triggered-assistant/v1";
+const MESSAGING_IDENTITY_ENTROPY: &[u8] = b"Phorminx/messaging-identity/v1";
+
+/// Account-bound DPAPI ciphertext of a binary secret such as a private key.
+/// Uses its own entropy tag, so it never decrypts as another secret kind.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProtectedBytes {
+    ciphertext: Vec<u8>,
+}
+impl std::fmt::Debug for ProtectedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProtectedBytes([redacted])")
+    }
+}
+impl ProtectedBytes {
+    /// Protects a messaging identity key.
+    pub fn protect_identity_key(plaintext: &[u8]) -> Result<Self, AssistantError> {
+        if plaintext.is_empty() || plaintext.len() > 4096 {
+            return Err(AssistantError::Credential);
+        }
+        Ok(Self {
+            ciphertext: transform(plaintext, true, MESSAGING_IDENTITY_ENTROPY)?,
+        })
+    }
+    pub fn from_ciphertext(ciphertext: Vec<u8>) -> Self {
+        Self { ciphertext }
+    }
+    pub fn ciphertext(&self) -> &[u8] {
+        &self.ciphertext
+    }
+    /// Short-lived plaintext; the buffer is overwritten when dropped.
+    pub fn expose_identity_key(&self) -> Result<ExposedSecret, AssistantError> {
+        if self.ciphertext.is_empty() || self.ciphertext.len() > 65_536 {
+            return Err(AssistantError::Credential);
+        }
+        Ok(ExposedSecret(transform(
+            &self.ciphertext,
+            false,
+            MESSAGING_IDENTITY_ENTROPY,
+        )?))
+    }
+}
+impl ExposedSecret {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 #[cfg(windows)]
-fn transform(bytes: &[u8], protect: bool) -> Result<Vec<u8>, AssistantError> {
+fn transform(bytes: &[u8], protect: bool, entropy_bytes: &[u8]) -> Result<Vec<u8>, AssistantError> {
     use windows::Win32::{
         Foundation::{HLOCAL, LocalFree},
         Security::Cryptography::{
@@ -71,7 +119,6 @@ fn transform(bytes: &[u8], protect: bool) -> Result<Vec<u8>, AssistantError> {
         cbData: bytes.len() as u32,
         pbData: bytes.as_ptr().cast_mut(),
     };
-    let entropy_bytes = b"Phorminx/user-triggered-assistant/v1";
     let entropy = CRYPT_INTEGER_BLOB {
         cbData: entropy_bytes.len() as u32,
         pbData: entropy_bytes.as_ptr().cast_mut(),
@@ -114,7 +161,7 @@ fn transform(bytes: &[u8], protect: bool) -> Result<Vec<u8>, AssistantError> {
     }
 }
 #[cfg(not(windows))]
-fn transform(_: &[u8], _: bool) -> Result<Vec<u8>, AssistantError> {
+fn transform(_: &[u8], _: bool, _: &[u8]) -> Result<Vec<u8>, AssistantError> {
     Err(AssistantError::Credential)
 }
 
@@ -146,5 +193,24 @@ mod tests {
         let mut bad = key;
         bad.ciphertext[0] ^= 0xff;
         assert!(bad.expose().is_err());
+    }
+    #[test]
+    #[cfg(windows)]
+    fn identity_key_roundtrip_is_bound_to_its_purpose() {
+        let seed = [7u8; 32];
+        let key = ProtectedBytes::protect_identity_key(&seed).unwrap();
+        assert_ne!(key.ciphertext(), &seed[..]);
+        assert_eq!(key.expose_identity_key().unwrap().as_bytes(), &seed[..]);
+        assert_eq!(format!("{key:?}"), "ProtectedBytes([redacted])");
+        let as_assistant = ProtectedSecret {
+            ciphertext: key.ciphertext().to_vec(),
+        };
+        assert!(as_assistant.expose().is_err());
+        let restored = ProtectedBytes::from_ciphertext(key.ciphertext().to_vec());
+        assert_eq!(
+            restored.expose_identity_key().unwrap().as_bytes(),
+            &seed[..]
+        );
+        assert!(ProtectedBytes::protect_identity_key(&[]).is_err());
     }
 }

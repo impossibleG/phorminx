@@ -11,7 +11,13 @@ pub use library::{
 };
 mod meeting;
 mod meeting_memory;
+mod messaging;
 pub use meeting_memory::{MeetingMemoryPassage, MeetingMemoryRepository, MeetingTitleSource};
+pub use messaging::{
+    MESSAGING_MAX_TEXT_BYTES, MessagingContactRecord, MessagingDirection, MessagingIdentityRecord,
+    MessagingInviteRecord, MessagingMessageRecord, MessagingMessageState, MessagingRepository,
+    NewMessagingContact,
+};
 mod migration;
 pub use meeting::{
     MeetingMessageRecord, MeetingMessageStatus, MeetingQuestionContext, MeetingRecord,
@@ -173,6 +179,10 @@ impl Persistence {
 
     pub fn meeting_memory(&self) -> MeetingMemoryRepository<'_> {
         MeetingMemoryRepository::new(&self.connection)
+    }
+
+    pub fn messaging(&self) -> MessagingRepository<'_> {
+        MessagingRepository::new(&self.connection)
     }
 
     pub fn recovery(&self) -> RecoveryRepository<'_> {
