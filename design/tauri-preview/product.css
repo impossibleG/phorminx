@@ -126,7 +126,7 @@ main :is(.page,.record-list,.record-detail,.scroll-content,.session-list,.recent
 .prompts-browser .record-list button strong{display:block;font-weight:600}
 .prompts-browser .record-list button span{display:block;color:#a8adb0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:3px}
 .prompt-editor{display:flex;flex-direction:column;gap:18px}
-.prompt-editor .action-form{margin:0}
+.prompt-editor .action-form{margin:0;padding:6px 0 0;overflow:visible;flex:none}.prompt-editor .action-form label:has(textarea){grid-column:1/-1}
 .prompt-versions h2{font-size:12px;font-weight:600;margin:0 0 8px}
 .prompt-version{border-top:1px solid #30363b;padding:9px 0}
 .prompt-version-head{display:flex;align-items:center;gap:10px;font-size:12px}
@@ -136,7 +136,7 @@ main :is(.page,.record-list,.record-detail,.scroll-content,.session-list,.recent
 .prompt-version-body[hidden]{display:none}
 @media(max-width:760px){.prompts-layout{grid-template-columns:1fr;overflow:auto}.prompts-browser .record-list{max-height:240px}}
 :root[data-theme="light"] .page-intro,:root[data-theme="light"] .prompts-browser .record-list button span{color:#555b60}
-:root[data-theme="light"] .prompts-layout,:root[data-theme="light"] .prompts-browser .record-list,:root[data-theme="light"] .prompt-version{border-color:#b9b7b0}
+:root[data-theme="light"] .prompts-layout,:root[data-theme="light"] .prompts-browser .record-list,:root[data-theme="light"] .prompt-version{border-color:#b9b7b0}:root[data-theme="light"] .prompts-layout{background:#b9b7b0}
 :root[data-theme="light"] .prompts-browser{background:#f7f5f0}
 :root[data-theme="light"] .prompts-browser>input,:root[data-theme="light"] .prompt-version-body{background:#f7f5f0;color:#202326;border-color:#a5a39d}
 :root[data-theme="light"] .prompt-tag-filter button{border-color:#a5a39d;color:#555b60}
