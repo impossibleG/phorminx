@@ -3,13 +3,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontIndirectW, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_GUI_FONT,
-    DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW,
-    EndPaint, FillRect, GetMonitorInfoW, GetStockObject, HGDIOBJ, InvalidateRect, LOGFONTW,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, SelectObject, SetBkMode,
-    SetTextColor, SetWindowRgn, TRANSPARENT,
+    DT_CALCRECT, DT_CENTER, DT_EDITCONTROL, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, DT_WORDBREAK, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
+    GetStockObject, HDC, HGDIOBJ, InvalidateRect, LOGFONTW, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromWindow, PAINTSTRUCT, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
+    SetWindowRgn, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -32,6 +33,10 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 const CLASS_NAME: windows::core::PCWSTR = w!("PhorminxStatusOverlay");
 const WM_STATUS: u32 = WM_APP + 10;
 const WM_LAUNCHER_ACTIONS: u32 = WM_APP + 11;
+const WM_EXTRAS: u32 = WM_APP + 12;
+/// Characters of live text kept for the pill; painting trims further to fit.
+const LIVE_TEXT_CHARS: usize = 160;
+const NOTE_CHARS: usize = 80;
 const INITIAL_TIMER_ID: usize = 1;
 
 #[repr(usize)]
@@ -104,10 +109,30 @@ impl OverlayStatus {
     }
 }
 
+/// Optional content shown with the fixed status label.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct OverlayExtras {
+    /// Recognized speech while dictating (Listening/Transcribing/Cleaning).
+    live_text: String,
+    /// One short secondary line after a dictation, for example why formatting
+    /// was skipped.
+    note: Option<String>,
+    /// Shows an Expand button on Inserted/Ready to paste.
+    expand: bool,
+}
+
+/// Clicks on the pill that the runtime acts on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OverlayEvent {
+    ExpandRequested,
+}
+
 pub struct StatusOverlay {
     window_bits: usize,
     thread: Option<JoinHandle<()>>,
     launcher_actions: Arc<Mutex<Vec<(u8, String)>>>,
+    extras: Arc<Mutex<OverlayExtras>>,
+    events: mpsc::Receiver<OverlayEvent>,
 }
 
 impl StatusOverlay {
@@ -122,9 +147,12 @@ impl StatusOverlay {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let launcher_actions = Arc::new(Mutex::new(Vec::new()));
         let thread_actions = launcher_actions.clone();
+        let extras = Arc::new(Mutex::new(OverlayExtras::default()));
+        let thread_extras = extras.clone();
+        let (event_tx, events) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("phorminx-overlay".to_owned())
-            .spawn(move || run_overlay(ready_tx, thread_actions))
+            .spawn(move || run_overlay(ready_tx, thread_actions, thread_extras, event_tx))
             .map_err(|error| {
                 ACTIVE.store(false, Ordering::Release);
                 OverlayError::Spawn(error)
@@ -146,7 +174,70 @@ impl StatusOverlay {
             window_bits,
             thread: Some(thread),
             launcher_actions,
+            extras,
+            events,
         })
+    }
+
+    /// Live recognized text for the active dictation; `None` clears it.
+    /// Only the tail that fits the pill is ever drawn.
+    pub fn set_live_text(&self, text: Option<&str>) -> Result<(), OverlayError> {
+        let text = text.map(live_text_tail).unwrap_or_default();
+        self.update_extras(|extras| {
+            if extras.live_text == text {
+                return false;
+            }
+            extras.live_text = text;
+            true
+        })
+    }
+
+    /// A short secondary line for the next result status; `None` clears it.
+    pub fn set_note(&self, note: Option<&str>) -> Result<(), OverlayError> {
+        let note = note
+            .map(|note| clean_line(note, NOTE_CHARS))
+            .filter(|note| !note.is_empty());
+        self.update_extras(|extras| {
+            if extras.note == note {
+                return false;
+            }
+            extras.note = note;
+            true
+        })
+    }
+
+    /// Offers the Expand button on the Inserted and Ready to paste states.
+    pub fn offer_expand(&self, offered: bool) -> Result<(), OverlayError> {
+        self.update_extras(|extras| {
+            if extras.expand == offered {
+                return false;
+            }
+            extras.expand = offered;
+            true
+        })
+    }
+
+    pub fn events(&self) -> &mpsc::Receiver<OverlayEvent> {
+        &self.events
+    }
+
+    fn update_extras(
+        &self,
+        change: impl FnOnce(&mut OverlayExtras) -> bool,
+    ) -> Result<(), OverlayError> {
+        let changed = change(&mut self.extras.lock().unwrap_or_else(|e| e.into_inner()));
+        if !changed {
+            return Ok(());
+        }
+        unsafe {
+            PostMessageW(
+                Some(window(self.window_bits)),
+                WM_EXTRAS,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        }
+        .map_err(OverlayError::PostStatus)
     }
 
     pub fn set(&self, status: OverlayStatus) -> Result<(), OverlayError> {
@@ -221,13 +312,19 @@ struct WindowState {
     /// never maps an old visible row to a new action before the redraw message.
     launcher_rows: Vec<(u8, String)>,
     launcher_row_height: i32,
+    extras: Arc<Mutex<OverlayExtras>>,
+    /// Snapshot of `extras` used by both painting and hit testing.
+    shown: OverlayExtras,
+    events: mpsc::Sender<OverlayEvent>,
 }
 
 fn run_overlay(
     ready_tx: mpsc::SyncSender<Result<usize, String>>,
     actions: Arc<Mutex<Vec<(u8, String)>>>,
+    extras: Arc<Mutex<OverlayExtras>>,
+    events: mpsc::Sender<OverlayEvent>,
 ) {
-    let result = unsafe { create_and_run(&ready_tx, actions) };
+    let result = unsafe { create_and_run(&ready_tx, actions, extras, events) };
     if let Err(error) = result {
         let _ = ready_tx.try_send(Err(error.to_string()));
     }
@@ -237,6 +334,8 @@ fn run_overlay(
 unsafe fn create_and_run(
     ready_tx: &mpsc::SyncSender<Result<usize, String>>,
     actions: Arc<Mutex<Vec<(u8, String)>>>,
+    extras: Arc<Mutex<OverlayExtras>>,
+    events: mpsc::Sender<OverlayEvent>,
 ) -> windows::core::Result<()> {
     let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let module = unsafe { GetModuleHandleW(None)? };
@@ -258,6 +357,9 @@ unsafe fn create_and_run(
         launcher_actions: actions,
         launcher_rows: launcher_rows(&[]),
         launcher_row_height: 54,
+        extras,
+        shown: OverlayExtras::default(),
+        events,
     });
     let state_pointer = (&mut *state as *mut WindowState).cast();
     let hwnd = match unsafe {
@@ -342,6 +444,26 @@ unsafe extern "system" fn window_procedure(
             }
             LRESULT(0)
         }
+        WM_EXTRAS => {
+            if let Some(state) = unsafe { window_state(hwnd) } {
+                let extras = state
+                    .extras
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let visible_before = visible_extras(state.status, &state.shown);
+                let visible_after = visible_extras(state.status, &extras);
+                if visible_before != visible_after && state.status != OverlayStatus::Hidden {
+                    // Re-layout without restarting a running auto-hide timer
+                    // unless the Expand offer changes how long it should stay.
+                    let restart_timer = visible_before.expand != visible_after.expand;
+                    unsafe { relayout_window(hwnd, state, restart_timer) };
+                } else {
+                    state.shown = extras;
+                }
+            }
+            LRESULT(0)
+        }
         WM_TIMER => {
             if let Some(state) = unsafe { window_state(hwnd) }
                 && wparam.0 == state.timer_id
@@ -362,7 +484,8 @@ unsafe extern "system" fn window_procedure(
         WM_ERASEBKGND => LRESULT(1),
         WM_NCHITTEST => LRESULT(
             if let Some(state) = unsafe { window_state(hwnd) }
-                && is_launcher(state.status)
+                && (is_launcher(state.status)
+                    || unsafe { expand_hit(hwnd, state, screen_point(lparam)) })
             {
                 HTCLIENT as isize
             } else {
@@ -371,6 +494,18 @@ unsafe extern "system" fn window_procedure(
         ),
         WM_LBUTTONUP => {
             if let Some(state) = unsafe { window_state(hwnd) }
+                && !is_launcher(state.status)
+            {
+                let point = POINT {
+                    x: (lparam.0 as u16) as i16 as i32,
+                    y: ((lparam.0 >> 16) as u16) as i16 as i32,
+                };
+                if unsafe { expand_hit_client(hwnd, state, point) } {
+                    let _ = state.events.send(OverlayEvent::ExpandRequested);
+                    // The panel replaces the pill; hide it immediately.
+                    unsafe { update_window(hwnd, state, OverlayStatus::Hidden) };
+                }
+            } else if let Some(state) = unsafe { window_state(hwnd) }
                 && is_launcher(state.status)
             {
                 let x = (lparam.0 as u16) as i16 as i32;
@@ -402,11 +537,21 @@ unsafe extern "system" fn window_procedure(
 }
 
 unsafe fn update_window(hwnd: HWND, state: &mut WindowState, status: OverlayStatus) {
-    if state.timer_id != 0 {
+    state.status = status;
+    unsafe { relayout_window(hwnd, state, true) };
+}
+
+unsafe fn relayout_window(hwnd: HWND, state: &mut WindowState, restart_timer: bool) {
+    let status = state.status;
+    if restart_timer && state.timer_id != 0 {
         let _ = unsafe { KillTimer(Some(hwnd), state.timer_id) };
         state.timer_id = 0;
     }
-    state.status = status;
+    state.shown = state
+        .extras
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
 
     if status == OverlayStatus::Hidden {
         unsafe {
@@ -438,7 +583,8 @@ unsafe fn update_window(hwnd: HWND, state: &mut WindowState, status: OverlayStat
                 .unwrap_or_else(|e| e.into_inner()),
         );
     }
-    let width = scale(if launcher { 360 } else { 300 });
+    let pill = pill_size(&visible_extras(status, &state.shown));
+    let width = scale(if launcher { 360 } else { pill.0 });
     let margin = scale(48);
     let work = monitor_info.rcWork;
     if launcher {
@@ -449,7 +595,7 @@ unsafe fn update_window(hwnd: HWND, state: &mut WindowState, status: OverlayStat
     let height = scale(if launcher {
         launcher_height(state.launcher_rows.len(), state.launcher_row_height)
     } else {
-        52
+        pill.1
     });
     let x = if launcher {
         (work.right - width - scale(24)).max(work.left)
@@ -480,7 +626,11 @@ unsafe fn update_window(hwnd: HWND, state: &mut WindowState, status: OverlayStat
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
 
-    if let Some(milliseconds) = status.hide_after_ms() {
+    if !restart_timer {
+        return;
+    }
+    let extras = visible_extras(status, &state.shown);
+    if let Some(milliseconds) = hide_after_ms_with(status, &extras) {
         let timer_id = state.next_timer_id.max(INITIAL_TIMER_ID);
         state.next_timer_id = timer_id.wrapping_add(1).max(INITIAL_TIMER_ID);
         state.timer_id = unsafe { SetTimer(Some(hwnd), timer_id, milliseconds, None) };
@@ -509,26 +659,339 @@ unsafe fn paint_window(hwnd: HWND) {
             SetBkMode(device_context, TRANSPARENT);
             SetTextColor(device_context, COLORREF(0x00F4_F4F4));
         }
-
-        let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
-        let previous_font = unsafe { SelectObject(device_context, font) };
-        let status = unsafe { window_state(hwnd) }
-            .map(|state| state.status)
-            .unwrap_or(OverlayStatus::Hidden);
-        let mut text = status.label().encode_utf16().collect::<Vec<_>>();
+        let extras = unsafe { window_state(hwnd) }
+            .map(|state| visible_extras(state.status, &state.shown))
+            .unwrap_or_default();
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+        let label_font = unsafe { OwnedFont::new(dpi, 14, 600) };
+        let small_font = unsafe { OwnedFont::new(dpi, 12, 400) };
         unsafe {
-            DrawTextW(
+            paint_pill(
                 device_context,
-                &mut text,
-                &mut rectangle,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-            );
-            SelectObject(device_context, previous_font);
-        }
+                &rectangle,
+                status,
+                &extras,
+                dpi,
+                &label_font,
+                &small_font,
+            )
+        };
     }
     unsafe {
         let _ = EndPaint(hwnd, &paint);
     }
+}
+
+/// A GDI font released on drop, falling back to the stock GUI font.
+struct OwnedFont {
+    handle: HGDIOBJ,
+    owned: bool,
+}
+
+impl OwnedFont {
+    unsafe fn new(dpi: u32, logical_height: i32, weight: i32) -> Self {
+        let mut description = LOGFONTW {
+            lfHeight: -(logical_height * dpi as i32 / 96),
+            lfWeight: weight,
+            ..Default::default()
+        };
+        for (index, code) in "Segoe UI".encode_utf16().enumerate() {
+            description.lfFaceName[index] = code;
+        }
+        let font = unsafe { CreateFontIndirectW(&description) };
+        if font.is_invalid() {
+            Self {
+                handle: unsafe { GetStockObject(DEFAULT_GUI_FONT) },
+                owned: false,
+            }
+        } else {
+            Self {
+                handle: HGDIOBJ(font.0),
+                owned: true,
+            }
+        }
+    }
+}
+
+impl Drop for OwnedFont {
+    fn drop(&mut self) {
+        if self.owned {
+            unsafe {
+                let _ = DeleteObject(self.handle);
+            }
+        }
+    }
+}
+
+unsafe fn paint_pill(
+    dc: HDC,
+    client: &RECT,
+    status: OverlayStatus,
+    extras: &OverlayExtras,
+    dpi: u32,
+    label_font: &OwnedFont,
+    small_font: &OwnedFont,
+) {
+    let scale = |value: i32| value * dpi as i32 / 96;
+    let draw = |text: &str, bounds: &mut RECT, format| unsafe {
+        DrawTextW(
+            dc,
+            &mut text.encode_utf16().collect::<Vec<_>>(),
+            bounds,
+            format,
+        )
+    };
+    let previous = unsafe { SelectObject(dc, label_font.handle) };
+    let simple = extras.live_text.is_empty() && extras.note.is_none() && !extras.expand;
+    if simple {
+        let mut bounds = *client;
+        unsafe {
+            draw(
+                status.label(),
+                &mut bounds,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+            SelectObject(dc, previous);
+        }
+        return;
+    }
+
+    let right = if extras.expand {
+        let button = scaled(expand_button_rect(pill_size(extras)), scale);
+        // Brand accent #c69767 with the app's near-black text (COLORREF is BGR).
+        let brush = unsafe { CreateSolidBrush(COLORREF(0x0067_97C6)) };
+        unsafe {
+            FillRect(dc, &button, brush);
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+            SelectObject(dc, small_font.handle);
+            SetTextColor(dc, COLORREF(0x0013_110E));
+            let mut bounds = button;
+            draw(
+                "Expand",
+                &mut bounds,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(dc, label_font.handle);
+            SetTextColor(dc, COLORREF(0x00F4_F4F4));
+        }
+        button.left - scale(10)
+    } else {
+        client.right - scale(18)
+    };
+    let left = client.left + scale(18);
+    let mut label_bounds = RECT {
+        left,
+        top: client.top + scale(8),
+        right,
+        bottom: client.top + scale(30),
+    };
+    if extras.live_text.is_empty() && extras.note.is_none() {
+        label_bounds.top = client.top;
+        label_bounds.bottom = client.bottom;
+    }
+    unsafe {
+        draw(
+            status.label(),
+            &mut label_bounds,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        SelectObject(dc, small_font.handle);
+        SetTextColor(dc, COLORREF(0x00BE_B5AD));
+    }
+    if let Some(note) = &extras.note {
+        let mut bounds = RECT {
+            left,
+            top: client.top + scale(30),
+            right,
+            bottom: client.bottom - scale(6),
+        };
+        draw(
+            note,
+            &mut bounds,
+            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+    } else if !extras.live_text.is_empty() {
+        let bounds = RECT {
+            left,
+            top: client.top + scale(32),
+            right,
+            bottom: client.bottom - scale(8),
+        };
+        let fitted = unsafe { fit_tail(dc, &extras.live_text, &bounds) };
+        let mut bounds = bounds;
+        draw(
+            &fitted,
+            &mut bounds,
+            DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX,
+        );
+    }
+    unsafe {
+        SelectObject(dc, previous);
+    }
+}
+
+/// Drops leading words until the text fits the box, so the newest words of
+/// the dictation stay visible.
+unsafe fn fit_tail(dc: HDC, text: &str, bounds: &RECT) -> String {
+    let height = bounds.bottom - bounds.top;
+    let mut candidate = text.to_owned();
+    for _ in 0..64 {
+        let mut measured = RECT {
+            bottom: bounds.top,
+            ..*bounds
+        };
+        unsafe {
+            DrawTextW(
+                dc,
+                &mut candidate.encode_utf16().collect::<Vec<_>>(),
+                &mut measured,
+                DT_CALCRECT | DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX,
+            )
+        };
+        if measured.bottom - measured.top <= height {
+            return candidate;
+        }
+        let trimmed = candidate.trim_start_matches('…');
+        match trimmed.trim_start().split_once(' ') {
+            Some((_, rest)) => candidate = format!("…{rest}"),
+            None => return candidate,
+        }
+    }
+    candidate
+}
+
+fn scaled(rect: RECT, scale: impl Fn(i32) -> i32) -> RECT {
+    RECT {
+        left: scale(rect.left),
+        top: scale(rect.top),
+        right: scale(rect.right),
+        bottom: scale(rect.bottom),
+    }
+}
+
+fn screen_point(lparam: LPARAM) -> POINT {
+    POINT {
+        x: (lparam.0 as u16) as i16 as i32,
+        y: ((lparam.0 >> 16) as u16) as i16 as i32,
+    }
+}
+
+unsafe fn expand_hit(hwnd: HWND, state: &WindowState, mut point: POINT) -> bool {
+    if !visible_extras(state.status, &state.shown).expand {
+        return false;
+    }
+    if !unsafe { ScreenToClient(hwnd, &mut point) }.as_bool() {
+        return false;
+    }
+    unsafe { expand_hit_client(hwnd, state, point) }
+}
+
+unsafe fn expand_hit_client(hwnd: HWND, state: &WindowState, point: POINT) -> bool {
+    let extras = visible_extras(state.status, &state.shown);
+    if !extras.expand {
+        return false;
+    }
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let button = scaled(expand_button_rect(pill_size(&extras)), |value| {
+        value * dpi as i32 / 96
+    });
+    (button.left..button.right).contains(&point.x) && (button.top..button.bottom).contains(&point.y)
+}
+
+/// The extras a status actually shows: live text only while dictating, the
+/// note and Expand offer only on results.
+fn visible_extras(status: OverlayStatus, extras: &OverlayExtras) -> OverlayExtras {
+    let dictating = matches!(
+        status,
+        OverlayStatus::Listening | OverlayStatus::Transcribing | OverlayStatus::Cleaning
+    );
+    let result = matches!(
+        status,
+        OverlayStatus::Inserted
+            | OverlayStatus::ClipboardReady
+            | OverlayStatus::NoSpeech
+            | OverlayStatus::Error
+    );
+    let offers_expand = matches!(
+        status,
+        OverlayStatus::Inserted | OverlayStatus::ClipboardReady
+    );
+    OverlayExtras {
+        live_text: if dictating {
+            extras.live_text.clone()
+        } else {
+            String::new()
+        },
+        note: extras.note.clone().filter(|_| result),
+        expand: extras.expand && offers_expand,
+    }
+}
+
+/// Logical pill size for a status and the extras it shows.
+/// Live text gets room for two lines; a note gets room for about sixty
+/// characters beside the Expand button.
+fn pill_size(extras: &OverlayExtras) -> (i32, i32) {
+    match (
+        !extras.live_text.is_empty(),
+        extras.note.is_some(),
+        extras.expand,
+    ) {
+        (true, _, _) => (440, 82),
+        (false, true, true) => (480, 60),
+        (false, true, false) => (420, 60),
+        (false, false, true) => (380, 52),
+        (false, false, false) => (300, 52),
+    }
+}
+
+/// Logical rectangle of the Expand button inside a pill of `size`.
+fn expand_button_rect(size: (i32, i32)) -> RECT {
+    let (width, height) = size;
+    RECT {
+        left: width - 104,
+        top: (height - 30) / 2,
+        right: width - 16,
+        bottom: (height - 30) / 2 + 30,
+    }
+}
+
+/// How long a result stays up. The Expand offer and a note need more time
+/// to read and act on than the bare label.
+fn hide_after_ms_with(status: OverlayStatus, extras: &OverlayExtras) -> Option<u32> {
+    let base = status.hide_after_ms()?;
+    Some(if extras.expand {
+        base.max(6_000)
+    } else if extras.note.is_some() {
+        base.max(4_000)
+    } else {
+        base
+    })
+}
+
+/// Keeps the newest words of the dictation, cut at a word boundary.
+fn live_text_tail(text: &str) -> String {
+    let text = clean_line(text, usize::MAX);
+    let count = text.chars().count();
+    if count <= LIVE_TEXT_CHARS {
+        return text;
+    }
+    let tail: String = text.chars().skip(count - LIVE_TEXT_CHARS).collect();
+    match tail.split_once(' ') {
+        Some((_, rest)) if !rest.is_empty() => format!("…{rest}"),
+        _ => format!("…{tail}"),
+    }
+}
+
+/// One line of display text: control characters and runs of whitespace
+/// collapse to single spaces, and the result is bounded.
+fn clean_line(text: &str, limit: usize) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(limit)
+        .collect()
 }
 
 unsafe fn window_state(hwnd: HWND) -> Option<&'static mut WindowState> {
@@ -802,6 +1265,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn live_text_keeps_the_newest_words_and_is_single_line() {
+        assert_eq!(live_text_tail("  hello\n\tworld\u{7}  "), "hello world");
+        let long = (0..100)
+            .map(|n| format!("word{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let tail = live_text_tail(&long);
+        assert!(tail.starts_with('…'));
+        assert!(tail.ends_with("word99"));
+        assert!(tail.chars().count() <= LIVE_TEXT_CHARS + 1);
+        assert!(!tail.contains("…word9 "), "cut lands on a word boundary");
+    }
+
+    #[test]
+    fn extras_only_show_on_matching_statuses() {
+        let extras = OverlayExtras {
+            live_text: "so far".into(),
+            note: Some("Formatting skipped".into()),
+            expand: true,
+        };
+        let listening = visible_extras(OverlayStatus::Listening, &extras);
+        assert_eq!(listening.live_text, "so far");
+        assert_eq!(listening.note, None);
+        assert!(!listening.expand);
+        let inserted = visible_extras(OverlayStatus::Inserted, &extras);
+        assert!(inserted.live_text.is_empty());
+        assert!(inserted.expand);
+        assert_eq!(inserted.note.as_deref(), Some("Formatting skipped"));
+        let no_speech = visible_extras(OverlayStatus::NoSpeech, &extras);
+        assert!(!no_speech.expand);
+        assert!(visible_extras(OverlayStatus::Hidden, &extras) == OverlayExtras::default());
+    }
+
+    #[test]
+    fn pill_grows_for_extras_and_expand_button_fits_inside() {
+        let plain = OverlayExtras::default();
+        assert_eq!(pill_size(&plain), (300, 52));
+        let live = OverlayExtras {
+            live_text: "hello".into(),
+            ..OverlayExtras::default()
+        };
+        assert_eq!(pill_size(&live), (440, 82));
+        let offer = OverlayExtras {
+            expand: true,
+            note: Some("note".into()),
+            ..OverlayExtras::default()
+        };
+        let size = pill_size(&offer);
+        let button = expand_button_rect(size);
+        assert!(button.left > 150 && button.right < size.0 && button.top > 0);
+        assert!(button.bottom < size.1);
+        assert_eq!(
+            hide_after_ms_with(OverlayStatus::Inserted, &offer),
+            Some(6_000)
+        );
+        assert_eq!(
+            hide_after_ms_with(OverlayStatus::Inserted, &plain),
+            Some(1_500)
+        );
+        assert_eq!(hide_after_ms_with(OverlayStatus::Listening, &offer), None);
     }
 
     #[test]

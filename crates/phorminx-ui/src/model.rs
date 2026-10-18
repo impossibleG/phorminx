@@ -754,6 +754,7 @@ pub enum FormattingStrength {
     #[default]
     Balanced,
     Strong,
+    Structured,
     Custom,
 }
 

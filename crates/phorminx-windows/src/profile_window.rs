@@ -40,6 +40,7 @@ pub enum ProfileFormatting {
     Light,
     Balanced,
     Strong,
+    Structured,
     Custom,
 }
 
@@ -358,6 +359,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
                 "Light".into(),
                 "Balanced".into(),
                 "Strong".into(),
+                "Structured".into(),
                 "Custom".into(),
             ],
             24,
@@ -513,7 +515,8 @@ fn formatting_index(value: ProfileFormatting) -> usize {
         ProfileFormatting::Light => 1,
         ProfileFormatting::Balanced => 2,
         ProfileFormatting::Strong => 3,
-        ProfileFormatting::Custom => 4,
+        ProfileFormatting::Structured => 4,
+        ProfileFormatting::Custom => 5,
     }
 }
 
@@ -523,6 +526,7 @@ fn formatting_from_index(value: isize) -> Option<ProfileFormatting> {
         ProfileFormatting::Light,
         ProfileFormatting::Balanced,
         ProfileFormatting::Strong,
+        ProfileFormatting::Structured,
         ProfileFormatting::Custom,
     ]
     .get(usize::try_from(value).ok()?)
@@ -760,6 +764,7 @@ mod tests {
             ProfileFormatting::Light,
             ProfileFormatting::Balanced,
             ProfileFormatting::Strong,
+            ProfileFormatting::Structured,
             ProfileFormatting::Custom,
         ]
         .into_iter()

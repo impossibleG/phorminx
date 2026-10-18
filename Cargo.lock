@@ -4101,6 +4101,7 @@ dependencies = [
  "clap",
  "phorminx-audio",
  "phorminx-core",
+ "phorminx-ollama",
  "phorminx-whisper",
 ]
 

@@ -28,6 +28,7 @@ mod overlay;
 mod performance;
 #[cfg(windows)]
 mod profile_window;
+mod replace;
 #[cfg(windows)]
 mod registered_hotkey;
 #[cfg(windows)]
@@ -78,7 +79,7 @@ pub use ollama::{
 #[cfg(windows)]
 pub use ollama_start::{OllamaStartError, start_verified_ollama};
 #[cfg(windows)]
-pub use overlay::{OverlayError, OverlayStatus, StatusOverlay};
+pub use overlay::{OverlayError, OverlayEvent, OverlayStatus, StatusOverlay};
 #[cfg(windows)]
 pub use performance::{
     HostResourceError, HostResourceSnapshot, host_cpu_busy_per_mille,
@@ -91,6 +92,7 @@ pub use profile_window::{
     ProfileWindowEvent,
 };
 #[cfg(windows)]
+pub use replace::{ReplaceOutcome, replace_inserted_text};
 pub use registered_hotkey::RegisteredHotkey;
 #[cfg(windows)]
 pub use settings_window::{
@@ -104,7 +106,6 @@ pub use setup_lock::{SetupOperationLock, SetupOperationLockError};
 pub use shortcut::{
     DEFAULT_LAUNCHER_SHORTCUT, Shortcut, ShortcutAvailabilityError, ShortcutBindings, ShortcutError,
 };
-#[cfg(windows)]
 pub use single_instance::{SingleInstance, SingleInstanceError, activate_existing_window};
 #[cfg(windows)]
 pub use startup::{

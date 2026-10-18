@@ -122,7 +122,21 @@ fn trim_sentence_range(input: &str, mut start: usize, mut end: usize) -> Range<u
 fn is_sentence_punctuation(character: char) -> bool {
     matches!(
         character,
-        '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.' | '!' | '?' | ';'
+        '"' | '\''
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '<'
+            | '>'
+            | '*'
+            | ','
+            | '.'
+            | '!'
+            | '?'
+            | ';'
     )
 }
 
@@ -177,13 +191,25 @@ impl OutputValidator {
         Self { policy }
     }
 
+    /// Restructuring profiles legitimately add list markers, headings and
+    /// line breaks, so they get more room to grow than in-place cleanup.
+    pub fn relaxed_for_restructuring(&self) -> Self {
+        Self {
+            policy: ValidationPolicy {
+                maximum_output_bytes: self.policy.maximum_output_bytes,
+                maximum_growth_factor: self.policy.maximum_growth_factor.max(4),
+                maximum_extra_bytes: self.policy.maximum_extra_bytes.max(1024),
+            },
+        }
+    }
+
     pub fn validate(
         &self,
         input: &str,
         output: &str,
         protected: &ProtectedTokens,
     ) -> Result<String, ValidationError> {
-        let output = output.trim();
+        let output = strip_transcript_tags(output.trim());
         if !input.trim().is_empty() && output.is_empty() {
             return Err(ValidationError::EmptyOutput);
         }
@@ -208,16 +234,36 @@ impl OutputValidator {
             return Err(ValidationError::ControlCharacter);
         }
         let lower = output.to_ascii_lowercase();
+        let input_lower = input.to_ascii_lowercase();
+        let echoed_scaffold = [
+            "begin transcript",
+            "end transcript",
+            "protected tokens",
+            "occurrence(s)",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker) && !input_lower.contains(marker));
         if lower.contains("<think>")
             || lower.contains("</think>")
             || lower.starts_with("here is the formatted")
             || lower.starts_with("here's the formatted")
+            || echoed_scaffold
             || (output.contains("```") && !input.contains("```"))
         {
             return Err(ValidationError::ModelCommentary);
         }
-        let actual_tokens = ProtectedTokens::extract(output);
+        // List markers the model added ("1.", "2)") are layout, not numbers
+        // from the dictation, so they are not counted against protected tokens.
+        let without_markers = strip_list_markers(&unwrap_markdown_links(output));
+        let actual_tokens = ProtectedTokens::extract(&without_markers);
+        let actual_numbers = numeric_counts(&without_markers);
+        let mut expected_numbers = BTreeMap::<String, (usize, &str)>::new();
         for token in protected.tokens() {
+            if let Some(number) = canonical_number(&token.value) {
+                let entry = expected_numbers.entry(number).or_insert((0, &token.value));
+                entry.0 += token.occurrences;
+                continue;
+            }
             let actual = actual_tokens
                 .tokens()
                 .binary_search_by(|candidate| candidate.value.cmp(&token.value))
@@ -231,8 +277,144 @@ impl OutputValidator {
                 });
             }
         }
+        // Plain numbers may be re-spelled ("12500" as "$12,500", "14" as
+        // "14th") as long as the same value appears the same number of times.
+        for (number, (expected, original)) in expected_numbers {
+            let actual = actual_numbers.get(&number).copied().unwrap_or(0);
+            if actual != expected {
+                return Err(ValidationError::ProtectedTokenChanged {
+                    token: original.to_owned(),
+                    expected,
+                    actual,
+                });
+            }
+        }
         Ok(output.to_owned())
     }
+}
+
+/// Some models wrap their answer in the tags that delimited the transcript.
+fn strip_transcript_tags(output: &str) -> &str {
+    output
+        .strip_prefix("<transcript>")
+        .and_then(|rest| rest.strip_suffix("</transcript>"))
+        .map_or(output, str::trim)
+}
+
+/// `[label](target)` becomes `label target`, or just `target` when the model
+/// repeated the URL as its own label, so each value is counted once.
+fn unwrap_markdown_links(output: &str) -> String {
+    let mut result = String::with_capacity(output.len());
+    let mut rest = output;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let link = after.find("](").and_then(|close| {
+            let label = &after[..close];
+            let target_part = &after[close + 2..];
+            let end = target_part.find(')')?;
+            (!label.contains('\n') && !label.contains('['))
+                .then(|| (label, &target_part[..end], &target_part[end + 1..]))
+        });
+        match link {
+            Some((label, target, remainder)) => {
+                result.push_str(&rest[..open]);
+                if label != target {
+                    result.push_str(label);
+                    result.push(' ');
+                }
+                result.push_str(target);
+                rest = remainder;
+            }
+            None => {
+                result.push_str(&rest[..=open]);
+                rest = after;
+            }
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
+fn strip_list_markers(output: &str) -> String {
+    output
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let digits = trimmed
+                .find(|character: char| !character.is_ascii_digit())
+                .unwrap_or(trimmed.len());
+            let rest = &trimmed[digits..];
+            if (1..=2).contains(&digits) && (rest.starts_with(". ") || rest.starts_with(") ")) {
+                &rest[2..]
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Canonical value of a plain number, or `None` for anything else (versions,
+/// times, identifiers, URLs), which must survive exactly as written.
+fn canonical_number(word: &str) -> Option<String> {
+    let word = word.trim_matches(|character: char| {
+        matches!(
+            character,
+            '*' | '_' | '"' | '\'' | '(' | ')' | ',' | '.' | '!' | '?' | ';' | ':'
+        )
+    });
+    let word = word.trim_start_matches(['$', '€', '£']);
+    let word = word.strip_prefix("R$").unwrap_or(word);
+    let lower = word.to_ascii_lowercase();
+    let body = ["st", "nd", "rd", "th", "%", "º", "ª"]
+        .iter()
+        .find_map(|suffix| lower.strip_suffix(suffix))
+        .unwrap_or(&lower);
+    if body.is_empty() || !body.starts_with(|character: char| character.is_ascii_digit()) {
+        return None;
+    }
+    if !body
+        .chars()
+        .all(|character| character.is_ascii_digit() || matches!(character, ',' | '.'))
+        || body.ends_with([',', '.'])
+    {
+        return None;
+    }
+    // A separator followed by exactly three digits groups thousands; any
+    // other separator is a decimal point.
+    let groups = body.split([',', '.']).collect::<Vec<_>>();
+    if groups.len() == 1 {
+        let trimmed = body.trim_start_matches('0');
+        return Some(if trimmed.is_empty() {
+            "0".to_owned()
+        } else {
+            trimmed.to_owned()
+        });
+    }
+    let thousands = groups[1..].iter().all(|group| group.len() == 3) && groups[0].len() <= 3;
+    if thousands {
+        let joined = groups.concat();
+        let trimmed = joined.trim_start_matches('0');
+        return Some(if trimmed.is_empty() {
+            "0".to_owned()
+        } else {
+            trimmed.to_owned()
+        });
+    }
+    if groups.len() == 2 {
+        return Some(format!("{}.{}", groups[0], groups[1]));
+    }
+    None
+}
+
+fn numeric_counts(output: &str) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for word in output.split_whitespace() {
+        if let Some(number) = canonical_number(word) {
+            *counts.entry(number).or_default() += 1;
+        }
+    }
+    counts
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -323,6 +505,150 @@ mod tests {
                 "unchanged source rejected: {input}"
             );
         }
+    }
+
+    #[test]
+    fn plain_numbers_may_be_respelled_but_not_changed() {
+        let validator = OutputValidator::default();
+        let input = "the budget is 12500 dollars for phase 1 due march 14";
+        let tokens = ProtectedTokens::extract(input);
+        assert!(
+            validator
+                .validate(
+                    input,
+                    "The budget is $12,500 for phase 1, due March 14th.",
+                    &tokens
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            validator.validate(
+                input,
+                "The budget is $12,000 for phase 1, due March 14.",
+                &tokens
+            ),
+            Err(ValidationError::ProtectedTokenChanged { .. })
+        ));
+        assert!(matches!(
+            validator.validate(
+                input,
+                "The budget is $12,500 for phase 1, due March fourteenth.",
+                &tokens
+            ),
+            Err(ValidationError::ProtectedTokenChanged { .. })
+        ));
+        let decimal = "the rate is 2.5 percent";
+        assert!(
+            validator
+                .validate(
+                    decimal,
+                    "The rate is 2.5%.",
+                    &ProtectedTokens::extract(decimal)
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            validator.validate(
+                decimal,
+                "The rate is 25%.",
+                &ProtectedTokens::extract(decimal)
+            ),
+            Err(ValidationError::ProtectedTokenChanged { .. })
+        ));
+        // Versions and times are not plain numbers and stay exact.
+        let version = "ship v2 at 10:30";
+        assert!(matches!(
+            validator.validate(
+                version,
+                "Ship version 2 at 10:30.",
+                &ProtectedTokens::extract(version)
+            ),
+            Err(ValidationError::ProtectedTokenChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn markdown_links_bold_and_autolinks_keep_protected_values() {
+        let validator = OutputValidator::default();
+        let input = "the spec is at https://example.com/spec write to ops@example.com";
+        let tokens = ProtectedTokens::extract(input);
+        for output in [
+            "- Spec: [https://example.com/spec](https://example.com/spec)\n- Contact: **ops@example.com**",
+            "The spec is at <https://example.com/spec>. Write to ops@example.com.",
+            "The [spec](https://example.com/spec) is ready; write to ops@example.com.",
+        ] {
+            assert!(
+                validator.validate(input, output, &tokens).is_ok(),
+                "rejected: {output}"
+            );
+        }
+        assert!(matches!(
+            validator.validate(
+                input,
+                "The [spec](https://example.com/other) is ready; write to ops@example.com.",
+                &tokens
+            ),
+            Err(ValidationError::ProtectedTokenChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn added_list_markers_do_not_count_as_numbers() {
+        let validator = OutputValidator::default();
+        let input = "we need 2 things the toggle and the picker";
+        let tokens = ProtectedTokens::extract(input);
+        assert!(
+            validator
+                .validate(
+                    input,
+                    "We need 2 things:\n1. The toggle\n2. The picker",
+                    &tokens
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn echoed_prompt_scaffolding_is_commentary_and_tags_are_unwrapped() {
+        let validator = OutputValidator::default();
+        let input = "meet at 10 tomorrow";
+        let tokens = ProtectedTokens::extract(input);
+        assert_eq!(
+            validator.validate(
+                input,
+                "- 10 (1 occurrence(s))\n--- BEGIN TRANSCRIPT ---\nMeet at 10 tomorrow.\n--- END TRANSCRIPT ---",
+                &tokens
+            ),
+            Err(ValidationError::ModelCommentary)
+        );
+        assert_eq!(
+            validator
+                .validate(
+                    input,
+                    "<transcript>\nMeet at 10 tomorrow.\n</transcript>",
+                    &tokens
+                )
+                .unwrap(),
+            "Meet at 10 tomorrow."
+        );
+    }
+
+    #[test]
+    fn restructuring_profiles_allow_more_growth() {
+        let input = "a b c";
+        let output = format!("- a\n- b\n- c\n{}", "x".repeat(600));
+        let empty = ProtectedTokens::default();
+        assert!(
+            OutputValidator::default()
+                .validate(input, &output, &empty)
+                .is_err()
+        );
+        assert!(
+            OutputValidator::default()
+                .relaxed_for_restructuring()
+                .validate(input, &output, &empty)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Review · Phorminx</title>
+  <link rel="stylesheet" href="review.css">
+  <link rel="stylesheet" href="instruction-field.css">
+  <script src="instruction-field.js" defer></script>
+  <script src="review.js" defer></script>
+</head>
+<body>
+  <header><img class="mark" src="../brand/png/app/phorminx-app-32.png" width="26" height="26" alt=""><strong>PHORMINX</strong><small>REVIEW</small></header>
+  <main>
+    <div class="composer">
+      <div class="composer-head"><label for="text">LAST DICTATION</label><span id="formatting-note" class="note" hidden></span></div>
+      <textarea id="text" rows="9" spellcheck="true" aria-describedby="notice"></textarea>
+    </div>
+    <div class="reformat">
+      <label>Formatting<select id="strength"><option value="light">Light</option><option value="balanced">Balanced</option><option value="strong">Strong</option><option value="structured">Structured · Markdown</option><option value="custom">Custom</option></select></label>
+      <label class="instruction">One-off instruction<textarea id="instruction" rows="1" maxlength="1000" placeholder="Optional, e.g. make it a short email, or @ for a prompt" data-instruction-field></textarea></label>
+      <button id="reformat" type="button">Reformat</button>
+    </div>
+    <div class="actions">
+      <button id="copy" class="primary" type="button" title="Copy (Ctrl+Enter)">Copy</button>
+      <button id="replace" type="button" hidden>Replace pasted text</button>
+      <button id="close" type="button">Close</button>
+      <p id="notice" role="status"></p>
+    </div>
+  </main>
+</body>
+</html>
