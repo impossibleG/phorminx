@@ -1075,6 +1075,23 @@ pub enum SettingsError {
 mod tests {
     use super::*;
 
+    /// Settings written by the dictation-fixes build must open here: unknown
+    /// fields are fatal at startup, which once stopped Phorminx from starting.
+    #[test]
+    fn settings_from_the_dictation_build_load_and_keep_their_values() {
+        let text = "schema_version = 7\n[formatting]\nstrength = 'custom'\npasses = 3\n\
+                    ollama_lifecycle = 'instant'\n[interaction]\nshow_live_text = false\n";
+        let settings: Settings = toml::from_str(text).unwrap();
+        assert_eq!(settings.formatting.passes, 3);
+        assert!(!settings.interaction.show_live_text);
+        let saved = toml::to_string(&settings).unwrap();
+        let reloaded: Settings = toml::from_str(&saved).unwrap();
+        assert_eq!(reloaded, settings);
+        let defaults: Settings = toml::from_str("schema_version = 7\n").unwrap();
+        assert_eq!(defaults.formatting.passes, DEFAULT_FORMATTING_PASSES);
+        assert!(defaults.interaction.show_live_text);
+    }
+
     #[test]
     fn fresh_install_recommends_nomic_without_migrating_existing_search_preferences() {
         assert_eq!(

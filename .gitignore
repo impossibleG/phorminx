@@ -41,3 +41,4 @@ id_rsa
 *.ogg
 *.pcm
 convo.txt
+/.spike/

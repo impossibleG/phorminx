@@ -16,6 +16,7 @@ use phorminx_app::incremental::{
     merge_overlapping, strip_known_non_speech_annotations,
 };
 use phorminx_app::lifecycle::{LifecycleLog, error_chain, profile_instance_scope};
+use phorminx_app::launcher_messaging::LauncherMessaging;
 use phorminx_app::model::{
     ModelDownload, ModelDownloadEvent, identify_pinned_model, model_for_variant,
 };
@@ -429,6 +430,9 @@ fn run() -> Result<()> {
     .context("failed to install the global hotkey")?;
     let mut launcher_open = false;
     let mut launcher_action_configs: Vec<phorminx_assistant::ActionConfig> = Vec::new();
+    let mut launcher_messaging = LauncherMessaging::load(&persistence);
+    let mut launcher_layout = launcher_messaging.layout(&[]);
+    hotkey.set_messaging_slot(launcher_layout.panel_key());
     let mut launcher_recording = false;
     let capture = ExtendedCaptureFactory::new(ExtendedCaptureConfig::new(
         settings_store
@@ -729,10 +733,19 @@ fn run() -> Result<()> {
                         })
                         .map(|config| config.actions)
                         .unwrap_or_default();
+                    let action_keys: Vec<u8> = launcher_action_configs
+                        .iter()
+                        .filter_map(|a| a.launcher_slot)
+                        .collect();
+                    launcher_messaging = LauncherMessaging::load(&persistence);
+                    launcher_layout = launcher_messaging.layout(&action_keys);
+                    hotkey.set_messaging_slot(launcher_layout.panel_key());
+                    overlay.set_launcher_contacts(None)?;
                     overlay.set_launcher_actions(
                         launcher_action_configs
                             .iter()
                             .filter_map(|a| a.launcher_slot.map(|slot| (slot, a.name.clone())))
+                            .chain(launcher_layout.main_rows())
                             .collect(),
                     )?;
                     // The hook already armed selection atomically. Reopening it
@@ -758,6 +771,28 @@ fn run() -> Result<()> {
             Ok(HoldEvent::LauncherDismissed) => {
                 launcher_open = false;
                 overlay.set(OverlayStatus::Hidden)?;
+                overlay.set_launcher_contacts(None)?;
+                Err(RecvTimeoutError::Timeout)
+            }
+            Ok(HoldEvent::LauncherContacts) => {
+                // The hook keeps the launcher open as the messaging contacts panel.
+                overlay.set_launcher_contacts(Some(launcher_messaging.panel_rows()))?;
+                overlay.set(launcher_overlay_status(&settings))?;
+                Err(RecvTimeoutError::Timeout)
+            }
+            Ok(HoldEvent::LauncherContact(key)) => {
+                hotkey.set_launcher_open(false)?;
+                launcher_open = false;
+                overlay.set(OverlayStatus::Hidden)?;
+                overlay.set_launcher_contacts(None)?;
+                if let (Some(shell), Some(contact_id)) = (
+                    product_shell.as_ref(),
+                    launcher_messaging.contact_for_key(key),
+                ) {
+                    shell
+                        .send(ProductShellControl::MessageContact { contact_id })
+                        .map_err(anyhow::Error::msg)?;
+                }
                 Err(RecvTimeoutError::Timeout)
             }
             Ok(action @ (HoldEvent::LauncherMeetings | HoldEvent::LauncherAction(_))) => {
@@ -771,7 +806,16 @@ fn run() -> Result<()> {
                             .iter()
                             .find(|a| a.launcher_slot == Some(slot))
                             .cloned()
-                            .map(ProductShellControl::TriggerAction),
+                            .map(ProductShellControl::TriggerAction)
+                            .or_else(|| {
+                                (launcher_layout.page_key() == Some(slot))
+                                    .then_some(ProductShellControl::OpenMessages)
+                            })
+                            .or_else(|| {
+                                launcher_layout.promoted_contact(slot).map(|contact_id| {
+                                    ProductShellControl::MessageContact { contact_id }
+                                })
+                            }),
                         _ => Some(ProductShellControl::StartMeeting),
                     };
                     if let Some(control) = control {
@@ -923,6 +967,8 @@ fn run() -> Result<()> {
                 | HoldEvent::LauncherDictate { .. }
                 | HoldEvent::LauncherMeetings
                 | HoldEvent::LauncherAction(_)
+                | HoldEvent::LauncherContacts
+                | HoldEvent::LauncherContact(_)
                 | HoldEvent::LauncherDismissed,
             ) => unreachable!("launcher events are normalized above"),
             Err(RecvTimeoutError::Disconnected) => {

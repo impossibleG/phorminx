@@ -15,6 +15,7 @@
   <script src="prompts.js" defer></script>
   <script src="investigation-model.js" defer></script>
   <script src="investigations.js" defer></script>
+  <script src="messages.js" defer></script>
 </head>
 <body data-shell="product">
   <div class="shell">
@@ -30,6 +31,7 @@
         <button type="button" data-route="prompts">Prompts</button>
         <button type="button" data-route="models">Models</button>
         <button type="button" data-route="actions">Actions</button>
+        <button type="button" data-route="messages">Messages<span id="messages-badge" class="nav-badge" hidden></span></button>
         <button type="button" data-route="settings">Settings</button>
         <button type="button" data-route="setup">Setup &amp; repair</button>
         <button id="open-feedback" type="button">Feedback</button>
@@ -248,6 +250,26 @@
           </div>
           <p id="inv-status" class="inv-status" role="status"></p>
         </section>
+        <section id="messaging" class="page" hidden>
+          <div class="page-head"><div><small>PEER TO PEER · OVER TOR</small><h1>Messages</h1></div><div class="head-actions"><span id="messaging-network" class="messaging-network" role="status"></span><button id="messaging-invite" type="button" hidden>Copy my invite</button><button id="messaging-add" type="button" class="primary" hidden>Add contact</button></div></div>
+          <p id="messaging-result" class="messaging-result" role="status"></p>
+          <div id="messaging-off" class="setting-card messaging-off" hidden>
+            <small>OFF UNTIL YOU TURN IT ON</small><h2>Message people directly</h2>
+            <p>Phorminx connects to the Tor network and talks straight to your contacts. There is no Phorminx server, no mailbox and no relay we run, and neither of you learns the other's IP address. Messages wait on your computer until your contact is online.</p>
+            <form id="messaging-enable-form" class="messaging-enable"><label>Your name, as contacts see it<input id="messaging-name" maxlength="64" required autocomplete="off" placeholder="e.g. mau"></label><button type="submit" class="primary">Turn on messaging</button></form>
+          </div>
+          <div id="messaging-on" class="messaging-layout" hidden>
+            <div class="messaging-contacts"><div id="messaging-contacts" class="record-list" aria-label="Contacts"></div><button id="messaging-settings-open" type="button" class="messaging-settings-open">Messaging settings</button></div>
+            <section class="messaging-conversation">
+              <div id="messaging-empty" class="messaging-empty"><strong>No conversation selected</strong><p>Add a contact by pasting their invite, or copy yours and send it to them any way you like. Each invite works once and expires after 24 hours.</p></div>
+              <div id="messaging-thread" class="messaging-thread" hidden>
+                <div class="messaging-thread-head"><div><h2 id="messaging-thread-name"></h2><small id="messaging-thread-state"></small></div><div class="messaging-thread-actions"><button id="messaging-rename" type="button">Rename</button><button id="messaging-keys" type="button">Keys</button><button id="messaging-block" type="button">Block</button><button id="messaging-clear" type="button">Delete history</button><button id="messaging-remove" type="button">Remove</button></div></div>
+                <div id="messaging-log" class="messaging-log scroll-content" role="log" aria-live="polite"></div>
+                <form id="messaging-compose" class="messaging-compose"><textarea id="messaging-text" rows="2" maxlength="4000" placeholder="Write a message. Enter sends, Shift+Enter adds a line."></textarea><div class="messaging-compose-buttons"><button id="messaging-dictate" type="button" title="Dictate, then review before sending">Dictate</button><button type="submit" class="primary">Send</button></div></form>
+              </div>
+            </section>
+          </div>
+        </section>
         <section id="live" class="page" hidden>
           <div class="page-head"><div><small>MEETINGS / LIVE</small><h1>Live session</h1></div><div class="head-actions"><button id="start" type="button" class="primary">Start meeting</button><button id="stop" type="button">Finish</button><button id="companion" type="button">Open companion</button></div></div>
           <div class="meeting-tabs" role="tablist" aria-label="Meetings"><button class="active" type="button" role="tab" aria-selected="true" data-route="live">Live session</button><button type="button" role="tab" aria-selected="false" data-route="saved">Saved sessions</button><button type="button" role="tab" aria-selected="false" data-route="meeting-settings">Meeting settings</button></div>
@@ -272,5 +294,8 @@
   <dialog id="inv-shortcut" class="inv-dialog"><form method="dialog" id="inv-shortcut-form"><small>QUICK CAPTURE</small><h2>Send the clipboard here from anywhere</h2><p>Press the shortcut in any app. The clipboard’s text, link or image goes into the active investigation, and a small confirmation appears.</p><input id="inv-shortcut-input" readonly placeholder="Click here, then press the keys" aria-label="Quick-capture shortcut"><p id="inv-shortcut-status" class="inv-prompt-error" role="status"></p><div class="dialog-actions"><button type="button" id="inv-shortcut-off">Turn off</button><span class="inv-tab-spacer"></span><button value="cancel" formnovalidate>Cancel</button><button value="save" class="primary">Save shortcut</button></div></form></dialog>
   <dialog id="setup-consent"><form method="dialog"><small>BEFORE CONTINUING</small><h2 id="setup-consent-title">Confirm setup</h2><div id="setup-consent-details"></div><div class="dialog-actions"><button value="cancel">Cancel</button><button id="setup-consent-confirm" value="confirm" class="primary">Confirm changes</button></div></form></dialog>
   <dialog id="bootstrap-consent"><form method="dialog"><small>BEFORE CONTINUING</small><h2>Prepare your local starter</h2><p>Phorminx will download verified speech assets, install Ollama and a small local language model, and install Vulkan if Windows needs it. Windows may ask for administrator approval for Vulkan. Existing text and settings are preserved; this can take several minutes and use substantial disk space.</p><div class="dialog-actions"><button value="cancel">Not now</button><button value="confirm" class="primary">Install starter</button></div></form></dialog>
+  <dialog id="messaging-add-dialog" class="messaging-dialog"><form method="dialog"><small>ADD CONTACT</small><h2>Paste their invite</h2><p>Ask your contact for their invite (it looks like <code>name#…</code>). Both of you need Phorminx open; connecting over Tor can take a few minutes.</p><textarea id="messaging-invite-text" rows="4" autocomplete="off" spellcheck="false"></textarea><p id="messaging-add-result" role="status"></p><div class="dialog-actions"><button value="cancel">Cancel</button><button id="messaging-add-confirm" value="default" class="primary">Add contact</button></div></form></dialog>
+  <dialog id="messaging-keys-dialog" class="messaging-dialog"><form method="dialog"><small>LAUNCHER KEYS</small><h2 id="messaging-keys-title">Keys</h2><label>Key in the contacts panel<select id="messaging-contacts-key"></select></label><label>Own key on the main launcher<select id="messaging-main-key"></select></label><p>A contact on the main launcher skips the contacts panel: shortcut, key, speak.</p><p id="messaging-keys-result" role="status"></p><div class="dialog-actions"><button value="cancel">Close</button><button id="messaging-keys-save" value="default" class="primary">Save keys</button></div></form></dialog>
+  <dialog id="messaging-settings-dialog" class="messaging-dialog"><form method="dialog"><small>MESSAGING</small><h2>Settings</h2><label>Your name<input id="messaging-self-name" maxlength="64" autocomplete="off"></label><label>Launcher key that opens your contacts<select id="messaging-launcher-key"></select></label><label>When a message arrives<select id="messaging-arrival-notice"><option value="preview">Show the name and a short preview</option><option value="name">Show only the name</option><option value="off">Show nothing (tray dot only)</option></select></label><p>Messages and contacts stay on this computer. Turning messaging off disconnects from Tor; nothing is deleted.</p><p id="messaging-settings-result" role="status"></p><div class="dialog-actions"><button id="messaging-turn-off" type="button">Turn off messaging</button><button value="cancel">Close</button><button id="messaging-settings-save" value="default" class="primary">Save</button></div></form></dialog>
 </body>
 </html>

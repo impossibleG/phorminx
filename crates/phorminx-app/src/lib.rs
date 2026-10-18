@@ -1,12 +1,16 @@
 //! Application orchestration for Phorminx.
 
 pub mod feedback;
+#[cfg(test)]
+mod frontend_tests;
 mod history_loader;
 pub mod incremental;
 pub mod investigation_assistant;
 pub mod investigation_links;
 pub mod investigation_ocr;
 pub mod investigations;
+pub mod launcher_messaging;
+pub mod message_arrival;
 mod library_search;
 pub mod lifecycle;
 pub mod meeting_audio;
@@ -30,6 +34,8 @@ pub mod tauri_contract;
 pub mod tauri_investigations;
 #[cfg(feature = "tauri-preview")]
 pub mod tauri_meetings;
+#[cfg(feature = "tauri-shell")]
+mod tauri_messaging;
 #[cfg(feature = "tauri-shell")]
 pub mod tauri_shell;
 pub mod text_recovery;

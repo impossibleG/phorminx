@@ -126,6 +126,8 @@ struct OverlayExtras {
 pub enum OverlayEvent {
     ExpandRequested,
 }
+/// Contact names for the messaging contacts panel; `None` shows the main panel.
+type LauncherContacts = Arc<Mutex<Option<Vec<(u8, String)>>>>;
 
 pub struct StatusOverlay {
     window_bits: usize,
@@ -133,6 +135,7 @@ pub struct StatusOverlay {
     launcher_actions: Arc<Mutex<Vec<(u8, String)>>>,
     extras: Arc<Mutex<OverlayExtras>>,
     events: mpsc::Receiver<OverlayEvent>,
+    launcher_contacts: LauncherContacts,
 }
 
 impl StatusOverlay {
@@ -150,9 +153,11 @@ impl StatusOverlay {
         let extras = Arc::new(Mutex::new(OverlayExtras::default()));
         let thread_extras = extras.clone();
         let (event_tx, events) = mpsc::channel();
+        let launcher_contacts = Arc::new(Mutex::new(None));
+        let thread_contacts = launcher_contacts.clone();
         let thread = thread::Builder::new()
             .name("phorminx-overlay".to_owned())
-            .spawn(move || run_overlay(ready_tx, thread_actions, thread_extras, event_tx))
+            .spawn(move || run_overlay(ready_tx, thread_actions, thread_extras, event_tx, thread_contacts))
             .map_err(|error| {
                 ACTIVE.store(false, Ordering::Release);
                 OverlayError::Spawn(error)
@@ -176,6 +181,7 @@ impl StatusOverlay {
             launcher_actions,
             extras,
             events,
+            launcher_contacts,
         })
     }
 
@@ -270,6 +276,28 @@ impl StatusOverlay {
         .map_err(OverlayError::PostStatus)
     }
 
+    /// Switches the launcher to the messaging contacts panel (contact names on
+    /// keys 1-9), or back to the main panel with `None`. Only display names
+    /// cross into the overlay thread.
+    pub fn set_launcher_contacts(
+        &self,
+        contacts: Option<Vec<(u8, String)>>,
+    ) -> Result<(), OverlayError> {
+        *self
+            .launcher_contacts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = contacts.map(clean_contact_rows);
+        unsafe {
+            PostMessageW(
+                Some(window(self.window_bits)),
+                WM_LAUNCHER_ACTIONS,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        }
+        .map_err(OverlayError::PostStatus)
+    }
+
     pub fn shutdown(mut self) -> Result<(), OverlayError> {
         self.stop()
     }
@@ -308,6 +336,8 @@ struct WindowState {
     timer_id: usize,
     next_timer_id: usize,
     launcher_actions: Arc<Mutex<Vec<(u8, String)>>>,
+    launcher_contacts: LauncherContacts,
+    contacts_panel: bool,
     /// Snapshot used for both painting and hit testing. A changed configuration
     /// never maps an old visible row to a new action before the redraw message.
     launcher_rows: Vec<(u8, String)>,
@@ -323,8 +353,9 @@ fn run_overlay(
     actions: Arc<Mutex<Vec<(u8, String)>>>,
     extras: Arc<Mutex<OverlayExtras>>,
     events: mpsc::Sender<OverlayEvent>,
+    contacts: LauncherContacts,
 ) {
-    let result = unsafe { create_and_run(&ready_tx, actions, extras, events) };
+    let result = unsafe { create_and_run(&ready_tx, actions, extras, events, contacts) };
     if let Err(error) = result {
         let _ = ready_tx.try_send(Err(error.to_string()));
     }
@@ -336,6 +367,7 @@ unsafe fn create_and_run(
     actions: Arc<Mutex<Vec<(u8, String)>>>,
     extras: Arc<Mutex<OverlayExtras>>,
     events: mpsc::Sender<OverlayEvent>,
+    contacts: LauncherContacts,
 ) -> windows::core::Result<()> {
     let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let module = unsafe { GetModuleHandleW(None)? };
@@ -355,6 +387,8 @@ unsafe fn create_and_run(
         timer_id: 0,
         next_timer_id: INITIAL_TIMER_ID,
         launcher_actions: actions,
+        launcher_contacts: contacts,
+        contacts_panel: false,
         launcher_rows: launcher_rows(&[]),
         launcher_row_height: 54,
         extras,
@@ -576,12 +610,21 @@ unsafe fn relayout_window(hwnd: HWND, state: &mut WindowState, restart_timer: bo
     let scale = |value: i32| value * dpi as i32 / 96;
     let launcher = is_launcher(status);
     if launcher {
-        state.launcher_rows = launcher_rows(
-            &state
-                .launcher_actions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        );
+        let contacts = state
+            .launcher_contacts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        state.contacts_panel = contacts.is_some();
+        state.launcher_rows = match contacts {
+            Some(rows) => contact_panel_rows(rows),
+            None => launcher_rows(
+                &state
+                    .launcher_actions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            ),
+        };
     }
     let pill = pill_size(&visible_extras(status, &state.shown));
     let width = scale(if launcher { 360 } else { pill.0 });
@@ -1025,6 +1068,30 @@ fn clean_launcher_actions(actions: Vec<(u8, String)>) -> Vec<(u8, String)> {
     result
 }
 
+fn clean_contact_rows(contacts: Vec<(u8, String)>) -> Vec<(u8, String)> {
+    let mut result: Vec<(u8, String)> = Vec::new();
+    for (slot, name) in contacts {
+        if !(1..=9).contains(&slot) || result.iter().any(|(existing, _)| *existing == slot) {
+            continue;
+        }
+        let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+        if !name.trim().is_empty() {
+            result.push((slot, name.trim().to_owned()));
+        }
+    }
+    result.sort_by_key(|(slot, _)| *slot);
+    result
+}
+
+fn contact_panel_rows(contacts: Vec<(u8, String)>) -> Vec<(u8, String)> {
+    if contacts.is_empty() {
+        // Slot 0 picks nothing in the contacts panel.
+        vec![(0, "No contacts on keys 1-9 yet".into())]
+    } else {
+        contacts
+    }
+}
+
 fn launcher_rows(actions: &[(u8, String)]) -> Vec<(u8, String)> {
     let mut rows = vec![(1, "Dictate".into()), (2, "Start meeting".into())];
     rows.extend_from_slice(actions);
@@ -1064,9 +1131,15 @@ unsafe fn paint_launcher(
     dc: windows::Win32::Graphics::Gdi::HDC,
     status: OverlayStatus,
 ) {
-    let (rows, row_height) = unsafe { window_state(hwnd) }
-        .map(|s| (s.launcher_rows.clone(), s.launcher_row_height))
-        .unwrap_or_else(|| (launcher_rows(&[]), 54));
+    let (rows, row_height, contacts_panel) = unsafe { window_state(hwnd) }
+        .map(|s| {
+            (
+                s.launcher_rows.clone(),
+                s.launcher_row_height,
+                s.contacts_panel,
+            )
+        })
+        .unwrap_or_else(|| (launcher_rows(&[]), 54, false));
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     let scale = |value: i32| value * dpi as i32 / 96;
     let dark = status == OverlayStatus::LauncherDark;
@@ -1136,7 +1209,15 @@ unsafe fn paint_launcher(
             )
         };
     }
-    text("PHORMINX", rect(58, 16, 230, 47), foreground);
+    text(
+        if contacts_panel {
+            "MESSAGES"
+        } else {
+            "PHORMINX"
+        },
+        rect(58, 16, 230, 47),
+        foreground,
+    );
     for (index, (slot, label)) in rows.iter().enumerate() {
         let top = 62 + index as i32 * (row_height + 6);
         text(
@@ -1149,17 +1230,25 @@ unsafe fn paint_launcher(
             rect(
                 67,
                 top,
-                if *slot == 1 { 275 } else { 332 },
+                if *slot == 1 && !contacts_panel {
+                    275
+                } else {
+                    332
+                },
                 top + row_height,
             ),
             foreground,
         );
-        if *slot == 1 {
+        if *slot == 1 && !contacts_panel {
             text("Enter", rect(286, top, 339, top + row_height), muted);
         }
     }
     text(
-        "Choose your next action",
+        if contacts_panel {
+            "Choose who to message"
+        } else {
+            "Choose your next action"
+        },
         rect(20, height - 39, 251, height - 10),
         muted,
     );

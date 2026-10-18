@@ -7,6 +7,7 @@ members = [
     "crates/phorminx-bench",
     "crates/phorminx-core",
     "crates/phorminx-ocr",
+    "crates/phorminx-messaging",
     "crates/phorminx-ollama",
     "crates/phorminx-persistence",
     "crates/phorminx-session",
@@ -16,6 +17,7 @@ members = [
     "crates/phorminx-windows",
     "crates/phorminx-whisper",
 ]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -60,3 +62,7 @@ zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[patch.crates-io]
+# See vendor/README.md: fixes an infinite loop in Arti on Windows.
+saturating-time = { path = "vendor/saturating-time" }

@@ -71,6 +71,13 @@ pub enum ProductShellControl {
         notice: String,
         replaced_text: Option<String>,
     },
+    /// Dictate a message to a messaging contact (launcher contacts panel).
+    MessageContact {
+        contact_id: i64,
+    },
+    /// Show the Messages page (the launcher's Messages key while messaging is
+    /// off or has no contacts yet).
+    OpenMessages,
     Quit,
 }
 
@@ -2153,6 +2160,10 @@ impl eframe::App for ProductShellApp {
                 }
                 // The review panel exists only in the Tauri shell.
                 ProductShellControl::OpenReview(_) | ProductShellControl::ReviewResult { .. } => {}
+                ProductShellControl::MessageContact { .. } | ProductShellControl::OpenMessages => {
+                    self.set_error("Messaging is available in the new Phorminx window.".into());
+                    self.refresh();
+                }
                 ProductShellControl::Quit => {
                     let _ = phorminx_windows::set_global_shortcut_capture(false);
                     let _ = self.events.send(ProductShellEvent::ShortcutCapture(false));

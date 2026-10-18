@@ -114,7 +114,7 @@ pub use startup::{
 #[cfg(windows)]
 pub use target::TargetSnapshot;
 #[cfg(windows)]
-pub use tray::{SystemTray, TrayError, TrayEvent, TrayStatus};
+pub use tray::{SystemTray, TrayError, TrayEvent, TrayStatus, set_tray_badge};
 #[cfg(windows)]
 pub use user_idle::user_idle_duration;
 

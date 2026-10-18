@@ -141,3 +141,49 @@ main :is(.page,.record-list,.record-detail,.scroll-content,.session-list,.recent
 :root[data-theme="light"] .prompts-browser>input,:root[data-theme="light"] .prompt-version-body{background:#f7f5f0;color:#202326;border-color:#a5a39d}
 :root[data-theme="light"] .prompt-tag-filter button{border-color:#a5a39d;color:#555b60}
 :root[data-theme="light"] .prompt-tag-filter button.active{border-color:#815026;color:#202326;background:rgba(129,80,38,.10)}
+
+/* Messages: contacts on the left, one conversation on the right. */
+.nav-badge{display:inline-block;min-width:17px;margin-left:8px;padding:1px 5px;border-radius:9px;background:#c69767;color:#0e1113;font-size:9px;font-weight:600;text-align:center;line-height:15px}
+.messaging-network{align-self:center;font-size:11px;color:#a8adb0;margin-right:6px}
+.messaging-network[data-state="online"]::before{content:'•';color:#7d9d80;margin-right:6px}
+.messaging-network[data-state="offline"]::before,.messaging-network[data-state="starting"]::before{content:'•';color:#c69767;margin-right:6px}
+.messaging-result{font-size:11px;color:#a8adb0;min-height:16px;margin:9px 0 0}
+.messaging-off{max-width:620px;margin-top:22px}.messaging-off p{font-size:12px;line-height:1.6;color:#a8adb0}
+.messaging-enable{display:flex;align-items:end;gap:12px;margin-top:14px}.messaging-enable label{display:flex;flex-direction:column;gap:7px;flex:1;color:#a8adb0;font-size:11px}.messaging-enable input{width:100%;background:#101416;color:#e8e5dd;border:1px solid #394046;border-radius:4px;padding:9px 10px}.messaging-enable .primary{background:#c69767;color:#0e1113;border-color:#c69767}
+.messaging-layout{display:grid;grid-template-columns:minmax(200px,30%) minmax(0,1fr);gap:1px;flex:1;min-height:0;margin-top:11px;background:#30363b;border:1px solid #30363b}
+.messaging-contacts{display:flex;flex-direction:column;min-height:0;background:#111517}.messaging-contacts .record-list{flex:1}
+.record-list .messaging-contact{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:2px 8px}
+.messaging-contact-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}.messaging-contact small{grid-column:1;margin:0}.messaging-contact .nav-badge{grid-column:2;grid-row:1/3;margin:0}
+.messaging-contact.blocked .messaging-contact-name{color:#858c90;text-decoration:line-through}
+.messaging-none{color:#858c90;font-size:12px;padding:15px 18px}
+.messaging-settings-open{margin:10px;border:0!important;background:transparent!important;color:#c69767!important;text-align:left}
+.messaging-conversation{display:flex;flex-direction:column;min-height:0;background:#151a1d}
+.messaging-empty{margin:auto;max-width:360px;text-align:center;color:#a8adb0;font-size:12px;line-height:1.6;padding:24px}.messaging-empty strong{color:#e8e5dd;font-weight:500;font-size:14px}
+.messaging-thread{display:flex;flex-direction:column;min-height:0;flex:1}.messaging-thread[hidden]{display:none}
+.messaging-thread-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;border-bottom:1px solid #30363b}.messaging-thread-head h2{font-size:15px;font-weight:500;margin:0}.messaging-thread-head small{color:#858c90;font-size:10px}
+.messaging-thread-actions{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end}
+.messaging-log{display:flex;flex-direction:column;gap:9px}
+.messaging-message{max-width:78%;padding:9px 12px;border-radius:8px;background:#22282c;align-self:flex-start}.messaging-message.outgoing{align-self:flex-end;background:#3a2e22}
+.messaging-message p{margin:0;font-size:13px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
+.messaging-message small{display:block;margin-top:4px;font-size:9px;color:#858c90}.messaging-state.waiting{color:#c69767}
+.messaging-compose{display:flex;gap:10px;align-items:flex-end;padding:12px 16px;border-top:1px solid #30363b}
+.messaging-compose textarea{flex:1;resize:none;border:1px solid #394046;border-radius:4px;background:#101416;color:#e8e5dd;padding:9px 10px;font:13px/1.45 "Segoe UI",Arial,sans-serif}
+.messaging-compose-buttons{display:flex;gap:6px}.messaging-compose .primary{background:#c69767;color:#0e1113;border-color:#c69767}
+.messaging-dialog{width:min(480px,calc(100vw - 36px));border:1px solid #485055;border-radius:5px;background:#171b1e;color:#e8e5dd;padding:25px;box-shadow:0 18px 65px #0008}.messaging-dialog::backdrop{background:#0009}
+.messaging-dialog small{color:#c69767;letter-spacing:.12em;font-size:9px}.messaging-dialog h2{font-size:20px;font-weight:500}.messaging-dialog p{font-size:12px;line-height:1.5;color:#a8adb0}
+.messaging-dialog label{display:flex;flex-direction:column;gap:7px;margin-top:12px;color:#a8adb0;font-size:11px}
+.messaging-dialog textarea,.messaging-dialog select,.messaging-dialog input{width:100%;border:1px solid #394046;border-radius:4px;background:#101416;color:#e8e5dd;padding:9px 10px;font:12px "Segoe UI",Arial,sans-serif}
+.messaging-dialog textarea{font-family:ui-monospace,Consolas,monospace;resize:vertical}
+.messaging-dialog .dialog-actions .primary{background:#c69767;color:#0e1113;border-color:#c69767}
+@media(max-width:760px){.messaging-layout{grid-template-columns:1fr;overflow:auto}.messaging-contacts{max-height:220px}}
+:root[data-theme="light"] .messaging-layout{background:#b9b7b0;border-color:#b9b7b0}
+:root[data-theme="light"] .messaging-contacts,:root[data-theme="light"] .messaging-conversation{background:#f7f5f0;color:#202326}
+:root[data-theme="light"] .messaging-message{background:#eae7e0}:root[data-theme="light"] .messaging-message.outgoing{background:#ead9c4}
+:root[data-theme="light"] .messaging-thread-head,:root[data-theme="light"] .messaging-compose{border-color:#b9b7b0}
+:root[data-theme="light"] .messaging-compose textarea,:root[data-theme="light"] .messaging-enable input,:root[data-theme="light"] .messaging-dialog textarea,:root[data-theme="light"] .messaging-dialog select,:root[data-theme="light"] .messaging-dialog input{background:#f7f5f0;color:#202326;border-color:#a5a39d}
+:root[data-theme="light"] .messaging-dialog{background:#eae7e0;color:#202326;border-color:#b9b7b0}
+:root[data-theme="light"] .messaging-empty strong{color:#202326}
+:root[data-theme="light"] .messaging-compose .primary,:root[data-theme="light"] .messaging-enable .primary,:root[data-theme="light"] .messaging-dialog .dialog-actions .primary{background:#815026;border-color:#815026;color:#fff}
+:root[data-theme="light"] .nav-badge{background:#815026;color:#fff}
+#messaging [hidden]{display:none!important}
+.nav-badge[hidden]{display:none}

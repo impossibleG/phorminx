@@ -27,7 +27,8 @@ function makeElement(tag, className, text) {
 
 function showRoute(route, persist = true) {
   if (currentRoute === 'settings' && route !== 'settings' && capturingShortcut) void endShortcutCapture();
-  const pageId = route === 'settings' ? 'app-settings' : route;
+  // The meeting chat log already owns id="messages", so the Messages page is #messaging.
+  const pageId = route === 'settings' ? 'app-settings' : route === 'messages' ? 'messaging' : route;
   const page = node(pageId);
   if (!page) return;
   currentRoute = route;
@@ -49,9 +50,10 @@ function showRoute(route, persist = true) {
   if (route === 'meeting-settings') void refreshProvider();
   if (route === 'prompts') window.dispatchEvent(new Event('prompts:show'));
   document.dispatchEvent(new CustomEvent('phorminx:route', {detail: route}));
-  // Prompts and Investigations are pages of this window only; the host keeps
-  // the last other route.
-  if (persist && hostInvoke && route !== 'prompts' && route !== 'investigations') {
+  window.phorminxMessages?.routeChanged(route);
+  // Prompts, Investigations and Messages are pages of this window only; the
+  // host keeps the last other route.
+  if (persist && hostInvoke && !['prompts', 'investigations', 'messages'].includes(route)) {
     const hostRoute = ['live', 'saved', 'meeting-settings'].includes(route) ? 'meetings' : route === 'action-editor' ? 'actions' : route === 'lexicon-editor' ? 'lexicon' : route === 'profile-editor' ? 'profiles' : route;
     lastHostRoute = hostRoute;
     void hostInvoke('plugin:phorminx-host|host_select_route', {route: hostRoute}).catch((error) => { node('status').textContent = String(error); });

@@ -47,7 +47,23 @@ mod transport_tests;
 enum Command {
     Event(Box<WorkspaceEvent>),
     Action(Box<ActionConfig>),
+    Message(MessageCapture),
     Shutdown,
+}
+/// A dictated message for a messaging contact. Recording reuses the action
+/// capture path; instead of an HTTP delivery, the transcript is handed back
+/// for the user to review before anything is sent.
+pub struct MessageCapture {
+    pub contact_id: i64,
+    pub contact_name: String,
+    pub drafts: mpsc::Sender<MessageDraft>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MessageDraft {
+    Recording { contact_id: i64 },
+    Ready { contact_id: i64, text: String },
+    Empty { contact_id: i64 },
+    Failed { contact_id: i64, message: String },
 }
 enum JobEvent {
     Delta(u64, String),
@@ -91,6 +107,13 @@ impl MeetingWorkspace {
     pub fn trigger_saved_action(&self, action: ActionConfig) -> Result<(), String> {
         self.commands
             .try_send(Command::Action(Box::new(action)))
+            .map_err(|_| "The workspace is busy. Please try again.".into())
+    }
+    /// Starts dictating a message for a contact, or stops the recording when
+    /// it is already capturing for that contact.
+    pub fn capture_message(&self, capture: MessageCapture) -> Result<(), String> {
+        self.commands
+            .try_send(Command::Message(capture))
             .map_err(|_| "The workspace is busy. Please try again.".into())
     }
     pub fn request_shutdown(&self) -> Result<(), String> {
@@ -201,6 +224,7 @@ struct Host {
     cutoff_question: Option<String>,
     cutoff_request: Option<u64>,
     action_capture: Option<ActionConfig>,
+    message_capture: Option<(i64, mpsc::Sender<MessageDraft>)>,
     memory: Option<crate::meeting_memory::MeetingMemoryWorker>,
     search_generation: u64,
     last_memory_poll: Instant,
@@ -264,6 +288,7 @@ impl Host {
             cutoff_question: None,
             cutoff_request: None,
             action_capture: None,
+            message_capture: None,
             memory: None,
             search_generation: 0,
             last_memory_poll: Instant::now() - Duration::from_secs(2),
@@ -308,9 +333,20 @@ impl Host {
                             self.view.notice = message;
                         }
                     }
+                    Ok(Command::Message(capture)) => {
+                        let (contact_id, drafts) = (capture.contact_id, capture.drafts.clone());
+                        if let Err(message) = self.trigger_message(capture) {
+                            let _ = drafts.send(MessageDraft::Failed {
+                                contact_id,
+                                message: message.clone(),
+                            });
+                            self.view.notice = message;
+                        }
+                    }
                     Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                         shutting_down = true;
                         self.action_capture = None;
+                        self.message_capture = None;
                         self.view.capture_action = None;
                         if let Some(memory) = &self.memory {
                             memory.set_paused(true);
@@ -680,6 +716,7 @@ impl Host {
             }
             WorkspaceEvent::CancelActionCapture => {
                 self.action_capture = None;
+                self.message_capture = None;
                 self.view.notice = "Action cancelled. Nothing will be sent.".into();
                 if self.note_capture
                     && let Some(audio) = &self.audio
@@ -802,6 +839,7 @@ impl Host {
         self.cutoff_question = None;
         self.cutoff_request = None;
         self.action_capture = None;
+        self.message_capture = None;
         self.view.capture_action = None;
         self.view.transcript_offset = 0;
         self.view.total_segments = 0;
@@ -1065,6 +1103,14 @@ impl Host {
                         self.deliver_config(action, text)?;
                     }
                 }
+                if let Some((contact_id, drafts)) = self.message_capture.take() {
+                    let text = self.view.note_text.trim().to_string();
+                    let _ = drafts.send(if text.is_empty() {
+                        MessageDraft::Empty { contact_id }
+                    } else {
+                        MessageDraft::Ready { contact_id, text }
+                    });
+                }
             }
             MeetingAudioEvent::Error { message } => {
                 if !self.view.ai_busy {
@@ -1075,6 +1121,12 @@ impl Host {
                 self.view.auto_commentary_notice =
                     "Automatic commentary stopped because recording ended.".into();
                 self.action_capture = None;
+                if let Some((contact_id, drafts)) = self.message_capture.take() {
+                    let _ = drafts.send(MessageDraft::Failed {
+                        contact_id,
+                        message: message.clone(),
+                    });
+                }
                 if let Some(request) = self.cutoff_request.take() {
                     self.view.chat_error_id = request;
                 }
@@ -1128,6 +1180,34 @@ impl Host {
         self.action_capture = Some(action);
         self.view.notice =
             "Recording your action. Stop to send, or Cancel to discard this attempt.".into();
+        Ok(())
+    }
+    fn trigger_message(&mut self, capture: MessageCapture) -> Result<(), String> {
+        if self
+            .message_capture
+            .as_ref()
+            .is_some_and(|(id, _)| *id == capture.contact_id)
+        {
+            if let Some(audio) = &self.audio {
+                audio.stop()?;
+                self.view.capture = CaptureState::Stopping;
+            }
+            return Ok(());
+        }
+        if self.audio.is_some() || self.view.delivery_busy {
+            return Err("Finish the current recording or action before starting another.".into());
+        }
+        let title = format!("Message to {}", capture.contact_name);
+        self.start_capture(CaptureSource::Microphone, None, title, true)?;
+        self.view.capture_action = Some(format!("Message to {}", capture.contact_name));
+        self.view.capture_action_endpoint = String::new();
+        let _ = capture.drafts.send(MessageDraft::Recording {
+            contact_id: capture.contact_id,
+        });
+        self.message_capture = Some((capture.contact_id, capture.drafts));
+        self.view.notice =
+            "Recording your message. Stop to review it before sending, or Cancel to discard."
+                .into();
         Ok(())
     }
     fn invalidate_meeting_memory(&mut self) {
