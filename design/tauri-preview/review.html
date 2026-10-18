@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Review · Phorminx</title>
   <link rel="stylesheet" href="review.css">
+  <link rel="stylesheet" href="instruction-field.css">
+  <script src="instruction-field.js" defer></script>
   <script src="review.js" defer></script>
 </head>
 <body>
@@ -16,7 +18,7 @@
     </div>
     <div class="reformat">
       <label>Formatting<select id="strength"><option value="light">Light</option><option value="balanced">Balanced</option><option value="strong">Strong</option><option value="structured">Structured · Markdown</option><option value="custom">Custom</option></select></label>
-      <label class="instruction">One-off instruction<input id="instruction" maxlength="1000" placeholder="Optional, e.g. make it a short email" autocomplete="off"></label>
+      <label class="instruction">One-off instruction<textarea id="instruction" rows="1" maxlength="1000" placeholder="Optional, e.g. make it a short email, or @ for a prompt" data-instruction-field></textarea></label>
       <button id="reformat" type="button">Reformat</button>
     </div>
     <div class="actions">

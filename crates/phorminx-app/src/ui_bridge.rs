@@ -817,6 +817,97 @@ impl UiBridge {
         Ok(())
     }
 
+    pub fn prompts(&self) -> Result<Vec<phorminx_persistence::Prompt>, UiBridgeError> {
+        self.persistence.prompts().list().map_err(prompt_error)
+    }
+
+    pub fn prompt_versions(
+        &self,
+        id: i64,
+    ) -> Result<Vec<phorminx_persistence::PromptVersion>, UiBridgeError> {
+        self.persistence
+            .prompts()
+            .versions(id)
+            .map_err(prompt_error)
+    }
+
+    /// Creates a prompt (`id` is `None`) or saves its next version.
+    pub fn save_prompt(
+        &self,
+        id: Option<i64>,
+        draft: &phorminx_persistence::PromptDraft,
+        now_ms: i64,
+    ) -> Result<i64, UiBridgeError> {
+        let prompts = self.persistence.prompts();
+        match id {
+            None => prompts.create(draft, now_ms).map_err(prompt_error),
+            Some(id) => match prompts.save(id, draft, now_ms).map_err(prompt_error)? {
+                true => Ok(id),
+                false => Err(UiBridgeError::not_found("prompt")),
+            },
+        }
+    }
+
+    pub fn restore_prompt(&self, id: i64, version: i64, now_ms: i64) -> Result<(), UiBridgeError> {
+        match self
+            .persistence
+            .prompts()
+            .restore(id, version, now_ms)
+            .map_err(prompt_error)?
+        {
+            true => Ok(()),
+            false => Err(UiBridgeError::not_found("prompt_version")),
+        }
+    }
+
+    pub fn delete_prompt(&self, id: i64) -> Result<(), UiBridgeError> {
+        self.persistence
+            .prompts()
+            .delete(id)
+            .map(|_| ())
+            .map_err(prompt_error)
+    }
+
+    /// Where a prompt is referenced among the instructions this bridge owns:
+    /// dictation formatting and application profiles. Meeting and Action
+    /// instructions live in the assistant configuration; see
+    /// [`crate::prompts::assistant_usages`].
+    pub fn prompt_usages(&self, id: i64) -> Result<Vec<String>, UiBridgeError> {
+        let Some(prompt) = self.persistence.prompts().get(id).map_err(prompt_error)? else {
+            return Ok(Vec::new());
+        };
+        let mut usages = Vec::new();
+        if self
+            .settings
+            .formatting
+            .custom_instructions
+            .as_deref()
+            .is_some_and(|text| crate::prompts::refers_to(text, &prompt))
+        {
+            usages.push("Dictation custom formatting".to_owned());
+        }
+        for profile in self
+            .persistence
+            .app_profiles()
+            .list()
+            .map_err(UiBridgeError::persistence)?
+        {
+            if profile
+                .custom_instructions
+                .as_deref()
+                .is_some_and(|text| crate::prompts::refers_to(text, &prompt))
+            {
+                usages.push(format!("Profile for {}", profile.executable.as_str()));
+            }
+        }
+        Ok(usages)
+    }
+
+    /// Instructions with every prompt reference replaced by its latest text.
+    pub fn resolve_instructions(&self, text: &str) -> crate::prompts::Resolved {
+        crate::prompts::resolve_with(&self.persistence, text)
+    }
+
     pub fn history_text(
         &self,
         id: i64,
@@ -1225,6 +1316,15 @@ fn same_recognizer(candidate: &Settings, current: &Settings) -> bool {
     recognition.minimum_rms = current.recognition.minimum_rms;
     recognition.microphone = current.recognition.microphone.clone();
     recognition == current.recognition
+}
+
+fn prompt_error(error: phorminx_persistence::PersistenceError) -> UiBridgeError {
+    match error {
+        phorminx_persistence::PersistenceError::Validation { field, reason } => {
+            UiBridgeError::validation(field, reason)
+        }
+        other => UiBridgeError::persistence(other),
+    }
 }
 
 fn requires_ollama(strength: FormattingStrength) -> bool {
@@ -2269,6 +2369,94 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.field, Some("executable"));
         assert_eq!(test.bridge.persistence.lexicon().list().unwrap(), []);
+    }
+
+    #[test]
+    fn prompt_references_save_verbatim_in_every_instruction_field_and_resolve() {
+        let mut test = TestBridge::new();
+        let readiness = test.readiness();
+        let draft = |name: &str, body: &str| phorminx_persistence::PromptDraft {
+            name: name.into(),
+            tags: Vec::new(),
+            body: body.into(),
+        };
+        let lists = test
+            .bridge
+            .save_prompt(None, &draft("Lists", "Use bullets."), 1)
+            .unwrap();
+        let text = "Keep names. @[Lists] @[Gone]";
+
+        // Dictation custom instructions.
+        let mut candidate = test.bridge.settings().clone();
+        candidate.formatting.custom_instructions = Some(text.into());
+        test.bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+            .unwrap();
+        let saved = test.bridge.store.load().unwrap();
+        assert_eq!(saved.formatting.custom_instructions.as_deref(), Some(text));
+
+        // An application profile.
+        test.bridge
+            .execute(
+                UiCommand::SaveProfile(UiProfileDraft {
+                    original_executable: None,
+                    executable: "code.exe".to_owned(),
+                    formatting_style: FormattingStyle::Custom,
+                    custom_instructions: Some(text.into()),
+                    language: None,
+                    insertion_preference: InsertionPreference::Automatic,
+                    deny: false,
+                }),
+                &readiness,
+                11,
+            )
+            .unwrap();
+        let profiles = test.bridge.persistence.app_profiles().list().unwrap();
+        assert_eq!(profiles[0].custom_instructions.as_deref(), Some(text));
+
+        // Meeting instructions and an Action, which live in assistant.json.
+        let mut config = phorminx_assistant::AssistantConfig {
+            preset: text.into(),
+            ..Default::default()
+        };
+        config.actions.push(phorminx_assistant::ActionConfig {
+            id: "notes".into(),
+            name: "Notes".into(),
+            endpoint: "http://127.0.0.1:9/notes".into(),
+            payload_prompt: text.into(),
+            ..Default::default()
+        });
+        let store = phorminx_assistant::ConfigStore::new(test.root.join("assistant.json"));
+        store.save(&config).unwrap();
+        let config = store.load().unwrap();
+
+        let resolved = test.bridge.resolve_instructions(text);
+        assert_eq!(resolved.text, "Keep names. Use bullets.");
+        assert_eq!(resolved.missing, ["Gone"]);
+        for stored in [&config.preset, &config.actions[0].payload_prompt] {
+            assert_eq!(test.bridge.resolve_instructions(stored), resolved);
+        }
+        assert_eq!(
+            test.bridge.prompt_usages(lists).unwrap(),
+            ["Dictation custom formatting", "Profile for code.exe"]
+        );
+        let prompt = test.bridge.prompts().unwrap().remove(0);
+        assert_eq!(
+            crate::prompts::assistant_usages(&config, &prompt),
+            [
+                "Meeting assistant instructions",
+                "Action \u{201c}Notes\u{201d}"
+            ]
+        );
+
+        // Editing the prompt changes every field from the next use on.
+        test.bridge
+            .save_prompt(Some(lists), &draft("Lists", "Use numbered steps."), 2)
+            .unwrap();
+        assert_eq!(
+            test.bridge.resolve_instructions(text).text,
+            "Keep names. Use numbered steps."
+        );
     }
 
     #[test]
