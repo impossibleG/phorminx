@@ -190,6 +190,8 @@ function renderHistory(view) {
     const button = makeElement('button', item.id === selectedHistoryId ? 'active' : '');
     button.type = 'button';
     button.append(makeElement('small', '', dateLabel(item.createdAtMs)), makeElement('span', '', item.preview));
+    const note = view.history.find((entry) => entry.id === item.id)?.formattingNote;
+    if (note) button.append(makeElement('em', 'record-note', note));
     button.addEventListener('click', () => { void selectHistory(item.id); });
     list.append(button);
   }
@@ -280,6 +282,23 @@ function renderProfiles(view) {
   node('profile-list').replaceChildren(fragment);
 }
 
+// Below this size (roughly a 4B model) local models tend to return plain
+// prose for Structured and Custom instructions; see the formatting bench.
+const STRUCTURED_MODEL_BYTES = 4 * 1024 * 1024 * 1024;
+
+function updateFormattingHint() {
+  const hint = node('formatting-hint');
+  const strength = node('formatting-strength').value;
+  const name = node('formatting-model').value;
+  const model = appView?.ollamaModels.find((entry) => entry.name === name);
+  const small = model?.sizeBytes && model.sizeBytes < STRUCTURED_MODEL_BYTES;
+  const restructures = strength === 'structured' || strength === 'custom';
+  hint.textContent = restructures && small
+    ? `${name} is a small model. Structured and Custom work best with a 7B-class model such as qwen2.5:7b-instruct.`
+    : '';
+  hint.hidden = !hint.textContent;
+}
+
 function renderModels(view, notice) {
   node('selected-whisper').textContent = `Selected: ${view.settings.accurateModel}`;
   node('vosk-state').textContent = view.systems.find((system) => system.name === 'Vosk')?.message || 'Checking assets…';
@@ -287,7 +306,8 @@ function renderModels(view, notice) {
   for (const model of view.ollamaModels) {
     const row = makeElement('div', 'record-row');
     const size = model.sizeBytes ? ` · ${(model.sizeBytes / 1048576).toFixed(0)} MiB` : '';
-    row.append(makeElement('small', '', model.selected ? 'SELECTED' : 'INSTALLED'), makeElement('span', '', `${model.name}${size}`));
+    const structured = model.sizeBytes && model.sizeBytes >= STRUCTURED_MODEL_BYTES ? ' · good for Structured' : '';
+    row.append(makeElement('small', '', model.selected ? 'SELECTED' : 'INSTALLED'), makeElement('span', '', `${model.name}${size}${structured}`));
     fragment.append(row);
   }
   if (!view.ollamaModels.length) fragment.append(makeElement('div', 'record-row', view.systems.find((system) => system.name === 'Ollama')?.message || 'No local models found.'));
@@ -400,6 +420,8 @@ async function selectHistory(id) {
     option.disabled = item ? !item.variants[option.value] : option.value !== 'output';
   }
   if (node('history-variant').selectedOptions[0]?.disabled) node('history-variant').value = 'output';
+  node('history-note').textContent = item?.formattingNote || '';
+  node('history-note').hidden = !item?.formattingNote;
   await loadHistoryText();
 }
 
@@ -507,6 +529,7 @@ function renderApp(view, runtimeStatus, notice) {
     node('launcher-shortcut').value = view.settings.launcherShortcut;
     node('app-theme').value = view.settings.theme;
     node('recording-mode').value = view.settings.recordingMode;
+    node('show-live-text').checked = view.settings.showLiveText !== false;
   }
   if (!dictationDirty) {
     node('recognition-mode').value = view.settings.recognitionMode;
@@ -515,6 +538,7 @@ function renderApp(view, runtimeStatus, notice) {
     node('minimum-rms').value = view.settings.minimumRms;
     node('formatting-strength').value = view.settings.formattingStrength;
     node('model-residency').value = view.settings.modelResidency;
+    node('formatting-passes').value = String(view.settings.formattingPasses || 2);
     const select = node('formatting-model');
     const options = [makeElement('option', '', 'No model')];
     options[0].value = '';
@@ -531,6 +555,7 @@ function renderApp(view, runtimeStatus, notice) {
     select.replaceChildren(...options);
     select.value = view.settings.formattingModel || '';
   }
+  updateFormattingHint();
   if (!privacyDirty) {
     node('history-retention').value = view.settings.historyRetention;
     node('embedding-model').value = view.settings.embeddingModel || '';
@@ -761,6 +786,7 @@ node('preferences-form').addEventListener('submit', async (event) => {
       theme: node('app-theme').value,
       recordingMode: node('recording-mode').value,
       launcherShortcut: node('launcher-shortcut').value.trim(),
+      showLiveText: node('show-live-text').checked,
     });
     preferencesDirty = false;
     node('preferences-result').textContent = 'Saved.';
@@ -770,7 +796,7 @@ node('preferences-form').addEventListener('submit', async (event) => {
 node('preferences-form').addEventListener('input', () => { preferencesDirty = true; });
 node('preferences-form').addEventListener('change', () => { preferencesDirty = true; });
 node('dictation-form').addEventListener('input', () => { dictationDirty = true; });
-node('dictation-form').addEventListener('change', () => { dictationDirty = true; });
+node('dictation-form').addEventListener('change', () => { dictationDirty = true; updateFormattingHint(); });
 node('privacy-form').addEventListener('input', () => { privacyDirty = true; });
 node('privacy-form').addEventListener('change', () => { privacyDirty = true; });
 node('dictation-form').addEventListener('submit', async (event) => {
@@ -787,6 +813,7 @@ node('dictation-form').addEventListener('submit', async (event) => {
       model: node('formatting-model').value || null,
       lifecycle: node('model-residency').value,
       customInstructions: node('custom-instructions').value.trim() || null,
+      passes: Number(node('formatting-passes').value),
     });
     dictationDirty = false;
     node('dictation-result').textContent = 'Saved.';

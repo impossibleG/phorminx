@@ -22,6 +22,7 @@ use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder};
 use crate::feedback::{FeedbackPanel, FeedbackView};
 use crate::library_search::{LibrarySearchConfig, LibrarySearchWorker, embedding_identity};
 use crate::product_shell::{ProductShellControl, ProductShellEvent};
+use crate::review::ReviewPanel;
 use crate::settings::{
     AccurateBackendPreference, AccurateModelVariant, AppearancePreference, FormattingStrength,
     HistoryRetention, OllamaLifecycle, OllamaModelIdentity, RecognitionMode, RecordingMode,
@@ -59,6 +60,7 @@ struct HostState {
     route: Mutex<UiRoute>,
     status: Mutex<UiRuntimeStatus>,
     notice: Mutex<String>,
+    review: Mutex<ReviewPanel>,
     events: Sender<ProductShellEvent>,
 }
 
@@ -195,7 +197,7 @@ impl BootstrapCenter {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_app_snapshot(state: State<'_, HostState>) -> Result<AppView, String> {
     let mut bridge = state
         .bridge
@@ -219,14 +221,14 @@ fn host_app_snapshot(state: State<'_, HostState>) -> Result<AppView, String> {
     Ok(AppView::from(&snapshot))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_input_devices() -> Result<Vec<String>, String> {
     input_devices()
         .map(|devices| devices.into_iter().map(|device| device.name).collect())
         .map_err(|_| "Microphone devices could not be listed.".to_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_history_text(
     id: i64,
     variant: Option<String>,
@@ -247,7 +249,7 @@ fn host_history_text(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_library_search(
     query: String,
     semantic: bool,
@@ -265,7 +267,7 @@ fn host_library_search(
     Ok(generation)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_library_update(state: State<'_, HostState>) -> Result<Option<LibrarySearchView>, String> {
     let library = state.library.lock().map_err(|_| "Search is unavailable.")?;
     Ok(library
@@ -274,7 +276,7 @@ fn host_library_update(state: State<'_, HostState>) -> Result<Option<LibrarySear
         .map(Into::into))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_select_route(route: String, state: State<'_, HostState>) -> Result<(), String> {
     let route = match route.as_str() {
         "home" => UiRoute::Home,
@@ -292,11 +294,12 @@ fn host_select_route(route: String, state: State<'_, HostState>) -> Result<(), S
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_preferences(
     theme: String,
     recording_mode: String,
     launcher_shortcut: String,
+    show_live_text: Option<bool>,
     state: State<'_, HostState>,
 ) -> Result<(), String> {
     let theme = match theme.as_str() {
@@ -321,6 +324,9 @@ fn host_save_preferences(
     candidate.appearance.theme = theme;
     candidate.interaction.recording_mode = recording_mode;
     candidate.interaction.launcher_shortcut = launcher_shortcut;
+    if let Some(show_live_text) = show_live_text {
+        candidate.interaction.show_live_text = show_live_text;
+    }
     let readiness = state
         .readiness
         .lock()
@@ -340,7 +346,7 @@ fn host_save_preferences(
         .map_err(|_| "Settings were saved, but the runtime could not be notified.".to_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_custom_instructions(state: State<'_, HostState>) -> Result<Option<String>, String> {
     Ok(state
         .bridge
@@ -352,7 +358,7 @@ fn host_custom_instructions(state: State<'_, HostState>) -> Result<Option<String
         .clone())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_dictation_settings(
     mode: String,
     backend: String,
@@ -363,6 +369,7 @@ fn host_save_dictation_settings(
     model: Option<String>,
     lifecycle: String,
     custom_instructions: Option<String>,
+    passes: Option<u8>,
     state: State<'_, HostState>,
 ) -> Result<(), String> {
     let mode = match mode.as_str() {
@@ -381,6 +388,7 @@ fn host_save_dictation_settings(
         "light" => FormattingStrength::Light,
         "balanced" => FormattingStrength::Balanced,
         "strong" => FormattingStrength::Strong,
+        "structured" => FormattingStrength::Structured,
         "custom" => FormattingStrength::Custom,
         _ => return Err("Choose a supported formatting strength.".into()),
     };
@@ -413,6 +421,9 @@ fn host_save_dictation_settings(
     candidate.recognition.language = language;
     candidate.recognition.minimum_rms = minimum_rms;
     candidate.formatting.strength = strength;
+    if let Some(passes) = passes {
+        candidate.formatting.passes = passes;
+    }
     candidate.formatting.ollama_lifecycle = lifecycle;
     candidate.formatting.custom_instructions = custom_instructions;
     let selected = model.filter(|model| !model.trim().is_empty());
@@ -449,7 +460,7 @@ fn host_save_dictation_settings(
     state.execute(UiCommand::SaveSettings(candidate))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_privacy_settings(
     retention: String,
     embedding_model: Option<String>,
@@ -576,7 +587,7 @@ fn dispatch_settings_outcome(
         .map_err(|_| "The change was saved, but the runtime could not be notified.".to_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_lexicon(
     id: Option<i64>,
     canonical: String,
@@ -605,12 +616,12 @@ fn host_save_lexicon(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_delete_lexicon(id: i64, state: State<'_, HostState>) -> Result<(), String> {
     state.execute(UiCommand::DeleteLexicon(id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_profile_detail(
     executable: String,
     state: State<'_, HostState>,
@@ -624,7 +635,7 @@ fn host_profile_detail(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_profile(
     original_executable: Option<String>,
     executable: String,
@@ -640,6 +651,7 @@ fn host_save_profile(
         "light" => FormattingStyle::Light,
         "balanced" => FormattingStyle::Balanced,
         "strong" => FormattingStyle::Strong,
+        "structured" => FormattingStyle::Structured,
         "custom" => FormattingStyle::Custom,
         _ => return Err("Choose a supported formatting style.".into()),
     };
@@ -660,12 +672,12 @@ fn host_save_profile(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_delete_profile(executable: String, state: State<'_, HostState>) -> Result<(), String> {
     state.execute(UiCommand::DeleteProfile(executable))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_setup_snapshot(
     app: tauri::AppHandle,
     state: State<'_, HostState>,
@@ -707,7 +719,7 @@ fn host_setup_snapshot(
     Ok(view)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_start_setup_action(
     id: String,
     consent_confirmed: bool,
@@ -738,7 +750,7 @@ fn host_start_setup_action(
     center.start(&id).map_err(str::to_owned)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_bootstrap_snapshot(app: tauri::AppHandle, state: State<'_, HostState>) -> Result<BootstrapView, String> {
     let mut bootstrap = state.bootstrap.lock().map_err(|_| "Starter setup is unavailable.")?;
     let completed = bootstrap.poll()?;
@@ -751,7 +763,7 @@ fn host_bootstrap_snapshot(app: tauri::AppHandle, state: State<'_, HostState>) -
     Ok(view)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_start_bootstrap(state: State<'_, HostState>) -> Result<BootstrapView, String> {
     if !state.bootstrap_allowed { return Err("Open Prepare Phorminx from the Start menu to run the full starter.".into()); }
     let readiness = state.readiness.lock().map_err(|_| "Readiness is unavailable.")?.clone();
@@ -763,14 +775,14 @@ fn host_start_bootstrap(state: State<'_, HostState>) -> Result<BootstrapView, St
     Ok(bootstrap.view.clone())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_cancel_bootstrap(state: State<'_, HostState>) -> Result<BootstrapView, String> {
     let mut bootstrap = state.bootstrap.lock().map_err(|_| "Starter setup is unavailable.")?;
     bootstrap.cancel_after_step()?;
     Ok(bootstrap.view.clone())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_cancel_setup_action(id: String, state: State<'_, HostState>) -> Result<(), String> {
     state
         .setup
@@ -799,7 +811,7 @@ fn update_idle(app: &tauri::AppHandle) -> bool {
     runtime_idle && meeting_idle
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_update_snapshot(app: tauri::AppHandle, state: State<'_, HostState>) -> Result<UpdateView, String> {
     let idle = update_idle(&app);
     let mut updates = state.updates.lock().map_err(|_| "Updates are unavailable.")?;
@@ -807,7 +819,7 @@ fn host_update_snapshot(app: tauri::AppHandle, state: State<'_, HostState>) -> R
     Ok(updates.snapshot())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_update_action(kind: String, enabled: Option<bool>, app: tauri::AppHandle, state: State<'_, HostState>) -> Result<UpdateView, String> {
     let idle = update_idle(&app);
     let mut updates = state.updates.lock().map_err(|_| "Updates are unavailable.")?;
@@ -828,7 +840,7 @@ fn host_update_action(kind: String, enabled: Option<bool>, app: tauri::AppHandle
     Ok(updates.snapshot())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_snapshot(state: State<'_, HostState>) -> Result<HostView, String> {
     Ok(HostView {
         route: format!(
@@ -852,7 +864,7 @@ fn host_snapshot(state: State<'_, HostState>) -> Result<HostView, String> {
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_action(kind: String, state: State<'_, HostState>) -> Result<(), String> {
     let event = match kind.as_str() {
         "test-dictation" => ProductShellEvent::TestDictation,
@@ -880,7 +892,7 @@ fn host_action(kind: String, state: State<'_, HostState>) -> Result<(), String> 
         .map_err(|_| "The dictation host is unavailable.".into())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_select_whisper_model(
     manifest_id: String,
     state: State<'_, HostState>,
@@ -893,7 +905,7 @@ fn host_select_whisper_model(
         .map_err(|_| "The model manager is unavailable.".into())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_install_vosk(state: State<'_, HostState>) -> Result<(), String> {
     state
         .events
@@ -901,7 +913,7 @@ fn host_install_vosk(state: State<'_, HostState>) -> Result<(), String> {
         .map_err(|_| "The model manager is unavailable.".into())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn feedback_snapshot(state: State<'_, HostState>) -> Result<FeedbackView, String> {
     let mut feedback = state
         .feedback
@@ -911,7 +923,7 @@ fn feedback_snapshot(state: State<'_, HostState>) -> Result<FeedbackView, String
     Ok(feedback.snapshot())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn feedback_update(
     text: String,
     diagnostics: bool,
@@ -924,7 +936,7 @@ fn feedback_update(
         .update_draft(text, diagnostics)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn feedback_action(kind: String, state: State<'_, HostState>) -> Result<(), String> {
     let mut feedback = state
         .feedback
@@ -1079,6 +1091,7 @@ fn run_shell(
         route: Mutex::new(initial_route),
         status: Mutex::new(initial_status),
         notice: Mutex::new(String::new()),
+        review: Mutex::new(ReviewPanel::default()),
         events: events.clone(),
     };
     let stopping = Arc::new(AtomicBool::new(false));
@@ -1133,6 +1146,11 @@ fn run_shell(
             feedback_update,
             feedback_action,
             host_open_feedback,
+            review_snapshot,
+            review_reformat,
+            review_copy,
+            review_replace,
+            review_close,
         ])
         .setup(move |app| {
             if !initially_visible {
@@ -1166,6 +1184,10 @@ fn run_shell(
                     {
                         feedback.close_window();
                     }
+                } else if window.label() == REVIEW_WINDOW {
+                    if let Ok(mut review) = window.app_handle().state::<HostState>().review.lock() {
+                        review.close();
+                    }
                 } else {
                     api.prevent_close();
                     let _ = window.hide();
@@ -1175,7 +1197,14 @@ fn run_shell(
                 }
             }
         })
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!())
+        // `Builder::run` ends in tao's `EventLoop::run`, which calls
+        // `process::exit` when the loop stops. That killed the whole process
+        // on Quit, before the runtime could clean up or relaunch after a
+        // settings save. `run_return` hands control back to the caller.
+        .map(|app| {
+            app.run_return(|_, _| {});
+        });
     stopping.store(true, Ordering::Release);
     if let Some(pump) = pump.lock().map_err(|_| "Control slot unavailable.")?.take() {
         let _ = pump.join();
@@ -1330,6 +1359,25 @@ fn control_loop(
             ProductShellControl::ActivationBlocked(_) => {
                 host.notice("That action is unavailable right now.")
             }
+            ProductShellControl::OpenReview(seed) => {
+                if let Ok(mut review) = host.review.lock() {
+                    review.open(*seed);
+                }
+                if open_review(&app).is_err() {
+                    host.notice("The review panel could not be opened.");
+                }
+            }
+            ProductShellControl::ReviewResult {
+                notice,
+                replaced_text,
+            } => {
+                if let Ok(mut review) = host.review.lock() {
+                    if let Some(text) = replaced_text.as_deref() {
+                        review.replaced(text);
+                    }
+                    review.set_notice(notice);
+                }
+            }
             ProductShellControl::Quit => {
                 app.exit(0);
                 break;
@@ -1346,6 +1394,139 @@ fn focus_route(app: &tauri::AppHandle, host: &HostState, route: UiRoute) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+const REVIEW_WINDOW: &str = "review";
+
+fn open_review(app: &tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(REVIEW_WINDOW) {
+        window.show().map_err(|_| "Review could not be shown.")?;
+        window
+            .set_focus()
+            .map_err(|_| "Review could not be focused.")?;
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(
+        app,
+        REVIEW_WINDOW,
+        WebviewUrl::App("tauri-preview/review.html".into()),
+    )
+    .title("Phorminx · Review")
+    .inner_size(560.0, 460.0)
+    .min_inner_size(400.0, 340.0)
+    .resizable(true)
+    .always_on_top(true)
+    .focused(true)
+    .build()
+    .map_err(|_| "Review could not be opened.")?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewWindowView {
+    revision: u64,
+    text: String,
+    strength: &'static str,
+    can_replace: bool,
+    busy: bool,
+    formatting_note: Option<String>,
+    notice: String,
+}
+
+fn strength_name(strength: FormattingStrength) -> &'static str {
+    match strength {
+        FormattingStrength::Raw => "raw",
+        FormattingStrength::Light => "light",
+        FormattingStrength::Balanced => "balanced",
+        FormattingStrength::Strong => "strong",
+        FormattingStrength::Structured => "structured",
+        FormattingStrength::Custom => "custom",
+    }
+}
+
+#[tauri::command(async)]
+fn review_snapshot(state: State<'_, HostState>) -> Result<ReviewWindowView, String> {
+    let view = state
+        .review
+        .lock()
+        .map_err(|_| "Review is unavailable.")?
+        .snapshot();
+    Ok(ReviewWindowView {
+        revision: view.revision,
+        text: view.text,
+        strength: strength_name(view.strength),
+        can_replace: view.can_replace,
+        busy: view.busy,
+        formatting_note: view.formatting_note,
+        notice: view.notice,
+    })
+}
+
+#[tauri::command(async)]
+fn review_reformat(
+    text: String,
+    strength: String,
+    instruction: Option<String>,
+    state: State<'_, HostState>,
+) -> Result<Option<String>, String> {
+    let strength = match strength.as_str() {
+        "light" => FormattingStrength::Light,
+        "balanced" => FormattingStrength::Balanced,
+        "strong" => FormattingStrength::Strong,
+        "structured" => FormattingStrength::Structured,
+        "custom" => FormattingStrength::Custom,
+        _ => return Err("Choose a supported formatting.".into()),
+    };
+    let settings = state.store.load().map_err(|error| error.to_string())?;
+    state
+        .review
+        .lock()
+        .map_err(|_| "Review is unavailable.")?
+        .start_reformat(
+            &text,
+            strength,
+            instruction.as_deref(),
+            move |profile, text| crate::review::reformat_with_local_model(&settings, profile, text),
+        )?;
+    Ok(None)
+}
+
+#[tauri::command(async)]
+fn review_copy(text: String, state: State<'_, HostState>) -> Result<Option<String>, String> {
+    if text.trim().is_empty() {
+        return Err("There is no text to copy.".into());
+    }
+    phorminx_windows::copy_and_maybe_paste(None, &text)
+        .map_err(|_| "The clipboard is unavailable. Try again.")?;
+    let notice = "Copied. Paste it wherever you need it.".to_owned();
+    if let Ok(mut review) = state.review.lock() {
+        review.set_notice(notice.clone());
+    }
+    Ok(Some(notice))
+}
+
+#[tauri::command(async)]
+fn review_replace(text: String, state: State<'_, HostState>) -> Result<Option<String>, String> {
+    if text.trim().is_empty() {
+        return Err("There is no text to insert.".into());
+    }
+    state
+        .events
+        .send(ProductShellEvent::ReviewReplace(text))
+        .map_err(|_| "Phorminx could not reach the pasted text.")?;
+    Ok(None)
+}
+
+#[tauri::command(async)]
+fn review_close(app: tauri::AppHandle, state: State<'_, HostState>) -> Result<(), String> {
+    if let Ok(mut review) = state.review.lock() {
+        review.close();
+    }
+    if let Some(window) = app.get_webview_window(REVIEW_WINDOW) {
+        let _ = window.destroy();
+    }
+    Ok(())
 }
 
 fn open_feedback(app: &tauri::AppHandle) -> Result<(), String> {

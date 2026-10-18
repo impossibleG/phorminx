@@ -112,3 +112,5 @@ main :is(.page,.record-list,.record-detail,.scroll-content,.session-list,.recent
 :root[data-theme="light"] #bootstrap-consent{background:#eae7e0;color:#202326;border-color:#b9b7b0}
 :root[data-theme="light"] #bootstrap-consent p{color:#555b60}
 :root[data-theme="light"] .bootstrap-control .primary,:root[data-theme="light"] #bootstrap-consent .primary{background:#815026;color:#fff;border-color:#815026}
+.record-list .record-note{display:block;margin-top:6px;color:#c69767;font-size:10px;font-style:normal}.history-note{margin:18px 0 0;padding:9px 12px;border-left:2px solid #c69767;background:#1b2023;color:#d9cbb9;font-size:11px;line-height:1.5}.history-note[hidden]{display:none}.history-note+#history-detail{margin-top:16px}:root[data-theme="light"] .history-note{background:#eae7e0;color:#5b3d22}:root[data-theme="light"] .record-list .record-note{color:#815026}
+.setting-hint{margin:12px 0 0;color:#a8adb0;font-size:11px;line-height:1.5}.setting-hint[hidden]{display:none}#formatting-hint{color:#d9cbb9}:root[data-theme="light"] .setting-hint{color:#555b60}:root[data-theme="light"] #formatting-hint{color:#5b3d22}

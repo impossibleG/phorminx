@@ -6,7 +6,7 @@ Phorminx uses a small native Win32 tray thread rather than carrying a browser or
 
 The tray icon is registered with notification-area version 4 semantics, restored after an Explorer restart, and removed before its owner window exits. Quit is prioritized ahead of simultaneous hotkey and transcription events. Central teardown drops an active recording before joining the transcription, tray, and overlay services, and attempts every shutdown even if an earlier one reports an error.
 
-Machine-specific settings live at `%LOCALAPPDATA%\Phorminx\settings.toml`. The schema starts at version 1, rejects unknown fields and future versions, caps input at 64 KiB, and preserves malformed files rather than replacing them. Saves use a fully flushed same-directory temporary file and atomic Windows replacement.
+Machine-specific settings live at `%LOCALAPPDATA%\Phorminx\settings.toml`. The schema starts at version 1, caps input at 64 KiB, and preserves malformed files rather than replacing them. Saves use a fully flushed same-directory temporary file and atomic Windows replacement.
 
 Formatting strengths are persisted as `raw`, `light`, `balanced`, `strong`, or `custom`. `light` is the compatibility default and performs only the existing deterministic spacing cleanup. `raw` preserves recognizer output. The remaining strengths are reserved for the local Ollama phase and fail explicitly until that pipeline is available.
 
@@ -23,3 +23,18 @@ Developer builds retain a console, Ctrl+C, diagnostics, and smoke-test output. P
 - Settings vocabulary is stable before the settings window and Ollama implementation arrive.
 - Settings changes have a clear, testable process boundary instead of live partial reconfiguration.
 - Balanced, Strong, and Custom cannot silently degrade to Light; users receive an unsupported-capability error until local AI formatting is implemented.
+
+## Amendment: settings from newer builds (2026-10-17)
+
+Unknown fields, unknown option values and newer schema versions no longer stop
+the app from starting. A build that was downgraded, or an older build sharing a
+profile with a newer one, must still open. Each section reads the fields it
+knows. An unknown option value, such as a formatting mode added later, falls
+back to that field's default. Every unknown key or value is logged by name
+(never by value) in `logs/lifecycle.log` as `settings_compatibility`.
+
+Saving writes unknown keys back unchanged. A replaced value is restored as long
+as the user has not changed that setting in this build. A newer
+`schema_version` is kept, so an upgrade does not think the file was migrated
+down. Malformed TOML and values of the wrong type are still rejected, and the
+rejected file is left in place.
