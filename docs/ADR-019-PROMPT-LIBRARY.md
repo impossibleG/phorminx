@@ -13,16 +13,25 @@ append-only and an accidental restore can itself be undone.
 Instruction fields are ordinary text boxes (`<textarea>`) and store plain
 text. Typing `@` opens suggestions at the caret. Picking one inserts a
 reference written as `@[Prompt name]`, as normal text, so undo, copy and
-paste, IME and screen readers behave as in any text box. Under the box, a row
-of read-only pills lists the prompts the text refers to. A pill opens a
-preview with "Edit in Prompts". The stored form keeps settings, profiles,
+paste, IME and screen readers behave as in any text box.
+
+A mirror layer drawn over the textarea, with the same font, padding, wrapping
+and scroll position, shows each reference as a chip; the textarea's own
+glyphs are transparent, and its caret and selection show through. References
+act as single units: the caret never rests inside one, a selection that
+touches one covers all of it, and Backspace or Delete next to one removes it
+whole, through the browser's editing so undo restores it. Clicking a chip
+opens a preview with "Edit in Prompts". Under the box, a row of pills lists
+the same prompts, which gives the keyboard and screen readers the same
+previews. The stored form keeps settings, profiles,
 the assistant configuration and Actions readable by code that does not know
 about prompts. It also avoids a second source of truth.
 
 The first test builds used a rich editor that drew references as chips
 inside a `contenteditable` element and stored `@{prompt:ID}`. That editor was
 removed: it was not a real text box, and it behaved differently from one.
-Old `@{prompt:ID}` references still resolve.
+Old `@{prompt:ID}` references still resolve, and a field shows them as
+`@[Name]` once the library has loaded, so the next save rewrites them.
 
 References resolve to the prompt's latest version when the instructions are
 used, not when they are saved:
