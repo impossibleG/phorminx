@@ -36,6 +36,23 @@ impl MeetingTauriState {
             .send(event)
     }
 
+    /// The text-only note capture used by Record-for-action and investigation
+    /// voice notes: capture state, note generation, recognized text, notice.
+    pub(crate) fn note_state(&self) -> Result<Option<(CaptureState, u64, String, String)>, String> {
+        let meeting = self
+            .meeting
+            .lock()
+            .map_err(|_| "Meeting state is unavailable.")?;
+        Ok(meeting.snapshot_after(u64::MAX).map(|snapshot| {
+            (
+                snapshot.capture,
+                snapshot.note_generation,
+                snapshot.note_text.clone(),
+                snapshot.notice.clone(),
+            )
+        }))
+    }
+
     pub fn snapshot(&self, since: u64) -> Result<Option<MeetingView>, String> {
         let meeting = self
             .meeting

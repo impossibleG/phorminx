@@ -4,6 +4,14 @@
 //! without augmenting them with database paths, dictated content, or window titles.
 
 mod history;
+mod investigation;
+pub use investigation::{
+    EdgeStatus, ImageReference, InvestigationEdgeRecord, InvestigationItemKind,
+    InvestigationItemRecord, InvestigationMessageRecord, InvestigationMessageStatus,
+    InvestigationNodeRecord, InvestigationRecord, InvestigationRepository, LinkPreviewUpdate,
+    MAX_INVESTIGATION_TITLE_CHARS, MAX_ITEM_BODY_BYTES, MAX_ITEM_TITLE_CHARS, MAX_ITEM_URL_BYTES,
+    NewInvestigationItem, OcrLineRecord, PendingWork, WorkState,
+};
 mod lexicon;
 mod library;
 pub use library::{
@@ -178,6 +186,10 @@ impl Persistence {
 
     pub fn meeting_memory(&self) -> MeetingMemoryRepository<'_> {
         MeetingMemoryRepository::new(&self.connection)
+    }
+
+    pub fn investigations(&self) -> InvestigationRepository<'_> {
+        InvestigationRepository::new(&self.connection)
     }
 
     pub fn recovery(&self) -> RecoveryRepository<'_> {
