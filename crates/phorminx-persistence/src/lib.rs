@@ -4,6 +4,14 @@
 //! without augmenting them with database paths, dictated content, or window titles.
 
 mod history;
+mod investigation;
+pub use investigation::{
+    EdgeStatus, ImageReference, InvestigationEdgeRecord, InvestigationItemKind,
+    InvestigationItemRecord, InvestigationMessageRecord, InvestigationMessageStatus,
+    InvestigationNodeRecord, InvestigationRecord, InvestigationRepository, LinkPreviewUpdate,
+    MAX_INVESTIGATION_TITLE_CHARS, MAX_ITEM_BODY_BYTES, MAX_ITEM_TITLE_CHARS, MAX_ITEM_URL_BYTES,
+    NewInvestigationItem, OcrLineRecord, PendingWork, WorkState,
+};
 mod lexicon;
 mod library;
 pub use library::{
@@ -24,6 +32,11 @@ pub use meeting::{
     MeetingRepository, MeetingSegmentRecord,
 };
 mod profile;
+mod prompt;
+pub use prompt::{
+    MAX_PROMPT_BODY_CHARS, MAX_PROMPT_NAME_CHARS, Prompt, PromptDraft, PromptRepository,
+    PromptVersion,
+};
 mod recovery;
 pub use recovery::{RecoveryRecord, RecoveryRepository};
 
@@ -181,6 +194,10 @@ impl Persistence {
         MeetingMemoryRepository::new(&self.connection)
     }
 
+    pub fn investigations(&self) -> InvestigationRepository<'_> {
+        InvestigationRepository::new(&self.connection)
+    }
+
     pub fn messaging(&self) -> MessagingRepository<'_> {
         MessagingRepository::new(&self.connection)
     }
@@ -195,6 +212,10 @@ impl Persistence {
 
     pub fn app_profiles(&self) -> AppProfileRepository<'_> {
         AppProfileRepository::new(&self.connection)
+    }
+
+    pub fn prompts(&self) -> PromptRepository<'_> {
+        PromptRepository::new(&self.connection)
     }
 
     pub fn schema_version(&self) -> Result<u32> {

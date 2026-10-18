@@ -6,6 +6,7 @@ members = [
     "crates/phorminx-app",
     "crates/phorminx-bench",
     "crates/phorminx-core",
+    "crates/phorminx-ocr",
     "crates/phorminx-messaging",
     "crates/phorminx-ollama",
     "crates/phorminx-persistence",
@@ -30,14 +31,17 @@ anyhow = "=1.0.100"
 base64 = "=0.23.1"
 ring = "=0.17.14"
 semver = "=1.0.28"
-arboard = { version = "=3.6.1", default-features = false }
+arboard = { version = "=3.6.1", default-features = false, features = ["image-data"] }
 clap = { version = "=4.5.48", features = ["derive"] }
 cpal = "=0.18.2"
 ctrlc = "=3.5.1"
 eframe = { version = "=0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 hound = "=3.5.1"
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "ico"] }
 libloading = "=0.8.9"
 ringbuf = { version = "=0.5.1", default-features = false, features = ["alloc"] }
+rten = { version = "=0.27.0", default-features = false, features = ["onnx_format"] }
+rten-tensor = "=0.27.0"
 rusqlite = { version = "=0.37.0", features = ["bundled", "functions"] }
 rubato = { version = "=5.0.0", default-features = false, features = ["fft_resampler"] }
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -46,6 +50,7 @@ sha2 = "=0.11.0"
 thiserror = "=2.0.20"
 toml = "=1.1.4"
 tempfile = "=3.23.0"
+url = "=2.5.8"
 ureq = { version = "=3.4.0", default-features = false, features = ["rustls"] }
 whisper-rs = { version = "=0.16.0", default-features = false, features = ["tracing_backend"] }
 windows = "=0.62.2"

@@ -112,6 +112,35 @@ main :is(.page,.record-list,.record-detail,.scroll-content,.session-list,.recent
 :root[data-theme="light"] #bootstrap-consent{background:#eae7e0;color:#202326;border-color:#b9b7b0}
 :root[data-theme="light"] #bootstrap-consent p{color:#555b60}
 :root[data-theme="light"] .bootstrap-control .primary,:root[data-theme="light"] #bootstrap-consent .primary{background:#815026;color:#fff;border-color:#815026}
+.record-list .record-note{display:block;margin-top:6px;color:#c69767;font-size:10px;font-style:normal}.history-note{margin:18px 0 0;padding:9px 12px;border-left:2px solid #c69767;background:#1b2023;color:#d9cbb9;font-size:11px;line-height:1.5}.history-note[hidden]{display:none}.history-note+#history-detail{margin-top:16px}:root[data-theme="light"] .history-note{background:#eae7e0;color:#5b3d22}:root[data-theme="light"] .record-list .record-note{color:#815026}
+.setting-hint{margin:12px 0 0;color:#a8adb0;font-size:11px;line-height:1.5}.setting-hint[hidden]{display:none}#formatting-hint{color:#d9cbb9}:root[data-theme="light"] .setting-hint{color:#555b60}:root[data-theme="light"] #formatting-hint{color:#5b3d22}
+.page-intro{margin:14px 0 0;color:#a8adb0;font-size:12px}
+.prompts-layout{display:grid;grid-template-columns:minmax(240px,36%) minmax(0,1fr);gap:1px;min-height:0;flex:1;background:#30363b;border:1px solid #30363b;margin-top:16px}
+.prompts-browser{display:flex;flex-direction:column;min-height:0;background:#111517}
+.prompts-browser>input{margin:12px;width:auto;background:#101416;color:#e8e5dd;border:1px solid #394046;border-radius:4px;padding:8px 10px;font-size:12px}
+.prompt-tag-filter{display:flex;flex-wrap:wrap;gap:6px;padding:0 12px 10px}
+.prompt-tag-filter:empty{display:none}
+.prompt-tag-filter button{border:1px solid #394046;border-radius:999px;background:transparent;color:#a8adb0;padding:2px 10px;font-size:11px}
+.prompt-tag-filter button.active{border-color:#c69767;color:#e8e5dd;background:rgba(198,151,103,.16)}
+.prompts-browser .record-list{flex:1;min-height:0;border-top:1px solid #30363b}
+.prompts-browser .record-list button strong{display:block;font-weight:600}
+.prompts-browser .record-list button span{display:block;color:#a8adb0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:3px}
+.prompt-editor{display:flex;flex-direction:column;gap:18px}
+.prompt-editor .action-form{margin:0;padding:6px 0 0;overflow:visible;flex:none}.prompt-editor .action-form label:has(textarea){grid-column:1/-1}
+.prompt-versions h2{font-size:12px;font-weight:600;margin:0 0 8px}
+.prompt-version{border-top:1px solid #30363b;padding:9px 0}
+.prompt-version-head{display:flex;align-items:center;gap:10px;font-size:12px}
+.prompt-version-head small{color:#858c90;font-size:10px;margin-right:auto}
+.prompt-version-head button{padding:4px 9px;font-size:11px}
+.prompt-version-body{white-space:pre-wrap;font:12px/1.5 "Segoe UI",Arial,sans-serif;color:#d6d3cc;background:#101416;border:1px solid #30363b;border-radius:4px;padding:8px 10px;margin:8px 0 0}
+.prompt-version-body[hidden]{display:none}
+@media(max-width:760px){.prompts-layout{grid-template-columns:1fr;overflow:auto}.prompts-browser .record-list{max-height:240px}}
+:root[data-theme="light"] .page-intro,:root[data-theme="light"] .prompts-browser .record-list button span{color:#555b60}
+:root[data-theme="light"] .prompts-layout,:root[data-theme="light"] .prompts-browser .record-list,:root[data-theme="light"] .prompt-version{border-color:#b9b7b0}:root[data-theme="light"] .prompts-layout{background:#b9b7b0}
+:root[data-theme="light"] .prompts-browser{background:#f7f5f0}
+:root[data-theme="light"] .prompts-browser>input,:root[data-theme="light"] .prompt-version-body{background:#f7f5f0;color:#202326;border-color:#a5a39d}
+:root[data-theme="light"] .prompt-tag-filter button{border-color:#a5a39d;color:#555b60}
+:root[data-theme="light"] .prompt-tag-filter button.active{border-color:#815026;color:#202326;background:rgba(129,80,38,.10)}
 
 /* Messages: contacts on the left, one conversation on the right. */
 .nav-badge{display:inline-block;min-width:17px;margin-left:8px;padding:1px 5px;border-radius:9px;background:#c69767;color:#0e1113;font-size:9px;font-weight:600;text-align:center;line-height:15px}

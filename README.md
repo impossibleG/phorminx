@@ -32,6 +32,10 @@ AI service.
   offers transcript, assistant, and split views. Asking the assistant includes newly
   captured transcript context without stopping capture. Optional automatic commentary
   runs only through a verified local Ollama model.
+- **Investigations:** long-lived collections of pasted text, notes, screenshots, links,
+  voice notes, and pinned answers, shown as a chronology or a connected diagram.
+  Screenshot text is read by locally downloaded OCR models. A dedicated shortcut sends
+  the clipboard to the active investigation, and the assistant answers with card citations.
 - **Library:** exact-word and optional local semantic search over retained text.
 - **Actions:** saved HTTP requests with transcript substitution or optional
   model-generated JSON, accessible from the launcher.
@@ -127,6 +131,12 @@ remain available even if translation is unavailable or cannot keep up. Fresh
 settings recommend `nomic-embed-text:latest`; existing embedding selections and
 indexes are not silently replaced.
 
+Investigations are kept until you delete them; dictation history retention does
+not apply to them. Screenshots are stored as re-encoded PNG files beside the
+database. Screenshot text recognition runs locally after an optional, verified
+model download (12.6 MB). A pasted link is fetched once, without cookies, for its
+title and preview; local and private-network addresses are never fetched.
+
 **Messages** (off by default) sends text directly to people you add with a
 one-time invite. Turning it on connects Phorminx to the Tor network through
 the embedded Arti client; there is no Phorminx server, and neither side learns
@@ -158,6 +168,7 @@ in bug reports or contributions. Use synthetic examples instead.
 - [Meeting capture and translation](docs/MEETING-CAPTURE-AND-TRANSLATION.md)
 - [Setup and operations release gates](docs/ADR-017-RELIABLE-SETUP-AND-MEETINGS.md)
 - [Setup and meetings acceptance checklist](docs/SETUP-MEETINGS-TEST-CHECKLIST.md)
+- [Investigations and local OCR](docs/ADR-018-INVESTIGATIONS-AND-LOCAL-OCR.md)
 
 ## License
 

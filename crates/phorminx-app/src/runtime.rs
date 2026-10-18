@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use phorminx_core::{
     AudioClip, DictationId, RuntimeState, RuntimeStateMachine, StateError, Transcript,
-    normalize_transcript, recommended_audio_context,
+    normalize_formatted, normalize_transcript, recommended_audio_context,
 };
 
 use crate::settings::RuntimeFormatting;
@@ -195,6 +195,11 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
 
     pub fn active_recording_mut(&mut self) -> Option<&mut Recording> {
         self.recording.as_mut()
+    }
+
+    /// The window the active dictation will be inserted into, if any.
+    pub fn active_target(&self) -> Option<&Target> {
+        self.target.as_ref()
     }
 
     pub fn is_clean_idle(&self) -> bool {
@@ -421,17 +426,15 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
         if self.machine.state() == RuntimeState::Transcribing {
             self.machine.transition(RuntimeState::Normalizing)?;
         }
-        let normalized = match self.formatting {
-            RuntimeFormatting::Raw => transcript.text,
-            RuntimeFormatting::Light => normalize_transcript(&transcript.text),
-            RuntimeFormatting::Balanced | RuntimeFormatting::Strong | RuntimeFormatting::Custom => {
-                if self.machine.state() == RuntimeState::Normalizing {
-                    self.machine.transition(RuntimeState::Cleaning)?;
-                    Self::show_status(io, UiStatus::Cleaning, &mut notices);
-                }
-                normalize_transcript(&transcript.text)
-            }
-        };
+        if !matches!(
+            self.formatting,
+            RuntimeFormatting::Raw | RuntimeFormatting::Light
+        ) && self.machine.state() == RuntimeState::Normalizing
+        {
+            self.machine.transition(RuntimeState::Cleaning)?;
+            Self::show_status(io, UiStatus::Cleaning, &mut notices);
+        }
+        let normalized = text_for_insertion(self.formatting, &transcript.text);
         if normalized.is_empty() {
             self.machine.cancel()?;
             io.discard_recovery(id);
@@ -592,6 +595,20 @@ impl<Target, Recording> AppRuntime<Target, Recording> {
     }
 }
 
+/// The exact text inserted for a transcript. Spoken text is joined into one
+/// tidy line; AI-formatted text keeps the paragraphs and lists the model
+/// produced, which the old single-line normalization flattened.
+pub fn text_for_insertion(formatting: RuntimeFormatting, text: &str) -> String {
+    match formatting {
+        RuntimeFormatting::Raw => text.to_owned(),
+        RuntimeFormatting::Light => normalize_transcript(text),
+        RuntimeFormatting::Balanced
+        | RuntimeFormatting::Strong
+        | RuntimeFormatting::Structured
+        | RuntimeFormatting::Custom => normalize_formatted(text),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -599,6 +616,27 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn ai_formatting_keeps_layout_but_spoken_text_is_one_line() {
+        let model = "Plan:\n\n- First ,  item\n- Second item";
+        assert_eq!(
+            text_for_insertion(RuntimeFormatting::Structured, model),
+            "Plan:\n\n- First, item\n- Second item"
+        );
+        assert_eq!(
+            text_for_insertion(RuntimeFormatting::Custom, model),
+            "Plan:\n\n- First, item\n- Second item"
+        );
+        assert_eq!(
+            text_for_insertion(RuntimeFormatting::Light, model),
+            "Plan: - First, item - Second item"
+        );
+        assert_eq!(
+            text_for_insertion(RuntimeFormatting::Raw, " as is "),
+            " as is "
+        );
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum FakeReason {

@@ -64,6 +64,13 @@ pub enum ProductShellControl {
     ModelDownloadFailed,
     VoskInstallFailed(String),
     ActivationBlocked(String),
+    /// Opens the review panel for the last dictation.
+    OpenReview(Box<crate::review::ReviewSeed>),
+    /// Outcome of a Replace request from the review panel.
+    ReviewResult {
+        notice: String,
+        replaced_text: Option<String>,
+    },
     /// Dictate a message to a messaging contact (launcher contacts panel).
     MessageContact {
         contact_id: i64,
@@ -87,6 +94,8 @@ pub enum ProductShellEvent {
     QuitRequested,
     Hidden,
     Failed(String),
+    /// The review panel asked to replace the last pasted text with this.
+    ReviewReplace(String),
 }
 
 pub struct ProductShell {
@@ -306,6 +315,7 @@ fn probe_readiness(
                 settings.formatting.strength,
                 FormattingStrength::Balanced
                     | FormattingStrength::Strong
+                    | FormattingStrength::Structured
                     | FormattingStrength::Custom
             ) || settings.search.embedding_model.is_some()
             {
@@ -2148,6 +2158,8 @@ impl eframe::App for ProductShellApp {
                     self.set_error(message);
                     self.refresh();
                 }
+                // The review panel exists only in the Tauri shell.
+                ProductShellControl::OpenReview(_) | ProductShellControl::ReviewResult { .. } => {}
                 ProductShellControl::MessageContact { .. } | ProductShellControl::OpenMessages => {
                     self.set_error("Messaging is available in the new Phorminx window.".into());
                     self.refresh();
@@ -2869,6 +2881,7 @@ fn map_formatting(value: FormattingStrength) -> ShellFormatting {
         FormattingStrength::Light => ShellFormatting::Light,
         FormattingStrength::Balanced => ShellFormatting::Balanced,
         FormattingStrength::Strong => ShellFormatting::Strong,
+        FormattingStrength::Structured => ShellFormatting::Structured,
         FormattingStrength::Custom => ShellFormatting::Custom,
     }
 }
@@ -2878,6 +2891,7 @@ fn unmap_formatting(value: ShellFormatting) -> FormattingStrength {
         ShellFormatting::Light => FormattingStrength::Light,
         ShellFormatting::Balanced => FormattingStrength::Balanced,
         ShellFormatting::Strong => FormattingStrength::Strong,
+        ShellFormatting::Structured => FormattingStrength::Structured,
         ShellFormatting::Custom => FormattingStrength::Custom,
     }
 }
@@ -2887,6 +2901,7 @@ fn map_profile_formatting(value: ShellFormatting) -> FormattingStyle {
         ShellFormatting::Light => FormattingStyle::Light,
         ShellFormatting::Balanced => FormattingStyle::Balanced,
         ShellFormatting::Strong => FormattingStyle::Strong,
+        ShellFormatting::Structured => FormattingStyle::Structured,
         ShellFormatting::Custom => FormattingStyle::Custom,
     }
 }
@@ -2919,6 +2934,7 @@ fn formatting_style_label(value: FormattingStyle) -> &'static str {
         FormattingStyle::Light => "Light",
         FormattingStyle::Balanced => "Balanced",
         FormattingStyle::Strong => "Strong",
+        FormattingStyle::Structured => "Structured",
         FormattingStyle::Custom => "Custom",
     }
 }

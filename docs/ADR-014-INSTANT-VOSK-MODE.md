@@ -91,3 +91,18 @@ runtime and model licenses must be reviewed before distributing a bundle. A
 stream-prefix continuity check, late/overrun detection, queue-drop detection,
 and an empty/high-energy sanity check route uncertain assembly through the
 untouched full archival clip.
+
+## Amendment (October 2026): a busy recognizer delays, it does not stop
+
+The live audio queue between the capture pump and the Instant worker was 8
+batches, and a full queue degraded the session, which stops the recording.
+In a quiet room Vosk can spend 0.3 to 1 second in one call while it
+finalizes an endpoint on silence, so dictations that did not start with
+speech were stopped after a second or two and reported "no speech".
+
+The queue now holds 64 batches, and when it is full the pump keeps the
+batch and retries it, in order, on the next tick. The capture retains every
+sample until the recognizer commits it, so delaying the live stream loses
+nothing. Only a worker that is gone ends the stream. Recognizer creation,
+slow Vosk calls and worker drain gaps are logged so a regression shows up in
+the diagnostics.

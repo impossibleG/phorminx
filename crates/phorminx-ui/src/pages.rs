@@ -1595,6 +1595,7 @@ fn profile_editor(ui: &mut Ui, draft: &mut ProfileDraft, outbox: &mut Vec<ShellE
                 FormattingStrength::Light,
                 FormattingStrength::Balanced,
                 FormattingStrength::Strong,
+                FormattingStrength::Structured,
                 FormattingStrength::Custom,
             ] {
                 ui.selectable_value(&mut draft.formatting, value, formatting_label(value));
@@ -1639,6 +1640,7 @@ fn parse_formatting(value: &str) -> FormattingStrength {
         "Raw" => FormattingStrength::Raw,
         "Light" => FormattingStrength::Light,
         "Strong" => FormattingStrength::Strong,
+        "Structured" => FormattingStrength::Structured,
         "Custom" => FormattingStrength::Custom,
         _ => FormattingStrength::Balanced,
     }
@@ -1958,6 +1960,7 @@ fn settings(
                             FormattingStrength::Light,
                             FormattingStrength::Balanced,
                             FormattingStrength::Strong,
+                            FormattingStrength::Structured,
                             FormattingStrength::Custom,
                         ] {
                             let available = matches!(
@@ -1992,6 +1995,7 @@ fn settings(
                     state.settings.formatting,
                     FormattingStrength::Balanced
                         | FormattingStrength::Strong
+                        | FormattingStrength::Structured
                         | FormattingStrength::Custom
                 )
             {
@@ -2195,6 +2199,7 @@ const fn formatting_label(value: FormattingStrength) -> &'static str {
         FormattingStrength::Light => "Light",
         FormattingStrength::Balanced => "Balanced",
         FormattingStrength::Strong => "Strong",
+        FormattingStrength::Structured => "Structured",
         FormattingStrength::Custom => "Custom",
     }
 }

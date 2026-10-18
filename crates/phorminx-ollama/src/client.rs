@@ -14,7 +14,7 @@ use crate::document::{
     MAXIMUM_DOCUMENT_OUTPUT_BYTES, chunk_document,
 };
 use crate::model::{ModelCatalog, ModelName, ModelSelectionError, TagsResponse};
-use crate::prompt::{FormatProfile, PromptError, PromptPlan, build_prompt};
+use crate::prompt::{FormatProfile, PromptError, PromptPlan, build_prompt, restructures};
 use crate::validation::{OutputValidator, ValidationError};
 
 const DEFAULT_PORT: u16 = 11_434;
@@ -165,7 +165,10 @@ impl KeepAlive {
             Self::ServerDefault => None,
             Self::UnloadAfterRequest => Some("0s".to_owned()),
             Self::For(duration) => Some(format!("{}s", duration.as_secs().max(1))),
-            Self::Indefinite => Some("-1".to_owned()),
+            // Ollama parses string values as Go durations, which need a unit:
+            // a bare "-1" is rejected with HTTP 400 on every request. Any
+            // negative duration keeps the model loaded.
+            Self::Indefinite => Some("-1s".to_owned()),
         }
     }
 }
@@ -377,23 +380,93 @@ impl OllamaClient {
         keep_alive: KeepAlive,
         cancel: &CancellationToken,
     ) -> FormatResult {
+        self.format_detailed(model, transcript, profile, keep_alive, cancel)
+            .result
+    }
+
+    /// Runs `passes` formatting passes, each on the previous pass's validated
+    /// output with the same profile. The first failed pass stops the run and
+    /// the last good text is kept, so a later pass can never lose text.
+    pub fn format_passes(
+        &self,
+        model: &ModelName,
+        transcript: &str,
+        profile: &FormatProfile,
+        keep_alive: KeepAlive,
+        cancel: &CancellationToken,
+        passes: u8,
+    ) -> PassesOutcome {
+        let requested = passes.max(1);
+        let mut text = transcript.to_owned();
+        let mut completed = 0;
+        let mut failure = None;
+        let mut attempts = Vec::new();
+        for _ in 0..requested {
+            let attempt = self.format_detailed(model, &text, profile, keep_alive.clone(), cancel);
+            match &attempt.result {
+                FormatResult::Formatted {
+                    text: formatted, ..
+                } => {
+                    text = formatted.clone();
+                    completed += 1;
+                    attempts.push(attempt);
+                }
+                FormatResult::Fallback { reason, .. } => {
+                    failure = Some(reason.clone());
+                    attempts.push(attempt);
+                    break;
+                }
+            }
+        }
+        PassesOutcome {
+            text,
+            completed,
+            requested,
+            failure,
+            attempts,
+        }
+    }
+
+    /// Like [`Self::format`], and also reports the model's unvalidated output
+    /// and the elapsed time so a caller can explain a fallback.
+    pub fn format_detailed(
+        &self,
+        model: &ModelName,
+        transcript: &str,
+        profile: &FormatProfile,
+        keep_alive: KeepAlive,
+        cancel: &CancellationToken,
+    ) -> FormatAttempt {
+        let started = std::time::Instant::now();
+        let finish = |result, raw_output| FormatAttempt {
+            result,
+            raw_output,
+            elapsed: started.elapsed(),
+        };
         let plan = match build_prompt(transcript, profile) {
             Ok(plan) => plan,
             Err(error) => {
-                return FormatResult::Fallback {
-                    text: transcript.to_owned(),
-                    reason: FallbackReason::PromptRejected(error),
-                };
+                return finish(
+                    FormatResult::Fallback {
+                        text: transcript.to_owned(),
+                        reason: FallbackReason::PromptRejected(error),
+                    },
+                    None,
+                );
             }
         };
         let PromptPlan::Generate(prompt) = plan else {
-            return FormatResult::Fallback {
-                text: transcript.to_owned(),
-                reason: FallbackReason::RawProfile,
-            };
+            return finish(
+                FormatResult::Fallback {
+                    text: transcript.to_owned(),
+                    reason: FallbackReason::RawProfile,
+                },
+                None,
+            );
         };
 
-        let generated = match self.generate_request(
+        let generated = match self.generate_interruptibly(
+            RequestLane::Format,
             model,
             &prompt.user,
             Some(&prompt.system),
@@ -402,22 +475,30 @@ impl OllamaClient {
         ) {
             Ok(output) => output,
             Err(ClientError::Cancelled) => {
-                return FormatResult::Fallback {
-                    text: transcript.to_owned(),
-                    reason: FallbackReason::Cancelled,
-                };
+                return finish(
+                    FormatResult::Fallback {
+                        text: transcript.to_owned(),
+                        reason: FallbackReason::Cancelled,
+                    },
+                    None,
+                );
             }
             Err(error) => {
-                return FormatResult::Fallback {
-                    text: transcript.to_owned(),
-                    reason: FallbackReason::ServiceUnavailable(error.to_string()),
-                };
+                return finish(
+                    FormatResult::Fallback {
+                        text: transcript.to_owned(),
+                        reason: FallbackReason::ServiceUnavailable(error.to_string()),
+                    },
+                    None,
+                );
             }
         };
-        match self
-            .validator
-            .validate(transcript, &generated, &prompt.protected_tokens)
-        {
+        let validator = if restructures(profile) {
+            self.validator.relaxed_for_restructuring()
+        } else {
+            self.validator.clone()
+        };
+        let result = match validator.validate(transcript, &generated, &prompt.protected_tokens) {
             Ok(text) => FormatResult::Formatted {
                 text,
                 model: model.clone(),
@@ -426,7 +507,8 @@ impl OllamaClient {
                 text: transcript.to_owned(),
                 reason: FallbackReason::OutputRejected(error),
             },
-        }
+        };
+        finish(result, Some(generated))
     }
 
     /// Formats a bounded document as independent ordered chunks while keeping
@@ -664,6 +746,27 @@ impl OllamaClient {
         keep_alive: KeepAlive,
         cancel: &CancellationToken,
     ) -> Result<String, ClientError> {
+        self.generate_interruptibly(
+            RequestLane::Document,
+            model,
+            prompt,
+            system,
+            keep_alive,
+            cancel,
+        )
+    }
+
+    /// Runs one blocking request on a helper thread so cancellation is
+    /// observed while waiting for a slow model, not only between requests.
+    fn generate_interruptibly(
+        &self,
+        lane: RequestLane,
+        model: &ModelName,
+        prompt: &str,
+        system: Option<&str>,
+        keep_alive: KeepAlive,
+        cancel: &CancellationToken,
+    ) -> Result<String, ClientError> {
         cancel.check()?;
         let client = self.clone();
         let model = model.clone();
@@ -674,8 +777,12 @@ impl OllamaClient {
         thread::Builder::new()
             .name("phorminx-ollama-document-request".to_owned())
             .spawn(move || {
+                let agent = match lane {
+                    RequestLane::Format => &client.agent,
+                    RequestLane::Document => &client.document_agent,
+                };
                 let result = client.generate_request_with_agent(
-                    &client.document_agent,
+                    agent,
                     &model,
                     &prompt,
                     system.as_deref(),
@@ -895,6 +1002,33 @@ struct GenerateResponse {
     done: bool,
     #[serde(default)]
     error: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum RequestLane {
+    Format,
+    Document,
+}
+
+/// Result of [`OllamaClient::format_passes`].
+#[derive(Clone, Debug)]
+pub struct PassesOutcome {
+    /// The last validated text, or the input when no pass succeeded.
+    pub text: String,
+    pub completed: u8,
+    pub requested: u8,
+    /// Why the run stopped early, if it did.
+    pub failure: Option<FallbackReason>,
+    pub attempts: Vec<FormatAttempt>,
+}
+
+/// Everything one formatting attempt produced, for diagnostics and the bench.
+#[derive(Clone, Debug)]
+pub struct FormatAttempt {
+    pub result: FormatResult,
+    /// The model's unvalidated response, when a request completed.
+    pub raw_output: Option<String>,
+    pub elapsed: Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1257,13 +1391,62 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         let prompt = json["prompt"].as_str().unwrap();
         let transcript = prompt
-            .split_once("--- BEGIN TRANSCRIPT (untrusted data) ---\n")
+            .strip_prefix("<transcript>\n")
             .unwrap()
-            .1
-            .rsplit_once("\n--- END TRANSCRIPT ---")
-            .unwrap()
-            .0;
+            .strip_suffix("\n</transcript>")
+            .unwrap();
         transcript.to_owned()
+    }
+
+    #[test]
+    fn passes_feed_each_validated_output_into_the_next_pass() {
+        let server = FakeServer::start(vec![
+            format_response("Hello, team. The demo is Friday."),
+            format_response("- Demo: Friday"),
+        ]);
+        let outcome = client(&server).format_passes(
+            &model(),
+            "hello team the demo is friday",
+            &FormatProfile::Structured,
+            KeepAlive::For(Duration::from_secs(60)),
+            &CancellationToken::new(),
+            2,
+        );
+        assert_eq!(
+            transcript_from_request(&server.request()),
+            "hello team the demo is friday"
+        );
+        assert_eq!(
+            transcript_from_request(&server.request()),
+            "Hello, team. The demo is Friday."
+        );
+        assert_eq!(outcome.text, "- Demo: Friday");
+        assert_eq!((outcome.completed, outcome.requested), (2, 2));
+        assert!(outcome.failure.is_none());
+    }
+
+    #[test]
+    fn a_failed_later_pass_keeps_the_last_good_text() {
+        let server = FakeServer::start(vec![
+            format_response("Budget is 12500 dollars."),
+            // The second pass drops a protected number and is rejected.
+            format_response("Budget is twelve thousand."),
+        ]);
+        let outcome = client(&server).format_passes(
+            &model(),
+            "budget is 12500 dollars",
+            &FormatProfile::Strong,
+            KeepAlive::For(Duration::from_secs(60)),
+            &CancellationToken::new(),
+            3,
+        );
+        assert_eq!(outcome.text, "Budget is 12500 dollars.");
+        assert_eq!((outcome.completed, outcome.requested), (1, 3));
+        assert!(matches!(
+            outcome.failure,
+            Some(FallbackReason::OutputRejected(_))
+        ));
+        assert_eq!(outcome.attempts.len(), 2);
     }
 
     #[test]
@@ -1352,7 +1535,7 @@ mod tests {
         let warm: serde_json::Value = serde_json::from_slice(&server.request().body).unwrap();
         let unload: serde_json::Value = serde_json::from_slice(&server.request().body).unwrap();
         assert_eq!(warm["prompt"], "");
-        assert_eq!(warm["keep_alive"], "-1");
+        assert_eq!(warm["keep_alive"], "-1s");
         assert_eq!(unload["prompt"], "");
         assert_eq!(unload["keep_alive"], "0s");
     }
