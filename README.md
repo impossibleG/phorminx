@@ -6,113 +6,211 @@
 
 <p align="center"><strong>Voice, disciplined.</strong></p>
 
-Local-first dictation and meeting assistance for Windows. Turn speech into text,
-keep searchable notes, and use optional AI formatting without requiring a paid
-AI service.
-
 <p align="center">
-  <a href="docs/DEVELOPMENT.md">Build from source</a> ·
-  <a href="#what-it-does">Features</a> ·
-  <a href="#privacy-and-network-access">Privacy</a>
+  Local-first dictation, meetings and research notes for Windows.<br>
+  Speak, keep searchable text, and use AI formatting without a paid AI service.
 </p>
 
-![Phorminx Meetings workspace in light mode](docs/images/meetings.png)
-
-<p align="center"><sub>The Meetings workspace. Screenshots use synthetic demo data.</sub></p>
-
-## What it does
-
-- **Dictation:** resident Vosk recognition for Instant mode, or Whisper with
-  optional Vulkan acceleration for Accurate mode. Transcription begins while
-  speaking, using a bounded rolling audio buffer.
-- **Formatting:** deterministic cleanup and an optional local Ollama model,
-  with configurable formatting strength, a personal lexicon, and app profiles.
-- **Meetings:** computer audio and microphone together, with source labels and timestamps;
-  optional local translation preserves the original transcript. A resizable companion
-  offers transcript, assistant, and split views. Asking the assistant includes newly
-  captured transcript context without stopping capture. Optional automatic commentary
-  runs only through a verified local Ollama model.
-- **Investigations:** long-lived collections of pasted text, notes, screenshots, links,
-  voice notes, and pinned answers, shown as a chronology or a connected diagram.
-  Screenshot text is read by locally downloaded OCR models. A dedicated shortcut sends
-  the clipboard to the active investigation, and the assistant answers with card citations.
-- **Library:** exact-word and optional local semantic search over retained text.
-- **Actions:** saved HTTP requests with transcript substitution or optional
-  model-generated JSON, accessible from the launcher.
-- **Desktop controls:** configurable shortcuts, light/dark appearance,
-  model management, and setup/repair tools.
-- **Operations:** review-and-send voice feedback and opt-in signed update support.
-  These require configured server storage and release signing before public use.
-
-### Keep the meeting in view
-
-The normal, resizable companion puts the live transcript and assistant beside the
-conversation. Choose Original, Translation, or Both; resize the split or focus on
-one pane. Ask a question with the latest transcript context while capture
-continues. Independent controls pause Phorminx's transcription of your mic or
-computer audio; they do not mute your call.
-
 <p align="center">
-  <img src="docs/images/companion.png" alt="Phorminx floating companion in dark mode, with a synthetic live transcript and assistant response" width="344" height="544">
+  <a href="https://github.com/impossibleG/phorminx/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/impossibleG/phorminx?label=release"></a>
+  <a href="https://github.com/impossibleG/phorminx/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/impossibleG/phorminx/total"></a>
+  <img alt="Windows 10 and 11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4">
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green"></a>
 </p>
 
-## Getting started
+<p align="center">
+  <a href="https://github.com/impossibleG/phorminx/releases/latest/download/Phorminx-x64-setup.exe"><img alt="Download for Windows" src="https://img.shields.io/badge/Download_for_Windows-x64_installer-1f6feb?style=for-the-badge&logo=windows&logoColor=white"></a>
+  <br>
+  <a href="https://phorminx.net">phorminx.net</a> ·
+  <a href="docs/GETTING-STARTED.md">Getting started</a> ·
+  <a href="docs/DEVELOPMENT.md">Build from source</a>
+</p>
 
-Phorminx targets Windows 10/11 x64. It is alpha software; recognition accuracy,
-latency, and compatibility depend on the device, audio source, and model.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/features/hero-dark.webp">
+  <source media="(prefers-color-scheme: light)" srcset="docs/features/hero-light.webp">
+  <img alt="The Phorminx meeting companion: an English transcript with its Portuguese translation beside an assistant answer" src="docs/features/hero-light.webp">
+</picture>
 
-Build from source using the [development guide](docs/DEVELOPMENT.md).
-Speech models and Vosk runtime assets are separate downloads and are not
-included in this source repository. Configure them in the application's setup
-and model screens. Ollama is optional; dictation can run without AI formatting.
+<p align="center"><sub>Screenshots show the real app running on a demo profile filled with made-up content.
+See <a href="docs/features/CAPTURE.md">how they are made</a>.</sub></p>
 
-The branded installer opens Phorminx's setup window after installation. Choose
-**Prepare everything** to install the local starter bundle without a terminal,
-or review individual repair steps. Progress and errors appear in Phorminx; a
-safe stop finishes the current step first. Use **Prepare Phorminx** in the Start
-menu to retry. Silent updates skip this onboarding. Setup preserves existing
-settings and saved text.
+<table>
+  <tr>
+    <td align="center" width="33%"><a href="#dictation"><img src="docs/features/dictation.webp" alt="Dictation"><br><b>Dictation</b></a></td>
+    <td align="center" width="33%"><a href="#formatting-and-custom-instructions"><img src="docs/features/formatting.webp" alt="Formatting"><br><b>Formatting</b></a></td>
+    <td align="center" width="33%"><a href="#prompts-library"><img src="docs/features/prompts.webp" alt="Prompts library"><br><b>Prompts</b></a></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="#meetings-and-live-translation"><img src="docs/features/meetings.webp" alt="Meetings"><br><b>Meetings</b></a></td>
+    <td align="center"><a href="#companion-assistant"><img src="docs/features/assistant.webp" alt="Companion assistant"><br><b>Companion assistant</b></a></td>
+    <td align="center"><a href="#investigations"><img src="docs/features/investigations.webp" alt="Investigations"><br><b>Investigations</b></a></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="#messages"><img src="docs/features/messages.webp" alt="Messages"><br><b>Messages</b></a></td>
+    <td align="center"><a href="#library-search"><img src="docs/features/library.webp" alt="Library search"><br><b>Library search</b></a></td>
+    <td align="center"><a href="#actions"><img src="docs/features/actions.webp" alt="Actions"><br><b>Actions</b></a></td>
+  </tr>
+</table>
 
-For an already installed app, an English starter bundle can be downloaded and
-configured automatically. Close Phorminx (including its tray icon), then run
-this from the repository folder in **64-bit PowerShell as your normal user**:
+## Dictation
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Initialize-Phorminx.ps1
-```
+Press a shortcut, speak, and the text lands in whatever app you were using.
+Recognition runs on your computer.
 
-The script downloads Vosk's English model/runtime, Whisper base.en, installs
-Ollama and the Vulkan runtime if missing, and pulls `qwen2.5:1.5b` for formatting
-and `nomic-embed-text` for semantic search. Allow several GB of free disk space
-and time for downloads. Windows may request administrator approval for Vulkan.
-The speech assets are hash-verified and installers are publisher-verified.
-On a fresh installation it configures Instant mode, balanced formatting, and
-local semantic search. Existing settings and saved text are preserved; existing
-installations may need to select the downloaded models in Settings/Models.
-The script can be rerun after a failed download. Add `-Plan` to preview its scope
-without changing anything. It is also standalone: the script file can be shared
-alongside the app installer, without requiring a repository checkout.
+<img src="docs/features/dictation.webp" alt="Phorminx Home with recent dictations and the status of local speech and language systems">
 
-This does **not** install Phorminx itself, source-build tools, or GPU drivers.
-Vulkan acceleration needs a compatible GPU/vendor driver; installing the Vulkan
-runtime alone does not establish GPU compatibility. This starter downloads
-English models, not every available language or model variant.
+- **Instant** mode uses resident Vosk recognition; **Accurate** mode uses
+  Whisper, with optional Vulkan acceleration.
+- Transcription begins while you speak, using a bounded rolling audio buffer.
+- **Live text** shows the last line or two of recognized speech in the status
+  pill while you dictate (on by default, switchable in Settings).
+- Hold-to-talk or toggle recording, from the `Ctrl+Alt+Space` launcher or an
+  optional direct dictation shortcut.
+- Dictations are kept in local history for 7 days by default; choose 1 day,
+  30 days, indefinitely, or off.
 
-The default `Ctrl+Alt+Space` shortcut opens the P launcher. Choose Dictate, speak,
-then press the shortcut again to finish. Settings provides shortcut and
-appearance preferences. Meetings and Actions have their own workspaces.
+## Review panel
 
-Models also offers curated English Vosk choices ranging from a small download to
-multi-gigabyte models. Downloads do not switch the active model: explicitly choose
-**Use for English Instant** after setup. Native validation runs in the background.
-Larger models require more memory and are not guaranteed to improve every voice.
-Dual-source meetings run two recognizers; headphones help avoid speaker audio
-being transcribed a second time through the microphone. Meeting settings save
-the input and output devices separately for the next session. A configured,
-installed small local fallback model may retry a failed assistant response once;
-assistant failure never ends capture.
+Fix the last dictation without dictating it again. Open it from the status
+pill's Expand button.
 
-## Privacy and network access
+- Edit the text, then copy it or replace what was inserted.
+- **Reformat** with another strength or a one-off instruction (which can use
+  `@` prompts).
+- **Replace** only updates the inserted text when it is still there and
+  unchanged; otherwise the result goes to the clipboard.
+
+<sub>No screenshot yet: the panel only opens after a live dictation, which
+could not be recorded with synthetic audio on the capture machine.</sub>
+
+## Formatting and custom instructions
+
+Turn rambling speech into clean text with a local Ollama model, or skip AI
+entirely and keep deterministic cleanup.
+
+<img src="docs/features/formatting.webp" alt="Dictation settings: Accurate Whisper mode, Custom formatting with a local model and two passes, and custom instructions that use an @ prompt chip">
+
+- Strengths from **Raw** to **Light**, **Balanced**, **Strong**, **Structured**
+  and **Custom** instructions.
+- **Formatting passes** run the model more than once, each pass refining the last.
+- The **lexicon** maps how words are heard to how they should be written
+  (names, products, jargon), optionally per language or app.
+- **App profiles** change formatting style, instructions, language and
+  insertion method for a specific program, or turn dictation off there.
+
+## Prompts library
+
+Named, tagged, versioned instructions you can reuse anywhere Phorminx asks
+for instructions.
+
+<img src="docs/features/prompts.webp" alt="The Prompts page with tagged prompts and the version history of one prompt">
+
+- Type `@` in any instruction field to insert a prompt; it shows as a chip.
+- References always use the prompt's latest version: dictation formatting,
+  app profiles, the review panel, the meeting assistant and AI-written Actions.
+- Every save keeps a version you can restore.
+- Deleting or renaming a prompt that is in use lists every place that refers to it first.
+
+## Meetings and live translation
+
+Capture computer audio and your microphone together, with timestamps and an
+optional local translation beside the original.
+
+<img src="docs/features/meetings.webp" alt="A saved meeting with each English line followed by its Portuguese translation">
+
+- Dual-source capture runs two recognizers; mute either source for Phorminx
+  without muting your call.
+- Translation uses a separately selected local Ollama model and never
+  replaces the original transcript.
+- Show Original, Translation, or Both.
+- Saved sessions are searchable by title, transcript and chat.
+
+## Companion assistant
+
+A resizable companion window keeps the transcript and an assistant beside the
+conversation.
+
+<img src="docs/features/assistant.webp" alt="The companion's Assistant view answering a question about the meeting">
+
+- **Transcript**, **Together** (split, with a draggable divider) and
+  **Assistant** views.
+- Asking a question includes newly captured transcript context without
+  stopping capture.
+- Use a local Ollama model, or choose OpenAI or Anthropic with your own key.
+- Optional automatic commentary runs only through a verified local Ollama model.
+- A configured local fallback model may retry a failed answer once; assistant
+  failure never ends capture.
+
+## Investigations
+
+Collect everything about one question in one place: pasted text, notes,
+screenshots, links, voice notes and pinned answers.
+
+<img src="docs/features/investigations.webp" alt="An investigation in chronology view with cards and an assistant answer citing them">
+
+<img src="docs/features/investigations-diagram.webp" alt="The same investigation as a diagram of connected cards and a concept">
+
+- See it as a **chronology** or as a **diagram** of connected cards and concepts.
+- The assistant answers from your cards with citations like `[#3]`, and can
+  suggest connections for you to accept or dismiss.
+- Screenshot text is read by locally downloaded OCR models.
+- A dedicated shortcut sends the clipboard to the active investigation from
+  any app. Export an investigation as Markdown.
+
+## Messages
+
+Send text directly to people you add with a one-time invite, with no
+Phorminx server in between. Off by default.
+
+<img src="docs/features/messages.webp" alt="The Messages page before it is turned on, explaining the direct Tor connection">
+
+- Turning it on connects to the Tor network through the embedded Arti client.
+- Neither side learns the other's IP address; contacts can see when you are online.
+- A message only moves while both of you have Phorminx running.
+- History stays on this computer and can be deleted per contact.
+
+## And also
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <h3 id="library-search">Library search</h3>
+      <img src="docs/features/library.webp" alt="History search finding a dictation by exact words">
+      <p>Exact-word and optional local semantic search over retained
+      dictations; saved meetings have their own search.</p>
+    </td>
+    <td width="50%" valign="top">
+      <h3 id="actions">Actions</h3>
+      <img src="docs/features/actions.webp" alt="Editing an action whose JSON payload is written by a local model">
+      <p>Saved HTTP requests with transcript substitution or local
+      model-written JSON, on launcher keys 3 to 9.</p>
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <h3 id="models-and-setup">Models and setup</h3>
+      <img src="docs/features/models.webp" alt="The Models page with Whisper, Vosk and screenshot text recognition">
+      <p>Hash-verified Whisper, Vosk and OCR downloads, Ollama models, and a
+      guided setup that can prepare everything or repair one step.</p>
+    </td>
+    <td valign="top">
+      <h3 id="automatic-updates">Automatic updates</h3>
+      <p>Release builds check GitHub Releases daily, verify signed metadata
+      and installer hashes, and install when Phorminx is closed or idle,
+      never during a recording. Both the daily check and automatic install
+      can be turned off in Settings → Updates.</p>
+    </td>
+  </tr>
+</table>
+
+## Privacy at a glance
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/features/privacy-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/features/privacy-light.svg">
+  <img alt="Speech recognition, local formatting, search, OCR and your saved text stay on your computer. Feedback, a remote assistant, Actions, Messages and downloads leave only when you choose." src="docs/features/privacy-light.svg" width="820">
+</picture>
 
 Speech recognition runs locally. The production capture path keeps audio in
 memory rather than saving recordings to disk. Retained text and settings live
@@ -158,8 +256,25 @@ feature makes an unconfigured feedback server ready.
 Do not include real transcripts, recordings, credentials, or personal settings
 in bug reports or contributions. Use synthetic examples instead.
 
+## Getting started
+
+1. **Install.** [Download the installer](https://github.com/impossibleG/phorminx/releases/latest/download/Phorminx-x64-setup.exe)
+   for Windows 10/11 x64. Alpha builds are not Authenticode-signed yet, so
+   SmartScreen may warn on first run.
+2. **Prepare.** The setup window opens after installation. Choose
+   **Prepare everything** for the English starter bundle (speech models,
+   Ollama, a small local formatting model and local embeddings), or run
+   individual steps. Ollama is optional; dictation works without AI formatting.
+3. **Dictate.** Press `Ctrl+Alt+Space` to open the P launcher, choose Dictate,
+   speak, and press the shortcut again to finish.
+
+Phorminx is alpha software; accuracy, latency and compatibility depend on the
+device, audio source and model. The [getting started guide](docs/GETTING-STARTED.md)
+covers the PowerShell starter bundle, model choices and meeting audio tips.
+
 ## Documentation
 
+- [Getting started](docs/GETTING-STARTED.md)
 - [Build, test, and package](docs/DEVELOPMENT.md)
 - [Windows compatibility checks](docs/WINDOWS-COMPATIBILITY-PROTOCOL.md)
 - [Architecture decision records](docs/README.md)
@@ -169,6 +284,9 @@ in bug reports or contributions. Use synthetic examples instead.
 - [Setup and operations release gates](docs/ADR-017-RELIABLE-SETUP-AND-MEETINGS.md)
 - [Setup and meetings acceptance checklist](docs/SETUP-MEETINGS-TEST-CHECKLIST.md)
 - [Investigations and local OCR](docs/ADR-018-INVESTIGATIONS-AND-LOCAL-OCR.md)
+- [Peer-to-peer messaging](docs/ADR-018-P2P-MESSAGING.md)
+- [Prompt library](docs/ADR-019-PROMPT-LIBRARY.md)
+- [Recreating the README screenshots](docs/features/CAPTURE.md)
 
 ## License
 
