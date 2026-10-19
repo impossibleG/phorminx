@@ -2,6 +2,7 @@
 
 pub mod benchmarks;
 pub mod feedback;
+pub mod feedback_status;
 #[cfg(test)]
 mod frontend_tests;
 mod history_loader;

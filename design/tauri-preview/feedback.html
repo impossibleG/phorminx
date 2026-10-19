@@ -13,7 +13,14 @@
   <main>
     <div class="heading"><small>REPORT / LOCAL DRAFT</small><h1>Tell us what happened.</h1><p>Only the report you send goes to phorminx.net. Audio, meetings and history are not attached.</p></div>
     <div class="composer"><label for="report">YOUR REPORT</label><textarea id="report" rows="11" maxlength="12000" placeholder="Describe what happened…"></textarea><div id="provisional" class="provisional" aria-live="polite"></div><div class="composer-foot"><span id="count">0 / 12,000 bytes</span><span>Review before sending</span></div></div>
-    <label class="diagnostics"><input id="diagnostics" type="checkbox"> Include app version and recognition mode only</label>
+    <div class="tidy" role="group" aria-label="Tidy up the text"><label for="strength">FORMATTING</label><select id="strength"><option value="light">Light</option><option value="balanced" selected>Balanced</option><option value="strong">Strong</option><option value="structured">Structured · Markdown</option><option value="custom">Custom</option></select><input id="instruction" maxlength="500" placeholder="One-off instruction, e.g. make it a list of steps" aria-label="One-off instruction"><button id="reformat" type="button">Reformat</button></div>
+    <label class="diagnostics"><input id="comment" type="checkbox"> This is a comment for the website, not a problem</label>
+    <div id="comment-options" class="comment-options" hidden>
+      <label class="diagnostics"><input id="consent" type="checkbox"> phorminx.net may show this comment once the team has read it</label>
+      <label class="comment-name" for="display-name">Name to show, optional<input id="display-name" maxlength="40" placeholder="A first name or nickname" autocomplete="off"></label>
+      <p class="comment-note">Comments carry no ticket, diagnostics or contact details. You can take yours down from Feedback at any time.</p>
+    </div>
+    <label id="diagnostics-row" class="diagnostics"><input id="diagnostics" type="checkbox"> Include app version and recognition mode only</label>
   </main>
   <footer class="actions-bar">
     <div class="actions"><button id="record" type="button">Record report</button><button id="stop" type="button" hidden>Stop recording</button><button id="send" class="primary" type="button">Send report</button></div>

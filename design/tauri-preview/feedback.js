@@ -10,7 +10,16 @@ let saving = false;
 let savePromise = Promise.resolve();
 
 function countBytes(text) { return new TextEncoder().encode(text).length; }
-function updateCount() { element('count').textContent = `${countBytes(element('report').value).toLocaleString()} / 12,000 bytes`; }
+// A public comment is shorter than a report.
+function limit() { return element('comment').checked ? 2000 : 12000; }
+function updateCount() { element('count').textContent = `${countBytes(element('report').value).toLocaleString()} / ${limit().toLocaleString()} bytes`; }
+function updateMode() {
+  const comment = element('comment').checked;
+  element('comment-options').hidden = !comment;
+  element('diagnostics-row').hidden = comment;
+  element('send').textContent = comment ? 'Share comment' : 'Send report';
+  updateCount();
+}
 
 function saveDraft() {
   if (!invoke) return Promise.resolve();
@@ -27,6 +36,9 @@ function saveDraft() {
       await invoke('plugin:phorminx-host|feedback_update', {
         text,
         diagnostics: element('diagnostics').checked,
+        comment: element('comment').checked,
+        consent: element('consent').checked,
+        displayName: element('display-name').value,
       });
       if (generation === editGeneration) {
         pendingEdit = false;
@@ -50,15 +62,25 @@ async function refresh() {
       lastServerText = view.text;
       updateCount();
     }
-    element('report').disabled = view.recording || view.sending;
-    element('diagnostics').disabled = view.recording || view.sending;
-    if (!pendingEdit) element('diagnostics').checked = view.diagnostics;
+    const busy = view.recording || view.sending || view.reformatting;
+    element('report').disabled = busy;
+    for (const id of ['diagnostics', 'comment', 'consent', 'display-name', 'strength', 'instruction']) element(id).disabled = busy;
+    element('reformat').disabled = busy || !element('report').value.trim();
+    element('reformat').textContent = view.reformatting ? 'Reformatting…' : 'Reformat';
+    if (!pendingEdit) {
+      element('diagnostics').checked = view.diagnostics;
+      element('comment').checked = view.comment;
+      element('consent').checked = view.consent;
+      if (document.activeElement !== element('display-name')) element('display-name').value = view.displayName;
+      updateMode();
+    }
     element('record').hidden = view.recording;
     element('record').disabled = view.sending;
     element('stop').hidden = !view.recording;
     element('stop').disabled = view.stopping;
-    element('send').disabled = view.recording || view.sending || !element('report').value.trim()
-      || countBytes(element('report').value) > 12000;
+    element('send').disabled = busy || !element('report').value.trim()
+      || countBytes(element('report').value) > limit()
+      || (element('comment').checked && !element('consent').checked);
     element('provisional').textContent = view.provisionalText;
     element('notice').textContent = view.notice;
   } catch (error) { element('notice').textContent = String(error); }
@@ -84,6 +106,17 @@ function draftChanged() {
 }
 element('report').addEventListener('input', draftChanged);
 element('diagnostics').addEventListener('change', draftChanged);
+element('comment').addEventListener('change', () => { updateMode(); draftChanged(); });
+element('consent').addEventListener('change', draftChanged);
+element('display-name').addEventListener('input', draftChanged);
+element('reformat').addEventListener('click', async () => {
+  if (!invoke) return;
+  try {
+    await saveDraft();
+    await invoke('plugin:phorminx-host|feedback_reformat', {strength: element('strength').value, instruction: element('instruction').value.trim() || null});
+    await refresh();
+  } catch (error) { element('notice').textContent = String(error); }
+});
 element('report').addEventListener('blur', () => { if (pendingEdit) void saveDraft().catch((error) => { element('notice').textContent = String(error); }); });
 element('diagnostics').addEventListener('blur', () => { if (pendingEdit) void saveDraft().catch((error) => { element('notice').textContent = String(error); }); });
 element('record').addEventListener('click', () => { void action('record'); });

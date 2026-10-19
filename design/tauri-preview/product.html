@@ -41,7 +41,7 @@
         <button type="button" data-route="models">Models</button>
         <button type="button" data-route="benchmarks">Benchmarks</button>
         <button type="button" data-route="setup">Setup &amp; repair</button>
-        <button id="open-feedback" type="button">Feedback</button>
+        <button type="button" data-route="feedback">Feedback</button>
         <p>LOCAL ONLY</p>
       </nav>
       <main>
@@ -145,6 +145,12 @@
           <div id="setup-updates-card" class="setting-card"><small>NEW FEATURES</small><h2>Keep Phorminx current</h2><label class="check-row"><input id="setup-auto-updates" type="checkbox" checked>Keep getting tested new features automatically</label><p>Phorminx checks signed GitHub Releases daily and installs a verified update when Phorminx restarts, or after you have been away for 30 minutes with nothing recording. Turn this off here or later in Settings → Updates.</p><p id="setup-update-note" role="status"></p></div>
           <div class="setting-card inv-ocr-card" data-ocr-card><small>OPTIONAL / INVESTIGATIONS</small><h2>Screenshot text recognition</h2><p data-ocr-message>Checking local text models…</p><div class="inv-ocr-progress" hidden><span></span></div><div class="inv-ocr-actions"><button type="button" data-ocr-install>Download verified models</button><button type="button" data-ocr-remove hidden>Remove</button></div></div>
           <small id="repair-label">INDIVIDUAL REPAIR</small><div class="setup-intro"><strong id="setup-stage">Inspecting this machine</strong><p id="setup-summary">Reading local capabilities…</p></div><div id="setup-list" class="record-list single-list"></div>
+        </section>
+        <section id="feedback" class="page" hidden>
+          <div class="page-head"><div><small>REPORTS / COMMENTS</small><h1>Feedback</h1></div><button id="open-feedback" type="button" class="primary">New report or comment</button></div>
+          <p class="setting-hint">What you sent from this computer. Reports show whether the team has solved them; Phorminx checks once a day and tells you when one is. Comments can be taken down from the website here.</p>
+          <div class="feedback-tools"><button id="feedback-check" type="button">Check now</button><span id="feedback-status" role="status"></span></div>
+          <div id="feedback-list" class="record-list single-list" role="list"></div>
         </section>
         <section id="app-settings" class="page" hidden>
           <div class="page-head"><div><small>PREFERENCES</small><h1>Settings</h1></div></div>
