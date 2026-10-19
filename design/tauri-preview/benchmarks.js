@@ -167,7 +167,7 @@
       const file = state.file;
       if (state.tab !== 'overview' && !features().includes(state.tab)) state.tab = 'overview';
       const colors = new Map(modelOrder(file).map((model, index) => [model, `var(--series-${(index % SLOTS) + 1})`]));
-      const ctx = { file, colors, tooltip, state, draw };
+      const ctx = { file, colors, tooltip, state, draw, options, root };
       root.replaceChildren();
       root.append(header(collection, ctx, options), verdict(file), tabs(ctx, features()));
       const panel = el('div', 'bench-panel');
@@ -180,6 +180,7 @@
       if (focus) root.querySelector(focus)?.focus();
     };
     draw();
+    return { redraw: () => draw() };
   }
 
   function header(collection, ctx, options) {
@@ -304,6 +305,8 @@
     const row = el('div', 'bench-tiles');
     for (const key of keys.filter((entry) => values.has(entry.key)).slice(0, 8)) row.append(tile(file, key, values.get(key.key)));
     panel.append(row);
+    const models = benchmarkedModels(ctx);
+    if (models) panel.append(models);
     const grid = el('div', 'bench-grid');
     const formatting = file.runs.filter((run) => run.feature === 'formatting');
     if (formatting.length) {
@@ -316,6 +319,99 @@
     }
     grid.append(trendChart(ctx));
     panel.append(grid, statusList(file));
+  }
+
+  /** Slots a model can fill, by kind; the host checks again before saving. */
+  const MODEL_SLOTS = [
+    ['formatting', 'Formatting', 'language'],
+    ['meetings', 'Meetings and investigations', 'language'],
+    ['fallback', 'Meeting fallback', 'language'],
+    ['translation', 'Live translation', 'language'],
+    ['search', 'Search', 'embedding'],
+  ];
+
+  /** Local models the report measured, as {model, facts}. */
+  function measuredModels(file) {
+    return modelOrder(file)
+      .filter((model) => file.runs.some((run) => run.model === model && run.backend === 'Ollama'))
+      .map((model) => {
+        const own = file.runs.filter((run) => run.model === model);
+        const formatting = own.filter((run) => run.feature === 'formatting' && run.config.start === 'warm' && run.config.passes === 1);
+        const summary = own.filter((run) => run.feature === 'meetings' && run.config.task === 'summary' && run.config.start === 'warm');
+        const answer = own.filter((run) => run.feature === 'investigations' && run.config.task === 'answer' && run.config.start === 'warm');
+        const facts = [];
+        if (formatting.length) facts.push(`Formatting ${format(average(formatting, 'latency'), 's')}, quality ${format(average(formatting, 'quality'), 'score')}`);
+        if (summary.length) facts.push(`meeting summary ${format(average(summary, 'answer'), 's')}`);
+        if (answer.length) facts.push(`investigation answer ${format(average(answer, 'answer'), 's')}`);
+        return { model, facts };
+      });
+  }
+
+  /**
+   * The benchmarked models, with "Use for…" and "Download" when the host
+   * passes `options.models` ({entries(), use(slot, name), download(name)}).
+   */
+  function benchmarkedModels(ctx) {
+    const { file, options, colors, state, root } = ctx;
+    const models = measuredModels(file);
+    if (!models.length) return null;
+    const box = el('section', 'bench-models');
+    box.setAttribute('aria-label', 'Benchmarked models');
+    box.append(el('h3', '', 'Benchmarked models'));
+    const status = el('p', 'bench-note', state.modelStatus || '');
+    status.setAttribute('role', 'status');
+    // The list redraws when the model registry changes; the last message stays.
+    const say = (message) => {
+      state.modelStatus = String(message);
+      const live = root.querySelector('.bench-models [role="status"]');
+      if (live) live.textContent = state.modelStatus;
+    };
+    const list = el('ul', 'bench-model-list');
+    const actions = options && options.models;
+    const entries = actions ? actions.entries() : [];
+    const same = (left, right) => String(left).replace(/:latest$/, '') === String(right).replace(/:latest$/, '');
+    for (const { model, facts } of models) {
+      const item = el('li', 'bench-model');
+      item.style.setProperty('--accent', colors.get(model) || 'var(--accent)');
+      const text = el('div', 'bench-model-text');
+      text.append(el('strong', '', model), el('span', '', facts.join(' · ') || 'Measured in this report.'));
+      item.append(text);
+      if (actions) {
+        const entry = entries.find((candidate) => candidate.family === 'ollama' && same(candidate.name, model));
+        const controls = el('div', 'bench-model-actions');
+        if (!entry || !entry.installed) {
+          const download = el('button', '', 'Download');
+          download.type = 'button';
+          download.addEventListener('click', async () => {
+            download.disabled = true;
+            say(`Downloading ${model}…`);
+            try { say(await actions.download(model)); } catch (error) { say(error); download.disabled = false; }
+          });
+          controls.append(download);
+        } else {
+          const label = el('label', 'bench-picker');
+          label.append(el('span', '', 'Use for'));
+          const select = el('select');
+          select.append(new Option('Choose a feature…', ''));
+          for (const [slot, name, kind] of MODEL_SLOTS) if (entry.tags.includes(kind)) select.append(new Option(name, slot));
+          select.addEventListener('change', async () => {
+            const slot = select.value;
+            if (!slot) return;
+            select.disabled = true;
+            try { say(await actions.use(slot, model)); } catch (error) { say(error); }
+            select.value = '';
+            select.disabled = false;
+          });
+          label.append(select);
+          controls.append(label);
+          if (entry.usedBy && entry.usedBy.length) controls.append(el('small', 'bench-model-used', `Used by ${entry.usedBy.join(', ')}`));
+        }
+        item.append(controls);
+      }
+      list.append(item);
+    }
+    box.append(list, status);
+    return box;
   }
 
   function tile(file, key, value) {
@@ -839,7 +935,7 @@
     return details;
   }
 
-  const api = { format, filterRuns, where, average, describe, wordDiff, trendPoints, modelOrder, render };
+  const api = { format, filterRuns, where, average, describe, wordDiff, trendPoints, modelOrder, measuredModels, render };
   global.PhorminxBenchmarks = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);

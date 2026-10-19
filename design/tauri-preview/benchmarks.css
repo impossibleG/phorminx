@@ -199,3 +199,11 @@
   .bench-tiles, .bench-pair { grid-template-columns: 1fr; }
   .bench-table { overflow-x: auto; }
 }
+/* Benchmarked models, with Use for and Download in the app. */
+.bench-models { border: 1px solid var(--border); background: var(--surface); padding: 14px 16px; }
+.bench-model-list { list-style: none; margin: 10px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); grid-auto-rows: 1fr; gap: 10px; }
+.bench-model { display: flex; flex-direction: column; justify-content: space-between; gap: 10px; border: 1px solid var(--border); border-left: 3px solid var(--accent); background: var(--surface-raised); padding: 10px 12px; min-width: 0; }
+.bench-model-text { display: flex; flex-direction: column; gap: 3px; }
+.bench-model-text strong { font-size: 14px; font-weight: 600; }
+.bench-model-text span, .bench-model-used { color: var(--text-secondary); }
+.bench-model-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }

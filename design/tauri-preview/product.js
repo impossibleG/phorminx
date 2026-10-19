@@ -45,7 +45,7 @@ function showRoute(route, persist = true) {
   }
   if (route === 'saved') void action('refresh');
   if (route === 'actions') void refreshActions();
-  if (route === 'models') void window.PhorminxModels?.refresh();
+  if (route === 'models' || route === 'benchmarks') void window.PhorminxModels?.refresh();
   if (route === 'setup') { void refreshSetup(); void refreshUpdates(); void refreshRepair(); }
   if (route === 'history' && node('history-query').value.trim()) void startHistorySearch();
   if (route === 'meeting-settings') void refreshProvider();
@@ -645,10 +645,24 @@ async function refreshApp() {
 let benchmarksShown = false;
 let benchmarksOnline = false;
 
+let benchmarksView = null;
+
 function renderBenchmarks(collection) {
-  window.PhorminxBenchmarks.render(node('benchmarks-view'), collection, {
+  benchmarksView = window.PhorminxBenchmarks.render(node('benchmarks-view'), collection, {
     loadReport: (id) => hostInvoke('benchmarks_report', {id, online: benchmarksOnline}),
     onRefresh: () => void refreshBenchmarks(),
+    models: window.PhorminxModels && {
+      entries: () => window.PhorminxModels.entries(),
+      use: async (slot, name) => {
+        const message = await hostInvoke('models_assign', {slot, name});
+        void window.PhorminxModels.refresh();
+        return message;
+      },
+      download: async (name) => {
+        await installModel(name, null);
+        return `Downloading ${name}. Progress shows on Models; the list updates when it is done.`;
+      },
+    },
   });
 }
 
@@ -1041,7 +1055,7 @@ if (window.PhorminxModels) {
   PhorminxModels.attach('translation-model', {kind: 'language', empty: 'Choose an installed model'});
   PhorminxModels.attach('action-model', {kind: 'language', empty: 'Choose a model'});
   node('provider-kind').addEventListener('change', () => answer?.render());
-  document.addEventListener('phorminx:models', (event) => renderRegistry(event.detail));
+  document.addEventListener('phorminx:models', (event) => { renderRegistry(event.detail); benchmarksView?.redraw(); });
   node('model-search').addEventListener('input', () => renderRegistry(PhorminxModels.entries()));
   node('model-install-form').addEventListener('submit', (event) => {
     event.preventDefault();
