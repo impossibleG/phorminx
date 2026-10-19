@@ -45,7 +45,7 @@ function showRoute(route, persist = true) {
   }
   if (route === 'saved') void action('refresh');
   if (route === 'actions') void refreshActions();
-  if (route === 'setup') { void refreshSetup(); void refreshUpdates(); }
+  if (route === 'setup') { void refreshSetup(); void refreshUpdates(); void refreshRepair(); }
   if (route === 'history' && node('history-query').value.trim()) void startHistorySearch();
   if (route === 'meeting-settings') void refreshProvider();
   if (route === 'prompts') window.dispatchEvent(new Event('prompts:show'));
@@ -354,6 +354,44 @@ function renderSetup(view) {
   node('setup-list').replaceChildren(fragment);
 }
 
+const REPAIR_STATES = {ok: ['✓', 'Ready'], missing: ['!', 'Missing'], unused: ['–', 'Not set up']};
+
+async function refreshRepair() {
+  if (!hostInvoke) return;
+  node('repair-status').textContent = 'Checking…';
+  try {
+    renderRepair(await hostInvoke('host_repair_status'));
+    node('repair-status').textContent = '';
+  } catch (error) { node('repair-status').textContent = String(error); }
+}
+
+function renderRepair(items) {
+  const list = node('repair-list');
+  list.replaceChildren();
+  for (const item of items) {
+    const row = makeElement('div', `repair-row repair-${item.state}`);
+    row.setAttribute('role', 'listitem');
+    const [mark, word] = REPAIR_STATES[item.state] || ['?', item.state];
+    const badge = makeElement('span', 'repair-badge', `${mark} ${word}`);
+    const text = makeElement('div', 'repair-text');
+    text.append(makeElement('small', '', item.workflow.toUpperCase()), makeElement('strong', '', item.label), makeElement('span', '', item.detail));
+    row.append(badge, text);
+    if (item.fix) {
+      const fix = makeElement('button', '', item.fix === 'setup' ? 'Run setup again' : item.fix === 'ocr' ? 'Install' : 'Open Models');
+      fix.type = 'button';
+      fix.addEventListener('click', () => {
+        if (item.fix === 'setup') node('bootstrap-consent').showModal();
+        else if (item.fix === 'models') showRoute('models');
+        else void hostInvoke('investigation_models', {kind: 'install'})
+          .then(() => { node('repair-status').textContent = 'Downloading the screenshot text models…'; })
+          .catch((error) => { node('repair-status').textContent = String(error); });
+      });
+      row.append(fix);
+    }
+    list.append(row);
+  }
+}
+
 async function refreshSetup() {
   if (!hostInvoke) return;
   try {
@@ -363,13 +401,23 @@ async function refreshSetup() {
   catch (error) { node('setup-summary').textContent = String(error); }
 }
 
+let lastBootstrapState = '';
+
 function renderBootstrap(view) {
   node('bootstrap-card').hidden = !view.available;
   if (!view.available) return;
   const working = view.state === 'working' || view.state === 'cancelling';
+  if (view.repair) {
+    node('bootstrap-label').textContent = 'REPAIR';
+    node('bootstrap-title').textContent = 'Run setup again';
+    node('bootstrap-intro').textContent = 'Reinstalls whatever is missing from the starter (speech recognition, GPU acceleration, Ollama, qwen2.5:1.5b and nomic-embed-text) and skips what is already there. Settings and saved text are kept.';
+  }
   node('bootstrap-start').disabled = working;
-  node('bootstrap-start').textContent = ['failed', 'cancelled'].includes(view.state) ? 'Retry preparation' : 'Prepare everything';
-  node('bootstrap-start').hidden = view.state === 'complete';
+  node('bootstrap-start').textContent = ['failed', 'cancelled'].includes(view.state) ? 'Retry' : view.repair ? 'Run setup again' : 'Prepare everything';
+  // A repair can always run again; the first-run starter is done once complete.
+  node('bootstrap-start').hidden = view.state === 'complete' && !view.repair;
+  if (lastBootstrapState === 'working' && view.state !== 'working') void refreshRepair();
+  lastBootstrapState = view.state;
   node('bootstrap-cancel').hidden = !working;
   node('bootstrap-cancel').disabled = view.state === 'cancelling';
   node('bootstrap-progress').textContent = working ? `Step ${view.step} of ${view.total}` : view.state === 'complete' ? 'Complete' : '';
@@ -687,6 +735,7 @@ node('setup-consent').addEventListener('close', () => {
   if (node('setup-consent').returnValue === 'confirm' && id) void startSetupAction(id, true);
 });
 node('bootstrap-start').addEventListener('click', () => node('bootstrap-consent').showModal());
+node('repair-refresh').addEventListener('click', () => void refreshRepair());
 node('bootstrap-cancel').addEventListener('click', async () => {
   try { renderBootstrap(await hostInvoke('host_cancel_bootstrap')); }
   catch (error) { node('bootstrap-message').textContent = String(error); }
