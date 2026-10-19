@@ -138,6 +138,7 @@ pub(crate) fn apply(connection: &Connection) -> Result<()> {
     transaction.execute_batch(crate::prompt::SCHEMA)?;
     transaction.execute_batch(crate::investigation::SCHEMA)?;
     transaction.execute_batch(crate::messaging::SCHEMA)?;
+    transaction.execute_batch(crate::feedback::SCHEMA)?;
     if current == TRANSITIONAL_ADDITIVE_VERSION {
         // Pre-release builds briefly labeled the same nullable extension as
         // schema 2. Normalize only that known shape so the previous binary can

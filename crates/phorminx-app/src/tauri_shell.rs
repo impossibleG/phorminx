@@ -1009,13 +1009,180 @@ fn feedback_snapshot(state: State<'_, HostState>) -> Result<FeedbackView, String
 fn feedback_update(
     text: String,
     diagnostics: bool,
+    comment: Option<bool>,
+    consent: Option<bool>,
+    display_name: Option<String>,
     state: State<'_, HostState>,
 ) -> Result<(), String> {
+    let mut feedback = state
+        .feedback
+        .lock()
+        .map_err(|_| "Feedback is unavailable.")?;
+    feedback.update_draft(text, diagnostics)?;
+    feedback.set_comment(
+        comment.unwrap_or(false),
+        consent.unwrap_or(false),
+        display_name.unwrap_or_default(),
+    )
+}
+
+/// The review window's controls in the feedback window: tidy the draft with
+/// the local formatting model before sending it.
+#[tauri::command(async)]
+fn feedback_reformat(
+    strength: String,
+    instruction: Option<String>,
+    state: State<'_, HostState>,
+) -> Result<(), String> {
+    let strength = match strength.as_str() {
+        "light" => FormattingStrength::Light,
+        "balanced" => FormattingStrength::Balanced,
+        "strong" => FormattingStrength::Strong,
+        "structured" => FormattingStrength::Structured,
+        "custom" => FormattingStrength::Custom,
+        _ => return Err("Choose a supported formatting.".into()),
+    };
+    let settings = state.store.load().map_err(|error| error.to_string())?;
+    let instruction = match instruction.filter(|text| !text.trim().is_empty()) {
+        Some(instruction) => Some(
+            state
+                .bridge
+                .lock()
+                .map_err(|_| "Prompts are unavailable.")?
+                .resolve_instructions(&instruction)
+                .text,
+        ),
+        None => None,
+    };
     state
         .feedback
         .lock()
         .map_err(|_| "Feedback is unavailable.")?
-        .update_draft(text, diagnostics)
+        .start_reformat(strength, instruction.as_deref(), &settings)
+}
+
+fn feedback_database(state: &HostState) -> Result<PathBuf, String> {
+    state
+        .store
+        .path()
+        .parent()
+        .map(|directory| directory.join("phorminx.db"))
+        .ok_or_else(|| "Your feedback history is unavailable.".to_owned())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedbackHistoryItem {
+    id: String,
+    kind: String,
+    sent_at_ms: i64,
+    text: String,
+    status: String,
+    resolution_note: Option<String>,
+    resolved_at_ms: Option<i64>,
+    checked_at_ms: Option<i64>,
+}
+
+/// Reports and comments sent from this computer, newest first.
+#[tauri::command]
+async fn feedback_history(state: State<'_, HostState>) -> Result<Vec<FeedbackHistoryItem>, String> {
+    let database = feedback_database(&state)?;
+    tauri::async_runtime::spawn_blocking(move || crate::feedback_status::history(&database))
+        .await
+        .map_err(|_| "Your feedback history could not be read.".to_owned())?
+        .map(|records| {
+            records
+                .into_iter()
+                .map(|record| FeedbackHistoryItem {
+                    id: record.id,
+                    kind: record.kind,
+                    sent_at_ms: record.sent_at_ms,
+                    text: record.text,
+                    status: record.status,
+                    resolution_note: record.resolution_note,
+                    resolved_at_ms: record.resolved_at_ms,
+                    checked_at_ms: record.checked_at_ms,
+                })
+                .collect()
+        })
+}
+
+/// Asks phorminx.net about every open report now; returns how many were solved.
+#[tauri::command]
+async fn feedback_check_now(app: tauri::AppHandle, state: State<'_, HostState>) -> Result<usize, String> {
+    let database = feedback_database(&state)?;
+    let resolved = tauri::async_runtime::spawn_blocking({
+        let database = database.clone();
+        move || crate::feedback_status::check(&database, true)
+    })
+    .await
+    .map_err(|_| "The status check could not run.".to_owned())??;
+    announce_resolved(&app, &database, &resolved);
+    Ok(resolved.len())
+}
+
+#[tauri::command]
+async fn feedback_forget(id: String, state: State<'_, HostState>) -> Result<(), String> {
+    let database = feedback_database(&state)?;
+    tauri::async_runtime::spawn_blocking(move || crate::feedback_status::forget(&database, &id))
+        .await
+        .map_err(|_| "That item could not be removed.".to_owned())?
+}
+
+#[tauri::command]
+async fn feedback_remove_comment(id: String, state: State<'_, HostState>) -> Result<(), String> {
+    let database = feedback_database(&state)?;
+    tauri::async_runtime::spawn_blocking(move || crate::feedback_status::remove_comment(&database, &id))
+        .await
+        .map_err(|_| "The comment could not be removed.".to_owned())?
+}
+
+/// Tells the user, once per report, that the team solved it.
+fn announce_resolved(app: &tauri::AppHandle, database: &std::path::Path, resolved: &[crate::feedback_status::Resolved]) {
+    for item in resolved {
+        let detail = match &item.note {
+            Some(note) => format!("\"{}\" · {note}", item.preview),
+            None => format!("\"{}\"", item.preview),
+        };
+        show_notice_toast(app, "Your report was resolved", &detail);
+        crate::feedback_status::mark_notified(database, &item.id);
+    }
+}
+
+/// A small, unfocused corner notice that closes itself.
+fn show_notice_toast(app: &tauri::AppHandle, title: &str, detail: &str) {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1;
+    let label = format!("notice-toast-{sequence}");
+    let payload = serde_json::json!({ "title": title, "detail": detail, "error": false });
+    let (width, height) = (380.0, 92.0);
+    let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("tauri-preview/toast.html".into()))
+        .title("Phorminx")
+        .inner_size(width, height)
+        .resizable(false)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focused(false)
+        .initialization_script(format!("window.__PHORMINX_TOAST__ = {payload};"));
+    if let Ok(Some(monitor)) = app.primary_monitor() {
+        let scale = monitor.scale_factor();
+        let area = monitor.work_area();
+        let x = area.position.x as f64 / scale + area.size.width as f64 / scale - width - 18.0;
+        let y = area.position.y as f64 / scale + area.size.height as f64 / scale - height - 18.0;
+        builder = builder.position(x, y);
+    }
+    if builder.build().is_ok() {
+        let handle = app.clone();
+        let _ = thread::Builder::new()
+            .name("phorminx-notice-toast".into())
+            .spawn(move || {
+                thread::sleep(Duration::from_secs(8));
+                if let Some(window) = handle.get_webview_window(&label) {
+                    let _ = window.destroy();
+                }
+            });
+    }
 }
 
 #[tauri::command(async)]
@@ -1283,6 +1450,11 @@ fn run_shell(
             feedback_snapshot,
             feedback_update,
             feedback_action,
+            feedback_reformat,
+            feedback_history,
+            feedback_check_now,
+            feedback_forget,
+            feedback_remove_comment,
             host_open_feedback,
             review_snapshot,
             review_reformat,
@@ -1318,6 +1490,19 @@ fn run_shell(
             benchmarks_report,
         ])
         .setup(move |app| {
+            // Once an hour, ask about open reports not checked for a day.
+            if let Some(database) = app.state::<HostState>().store.path().parent().map(|directory| directory.join("phorminx.db")) {
+                let handle = app.handle().clone();
+                let _ = thread::Builder::new()
+                    .name("phorminx-feedback-status".into())
+                    .spawn(move || loop {
+                        thread::sleep(Duration::from_secs(60));
+                        if let Ok(resolved) = crate::feedback_status::check(&database, false) {
+                            announce_resolved(&handle, &database, &resolved);
+                        }
+                        thread::sleep(Duration::from_secs(59 * 60));
+                    });
+            }
             if !initially_visible {
                 if let Some(window) = app.get_webview_window("main") {
                     window.hide()?;
