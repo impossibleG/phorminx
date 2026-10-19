@@ -1,51 +1,51 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 410" width="820" height="410" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" role="img" aria-label="What stays on your computer and what can leave it">
-<rect width="820" height="410" rx="12" fill="#0d1117"/>
-<rect x="24" y="20" width="350" height="370" rx="10" fill="#161b22" stroke="#30363d"/>
-<circle cx="48" cy="50" r="6" fill="#3fb950"/>
-<text x="64" y="56" font-size="17" font-weight="600" fill="#e6edf3">Stays on this computer</text>
-<rect x="40" y="86" width="318" height="48" rx="7" fill="#0d1117" stroke="#30363d"/>
-<rect x="40" y="86" width="4" height="48" rx="2" fill="#3fb950"/>
-<text x="56" y="106" font-size="14" font-weight="600" fill="#e6edf3">Speech recognition</text>
-<text x="56" y="125" font-size="12.5" fill="#8b949e">Vosk and Whisper; audio stays in memory</text>
-<rect x="40" y="144" width="318" height="48" rx="7" fill="#0d1117" stroke="#30363d"/>
-<rect x="40" y="144" width="4" height="48" rx="2" fill="#3fb950"/>
-<text x="56" y="164" font-size="14" font-weight="600" fill="#e6edf3">Formatting and translation</text>
-<text x="56" y="183" font-size="12.5" fill="#8b949e">local Ollama models</text>
-<rect x="40" y="202" width="318" height="48" rx="7" fill="#0d1117" stroke="#30363d"/>
-<rect x="40" y="202" width="4" height="48" rx="2" fill="#3fb950"/>
-<text x="56" y="222" font-size="14" font-weight="600" fill="#e6edf3">Semantic search</text>
-<text x="56" y="241" font-size="12.5" fill="#8b949e">local embeddings</text>
-<rect x="40" y="260" width="318" height="48" rx="7" fill="#0d1117" stroke="#30363d"/>
-<rect x="40" y="260" width="4" height="48" rx="2" fill="#3fb950"/>
-<text x="56" y="280" font-size="14" font-weight="600" fill="#e6edf3">Screenshot text (OCR)</text>
-<text x="56" y="299" font-size="12.5" fill="#8b949e">local models, verified download</text>
-<rect x="40" y="318" width="318" height="48" rx="7" fill="#0d1117" stroke="#30363d"/>
-<rect x="40" y="318" width="4" height="48" rx="2" fill="#3fb950"/>
-<text x="56" y="338" font-size="14" font-weight="600" fill="#e6edf3">Your text</text>
-<text x="56" y="357" font-size="12.5" fill="#8b949e">history, meetings, investigations, prompts</text>
-<rect x="446" y="20" width="350" height="370" rx="10" fill="#161b22" stroke="#30363d"/>
-<circle cx="470" cy="50" r="6" fill="#d29922"/>
-<text x="486" y="56" font-size="17" font-weight="600" fill="#e6edf3">Leaves only when you choose</text>
-<rect x="462" y="86" width="318" height="48" rx="7" fill="#0d1117" stroke="#30363d"/>
-<rect x="462" y="86" width="4" height="48" rx="2" fill="#d29922"/>
-<text x="478" y="106" font-size="14" font-weight="600" fill="#e6edf3">Feedback</text>
-<text x="478" y="125" font-size="12.5" fill="#8b949e">only after you press Send, to phorminx.net</text>
-<rect x="462" y="144" width="318" height="48" rx="7" fill="#0d1117" stroke="#30363d"/>
-<rect x="462" y="144" width="4" height="48" rx="2" fill="#d29922"/>
-<text x="478" y="164" font-size="14" font-weight="600" fill="#e6edf3">Remote assistant</text>
-<text x="478" y="183" font-size="12.5" fill="#8b949e">OpenAI or Anthropic, if you pick one</text>
-<rect x="462" y="202" width="318" height="48" rx="7" fill="#0d1117" stroke="#30363d"/>
-<rect x="462" y="202" width="4" height="48" rx="2" fill="#d29922"/>
-<text x="478" y="222" font-size="14" font-weight="600" fill="#e6edf3">Actions</text>
-<text x="478" y="241" font-size="12.5" fill="#8b949e">your saved HTTP request, when you run it</text>
-<rect x="462" y="260" width="318" height="48" rx="7" fill="#0d1117" stroke="#30363d"/>
-<rect x="462" y="260" width="4" height="48" rx="2" fill="#d29922"/>
-<text x="478" y="280" font-size="14" font-weight="600" fill="#e6edf3">Messages</text>
-<text x="478" y="299" font-size="12.5" fill="#8b949e">off by default; direct to contacts over Tor</text>
-<rect x="462" y="318" width="318" height="48" rx="7" fill="#0d1117" stroke="#30363d"/>
-<rect x="462" y="318" width="4" height="48" rx="2" fill="#d29922"/>
-<text x="478" y="338" font-size="14" font-weight="600" fill="#e6edf3">Downloads and updates</text>
-<text x="478" y="357" font-size="12.5" fill="#8b949e">models, link previews, GitHub Releases</text>
-<path d="M 382 215 L 436 215" stroke="#6e7681" stroke-width="2" stroke-dasharray="5 4" fill="none"/>
-<path d="M 429 209 L 438 215 L 429 221" stroke="#6e7681" stroke-width="2" fill="none"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 410" width="820" height="410" font-family="Segoe UI Variable,Segoe UI,-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif" role="img" aria-label="What stays on your computer and what can leave it">
+<rect width="820" height="410" rx="0" fill="#0c0f11"/>
+<rect x="24" y="20" width="350" height="370" rx="0" fill="#15191c" stroke="#343a3d"/>
+<rect x="42" y="44" width="12" height="12" fill="#7fa88a"/>
+<text x="64" y="56" font-size="13" font-weight="650" letter-spacing="2" fill="#7fa88a">STAYS ON THIS COMPUTER</text>
+<rect x="40" y="86" width="318" height="48" rx="0" fill="#0c0f11" stroke="#343a3d"/>
+<rect x="40" y="86" width="4" height="48" rx="2" fill="#7fa88a"/>
+<text x="56" y="106" font-size="14" font-weight="600" fill="#eceae4">Speech recognition</text>
+<text x="56" y="125" font-size="12.5" fill="#aeb4b7">Vosk and Whisper; audio stays in memory</text>
+<rect x="40" y="144" width="318" height="48" rx="0" fill="#0c0f11" stroke="#343a3d"/>
+<rect x="40" y="144" width="4" height="48" rx="2" fill="#7fa88a"/>
+<text x="56" y="164" font-size="14" font-weight="600" fill="#eceae4">Formatting and translation</text>
+<text x="56" y="183" font-size="12.5" fill="#aeb4b7">local Ollama models</text>
+<rect x="40" y="202" width="318" height="48" rx="0" fill="#0c0f11" stroke="#343a3d"/>
+<rect x="40" y="202" width="4" height="48" rx="2" fill="#7fa88a"/>
+<text x="56" y="222" font-size="14" font-weight="600" fill="#eceae4">Semantic search</text>
+<text x="56" y="241" font-size="12.5" fill="#aeb4b7">local embeddings</text>
+<rect x="40" y="260" width="318" height="48" rx="0" fill="#0c0f11" stroke="#343a3d"/>
+<rect x="40" y="260" width="4" height="48" rx="2" fill="#7fa88a"/>
+<text x="56" y="280" font-size="14" font-weight="600" fill="#eceae4">Screenshot text (OCR)</text>
+<text x="56" y="299" font-size="12.5" fill="#aeb4b7">local models, verified download</text>
+<rect x="40" y="318" width="318" height="48" rx="0" fill="#0c0f11" stroke="#343a3d"/>
+<rect x="40" y="318" width="4" height="48" rx="2" fill="#7fa88a"/>
+<text x="56" y="338" font-size="14" font-weight="600" fill="#eceae4">Your text</text>
+<text x="56" y="357" font-size="12.5" fill="#aeb4b7">history, meetings, investigations, prompts</text>
+<rect x="446" y="20" width="350" height="370" rx="0" fill="#15191c" stroke="#343a3d"/>
+<rect x="464" y="44" width="12" height="12" fill="#c69767"/>
+<text x="486" y="56" font-size="13" font-weight="650" letter-spacing="2" fill="#c69767">LEAVES ONLY WHEN YOU CHOOSE</text>
+<rect x="462" y="86" width="318" height="48" rx="0" fill="#0c0f11" stroke="#343a3d"/>
+<rect x="462" y="86" width="4" height="48" rx="2" fill="#c69767"/>
+<text x="478" y="106" font-size="14" font-weight="600" fill="#eceae4">Feedback</text>
+<text x="478" y="125" font-size="12.5" fill="#aeb4b7">only after you press Send, to phorminx.net</text>
+<rect x="462" y="144" width="318" height="48" rx="0" fill="#0c0f11" stroke="#343a3d"/>
+<rect x="462" y="144" width="4" height="48" rx="2" fill="#c69767"/>
+<text x="478" y="164" font-size="14" font-weight="600" fill="#eceae4">Remote assistant</text>
+<text x="478" y="183" font-size="12.5" fill="#aeb4b7">OpenAI or Anthropic, if you pick one</text>
+<rect x="462" y="202" width="318" height="48" rx="0" fill="#0c0f11" stroke="#343a3d"/>
+<rect x="462" y="202" width="4" height="48" rx="2" fill="#c69767"/>
+<text x="478" y="222" font-size="14" font-weight="600" fill="#eceae4">Actions</text>
+<text x="478" y="241" font-size="12.5" fill="#aeb4b7">your saved HTTP request, when you run it</text>
+<rect x="462" y="260" width="318" height="48" rx="0" fill="#0c0f11" stroke="#343a3d"/>
+<rect x="462" y="260" width="4" height="48" rx="2" fill="#c69767"/>
+<text x="478" y="280" font-size="14" font-weight="600" fill="#eceae4">Messages</text>
+<text x="478" y="299" font-size="12.5" fill="#aeb4b7">off by default; direct to contacts over Tor</text>
+<rect x="462" y="318" width="318" height="48" rx="0" fill="#0c0f11" stroke="#343a3d"/>
+<rect x="462" y="318" width="4" height="48" rx="2" fill="#c69767"/>
+<text x="478" y="338" font-size="14" font-weight="600" fill="#eceae4">Downloads and updates</text>
+<text x="478" y="357" font-size="12.5" fill="#aeb4b7">models, link previews, GitHub Releases</text>
+<path d="M 382 215 L 436 215" stroke="#62666a" stroke-width="2" stroke-dasharray="5 4" fill="none"/>
+<path d="M 429 209 L 438 215 L 429 221" stroke="#62666a" stroke-width="2" fill="none"/>
 </svg>

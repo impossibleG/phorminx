@@ -1,18 +1,24 @@
-# Recreating the README screenshots
+# Recreating the README visuals
 
-Every image in the README is a capture of the real app, running from a
-separate demo profile filled with made-up content. Never capture a personal
-profile: no real history, meetings, investigations, contacts or settings.
-The assistant answers in the demo are seeded text, not live model output.
-
-The scripts used here live in [`capture/`](capture/):
+The README images are designed banners and diagrams, built from HTML templates
+in [`src/`](src/) and rendered to WebP by one script. Product details in them are
+2x crops of the real app, running from a separate demo profile filled with
+made-up content. Never capture a personal profile: no real history, meetings,
+investigations, contacts or settings. The assistant answers in the demo are
+seeded text, not live model output.
 
 | File | Purpose |
 | --- | --- |
-| [`readme_demo_profile.rs`](../../crates/phorminx-persistence/examples/readme_demo_profile.rs) | Seeds the demo database (dictations, a meeting with translation and an answer, prompts, an investigation, lexicon and profiles). |
-| [`cdp.mjs`](capture/cdp.mjs) | Drives a running Phorminx window over the WebView2 DevTools protocol and saves screenshots. |
-| [`convert.py`](capture/convert.py) | Turns the raw PNG captures into the WebP stills in this folder. |
-| [`privacy_diagram.py`](capture/privacy_diagram.py) | Writes `privacy-dark.svg` and `privacy-light.svg`. |
+| [`src/*.html`](src/), [`src/style.css`](src/style.css), [`src/common.js`](src/common.js) | One template per visual, in the phorminx.net colours and type. `?theme=light` switches the theme. |
+| [`src/crops/`](src/crops/) | The 2x app crops the templates use. |
+| [`src/render.py`](src/render.py) | Renders every template with headless Edge into `docs/features/*.webp` and writes `src/contact-sheet.webp`. |
+| [`src/privacy_diagram.py`](src/privacy_diagram.py) | Writes `privacy-dark.svg` and `privacy-light.svg`. |
+| [`src/cdp.mjs`](src/cdp.mjs) | Drives a running Phorminx window over the WebView2 DevTools protocol to take the crops. |
+| [`readme_demo_profile.rs`](../../crates/phorminx-persistence/examples/readme_demo_profile.rs) | Seeds the demo database. |
+
+To change copy or layout only, edit a template and run
+`python docs/features/src/render.py` (or name visuals: `render.py hero-dark hero-light`).
+Recapture crops only when the app's UI has changed.
 
 ## 1. Build
 
@@ -136,79 +142,59 @@ them can lose the race ("Meeting storage could not open" on Meetings, or
 Check both pages; if either shows the message, stop the demo process and
 start it again.
 
-## 4. Capture
+## 4. Capture the crops
 
-Run from `docs/features/capture`, with `$S` an empty folder for raw PNGs.
-`cdp.mjs` runs its operations in order on one connection; the main window
-re-applies its theme every 4 seconds, so wait 5 seconds after `media:`.
+Run from `docs/features/src` with `$C` pointing at `crops`. `dpr:2` renders
+at twice the pixel density; `dpr:2,600,720` also narrows the viewport so a
+window reflows to its compact layout. `crop:` saves only the matching
+elements. The main window re-applies its theme every 4 seconds, so wait 5
+seconds after changing `theme` in `settings.toml`.
 
-```bash
-R(){ echo "eval:document.querySelector('.side [data-route=$1]').click(); 1"; }
-node cdp.mjs 9333 product.html locale:en-US "$(R home)" wait:2500 "shot:$S/home.png"
-node cdp.mjs 9333 product.html "$(R prompts)" wait:1500 \
-  "eval:[...document.querySelectorAll('#prompts *')].find(e=>e.children.length<3&&e.textContent.trim().startsWith('Meeting notes'))?.closest('button,li,div')?.click(); 1" \
-  wait:1500 "shot:$S/prompts.png"
-node cdp.mjs 9333 product.html "$(R models)" wait:3000 "shot:$S/models.png"
-node cdp.mjs 9333 product.html "$(R messages)" wait:2500 "shot:$S/messages.png"
-node cdp.mjs 9333 product.html "$(R settings)" wait:1500 \
-  "eval:document.querySelector('[data-settings-tab=dictation]').click(); 1" wait:2000 "shot:$S/settings-dictation.png"
-node cdp.mjs 9333 product.html "$(R actions)" wait:2000 \
-  "eval:[...document.querySelectorAll('#actions button')].filter(b=>b.textContent.trim()==='Edit')[1].click(); 1" \
-  wait:2000 "shot:$S/action-editor.png"
-node cdp.mjs 9333 product.html "$(R history)" wait:1500 \
-  "eval:(()=>{const q=document.querySelector('#history-query'); q.value='checklist'; q.dispatchEvent(new Event('input')); return 1})()" wait:3000 \
-  "eval:[...document.querySelectorAll('#history button')].find(b=>b.textContent.includes('launch checklist')).click(); 1" \
-  wait:1500 "shot:$S/history.png"
-```
-
-Investigations, chronology and then the diagram with the assistant hidden:
+With Meetings working (open **Meetings → Saved sessions**, select the session,
+then open its companion):
 
 ```bash
-B="[...document.querySelectorAll('#investigations button')]"
-node cdp.mjs 9333 product.html "$(R investigations)" wait:2500 "shot:$S/inv-chron.png" \
-  "eval:$B.find(b=>b.textContent.trim()==='Diagram').click(); 1" wait:1500 \
-  "eval:$B.find(b=>b.textContent.trim()==='Assistant').click(); 1" wait:800 \
-  "eval:$B.find(b=>b.textContent.trim()==='Fit').click(); 1" wait:800 "shot:$S/inv-diagram.png"
+node cdp.mjs 9333 product.html "eval:window.__TAURI__.core.invoke('meeting_action',{kind:'companion',value:null}).then(()=>'ok')"
+node cdp.mjs 9333 product.html dpr:2 "crop:$C/home-dark.png@@#home .page-head, #home .home-grid, #home .recent@@28"
+node cdp.mjs 9333 companion.html dpr:2 "eval:[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Together').click(); 1"   wait:800 "shot:$C/companion-dark.png"   "eval:(()=>{const p=[...document.querySelectorAll('.phrase')]; p.slice(1,4).forEach(e=>e.dataset.crop=1); p[1].scrollIntoView(); return 1})()"   wait:600 "crop:$C/transcript.png@@[data-crop]"
+node cdp.mjs 9333 companion.html dpr:2,600,720 "eval:[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Assistant').click(); 1"   wait:1000 "crop:$C/answer.png@@.message@@20"
 ```
 
-Meetings: open the saved session, then open the companion for it. The
-companion reads its theme from the profile setting, so capture it once with
-`theme = "dark"` and once with `theme = "light"` in `settings.toml`
-(reload the companion with `eval:location.reload(); 1` after editing).
+The instruction field with its `@` chip (Settings → Dictation) and the prompts
+library (Prompts, with **Meeting notes** selected): tag the element, then crop it.
 
 ```bash
-node cdp.mjs 9333 product.html "$(R live)" "eval:document.querySelector('[data-route=saved]').click(); 1" wait:2000 \
-  "eval:document.querySelector('#sessions button').click(); 1" wait:2500 "shot:$S/saved-dark.png" \
-  "eval:window.__TAURI__.core.invoke('meeting_action',{kind:'companion',value:null}).then(()=>'ok')"
-node cdp.mjs 9333 companion.html wait:2000 "shot:$S/companion-dark.png" \
-  "eval:[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Assistant').click(); 1" \
-  wait:1200 "shot:$S/companion-assistant.png"
-# after switching the profile to theme = "light" and reloading the companion:
-node cdp.mjs 9333 companion.html wait:2000 "shot:$S/companion.png"
+node cdp.mjs 9333 product.html dpr:2   "eval:(()=>{const h=[...document.querySelectorAll('h2')].find(h=>h.textContent==='Instructions'); h.closest('.setting-card').dataset.crop='chip'; return 1})()"   "crop:$C/chip.png@@[data-crop=chip]"
+node cdp.mjs 9333 product.html dpr:2 "crop:$C/prompts.png@@#prompts .prompts-layout"
 ```
+
+Switch the profile to `theme = "light"`, reload the companion
+(`eval:location.reload(); 1`) and repeat the `home-` and `companion-` captures
+as `home-light.png` and `companion-light.png`.
+
+With Investigations working: `crop:$C/inv-chron.png@@#investigations .inv-body`
+on the Chronology tab, then Diagram, hide the Assistant panel, press Fit, and
+`crop:$C/inv-diagram.png@@#investigations .inv-canvas-wrap`.
 
 Close the demo instance afterwards (tray → Quit, or end the process).
 
-## 5. Convert
+## 5. Render
 
 From the repository root:
 
 ```powershell
-python docs/features/capture/convert.py $S
-python docs/features/capture/privacy_diagram.py
+python docs/features/src/render.py
+python docs/features/src/privacy_diagram.py
 ```
 
-`convert.py` lists which raw capture becomes which README image and keeps each
-WebP under 250 KB.
+Each WebP is kept under 250 KB. Text inside the templates is product copy:
+keep it matched to the code and repeat the key words in the README alt text.
 
-## Not captured yet
+## Not shown
 
 - **Review panel** and **live text in the status pill** only appear during and
   after a real dictation in the same session. They need speech into a
   microphone (a virtual audio cable playing synthetic speech works); do not
   use a real person's voice or room audio.
-- **Messages with a contact** needs messaging turned on, which connects to Tor
-  and needs a second instance to accept an invite. The README shows the
-  page before it is turned on.
-- **Automatic updates** has no image: a local build without the release key
-  shows updates as unavailable, which is not what users see.
+- **Messages with a contact** needs messaging turned on, which connects to Tor.
+  The Messages banner is a diagram instead.

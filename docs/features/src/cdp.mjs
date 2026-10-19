@@ -9,7 +9,10 @@
 //   locale:en-US               format dates and numbers for this locale
 //   eval:<js>                  run JavaScript in the page and print the result
 //   wait:<ms>                  pause
+//   dpr:2 | dpr:2,560,640      render at this device pixel ratio (and viewport)
 //   shot:<file.png>            capture the page as PNG
+//   crop:<file.png>@@<selector>[@@pad]
+//                              capture only the matching element(s)
 // Needs Node 18+ (global fetch and WebSocket). Nothing here talks to the
 // network beyond 127.0.0.1.
 import { writeFileSync } from 'node:fs';
@@ -52,6 +55,32 @@ for (const op of ops) {
     else if (result.result.value !== undefined) console.log(JSON.stringify(result.result.value));
   } else if (name === 'wait') {
     await new Promise((resolve) => setTimeout(resolve, Number(arg)));
+  } else if (name === 'dpr') {
+    // dpr:2 keeps the window size; dpr:2,560,640 also sets the viewport.
+    const [scale, forcedWidth, forcedHeight] = arg.split(',').map(Number);
+    const size = await send('Runtime.evaluate', { expression: '[innerWidth, innerHeight]', returnByValue: true });
+    const [width, height] = forcedWidth ? [forcedWidth, forcedHeight] : size.result.value;
+    await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: scale, mobile: false });
+  } else if (name === 'crop') {
+    // crop:<file.png>@@<css selector>[@@padding]; several matches are united.
+    const [file, selector, pad = '0'] = arg.split('@@');
+    const rect = await send('Runtime.evaluate', {
+      returnByValue: true,
+      expression: `(() => {
+        const boxes = [...document.querySelectorAll(${JSON.stringify(selector)})]
+          .map((e) => e.getBoundingClientRect()).filter((r) => r.width && r.height);
+        if (!boxes.length) return null;
+        const p = ${Number(pad)};
+        const x = Math.max(0, Math.min(...boxes.map((r) => r.left)) - p);
+        const y = Math.max(0, Math.min(...boxes.map((r) => r.top)) - p);
+        return { x, y, width: Math.min(innerWidth, Math.max(...boxes.map((r) => r.right)) + p) - x,
+                 height: Math.min(innerHeight, Math.max(...boxes.map((r) => r.bottom)) + p) - y, scale: 1 };
+      })()`,
+    });
+    if (!rect.result.value) throw new Error(`nothing matches ${selector}`);
+    const { data } = await send('Page.captureScreenshot', { format: 'png', clip: rect.result.value });
+    writeFileSync(file, Buffer.from(data, 'base64'));
+    console.log(`saved ${file}`);
   } else if (name === 'shot') {
     const { data } = await send('Page.captureScreenshot', { format: 'png' });
     writeFileSync(arg, Buffer.from(data, 'base64'));

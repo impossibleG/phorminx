@@ -1,14 +1,15 @@
 """Writes docs/features/privacy-dark.svg and privacy-light.svg.
 
-Run from the repository root: python docs/features/capture/privacy_diagram.py
+Run from the repository root: python docs/features/src/privacy_diagram.py
+Colours follow phorminx.net (Abyss, Limestone, Bronze).
 """
 from pathlib import Path
 
 THEMES = {
-    "dark": dict(bg="#0d1117", panel="#161b22", border="#30363d", text="#e6edf3",
-                 muted="#8b949e", local="#3fb950", remote="#d29922", line="#6e7681"),
-    "light": dict(bg="#ffffff", panel="#f6f8fa", border="#d0d7de", text="#1f2328",
-                  muted="#59636e", local="#1a7f37", remote="#9a6700", line="#8c959f"),
+    "dark": dict(bg="#0c0f11", panel="#15191c", border="#343a3d", text="#eceae4",
+                 muted="#aeb4b7", local="#7fa88a", remote="#c69767", line="#62666a"),
+    "light": dict(bg="#f2f0e9", panel="#faf8f2", border="#cbc7bd", text="#1f2022",
+                  muted="#62666a", local="#4f7a5a", remote="#a87542", line="#8c8a84"),
 }
 
 LOCAL = [
@@ -36,20 +37,20 @@ def render(c: dict) -> str:
     height = top + row * len(LOCAL) + 28
     out = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}" '
-        'font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" role="img" '
+        'font-family="Segoe UI Variable,Segoe UI,-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif" role="img" '
         'aria-label="What stays on your computer and what can leave it">',
-        f'<rect width="{width}" height="{height}" rx="12" fill="{c["bg"]}"/>',
+        f'<rect width="{width}" height="{height}" rx="0" fill="{c["bg"]}"/>',
     ]
     columns = [(24, "Stays on this computer", c["local"], LOCAL),
                (446, "Leaves only when you choose", c["remote"], REMOTE)]
     for x, title, accent, items in columns:
-        out.append(f'<rect x="{x}" y="20" width="350" height="{height - 40}" rx="10" '
+        out.append(f'<rect x="{x}" y="20" width="350" height="{height - 40}" rx="0" '
                    f'fill="{c["panel"]}" stroke="{c["border"]}"/>')
-        out.append(f'<circle cx="{x + 24}" cy="50" r="6" fill="{accent}"/>')
-        out.append(f'<text x="{x + 40}" y="56" font-size="17" font-weight="600" fill="{c["text"]}">{escape(title)}</text>')
+        out.append(f'<rect x="{x + 18}" y="44" width="12" height="12" fill="{accent}"/>')
+        out.append(f'<text x="{x + 40}" y="56" font-size="13" font-weight="650" letter-spacing="2" fill="{accent}">{escape(title.upper())}</text>')
         for index, (name, detail) in enumerate(items):
             y = top + index * row
-            out.append(f'<rect x="{x + 16}" y="{y - 6}" width="318" height="{row - 10}" rx="7" '
+            out.append(f'<rect x="{x + 16}" y="{y - 6}" width="318" height="{row - 10}" rx="0" '
                        f'fill="{c["bg"]}" stroke="{c["border"]}"/>')
             out.append(f'<rect x="{x + 16}" y="{y - 6}" width="4" height="{row - 10}" rx="2" fill="{accent}"/>')
             out.append(f'<text x="{x + 32}" y="{y + 14}" font-size="14" font-weight="600" fill="{c["text"]}">{escape(name)}</text>')

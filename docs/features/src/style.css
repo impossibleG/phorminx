@@ -1,0 +1,70 @@
+/* Shared look for the README visuals. Tokens follow phorminx.net. */
+:root {
+  --abyss: #0c0f11;
+  --abyss-raised: #15191c;
+  --limestone: #f2f0e9;
+  --limestone-deep: #e5e1d8;
+  --bronze: #a87542;
+  --bronze-light: #c69767;
+  --bronze-dark: #76502d;
+  --ink: #1f2022;
+  --page: var(--abyss);
+  --surface: var(--abyss-raised);
+  --text: #eceae4;
+  --quiet: #aeb4b7;
+  --rule: #343a3d;
+  --accent: var(--bronze-light);
+  --font: "Segoe UI Variable Display", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+}
+:root[data-theme="light"] {
+  --page: var(--limestone);
+  --surface: #faf8f2;
+  --text: var(--ink);
+  --quiet: #62666a;
+  --rule: #cbc7bd;
+  --accent: var(--bronze);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  width: 1600px;
+  background: var(--page);
+  color: var(--text);
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+.canvas { position: relative; width: 1600px; height: 800px; overflow: hidden; }
+.canvas.auto { height: auto; }
+
+.eyebrow { margin: 0 0 28px; color: var(--accent); font-size: 17px; font-weight: 650; letter-spacing: .17em; text-transform: uppercase; }
+h1 { margin: 0; font-size: 92px; font-weight: 450; line-height: .95; letter-spacing: -.055em; }
+h2 { margin: 0; font-size: 64px; font-weight: 450; line-height: 1; letter-spacing: -.05em; }
+.sub { margin: 30px 0 0; max-width: 560px; color: var(--quiet); font-size: 25px; line-height: 1.5; }
+
+/* The angular bronze field that sits behind product crops on phorminx.net. */
+.field { position: absolute; background: var(--bronze); clip-path: polygon(16% 0, 100% 0, 100% 82%, 82% 100%, 0 92%, 0 19%); }
+
+.shot { position: absolute; display: block; border: 1px solid #2a2f32; box-shadow: 0 40px 80px rgba(12, 15, 17, .38); }
+:root[data-theme="light"] .shot { border-color: #d1cec5; box-shadow: 0 40px 80px rgba(12, 15, 17, .22); }
+
+/* Numbered callouts over focus crops. */
+.callout { position: absolute; display: flex; align-items: center; gap: 12px; color: var(--text); font-size: 20px; font-weight: 600; white-space: nowrap; }
+.callout b { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 50%; background: var(--bronze); color: #fff; font-size: 18px; flex: none; }
+.callout.left { flex-direction: row-reverse; }
+
+/* Diagram pieces */
+.node { display: flex; flex-direction: column; align-items: center; gap: 14px; text-align: center; }
+.node .icon { display: grid; place-items: center; width: 104px; height: 104px; border: 1.5px solid var(--rule); background: var(--surface); }
+.node .icon svg { width: 52px; height: 52px; fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.node strong { font-size: 22px; font-weight: 600; }
+.node span { max-width: 210px; color: var(--quiet); font-size: 17px; line-height: 1.4; }
+.arrow { flex: none; width: 70px; height: 2px; margin-top: 52px; background: linear-gradient(90deg, var(--rule), var(--accent)); position: relative; }
+.arrow::after { content: ""; position: absolute; right: -2px; top: -6px; border: 7px solid transparent; border-left: 11px solid var(--accent); border-right: 0; }
+
+.card { border: 1px solid var(--rule); background: var(--surface); padding: 30px 34px; }
+.card small { display: block; margin-bottom: 14px; color: var(--accent); font-size: 15px; font-weight: 650; letter-spacing: .15em; text-transform: uppercase; }
+.key { display: inline-grid; place-items: center; min-width: 66px; height: 66px; padding: 0 18px; border: 1.5px solid var(--rule); border-bottom-width: 5px; background: var(--surface); font-size: 22px; font-weight: 600; }
+.mark { color: var(--accent); font-weight: 650; }
+.foot { position: absolute; left: 96px; bottom: 34px; color: var(--quiet); font-size: 16px; letter-spacing: .02em; }
