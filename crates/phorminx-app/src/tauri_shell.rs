@@ -811,6 +811,52 @@ fn models_pull_status() -> crate::model_registry::PullView {
     crate::model_registry::pull_status()
 }
 
+/// "Use for…": points one feature at an installed model of the right kind,
+/// through the same settings and meeting paths as the Settings pages.
+#[tauri::command(async)]
+fn models_assign(
+    slot: String,
+    name: String,
+    app: tauri::AppHandle,
+    state: State<'_, HostState>,
+) -> Result<String, String> {
+    let entries = crate::model_registry::list(&state.store);
+    let entry = crate::model_registry::check_assignable(&entries, &slot, &name)?;
+    let feature = match slot.as_str() {
+        "formatting" | "search" => {
+            let mut candidate = state
+                .bridge
+                .lock()
+                .map_err(|_| "Settings are unavailable.")?
+                .settings()
+                .clone();
+            if slot == "formatting" {
+                candidate.formatting.ollama_model_identity = Some(
+                    OllamaModelIdentity::new(
+                        entry.digest.as_deref().ok_or("The model has no verified digest.")?,
+                        entry.size_bytes.ok_or("The model has no verified size.")?,
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
+                candidate.formatting.ollama_model = Some(entry.name.clone());
+            } else {
+                candidate.search.embedding_model = Some(entry.name.clone());
+            }
+            state.execute(UiCommand::SaveSettings(candidate))?;
+            if slot == "formatting" { "Formatting" } else { "Search" }
+        }
+        other => {
+            app.state::<MeetingTauriState>().assign_model(other, &entry.name)?;
+            match other {
+                "meetings" => "The meeting and investigation assistant",
+                "fallback" => "The meeting fallback",
+                _ => "Live translation",
+            }
+        }
+    };
+    Ok(format!("{feature} now uses {}.", entry.name))
+}
+
 #[tauri::command(async)]
 fn host_cancel_bootstrap(state: State<'_, HostState>) -> Result<BootstrapView, String> {
     let mut bootstrap = state.bootstrap.lock().map_err(|_| "Starter setup is unavailable.")?;
@@ -1228,6 +1274,7 @@ fn run_shell(
             models_registry,
             models_pull,
             models_pull_status,
+            models_assign,
             host_update_snapshot,
             host_update_action,
             host_action,
