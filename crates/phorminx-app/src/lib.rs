@@ -18,6 +18,7 @@ pub mod meeting_audio;
 pub mod meeting_memory;
 pub mod meeting_workspace;
 pub mod model;
+pub mod model_registry;
 pub mod ollama_onboarding;
 pub mod ollama_recovery;
 pub mod performance;
