@@ -882,3 +882,53 @@ fn disabling_retention_before_database_policy_sync_blocks_queued_writes() {
             .is_empty()
     );
 }
+
+fn wait_until_finished(workspace: &MeetingWorkspace) {
+    let started = Instant::now();
+    while !workspace.is_finished() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the worker never stopped"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_worker_that_cannot_start_reports_why_instead_of_busy() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SettingsStore::new(directory.path().join("settings.toml")).unwrap();
+    store.save(&Settings::default()).unwrap();
+    std::fs::write(directory.path().join("assistant.json"), b"{ not json").unwrap();
+    let workspace = MeetingWorkspace::start(store).unwrap();
+    let mut last = Ok(());
+    for _ in 0..=MAX_RESTARTS + 1 {
+        wait_until_finished(&workspace);
+        last = workspace.send(WorkspaceEvent::Refresh);
+        if last.is_err() {
+            break;
+        }
+    }
+    let message = last.expect_err("a worker that keeps failing is not restarted forever");
+    assert!(
+        message.starts_with("Meetings could not start:"),
+        "{message}"
+    );
+    assert!(message.contains("assistant settings"), "{message}");
+    assert!(!message.contains("busy"), "{message}");
+    let log = std::fs::read_to_string(directory.path().join("logs/lifecycle.log")).unwrap();
+    assert!(log.contains("event=meeting_worker_stopped"), "{log}");
+    assert!(log.contains("event=meeting_worker_restarted"), "{log}");
+}
+
+#[test]
+fn a_stopped_worker_is_replaced_and_keeps_working() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SettingsStore::new(directory.path().join("settings.toml")).unwrap();
+    store.save(&Settings::default()).unwrap();
+    let workspace = MeetingWorkspace::start(store).unwrap();
+    workspace.request_shutdown().unwrap();
+    wait_until_finished(&workspace);
+    workspace.send(WorkspaceEvent::Refresh).unwrap();
+    assert!(!workspace.is_finished(), "a new worker took over");
+}
