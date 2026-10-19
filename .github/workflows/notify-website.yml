@@ -1,0 +1,29 @@
+name: Notify website
+
+# phorminx.net reads features, release notes and the latest version from this
+# repository at build time. Publishing a stable release asks Render to rebuild
+# the site so it picks them up.
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+jobs:
+  deploy:
+    if: ${{ !github.event.release.prerelease && !github.event.release.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trigger the phorminx.net deploy hook
+        env:
+          DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_PHORMINX }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ -z "$DEPLOY_HOOK" ]; then
+            echo "::notice::RENDER_DEPLOY_HOOK_PHORMINX is not set; the website was not rebuilt for $TAG."
+            exit 0
+          fi
+          curl --fail --silent --show-error --max-time 30 --retry 3 --retry-delay 10 \
+            --request POST --output /dev/null "$DEPLOY_HOOK"
+          echo "::notice::Asked Render to rebuild phorminx.net for $TAG."
