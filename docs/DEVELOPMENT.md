@@ -44,6 +44,32 @@ cargo run -p phorminx-bench -- format-bench --model qwen2.5:7b-instruct `
     --custom "Use short bullet points." --output format-bench.md
 ```
 
+Published benchmarks live in `docs/benchmarks/` and are shown, read-only, by
+the app's Benchmarks page and the website
+([ADR-020](ADR-020-BENCHMARKS-SECTION.md), [README](benchmarks/README.md)).
+The suite needs a folder of model files (Vosk runtime and model, the Whisper
+files, the OCR models) and the Ollama models under test. Build it with
+`--features vulkan` to include Accurate on the GPU, then run each feature; each
+merges its results into `docs/benchmarks/benchmarks.json`:
+
+```powershell
+$assets = 'C:\bench-assets'
+& cargo run --release -p phorminx-bench --features vulkan -- suite --assets $assets fixtures
+& cargo run --release -p phorminx-bench --features vulkan -- suite --assets $assets dictation
+& cargo run --release -p phorminx-bench --features vulkan -- suite --assets $assets formatting
+& cargo run --release -p phorminx-bench --features vulkan -- suite --assets $assets meetings
+& cargo run --release -p phorminx-bench --features vulkan -- suite --assets $assets investigations
+& cargo run --release -p phorminx-bench --features vulkan -- suite --assets $assets messaging --tor
+& cargo run --release -p phorminx-bench --features vulkan -- suite --assets $assets app --exe <phorminx-app.exe>
+& cargo run --release -p phorminx-bench --features vulkan -- suite --assets $assets finalize
+```
+
+Run it on an otherwise idle machine: a build, a second model in GPU memory or
+a busy desktop can double latency, and each run records decode speed so a
+model that spilled out of GPU memory is visible. Edit the `summary` in the
+JSON by hand if the findings need words, then run `finalize` again. Commit
+the JSON files; never commit personal recordings or transcripts.
+
 ## Automated checks
 
 Initialize the native developer shell first, then run:
@@ -57,6 +83,7 @@ cargo clippy --workspace --all-targets --features phorminx-app/desktop -- -D war
 python .\scripts\build-brand-assets.py --check
 node .\design\tauri-preview\markdown.test.js
 node .\design\tauri-preview\investigation-model.test.js
+node .\design\tauri-preview\benchmarks.test.js
 ```
 
 To measure OCR accuracy and speed after changing `phorminx-ocr`, download the

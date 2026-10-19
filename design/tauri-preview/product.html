@@ -8,7 +8,9 @@
   <link rel="stylesheet" href="product.css">
   <link rel="stylesheet" href="instruction-field.css">
   <link rel="stylesheet" href="investigations.css">
+  <link rel="stylesheet" href="benchmarks.css">
   <script src="markdown.js" defer></script>
+  <script src="benchmarks.js" defer></script>
   <script src="preview.js" defer></script>
   <script src="instruction-field.js" defer></script>
   <script src="product.js" defer></script>
@@ -30,6 +32,7 @@
         <button type="button" data-route="profiles">Profiles</button>
         <button type="button" data-route="prompts">Prompts</button>
         <button type="button" data-route="models">Models</button>
+        <button type="button" data-route="benchmarks">Benchmarks</button>
         <button type="button" data-route="actions">Actions</button>
         <button type="button" data-route="messages">Messages<span id="messages-badge" class="nav-badge" hidden></span></button>
         <button type="button" data-route="settings">Settings</button>
@@ -106,6 +109,11 @@
           <div class="setting-card inv-ocr-card" data-ocr-card><small>SCREENSHOTS / TEXT</small><h2>Screenshot text recognition</h2><p data-ocr-message>Checking local text models…</p><div class="inv-ocr-progress" hidden><span></span></div><div class="inv-ocr-actions"><button type="button" class="primary" data-ocr-install>Download verified models</button><button type="button" data-ocr-remove hidden>Remove</button></div><p class="inv-ocr-fineprint">PaddleOCR PP-OCRv4 detection and PP-OCRv5 Latin recognition (English, Spanish and 30 more), Apache-2.0, run on this computer. Pinned files are verified by SHA-256 before use.</p></div>
           <div class="setting-card model-ollama"><small>LOCAL LANGUAGE MODELS</small><h2>Ollama</h2><p class="setting-hint">Structured and Custom formatting reorganize what you said, which needs a 7B-class model such as qwen2.5:7b-instruct. Smaller models are fast for Light, Balanced and Strong but tend to ignore restructuring instructions.</p><div id="ollama-models"></div></div>
           <p id="model-result" role="status"></p>
+        </section>
+        <section id="benchmarks" class="page" hidden>
+          <div class="page-head"><div><small>RESEARCH</small><h1>Benchmarks</h1></div></div>
+          <p class="setting-hint">How each feature and setup performed in the Phorminx team's published test runs, on synthetic inputs. Read-only: nothing is measured or sent from this computer.</p>
+          <div id="benchmarks-view" class="scroll-content"></div>
         </section>
         <section id="actions" class="page" hidden><div class="page-head"><div><small>AUTOMATION</small><h1>Actions</h1></div><button id="new-action" type="button" class="primary">New action</button></div><div id="actions-list" class="record-list single-list"></div></section>
         <section id="action-editor" class="page" hidden>
