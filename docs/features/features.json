@@ -1,0 +1,127 @@
+{
+  "schemaVersion": 1,
+  "description": "Feature catalog for the README and phorminx.net. The website reads this file at the latest release tag. Image paths are relative to the repository root; text must match the code at that tag.",
+  "hero": {
+    "image": "docs/features/hero-light.webp",
+    "imageDark": "docs/features/hero-dark.webp",
+    "width": 1600,
+    "height": 800,
+    "alt": "Your voice, written and translated on your own PC: recent dictations and the meeting companion with an English transcript, its Portuguese translation and an assistant answer"
+  },
+  "socialImage": "docs/features/social-preview-web.png",
+  "features": [
+    {
+      "id": "dictation",
+      "order": 10,
+      "title": "Dictation",
+      "tagline": "Press, speak, and it is typed where you were.",
+      "body": "Press Ctrl+Alt+Space, speak, and Phorminx types into the app you were using. Recognition runs on your PC: Instant mode uses Vosk for speed, Accurate mode uses Whisper with optional Vulkan GPU acceleration. Live text shows what it heard while you talk.",
+      "image": "docs/features/dictation.webp",
+      "width": 1600,
+      "height": 800,
+      "alt": "Dictation: press Ctrl+Alt+Space, speak, the speech is recognized locally, optionally formatted by a local Ollama model, and inserted into the app you are using. Instant mode uses Vosk (fastest); Accurate mode uses Whisper (most accurate, optional Vulkan GPU).",
+      "since": "0.2.0",
+      "showOnSite": true
+    },
+    {
+      "id": "review-panel",
+      "order": 15,
+      "title": "Review panel",
+      "tagline": "Fix the last dictation without saying it again.",
+      "body": "Open the last dictation from the status pill to edit it, reformat it with another strength or a one-off instruction, copy it, or replace the text you inserted. Replace only touches text that is still there and unchanged; otherwise the result goes to the clipboard.",
+      "since": "0.2.3",
+      "showOnSite": true
+    },
+    {
+      "id": "formatting",
+      "order": 20,
+      "title": "Formatting",
+      "tagline": "Speak loosely. Paste it polished.",
+      "body": "A local Ollama model turns rambling speech into clean text, from light punctuation to structured lists, and can run more than once to refine the result. Teach names and jargon in the lexicon, and give each app its own style with profiles. Formatting is optional.",
+      "image": "docs/features/formatting.webp",
+      "width": 1600,
+      "height": 800,
+      "alt": "Speak loosely, paste it polished: raw speech becomes a formatted list after 2 local formatting passes, with lexicon words such as Priya and Kubernetes corrected, and an @ prompt chip inside the custom instructions field.",
+      "since": "0.2.0",
+      "showOnSite": true
+    },
+    {
+      "id": "prompts",
+      "order": 30,
+      "title": "Prompts",
+      "tagline": "Write an instruction once. Use it everywhere.",
+      "body": "Keep named, tagged instructions in one library. Type @ in any instruction field to use one: formatting, app profiles, the review panel, the meeting assistant or Actions. Every save is a version you can restore, and references always use the latest one.",
+      "image": "docs/features/prompts.webp",
+      "width": 1600,
+      "height": 800,
+      "alt": "Write an instruction once, use it everywhere: the prompts library with tags, a selected prompt and its version history.",
+      "since": "0.2.3",
+      "showOnSite": true
+    },
+    {
+      "id": "meetings",
+      "order": 40,
+      "title": "Meetings",
+      "tagline": "Both sides of the call, transcribed and translated.",
+      "body": "Phorminx captures your microphone and your computer's audio together and writes the meeting down as it happens. Turn on translation and a local model adds each line in your language right under the original, which is always kept.",
+      "image": "docs/features/meetings.webp",
+      "width": 1600,
+      "height": 800,
+      "alt": "Both sides of the call, transcribed and translated: your microphone and computer audio go to two local recognizers, and a local Ollama model adds a translation under each line while keeping the original.",
+      "since": "0.2.0",
+      "showOnSite": true
+    },
+    {
+      "id": "assistant",
+      "order": 50,
+      "title": "Assistant",
+      "tagline": "Ask what you missed, while the call continues.",
+      "body": "Ask a question and get an answer drawn from the conversation so far, without stopping capture. The compact companion stays beside your call. Use a local Ollama model, or OpenAI or Anthropic with your own key.",
+      "image": "docs/features/assistant.webp",
+      "width": 1600,
+      "height": 800,
+      "alt": "Ask what you missed, while the call continues: a question in the companion and the assistant's answer listing what was decided and what is still open.",
+      "since": "0.2.0",
+      "showOnSite": true
+    },
+    {
+      "id": "investigations",
+      "order": 60,
+      "title": "Investigations",
+      "tagline": "Everything about one question, in one place.",
+      "body": "Collect pasted text, screenshots, links and voice notes as cards. Screenshot text is read by local OCR. See them as a chronology or a diagram, and ask the assistant, which answers with citations to your cards.",
+      "image": "docs/features/investigations.webp",
+      "width": 1600,
+      "height": 1100,
+      "alt": "Everything about one question, in one place: pasted text, screenshots read by local OCR, links and voice notes become cards, shown as a chronology or a diagram, and the assistant answers with citations to cards.",
+      "since": "0.2.3",
+      "showOnSite": true
+    },
+    {
+      "id": "messages",
+      "order": 70,
+      "title": "Messages",
+      "tagline": "Message people directly. No server in between.",
+      "body": "Add people with a one-time invite and send text straight to them over the Tor network. There is no Phorminx server, and neither side learns the other's IP address. It is off until you turn it on, and history stays on your PC.",
+      "image": "docs/features/messages.webp",
+      "width": 1600,
+      "height": 800,
+      "alt": "Message people directly with no server in between: you and a contact connect through the Tor network. Off by default, no Phorminx server, neither side learns the other's IP address, history stays local.",
+      "since": "0.2.3",
+      "showOnSite": true
+    },
+    {
+      "id": "more",
+      "order": 80,
+      "title": "And also",
+      "tagline": "Search, actions, guided setup and safe updates.",
+      "body": "Search everything you kept by exact words or meaning, send a dictation to any HTTP endpoint with Actions, set up verified models in one guided run, and get signed updates that never interrupt a recording.",
+      "image": "docs/features/more.webp",
+      "width": 1600,
+      "height": 800,
+      "alt": "Library search with exact words or local semantic search, Actions that send a dictation to an HTTP endpoint, hash-verified models and guided setup, and automatic updates: a signed manifest is checked, the installer hash is verified, and it installs after you exit or while idle, never during a recording.",
+      "since": "0.2.0",
+      "showOnSite": true
+    }
+  ]
+}
