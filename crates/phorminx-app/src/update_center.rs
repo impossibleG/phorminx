@@ -344,13 +344,11 @@ impl UpdateCenter {
             ui.label("Only signed stable releases are accepted. Installation waits until you close Phorminx; recording is never stopped for an update.");
             let configured=updates::configured_key().is_ok();
             let mut daily=self.preferences.check_daily;
-            if ui.checkbox(&mut daily,"Check for signed releases daily").changed() {
-                if let Err(error)=self.set_daily_checks(daily) {self.notice=error;}
-            }
+            if ui.checkbox(&mut daily,"Check for signed releases daily").changed()
+                && let Err(error)=self.set_daily_checks(daily) {self.notice=error;}
             let mut automatic=self.preferences.automatic;
-            if ui.add_enabled(configured&&!self.scheduled,egui::Checkbox::new(&mut automatic,"Automatically download and install on exit")).changed() {
-                if let Err(error)=self.set_automatic_install(automatic){self.notice=error;}
-            }
+            if ui.add_enabled(configured&&!self.scheduled,egui::Checkbox::new(&mut automatic,"Automatically download and install on exit")).changed()
+                && let Err(error)=self.set_automatic_install(automatic){self.notice=error;}
             ui.horizontal(|ui|{
                 if ui.add_enabled(self.pending.is_none()&&!self.scheduled,egui::Button::new("Check for updates")).clicked(){self.check();}
                 if self.release.is_some()&&self.staged.is_none()&&ui.add_enabled(self.pending.is_none(),egui::Button::new("Download update")).clicked(){self.download();}

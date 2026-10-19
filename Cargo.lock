@@ -5462,16 +5462,28 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "phorminx-app",
+ "phorminx-assistant",
  "phorminx-audio",
  "phorminx-core",
+ "phorminx-messaging",
+ "phorminx-ocr",
  "phorminx-ollama",
+ "phorminx-persistence",
+ "phorminx-vosk",
  "phorminx-whisper",
+ "serde",
+ "serde_json",
+ "ureq",
+ "url",
 ]
 
 [[package]]
 name = "phorminx-core"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
 ]
 

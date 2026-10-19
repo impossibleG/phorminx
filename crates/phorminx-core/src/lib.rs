@@ -1,5 +1,7 @@
 //! Platform-neutral domain types and contracts for Phorminx.
 
+pub mod benchmark_report;
+
 use std::path::Path;
 use std::time::Duration;
 
