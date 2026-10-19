@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Formatting</title><link rel="stylesheet" href="style.css">
+<style>
+  .head { position: absolute; left: 96px; top: 84px; width: 1400px; }
+  .pair { position: absolute; left: 96px; top: 270px; width: 940px; display: grid; grid-template-columns: 1fr 70px 1fr; align-items: stretch; }
+  .pair .card { min-height: 330px; }
+  .raw p { margin: 0; color: var(--quiet); font-family: var(--mono); font-size: 22px; line-height: 1.6; }
+  .done p, .done li { font-size: 25px; line-height: 1.5; }
+  .done p { margin: 0 0 10px; }
+  .done ul { margin: 0; padding-left: 26px; }
+  .lex { padding: 0 4px; border-bottom: 2px solid var(--accent); color: var(--text); }
+  .mid { display: grid; place-items: center; }
+  .mid .arrow { margin: 0; width: 46px; }
+  .chip { position: absolute; right: 96px; top: 250px; width: 440px; }
+  .chip img { position: static; height: 400px; width: auto; }
+  .chip .callout { position: static; margin-top: 26px; white-space: normal; align-items: flex-start; }
+  .chip .callout span { font-weight: 500; color: var(--quiet); font-size: 19px; line-height: 1.4; }
+  .chip .callout span strong { color: var(--text); }
+</style></head>
+<body><div class="canvas">
+  <div class="head">
+    <p class="eyebrow">Formatting · lexicon · profiles</p>
+    <h2>Speak loosely. Paste it polished.</h2>
+  </div>
+  <div class="pair">
+    <div class="card raw"><small>What you said</small>
+      <p>um so pria wants the q3 numbers by friday uh and also the cube or net ease migration plan before the review</p></div>
+    <div class="mid"><div class="arrow"></div></div>
+    <div class="card done"><small>After 2 local passes</small>
+      <p><span class="lex">Priya</span> wants, before the review:</p>
+      <ul><li>The Q3 numbers by Friday</li><li>The <span class="lex">Kubernetes</span> migration plan</li></ul></div>
+  </div>
+  <div class="chip">
+    <img class="shot" src="crops/chip.png" alt="">
+    <div class="callout"><b>1</b><span><strong>Type @ to reuse a saved prompt.</strong> It shows as a chip and always uses the prompt's latest version.</span></div>
+  </div>
+  <p class="foot" style="max-width:940px;line-height:1.5">Illustrative example. <span class="mark">Underlined</span> words come from the lexicon (pria → Priya, cube or net ease → Kubernetes). Formatting runs on a local Ollama model and is optional.</p>
+</div>
+<script src="common.js"></script>
+</body></html>

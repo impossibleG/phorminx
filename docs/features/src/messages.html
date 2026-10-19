@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Messages</title><link rel="stylesheet" href="style.css">
+<style>
+  .head { position: absolute; left: 96px; top: 84px; width: 1400px; }
+  .net { position: absolute; left: 96px; right: 96px; top: 300px; display: grid; grid-template-columns: 1fr 1.5fr 1fr; align-items: center; }
+  .net .node .icon { width: 120px; height: 120px; }
+  .net .node .icon svg { width: 60px; height: 60px; }
+  .tor { position: relative; display: grid; place-items: center; height: 200px; }
+  .tor::before { content: ""; position: absolute; left: 0; right: 0; top: 50%; border-top: 2px dashed var(--accent); }
+  .tor .node { position: relative; padding: 0 26px; background: var(--page); }
+  .server { position: absolute; top: -10px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; color: var(--quiet); font-size: 18px; white-space: nowrap; }
+  .server i svg { width: 26px; height: 26px; fill: none; stroke: var(--quiet); stroke-width: 1.7; stroke-linecap: round; }
+  .facts { position: absolute; left: 96px; right: 96px; bottom: 80px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 22px; }
+  .facts .card { padding: 22px 26px; font-size: 19px; color: var(--quiet); line-height: 1.4; }
+  .facts strong { display: block; margin-bottom: 6px; color: var(--text); font-size: 21px; font-weight: 600; }
+</style></head>
+<body><div class="canvas">
+  <div class="head">
+    <p class="eyebrow">Messages · peer to peer</p>
+    <h2>Message people directly. No server in between.</h2>
+  </div>
+  <div class="net">
+    <div class="node"><div class="icon" data-icon="user"></div><strong>You</strong><span>Phorminx running</span></div>
+    <div class="tor">
+      <div class="node"><div class="icon" data-icon="onion"></div><strong>Tor network</strong><span>onion services via the embedded Arti client</span></div>
+    </div>
+    <div class="node"><div class="icon" data-icon="user"></div><strong>Your contact</strong><span>added with a one-time invite</span></div>
+  </div>
+  <div class="facts">
+    <div class="card"><strong>Off by default</strong>No Tor connection until you turn it on.</div>
+    <div class="card"><strong>No Phorminx server</strong>No mailbox and no relay we run.</div>
+    <div class="card"><strong>IP addresses stay private</strong>Neither side learns the other's.</div>
+    <div class="card"><strong>History stays local</strong>Delete it per contact. Contacts can see when you are online.</div>
+  </div>
+</div>
+<script src="common.js"></script>
+</body></html>
