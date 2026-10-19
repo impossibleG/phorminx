@@ -23,7 +23,7 @@ OUT = SRC.parent
 EDGE = os.environ.get("EDGE", r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
 LIMIT = 250 * 1024
 
-# output name -> (template, theme, height)
+# output name -> (template + query, theme, height[, width, format])
 VISUALS = {
     "hero-dark": ("hero.html", "dark", 800),
     "hero-light": ("hero.html", "light", 800),
@@ -35,16 +35,22 @@ VISUALS = {
     "investigations": ("investigations.html", "dark", 1100),
     "messages": ("messages.html", "dark", 800),
     "more": ("more.html", "dark", 800),
+    # Repository social preview (Settings > General > Social preview) and a
+    # 1200x630 variant for phorminx.net. PNG, because GitHub needs PNG/JPG/GIF.
+    "social-preview": ("social.html", "light", 640, 1280, "png"),
+    "social-preview-web": ("social.html?size=web", "light", 630, 1200, "png"),
 }
 
 
-def render(name: str, template: str, theme: str, height: int, scratch: Path) -> Path:
+def render(name: str, template: str, theme: str, height: int, scratch: Path,
+           width: int = 1600, fmt: str = "webp") -> Path:
     png = scratch / f"{name}.png"
-    url = (SRC / template).as_uri() + f"?theme={theme}"
+    page, _, query = template.partition("?")
+    url = (SRC / page).as_uri() + f"?theme={theme}" + (f"&{query}" if query else "")
     subprocess.run(
         [EDGE, "--headless=new", "--disable-gpu", "--hide-scrollbars",
          "--force-device-scale-factor=1", "--allow-file-access-from-files",
-         f"--user-data-dir={scratch / 'profile'}", f"--window-size=1600,{height}",
+         f"--user-data-dir={scratch / 'profile'}", f"--window-size={width},{height}",
          "--virtual-time-budget=3000", f"--screenshot={png}", url],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
@@ -54,7 +60,12 @@ def render(name: str, template: str, theme: str, height: int, scratch: Path) -> 
             break
         time.sleep(0.2)
     time.sleep(0.3)
-    image = Image.open(png).convert("RGB")
+    image = Image.open(png).convert("RGB").crop((0, 0, width, height))
+    if fmt == "png":
+        out = OUT / f"{name}.png"
+        image.save(out, "PNG", optimize=True)
+        print(f"{out.name}: {image.width}x{image.height}, {out.stat().st_size // 1024} KB")
+        return out
     out = OUT / f"{name}.webp"
     for quality in (90, 84, 78, 70, 62):
         image.save(out, "WEBP", quality=quality, method=6)
@@ -83,6 +94,6 @@ def contact_sheet(paths: list[Path]) -> None:
 if __name__ == "__main__":
     only = set(sys.argv[1:])
     with tempfile.TemporaryDirectory() as scratch:
-        outputs = [render(name, *spec, Path(scratch)) for name, spec in VISUALS.items() if not only or name in only]
+        outputs = [render(name, *spec[:3], Path(scratch), *spec[3:]) for name, spec in VISUALS.items() if not only or name in only]
     if not only:
-        contact_sheet(outputs)
+        contact_sheet([o for o in outputs if o.suffix == ".webp"])
