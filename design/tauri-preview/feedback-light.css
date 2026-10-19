@@ -1,5 +1,5 @@
 :root[data-theme="light"]{background:#f4f1eb;color:#202326}
-:root[data-theme="light"] header,:root[data-theme="light"] .composer{background:#eae7e0;border-color:#b9b7b0}
+:root[data-theme="light"] header,:root[data-theme="light"] .composer,:root[data-theme="light"] .actions-bar{background:#eae7e0;border-color:#b9b7b0}
 :root[data-theme="light"] .heading p,:root[data-theme="light"] .diagnostics,:root[data-theme="light"] .composer-foot{color:#555b60}
 :root[data-theme="light"] .composer textarea{color:#202326}
 :root[data-theme="light"] .composer-foot{border-color:#b9b7b0}
