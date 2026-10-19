@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 410" width="820" height="410" font-family="Segoe UI Variable,Segoe UI,-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif" role="img" aria-label="What stays on your computer and what can leave it">
+<rect width="820" height="410" rx="0" fill="#f2f0e9"/>
+<rect x="24" y="20" width="350" height="370" rx="0" fill="#faf8f2" stroke="#cbc7bd"/>
+<rect x="42" y="44" width="12" height="12" fill="#4f7a5a"/>
+<text x="64" y="56" font-size="13" font-weight="650" letter-spacing="2" fill="#4f7a5a">STAYS ON THIS COMPUTER</text>
+<rect x="40" y="86" width="318" height="48" rx="0" fill="#f2f0e9" stroke="#cbc7bd"/>
+<rect x="40" y="86" width="4" height="48" rx="2" fill="#4f7a5a"/>
+<text x="56" y="106" font-size="14" font-weight="600" fill="#1f2022">Speech recognition</text>
+<text x="56" y="125" font-size="12.5" fill="#62666a">Vosk and Whisper; audio stays in memory</text>
+<rect x="40" y="144" width="318" height="48" rx="0" fill="#f2f0e9" stroke="#cbc7bd"/>
+<rect x="40" y="144" width="4" height="48" rx="2" fill="#4f7a5a"/>
+<text x="56" y="164" font-size="14" font-weight="600" fill="#1f2022">Formatting and translation</text>
+<text x="56" y="183" font-size="12.5" fill="#62666a">local Ollama models</text>
+<rect x="40" y="202" width="318" height="48" rx="0" fill="#f2f0e9" stroke="#cbc7bd"/>
+<rect x="40" y="202" width="4" height="48" rx="2" fill="#4f7a5a"/>
+<text x="56" y="222" font-size="14" font-weight="600" fill="#1f2022">Semantic search</text>
+<text x="56" y="241" font-size="12.5" fill="#62666a">local embeddings</text>
+<rect x="40" y="260" width="318" height="48" rx="0" fill="#f2f0e9" stroke="#cbc7bd"/>
+<rect x="40" y="260" width="4" height="48" rx="2" fill="#4f7a5a"/>
+<text x="56" y="280" font-size="14" font-weight="600" fill="#1f2022">Screenshot text (OCR)</text>
+<text x="56" y="299" font-size="12.5" fill="#62666a">local models, verified download</text>
+<rect x="40" y="318" width="318" height="48" rx="0" fill="#f2f0e9" stroke="#cbc7bd"/>
+<rect x="40" y="318" width="4" height="48" rx="2" fill="#4f7a5a"/>
+<text x="56" y="338" font-size="14" font-weight="600" fill="#1f2022">Your text</text>
+<text x="56" y="357" font-size="12.5" fill="#62666a">history, meetings, investigations, prompts</text>
+<rect x="446" y="20" width="350" height="370" rx="0" fill="#faf8f2" stroke="#cbc7bd"/>
+<rect x="464" y="44" width="12" height="12" fill="#a87542"/>
+<text x="486" y="56" font-size="13" font-weight="650" letter-spacing="2" fill="#a87542">LEAVES ONLY WHEN YOU CHOOSE</text>
+<rect x="462" y="86" width="318" height="48" rx="0" fill="#f2f0e9" stroke="#cbc7bd"/>
+<rect x="462" y="86" width="4" height="48" rx="2" fill="#a87542"/>
+<text x="478" y="106" font-size="14" font-weight="600" fill="#1f2022">Feedback</text>
+<text x="478" y="125" font-size="12.5" fill="#62666a">only after you press Send, to phorminx.net</text>
+<rect x="462" y="144" width="318" height="48" rx="0" fill="#f2f0e9" stroke="#cbc7bd"/>
+<rect x="462" y="144" width="4" height="48" rx="2" fill="#a87542"/>
+<text x="478" y="164" font-size="14" font-weight="600" fill="#1f2022">Remote assistant</text>
+<text x="478" y="183" font-size="12.5" fill="#62666a">OpenAI or Anthropic, if you pick one</text>
+<rect x="462" y="202" width="318" height="48" rx="0" fill="#f2f0e9" stroke="#cbc7bd"/>
+<rect x="462" y="202" width="4" height="48" rx="2" fill="#a87542"/>
+<text x="478" y="222" font-size="14" font-weight="600" fill="#1f2022">Actions</text>
+<text x="478" y="241" font-size="12.5" fill="#62666a">your saved HTTP request, when you run it</text>
+<rect x="462" y="260" width="318" height="48" rx="0" fill="#f2f0e9" stroke="#cbc7bd"/>
+<rect x="462" y="260" width="4" height="48" rx="2" fill="#a87542"/>
+<text x="478" y="280" font-size="14" font-weight="600" fill="#1f2022">Messages</text>
+<text x="478" y="299" font-size="12.5" fill="#62666a">off by default; direct to contacts over Tor</text>
+<rect x="462" y="318" width="318" height="48" rx="0" fill="#f2f0e9" stroke="#cbc7bd"/>
+<rect x="462" y="318" width="4" height="48" rx="2" fill="#a87542"/>
+<text x="478" y="338" font-size="14" font-weight="600" fill="#1f2022">Downloads and updates</text>
+<text x="478" y="357" font-size="12.5" fill="#62666a">models, link previews, GitHub Releases</text>
+<path d="M 382 215 L 436 215" stroke="#8c8a84" stroke-width="2" stroke-dasharray="5 4" fill="none"/>
+<path d="M 429 209 L 438 215 L 429 221" stroke="#8c8a84" stroke-width="2" fill="none"/>
+</svg>

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Meetings</title><link rel="stylesheet" href="style.css">
+<style>
+  .head { position: absolute; left: 96px; top: 84px; width: 1400px; }
+  .diagram { position: absolute; left: 96px; top: 262px; width: 780px; display: flex; align-items: center; gap: 18px; }
+  .diagram .arrow { width: 54px; margin-top: 0; }
+  .diagram .node span { max-width: 180px; }
+  .diagram .node .icon { width: 92px; height: 92px; }
+  .stack { display: grid; gap: 26px; }
+  .stack .node { flex-direction: row; gap: 16px; }
+  .stack .node .icon { width: 76px; height: 76px; }
+  .out { position: absolute; left: 96px; bottom: 80px; display: flex; gap: 22px; }
+  .out .card { padding: 18px 24px; font-size: 19px; color: var(--quiet); }
+  .out .card strong { display: block; color: var(--text); font-size: 21px; margin-bottom: 4px; font-weight: 600; }
+  .field { left: 930px; top: 230px; width: 640px; height: 540px; }
+  .lines { left: 910px; top: 270px; width: 600px; }
+</style></head>
+<body><div class="canvas">
+  <div class="head">
+    <p class="eyebrow">Meetings · live translation</p>
+    <h2>Both sides of the call, transcribed and translated.</h2>
+  </div>
+  <div class="diagram">
+    <div class="stack">
+      <div class="node"><div class="icon" data-icon="mic"></div><strong>Your microphone</strong></div>
+      <div class="node"><div class="icon" data-icon="speaker"></div><strong>Computer audio</strong></div>
+    </div>
+    <div class="arrow"></div>
+    <div class="node"><div class="icon" data-icon="chip"></div><strong>Two local recognizers</strong><span>one per source, Vosk or Whisper</span></div>
+    <div class="arrow"></div>
+    <div class="node"><div class="icon" data-icon="translate"></div><strong>Transcript + translation</strong><span>a local Ollama model adds the translation; the original is kept</span></div>
+  </div>
+  <div class="out">
+    <div class="card"><strong>Original, Translation or Both</strong>choose what the companion shows</div>
+    <div class="card"><strong>Pause either source</strong>without muting your call</div>
+  </div>
+  <div class="field"></div>
+  <img class="shot lines" src="crops/transcript.png" alt="">
+</div>
+<script src="common.js"></script>
+</body></html>

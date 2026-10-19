@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Investigations</title><link rel="stylesheet" href="style.css">
+<style>
+  .canvas { height: 1100px; }
+  .head { position: absolute; left: 96px; top: 84px; width: 1400px; }
+  .flow { position: absolute; left: 96px; right: 96px; top: 280px; display: grid; grid-template-columns: 330px 70px 1fr 70px 1fr 70px 1fr; align-items: center; }
+  .inputs { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .in { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1.5px solid var(--rule); background: var(--surface); font-size: 18px; font-weight: 600; }
+  .in i { width: 28px; height: 28px; flex: none; }
+  .in i svg { width: 28px; height: 28px; fill: none; stroke: var(--accent); stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .in small { display: block; color: var(--quiet); font-size: 14px; font-weight: 500; }
+  .flow .arrow { margin: 0; width: 56px; justify-self: center; }
+  .flow .node .icon { width: 92px; height: 92px; }
+  .crops { position: absolute; left: 96px; right: 96px; bottom: 70px; display: grid; grid-template-columns: 1fr 1fr; gap: 36px; }
+  .crops figure { margin: 0; }
+  .crops img { position: static; width: 100%; height: 440px; object-fit: cover; object-position: top left; }
+  .crops figcaption { margin-top: 14px; color: var(--quiet); font-size: 18px; }
+  .crops figcaption strong { color: var(--text); }
+</style></head>
+<body><div class="canvas">
+  <div class="head">
+    <p class="eyebrow">Investigations</p>
+    <h2>Everything about one question, in one place.</h2>
+  </div>
+  <div class="flow">
+    <div class="inputs">
+      <div class="in"><i data-icon="clipboard"></i><span>Paste<small>text, any app</small></span></div>
+      <div class="in"><i data-icon="image"></i><span>Screenshot<small>local OCR</small></span></div>
+      <div class="in"><i data-icon="link"></i><span>Link<small>title + preview</small></span></div>
+      <div class="in"><i data-icon="mic"></i><span>Voice note<small>transcribed</small></span></div>
+    </div>
+    <div class="arrow"></div>
+    <div class="node"><div class="icon" data-icon="note"></div><strong>Cards</strong><span>kept until you delete them</span></div>
+    <div class="arrow"></div>
+    <div class="node"><div class="icon" data-icon="graph"></div><strong>Chronology or diagram</strong><span>connect cards and concepts</span></div>
+    <div class="arrow"></div>
+    <div class="node"><div class="icon" data-icon="quote"></div><strong>Cited answers</strong><span>every claim points to a card, like [#3]</span></div>
+  </div>
+  <div class="crops">
+    <figure><img class="shot" style="object-position: 100% 0" src="crops/inv-chron.png" alt=""><figcaption><strong>Chronology</strong> with the assistant citing cards</figcaption></figure>
+    <figure><img class="shot" src="crops/inv-diagram.png" alt=""><figcaption><strong>Diagram</strong> with a suggested connection to accept or dismiss</figcaption></figure>
+  </div>
+</div>
+<script src="common.js"></script>
+</body></html>
