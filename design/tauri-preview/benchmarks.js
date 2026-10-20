@@ -330,6 +330,107 @@
     ['search', 'Search', 'embedding'],
   ];
 
+  /** The registry's "used by" labels that are model slots. */
+  const SLOT_FOR_USE = { Formatting: 'formatting', Search: 'search', Meetings: 'meetings', 'Meeting fallback': 'fallback', 'Live translation': 'translation' };
+
+  /** Slots a model currently fills, in display order. */
+  function assignedSlots(usedBy) {
+    const slots = new Set((usedBy || []).map((use) => SLOT_FOR_USE[use]).filter(Boolean));
+    return MODEL_SLOTS.filter(([slot]) => slots.has(slot)).map(([slot]) => slot);
+  }
+
+  /** Slots the model's kinds fit and it does not fill yet, matching `query`. */
+  function addableSlots(tags, assigned, query) {
+    const needle = String(query || '').trim().toLowerCase();
+    return MODEL_SLOTS
+      .filter(([slot, name, kind]) => (tags || []).includes(kind) && !assigned.includes(slot) && (!needle || name.toLowerCase().includes(needle)))
+      .map(([slot, name]) => ({ slot, name }));
+  }
+
+  /**
+   * One model's features as removable chips, plus an input that adds more
+   * from a filtered list, so one model can serve several features.
+   */
+  function featureCloud(model, entry, actions, say) {
+    const cloud = el('div', 'bench-cloud');
+    const assigned = assignedSlots(entry.usedBy);
+    const names = Object.fromEntries(MODEL_SLOTS.map(([slot, name]) => [slot, name]));
+    const chips = el('ul', 'bench-chips');
+    chips.setAttribute('aria-label', `Features using ${model}`);
+    for (const slot of assigned) {
+      const chip = el('li', 'bench-chip-tag');
+      chip.append(el('span', '', names[slot]));
+      const remove = el('button', 'bench-chip-remove', '×');
+      remove.type = 'button';
+      remove.setAttribute('aria-label', `Stop using ${model} for ${names[slot]}`);
+      remove.title = `Stop using ${model} for ${names[slot]}`;
+      remove.addEventListener('click', async () => {
+        remove.disabled = true;
+        try { say(await actions.unuse(slot, model)); } catch (error) { say(error); remove.disabled = false; }
+      });
+      chip.append(remove);
+      chips.append(chip);
+    }
+    if (!assigned.length) chips.append(el('li', 'bench-chip-empty', 'Not used by any feature'));
+    const others = (entry.usedBy || []).filter((use) => !SLOT_FOR_USE[use]);
+    const combo = el('div', 'bench-combo');
+    const input = el('input');
+    const listId = `bench-add-${model.replace(/[^a-z0-9]/gi, '-')}`;
+    input.type = 'text';
+    input.placeholder = 'Add a feature…';
+    input.autocomplete = 'off';
+    input.setAttribute('role', 'combobox');
+    input.setAttribute('aria-label', `Use ${model} for another feature`);
+    input.setAttribute('aria-controls', listId);
+    input.setAttribute('aria-expanded', 'false');
+    const options = el('ul', 'bench-combo-list');
+    options.id = listId;
+    options.setAttribute('role', 'listbox');
+    options.hidden = true;
+    let active = 0;
+    const choose = async (slot) => {
+      input.disabled = true;
+      options.hidden = true;
+      try { say(await actions.use(slot, model)); } catch (error) { say(error); input.disabled = false; }
+    };
+    const show = () => {
+      const matches = addableSlots(entry.tags, assigned, input.value);
+      active = Math.min(active, Math.max(matches.length - 1, 0));
+      options.replaceChildren(...matches.map(({ slot, name }, index) => {
+        const option = el('li', `bench-combo-option${index === active ? ' active' : ''}`, name);
+        option.id = `${listId}-${slot}`;
+        option.setAttribute('role', 'option');
+        option.setAttribute('aria-selected', String(index === active));
+        option.addEventListener('mousedown', (event) => { event.preventDefault(); void choose(slot); });
+        return option;
+      }));
+      if (!matches.length) options.append(el('li', 'bench-combo-none', assigned.length === MODEL_SLOTS.length ? 'Already used everywhere it fits.' : 'No other feature fits this model.'));
+      options.hidden = false;
+      input.setAttribute('aria-expanded', 'true');
+      input.setAttribute('aria-activedescendant', matches[active] ? `${listId}-${matches[active].slot}` : '');
+      return matches;
+    };
+    const hide = () => { options.hidden = true; input.setAttribute('aria-expanded', 'false'); };
+    input.addEventListener('focus', show);
+    input.addEventListener('input', () => { active = 0; show(); });
+    input.addEventListener('blur', hide);
+    input.addEventListener('keydown', (event) => {
+      const matches = addableSlots(entry.tags, assigned, input.value);
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        if (matches.length) active = (active + (event.key === 'ArrowDown' ? 1 : matches.length - 1)) % matches.length;
+        show();
+      } else if (event.key === 'Enter' && matches[active]) {
+        event.preventDefault();
+        void choose(matches[active].slot);
+      } else if (event.key === 'Escape') hide();
+    });
+    combo.append(input, options);
+    cloud.append(chips, combo);
+    if (others.length) cloud.append(el('small', 'bench-model-used', `Also used by ${others.join(', ')}`));
+    return cloud;
+  }
+
   /** Local models the report measured, as {model, facts}. */
   function measuredModels(file) {
     return modelOrder(file)
@@ -389,22 +490,7 @@
           });
           controls.append(download);
         } else {
-          const label = el('label', 'bench-picker');
-          label.append(el('span', '', 'Use for'));
-          const select = el('select');
-          select.append(new Option('Choose a feature…', ''));
-          for (const [slot, name, kind] of MODEL_SLOTS) if (entry.tags.includes(kind)) select.append(new Option(name, slot));
-          select.addEventListener('change', async () => {
-            const slot = select.value;
-            if (!slot) return;
-            select.disabled = true;
-            try { say(await actions.use(slot, model)); } catch (error) { say(error); }
-            select.value = '';
-            select.disabled = false;
-          });
-          label.append(select);
-          controls.append(label);
-          if (entry.usedBy && entry.usedBy.length) controls.append(el('small', 'bench-model-used', `Used by ${entry.usedBy.join(', ')}`));
+          controls.append(featureCloud(model, entry, actions, say));
         }
         item.append(controls);
       }
@@ -935,7 +1021,7 @@
     return details;
   }
 
-  const api = { format, filterRuns, where, average, describe, wordDiff, trendPoints, modelOrder, measuredModels, render };
+  const api = { format, filterRuns, where, average, describe, wordDiff, trendPoints, modelOrder, measuredModels, assignedSlots, addableSlots, render };
   global.PhorminxBenchmarks = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);
