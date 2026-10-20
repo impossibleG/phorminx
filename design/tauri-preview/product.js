@@ -658,6 +658,11 @@ function renderBenchmarks(collection) {
         void window.PhorminxModels.refresh();
         return message;
       },
+      unuse: async (slot) => {
+        const message = await hostInvoke('models_unassign', {slot});
+        void window.PhorminxModels.refresh();
+        return message;
+      },
       download: async (name) => {
         await installModel(name, null);
         return `Downloading ${name}. Progress shows on Models; the list updates when it is done.`;

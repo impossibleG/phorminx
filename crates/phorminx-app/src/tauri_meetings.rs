@@ -88,6 +88,35 @@ impl MeetingTauriState {
         }
     }
 
+    /// Stops using a model for the assistant, its fallback or translation.
+    /// Translation is turned off, since it cannot run without a model.
+    pub(crate) fn unassign_model(&self, slot: &str) -> Result<(), String> {
+        let snapshot = self
+            .meeting
+            .lock()
+            .map_err(|_| "Meeting state is unavailable.")?
+            .snapshot_after(u64::MAX)
+            .ok_or("Meeting settings are busy; try again.")?;
+        let mut provider = snapshot.provider.clone();
+        provider.api_key.clear();
+        provider.clear_credential = false;
+        match slot {
+            "meetings" => {
+                provider.model.clear();
+                self.send(WorkspaceEvent::SaveProvider(provider))
+            }
+            "fallback" => {
+                provider.fallback_model.clear();
+                self.send(WorkspaceEvent::SaveProvider(provider))
+            }
+            "translation" => self.send(WorkspaceEvent::SaveTranslation {
+                language: String::new(),
+                model: String::new(),
+            }),
+            _ => Err("That feature has no model to remove.".into()),
+        }
+    }
+
     /// Starts (or stops) dictating a message for a messaging contact.
     pub fn capture_message(
         &self,

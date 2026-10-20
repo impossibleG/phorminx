@@ -811,6 +811,46 @@ fn models_pull_status() -> crate::model_registry::PullView {
     crate::model_registry::pull_status()
 }
 
+/// Stops using a model for one feature; the feature falls back to its
+/// default, and the returned note says what that is.
+#[tauri::command(async)]
+fn models_unassign(slot: String, app: tauri::AppHandle, state: State<'_, HostState>) -> Result<String, String> {
+    match slot.as_str() {
+        "formatting" | "search" => {
+            let mut candidate = state
+                .bridge
+                .lock()
+                .map_err(|_| "Settings are unavailable.")?
+                .settings()
+                .clone();
+            let note = if slot == "formatting" {
+                candidate.formatting.ollama_model = None;
+                candidate.formatting.ollama_model_identity = None;
+                // Only Light formatting works without a local model.
+                if !matches!(candidate.formatting.strength, FormattingStrength::Raw | FormattingStrength::Light) {
+                    candidate.formatting.strength = FormattingStrength::Light;
+                }
+                "Formatting no longer uses a local model; dictation gets Light formatting."
+            } else {
+                candidate.search.embedding_model = None;
+                "Search no longer uses a model; it finds exact words only."
+            };
+            state.execute(UiCommand::SaveSettings(candidate))?;
+            Ok(note.into())
+        }
+        "meetings" | "fallback" | "translation" => {
+            app.state::<MeetingTauriState>().unassign_model(&slot)?;
+            Ok(match slot.as_str() {
+                "meetings" => "The meeting and investigation assistant has no model until you choose one.",
+                "fallback" => "The meeting assistant has no fallback model.",
+                _ => "Live translation is off until you choose a model.",
+            }
+            .into())
+        }
+        _ => Err("That feature has no model to remove.".into()),
+    }
+}
+
 /// "Use for…": points one feature at an installed model of the right kind,
 /// through the same settings and meeting paths as the Settings pages.
 #[tauri::command(async)]
@@ -1275,6 +1315,7 @@ fn run_shell(
             models_pull,
             models_pull_status,
             models_assign,
+            models_unassign,
             host_update_snapshot,
             host_update_action,
             host_action,
