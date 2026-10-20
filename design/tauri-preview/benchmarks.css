@@ -207,3 +207,16 @@
 .bench-model-text strong { font-size: 14px; font-weight: 600; }
 .bench-model-text span, .bench-model-used { color: var(--text-secondary); }
 .bench-model-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+/* Features a model serves: removable chips plus an add box. */
+.bench-cloud { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.bench-chips { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; }
+.bench-chip-tag { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--accent); border-radius: 999px; padding: 2px 4px 2px 10px; font-size: 11px; }
+.bench .bench-chip-remove { border: 0; background: transparent; padding: 0 6px; font-size: 13px; line-height: 1; color: var(--text-secondary); border-radius: 999px; }
+.bench .bench-chip-remove:hover { color: var(--text-primary); }
+.bench-chip-empty, .bench-combo-none { color: var(--text-secondary); font-size: 11px; }
+.bench-combo { position: relative; }
+.bench-combo input { width: 100%; box-sizing: border-box; border: 1px solid var(--axis); border-radius: 4px; background: var(--surface); color: var(--text-primary); padding: 7px 10px; font: inherit; }
+.bench-combo-list { position: absolute; z-index: 4; left: 0; right: 0; top: calc(100% + 4px); list-style: none; margin: 0; padding: 4px; background: var(--surface-raised); border: 1px solid var(--axis); border-radius: 4px; box-shadow: 0 6px 22px #0005; }
+.bench-combo-option { padding: 6px 8px; border-radius: 3px; cursor: pointer; }
+.bench-combo-option.active, .bench-combo-option:hover { background: var(--surface); color: var(--text-primary); outline: 1px solid var(--accent); }
+.bench-combo-none { padding: 6px 8px; }

@@ -66,4 +66,11 @@ const report = { runs: [
 ] };
 assert.deepEqual(bench.measuredModels(report), [{ model: 'qwen2.5:7b', facts: ['Formatting 1.50 s, quality 95/100', 'meeting summary 2.50 s'] }]);
 
+// Feature chips: what a model serves now, and what it could still serve.
+assert.deepEqual(bench.assignedSlots(['Live translation', 'Formatting', 'Action: Mail', 'Investigations']), ['formatting', 'translation']);
+assert.deepEqual(bench.addableSlots(['language', 'tools'], ['formatting'], '').map((s) => s.slot), ['meetings', 'fallback', 'translation']);
+assert.deepEqual(bench.addableSlots(['language'], [], 'trans').map((s) => s.slot), ['translation']);
+assert.deepEqual(bench.addableSlots(['embedding'], [], '').map((s) => s.slot), ['search']);
+assert.deepEqual(bench.addableSlots(['vision'], [], '').map((s) => s.slot), []);
+
 console.log('benchmarks.test.js: ok');
