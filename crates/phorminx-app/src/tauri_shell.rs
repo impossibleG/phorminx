@@ -72,6 +72,8 @@ struct HostState {
 #[serde(rename_all = "camelCase")]
 struct BootstrapView {
     available: bool,
+    /// Phorminx is already set up: the starter runs again as a repair.
+    repair: bool,
     state: String,
     message: String,
     step: u8,
@@ -96,18 +98,21 @@ struct BootstrapCenter {
 }
 
 impl BootstrapCenter {
-    fn new(status_path: PathBuf, available: bool) -> Self {
+    /// `first_run` is a new installation; otherwise the same starter runs
+    /// as a repair, reinstalling only what is missing.
+    fn new(status_path: PathBuf, first_run: bool) -> Self {
         Self {
             child: None,
             run_id: String::new(),
             status_path,
             view: BootstrapView {
-                available,
+                available: true,
+                repair: !first_run,
                 state: "idle".into(),
-                message: if available {
+                message: if first_run {
                     "Install the recommended local starter in one guided run.".into()
                 } else {
-                    "To run the complete starter setup, open Prepare Phorminx from the Start menu.".into()
+                    "Reinstall anything missing from the starter: speech recognition, GPU acceleration, Ollama and the starter models. Your settings and saved text are kept.".into()
                 },
                 step: 0,
                 total: 6,
@@ -117,7 +122,6 @@ impl BootstrapCenter {
     }
 
     fn start(&mut self) -> Result<(), String> {
-        if !self.view.available { return Err("Open Prepare Phorminx from the Start menu.".into()); }
         if self.child.is_some() { return Err("Starter setup is already running.".into()); }
         let executable = std::env::current_exe().map_err(|_| "Could not locate Phorminx.")?;
         let script = executable.parent().ok_or("Could not locate Phorminx.")?
@@ -769,7 +773,6 @@ fn host_bootstrap_snapshot(app: tauri::AppHandle, state: State<'_, HostState>) -
 
 #[tauri::command(async)]
 fn host_start_bootstrap(state: State<'_, HostState>) -> Result<BootstrapView, String> {
-    if !state.bootstrap_allowed { return Err("Open Prepare Phorminx from the Start menu to run the full starter.".into()); }
     let readiness = state.readiness.lock().map_err(|_| "Readiness is unavailable.")?.clone();
     let busy = state.setup.lock().map_err(|_| "Setup is unavailable.")?.as_ref()
         .is_some_and(|center| center.snapshot(&readiness).actions.iter().any(|action| action.running));
@@ -777,6 +780,15 @@ fn host_start_bootstrap(state: State<'_, HostState>) -> Result<BootstrapView, St
     let mut bootstrap = state.bootstrap.lock().map_err(|_| "Starter setup is unavailable.")?;
     bootstrap.start()?;
     Ok(bootstrap.view.clone())
+}
+
+/// The repair checklist: what each workflow needs and whether it is there.
+#[tauri::command]
+async fn host_repair_status(state: State<'_, HostState>) -> Result<Vec<crate::repair::RepairItem>, String> {
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::repair::check(&store))
+        .await
+        .map_err(|_| "The repair check could not run.".to_owned())
 }
 
 #[tauri::command(async)]
@@ -1192,6 +1204,7 @@ fn run_shell(
             host_bootstrap_snapshot,
             host_start_bootstrap,
             host_cancel_bootstrap,
+            host_repair_status,
             host_update_snapshot,
             host_update_action,
             host_action,
