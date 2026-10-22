@@ -98,7 +98,7 @@
 .bench-summary { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; max-width: 90ch; }
 .bench-summary :is(p, ul, ol) { margin: 6px 0; }
 
-.bench-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+.bench-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); grid-auto-rows: 1fr; gap: 12px; }
 .bench-tile { border: 1px solid var(--border); background: var(--surface); padding: 14px 16px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .bench-tile-label, .bench-tile-detail { color: var(--text-secondary); font-size: 10px; overflow: hidden; text-overflow: ellipsis; }
 .bench-tile strong { font-size: 26px; font-weight: 400; font-variant-numeric: tabular-nums; }
@@ -170,7 +170,8 @@
 .bench table { width: 100%; border-collapse: collapse; margin-top: 8px; font-variant-numeric: tabular-nums; }
 .bench th, .bench td { text-align: left; border-bottom: 1px solid var(--border); padding: 6px 8px; }
 .bench th { color: var(--text-secondary); font-weight: 500; font-size: 10px; }
-.bench-nudges { list-style: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; margin: 14px 0 0; padding: 0; }
+/* Every nudge card and tile is the same size: equal columns, equal rows. */
+.bench-nudges { list-style: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); grid-auto-rows: 1fr; gap: 10px; margin: 14px 0 0; padding: 0; }
 .bench-nudge { display: flex; flex-direction: column; gap: 3px; border: 1px solid var(--border); border-left: 3px solid var(--accent); background: var(--surface); padding: 10px 12px; min-width: 0; }
 .bench-nudge-kind { color: var(--text-secondary); font-size: 10px; letter-spacing: .04em; }
 .bench-nudge strong { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }

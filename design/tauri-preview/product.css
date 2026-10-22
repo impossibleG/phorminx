@@ -187,3 +187,5 @@ main :is(.page,.record-list,.record-detail,.scroll-content,.session-list,.recent
 :root[data-theme="light"] .nav-badge{background:#815026;color:#fff}
 #messaging [hidden]{display:none!important}
 .nav-badge[hidden]{display:none}
+/* Sidebar groups: work, your words, settings. The list scrolls on short windows. */
+.side{overflow-y:auto;scrollbar-width:thin;scrollbar-color:#394046 transparent}.side button{flex:none;padding-top:9px;padding-bottom:9px}.side-group{flex:none;margin:12px 12px 2px;color:#858c90;font-size:9px;letter-spacing:.14em}:root[data-theme="light"] .side-group{color:#555b60}:root[data-theme="light"] .side{scrollbar-color:#b9b7b0 transparent}
