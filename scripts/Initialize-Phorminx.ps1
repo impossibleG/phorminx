@@ -164,8 +164,14 @@ if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitProcess -or
     $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Run in 64-bit PowerShell on Windows x64.' }
 $appProcesses = @(Get-Process -Name 'phorminx-app' -ErrorAction SilentlyContinue)
 if ($FromApp) {
+    # Another copy installed elsewhere (a test build, say) keeps its own files;
+    # only a second instance of this same installation would conflict.
+    $hostProcess = @($appProcesses | Where-Object { $_.Id -eq $HostProcessId })
+    $sameInstall = if ($hostProcess.Count -eq 1 -and $hostProcess[0].Path) {
+        @($appProcesses | Where-Object { $_.Path -eq $hostProcess[0].Path })
+    } else { @() }
     if ($HostProcessId -le 0 -or $RunId -notmatch '^[a-zA-Z0-9-]{1,80}$' -or
-        $appProcesses.Count -ne 1 -or $appProcesses[0].Id -ne $HostProcessId) {
+        $hostProcess.Count -ne 1 -or $sameInstall.Count -ne 1) {
         throw 'Setup can run only from the single active Phorminx setup window.'
     }
 } elseif ($appProcesses.Count -gt 0) { throw 'Close Phorminx (including the tray icon), then run this command again.' }

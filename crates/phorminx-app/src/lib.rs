@@ -24,6 +24,7 @@ pub mod performance;
 pub mod performance_runtime;
 pub mod product_shell;
 pub mod prompts;
+pub mod repair;
 pub mod review;
 pub mod runtime;
 pub mod settings;
