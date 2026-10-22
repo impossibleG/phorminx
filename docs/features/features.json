@@ -111,6 +111,15 @@
       "showOnSite": true
     },
     {
+      "id": "benchmarks",
+      "order": 75,
+      "title": "Benchmarks",
+      "tagline": "Know which model to use before you download it.",
+      "body": "Phorminx publishes quick benchmarks of its recognition engines and local models for each feature, with a plain recommendation for each. From the Benchmarks page, use a benchmarked model for a feature or download it in one click. Every place that needs a model opens the same picker, showing what is installed and what fits.",
+      "since": "0.2.4",
+      "showOnSite": true
+    },
+    {
       "id": "more",
       "order": 80,
       "title": "And also",
