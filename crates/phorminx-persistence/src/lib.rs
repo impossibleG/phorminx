@@ -33,6 +33,7 @@ pub use meeting::{
 };
 mod profile;
 mod prompt;
+mod feedback;
 pub use prompt::{
     MAX_PROMPT_BODY_CHARS, MAX_PROMPT_NAME_CHARS, Prompt, PromptDraft, PromptRepository,
     PromptVersion,
@@ -43,6 +44,7 @@ pub use recovery::{RecoveryRecord, RecoveryRepository};
 use std::ffi::OsString;
 use std::{fs, path::Path, path::PathBuf, time::Duration};
 
+pub use feedback::{FeedbackRecord, FeedbackRepository};
 pub use history::{
     DictationDraft, DictationRecord, HISTORY_PREVIEW_MAX_CHARS, HistoryRepository, HistorySummary,
     HistoryTextVariant, HistoryVariantAvailability, MAX_TERMINAL_TEXT_BYTES,
@@ -212,6 +214,10 @@ impl Persistence {
 
     pub fn app_profiles(&self) -> AppProfileRepository<'_> {
         AppProfileRepository::new(&self.connection)
+    }
+
+    pub fn feedback(&self) -> FeedbackRepository<'_> {
+        FeedbackRepository::new(&self.connection)
     }
 
     pub fn prompts(&self) -> PromptRepository<'_> {
