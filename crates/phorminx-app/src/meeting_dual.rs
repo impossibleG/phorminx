@@ -18,7 +18,16 @@ pub struct DualAudioService {
     partials: [String; 2],
     stopping: bool,
     terminal: bool,
+    /// A restarted input counts samples from zero again; `base` keeps each
+    /// source's ledger monotonic across restarts.
+    base: [u64; 2],
+    restarts: [u32; 2],
+    restart: Option<Restarter>,
 }
+/// Reopens one input (0 = computer audio, 1 = microphone) after it failed.
+type Restarter = Box<dyn FnMut(usize, u32) -> Result<SingleAudioService, String> + Send>;
+/// A recognizer that falls behind is restarted a few times, not forever.
+const MAX_SOURCE_RESTARTS: u32 = 3;
 struct Barrier {
     id: u64,
     sample: u64,
@@ -142,15 +151,36 @@ impl DualAudioService {
         let computer = SingleAudioService::start(
             settings.clone(),
             MeetingAudioSource::SystemAudio,
-            output_device,
+            output_device.clone(),
             scratch.join("computer"),
         )?;
         let microphone = SingleAudioService::start(
-            settings,
+            settings.clone(),
             MeetingAudioSource::Microphone,
-            microphone_device,
+            microphone_device.clone(),
             scratch.join("microphone"),
         )?;
+        let restart: Restarter = Box::new(move |source, attempt| {
+            let (kind, device, name) = if source == 0 {
+                (
+                    MeetingAudioSource::SystemAudio,
+                    output_device.clone(),
+                    "computer",
+                )
+            } else {
+                (
+                    MeetingAudioSource::Microphone,
+                    microphone_device.clone(),
+                    "microphone",
+                )
+            };
+            SingleAudioService::start(
+                settings.clone(),
+                kind,
+                device,
+                scratch.join(format!("{name}-restart-{attempt}")),
+            )
+        });
         Ok(Self {
             inputs: [computer, microphone],
             epoch,
@@ -165,6 +195,9 @@ impl DualAudioService {
             partials: Default::default(),
             stopping: false,
             terminal: false,
+            base: [0; 2],
+            restarts: [0; 2],
+            restart: Some(restart),
         })
     }
     pub fn request_cutoff(&mut self, id: u64) -> Result<u64, String> {
@@ -195,6 +228,8 @@ impl DualAudioService {
                 .lock()
                 .map_err(|_| "Meeting control unavailable.")?,
         ];
+        // `local` is each input's own clock; `markers` is the rebased ledger clock.
+        let mut local = [0; 2];
         let mut markers = [0; 2];
         for i in 0..2 {
             if self.ended[i] {
@@ -205,12 +240,13 @@ impl DualAudioService {
             if c.closed || c.stop_at.is_some() || c.cutoffs.len() >= MAX_PENDING_CUTOFFS {
                 return Err("A meeting input is changing state. Please retry.".into());
             }
-            markers[i] = c
+            local[i] = c
                 .observer
                 .as_ref()
                 .ok_or("Meeting input is still starting.")?
                 .progress()
                 .canonical_samples;
+            markers[i] = local[i].saturating_add(self.base[i]);
         }
         // This is a delivery ledger, not either device's clock. A later cutoff
         // can contain new source text even when clock skew leaves its maximum
@@ -228,7 +264,7 @@ impl DualAudioService {
             .max(next_delivery);
         for i in 0..2 {
             if !self.ended[i] {
-                controls[i].cutoffs.push_back((id, markers[i]));
+                controls[i].cutoffs.push_back((id, local[i]));
             }
         }
         self.pending.push_back(Barrier {
@@ -276,13 +312,46 @@ impl DualAudioService {
         self.output.pop_front()
     }
     fn accept(&mut self, source: usize, event: MeetingAudioEvent) {
+        let base = self.base[source];
+        let event = match event {
+            MeetingAudioEvent::Segment {
+                start_sample,
+                end_sample,
+                text,
+            } => MeetingAudioEvent::Segment {
+                start_sample: start_sample + base,
+                end_sample: end_sample + base,
+                text,
+            },
+            MeetingAudioEvent::Progress {
+                captured_samples,
+                committed_samples,
+            } => MeetingAudioEvent::Progress {
+                captured_samples: captured_samples + base,
+                committed_samples: committed_samples + base,
+            },
+            MeetingAudioEvent::Partial { start_sample, text } => MeetingAudioEvent::Partial {
+                start_sample: start_sample + base,
+                text,
+            },
+            MeetingAudioEvent::CutoffReached { id, sample } => MeetingAudioEvent::CutoffReached {
+                id,
+                sample: sample + base,
+            },
+            MeetingAudioEvent::Stopped { sample } => MeetingAudioEvent::Stopped {
+                sample: sample + base,
+            },
+            other => other,
+        };
         match event {
             MeetingAudioEvent::SourceSegment { .. } => {
                 unreachable!("single-source worker cannot emit merged metadata")
             }
             MeetingAudioEvent::Ready => {
                 self.ready[source] = true;
-                self.offsets[source] = self.inputs[source]
+                // A restarted input is back; it owns new audio again.
+                self.ended[source] = false;
+                let opened = self.inputs[source]
                     .control
                     .lock()
                     .ok()
@@ -291,6 +360,7 @@ impl DualAudioService {
                         start.saturating_duration_since(self.epoch).as_secs_f64() * RATE as f64
                     })
                     .unwrap_or(0.0) as u64;
+                self.offsets[source] = opened.saturating_sub(self.base[source]);
                 if self
                     .ready
                     .iter()
@@ -352,11 +422,39 @@ impl DualAudioService {
                 for barrier in &mut self.pending {
                     barrier.reached[source] = true;
                 }
+                if self.try_restart(source) {
+                    self.output.push_back(MeetingAudioEvent::Warning { message: format!("{} fell behind and was restarted. A few seconds of it may be missing from the transcript; the rest of the meeting continues.", label(source)) });
+                    return;
+                }
                 self.output.push_back(MeetingAudioEvent::Warning { message: format!("{} is unavailable: {message} The other input continues if available; missing audio is not reconstructed.", label(source)) });
                 if self.ready[1 - source] {
                     self.output.push_back(MeetingAudioEvent::Ready);
                 }
             }
+        }
+    }
+    /// Reopens a failed input. Its clock restarts at zero, so later samples are
+    /// rebased past everything it already captured, keeping source ledgers
+    /// monotonic; the lost stretch simply has no text.
+    fn try_restart(&mut self, source: usize) -> bool {
+        if self.stopping || self.terminal || self.restarts[source] >= MAX_SOURCE_RESTARTS {
+            return false;
+        }
+        let Some(restart) = self.restart.as_mut() else {
+            return false;
+        };
+        self.restarts[source] += 1;
+        match restart(source, self.restarts[source]) {
+            Ok(input) => {
+                self.base[source] = self.captured[source].max(self.committed[source]);
+                self.captured[source] = self.base[source];
+                self.committed[source] = self.base[source];
+                self.ready[source] = false;
+                // Dropping the failed input asks its worker to shut down.
+                self.inputs[source] = input;
+                true
+            }
+            Err(_) => false,
         }
     }
     fn flush(&mut self) {
@@ -478,7 +576,93 @@ mod tests {
             partials: Default::default(),
             stopping: false,
             terminal: false,
+            base: [0; 2],
+            restarts: [0; 2],
+            restart: None,
         }
+    }
+    fn idle_input(source: MeetingAudioSource) -> SingleAudioService {
+        let (_, events) = mpsc::channel();
+        SingleAudioService {
+            source,
+            control: Arc::new(Mutex::new(Control::default())),
+            events,
+        }
+    }
+    #[test]
+    fn fallen_behind_input_restarts_and_keeps_its_ledger_monotonic() {
+        let mut service = fixture();
+        service.restart = Some(Box::new(|_, _| {
+            Ok(idle_input(MeetingAudioSource::Microphone))
+        }));
+        service.accept(
+            1,
+            MeetingAudioEvent::Segment {
+                start_sample: 0,
+                end_sample: 1_000,
+                text: "before".into(),
+            },
+        );
+        service.accept(
+            1,
+            MeetingAudioEvent::Progress {
+                captured_samples: 5_000,
+                committed_samples: 1_000,
+            },
+        );
+        service.accept(
+            1,
+            MeetingAudioEvent::Error {
+                message: "backlog".into(),
+            },
+        );
+        assert!(service.output.iter().any(
+            |e| matches!(e, MeetingAudioEvent::Warning { message } if message.contains("restarted"))
+        ));
+        assert_eq!(service.restarts[1], 1);
+        assert_eq!(service.base[1], 5_000);
+        service.accept(1, MeetingAudioEvent::Ready);
+        assert!(!service.ended[1]);
+        service.accept(
+            1,
+            MeetingAudioEvent::Segment {
+                start_sample: 0,
+                end_sample: 800,
+                text: "after".into(),
+            },
+        );
+        let mic_segments: Vec<_> = service
+            .output
+            .iter()
+            .filter_map(|e| match e {
+                MeetingAudioEvent::SourceSegment {
+                    start_sample,
+                    end_sample,
+                    ..
+                } => Some((*start_sample, *end_sample)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mic_segments, vec![(0, 1_000), (5_000, 5_800)]);
+    }
+    #[test]
+    fn restarts_are_bounded() {
+        let mut service = fixture();
+        service.restart = Some(Box::new(|_, _| {
+            Ok(idle_input(MeetingAudioSource::Microphone))
+        }));
+        for _ in 0..=MAX_SOURCE_RESTARTS {
+            service.accept(1, MeetingAudioEvent::Ready);
+            service.accept(
+                1,
+                MeetingAudioEvent::Error {
+                    message: "backlog".into(),
+                },
+            );
+        }
+        assert_eq!(service.restarts[1], MAX_SOURCE_RESTARTS);
+        assert!(service.ended[1]);
+        assert!(service.output.iter().any(|e| matches!(e, MeetingAudioEvent::Warning { message } if message.contains("unavailable"))));
     }
     #[test]
     fn source_mutes_are_independent_and_do_not_stop_the_meeting() {

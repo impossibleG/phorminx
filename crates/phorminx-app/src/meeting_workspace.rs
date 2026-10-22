@@ -1182,11 +1182,15 @@ impl Host {
                     }
                     self.view.note_text.push_str(text.trim());
                 }
-                self.view.transcript.push(MeetingLine {
-                    start_sample,
-                    end_sample,
-                    text,
-                });
+                // Silence still owns its samples in the saved ledger, but it is
+                // not a line anyone can read.
+                if !text.trim().is_empty() {
+                    self.view.transcript.push(MeetingLine {
+                        start_sample,
+                        end_sample,
+                        text,
+                    });
+                }
                 if self.view.transcript.len() > VISIBLE_SEGMENTS {
                     self.view.transcript.remove(0);
                 }

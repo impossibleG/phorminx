@@ -250,6 +250,12 @@ fn used_by(uses: &[(String, String)], name: &str, family: &str) -> Vec<String> {
 
 /// Ollama capabilities by model digest; a digest never changes its contents.
 static CAPABILITIES: LazyLock<Mutex<HashMap<String, Vec<String>>>> = LazyLock::new(Mutex::default);
+/// The installed Ollama models from the last answer. Ollama can be too busy to
+/// answer quickly (loading a model, answering in a meeting); pickers keep
+/// showing what is installed instead of calling everything "not installed".
+/// Name, manifest digest and size of one installed Ollama model.
+type InstalledModel = (String, Option<String>, Option<u64>);
+static LAST_INSTALLED: LazyLock<Mutex<Vec<InstalledModel>>> = LazyLock::new(Mutex::default);
 
 fn agent(timeout: Option<Duration>) -> ureq::Agent {
     ureq::Agent::config_builder()
@@ -301,17 +307,35 @@ pub fn list(store: &SettingsStore) -> Vec<RegistryEntry> {
         OllamaEndpoint::default(),
         ClientTimeouts {
             connect: Duration::from_millis(500),
-            response_headers: Duration::from_secs(3),
-            response_body: Duration::from_secs(3),
-            overall: Duration::from_secs(4),
+            response_headers: Duration::from_secs(6),
+            response_body: Duration::from_secs(6),
+            overall: Duration::from_secs(8),
         },
     )
     .ok()
-    .and_then(|client| client.discover(&CancellationToken::new()).ok());
-    if let Some(catalog) = &installed {
-        for model in catalog.models() {
-            let name = model.name.as_str().to_owned();
-            let key = model.digest.clone().unwrap_or_else(|| name.clone());
+    .and_then(|client| client.discover(&CancellationToken::new()).ok())
+    .map(|catalog| {
+        let models: Vec<_> = catalog
+            .models()
+            .iter()
+            .map(|model| {
+                (
+                    model.name.as_str().to_owned(),
+                    model.digest.clone(),
+                    model.size,
+                )
+            })
+            .collect();
+        if let Ok(mut last) = LAST_INSTALLED.lock() {
+            last.clone_from(&models);
+        }
+        models
+    })
+    .or_else(|| LAST_INSTALLED.lock().ok().map(|last| last.clone()));
+    if let Some(models) = &installed {
+        for (name, digest, size) in models {
+            let name = name.clone();
+            let key = digest.clone().unwrap_or_else(|| name.clone());
             let known = CAPABILITIES
                 .lock()
                 .ok()
@@ -323,18 +347,26 @@ pub fn list(store: &SettingsStore) -> Vec<RegistryEntry> {
                 }
                 Some(found)
             });
+            // When Ollama cannot say, a curated model's known kinds stand in.
+            let tags = found
+                .map(|found| kinds_from_capabilities(&found))
+                .or_else(|| {
+                    CURATED
+                        .iter()
+                        .find(|(curated, _, _)| same_model(curated, &name))
+                        .map(|(_, tags, _)| tags.to_vec())
+                })
+                .unwrap_or_default();
             entries.push(RegistryEntry {
                 used_by: used_by(&uses, &name, "ollama"),
-                tags: found
-                    .map(|found| kinds_from_capabilities(&found))
-                    .unwrap_or_default(),
+                tags,
+                benchmarked_digest: benchmarked_digest(&name),
                 name,
                 family: "ollama",
                 installed: true,
-                size_bytes: model.size,
+                size_bytes: *size,
                 note: String::new(),
-                benchmarked_digest: benchmarked_digest(model.name.as_str()),
-                digest: model.digest.clone(),
+                digest: digest.clone(),
             });
         }
     }

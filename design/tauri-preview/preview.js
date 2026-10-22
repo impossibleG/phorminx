@@ -43,7 +43,8 @@ function textRow(label, text) {
 function renderTranscript(meeting, target) {
   const fragment = document.createDocumentFragment();
   const translations = new Map(meeting.translations.map((line) => [`${line.startSample}:${line.endSample}`, line]));
-  for (const line of meeting.transcript) {
+  const lines = meeting.transcript.filter((line) => line.text.trim());
+  for (const line of lines) {
     const source = line.source === 'microphone' ? 'MICROPHONE' : line.source === 'computer' ? 'COMPUTER' : 'CONVERSATION';
     fragment.append(textRow(source, line.text));
     const translation = translations.get(`${line.startSample}:${line.endSample}`);
@@ -61,7 +62,7 @@ function renderTranscript(meeting, target) {
     fragment.append(row);
   }
   target.replaceChildren(fragment);
-  if (!meeting.transcript.length && !meeting.provisionalText) target.append(textRow('', 'Nothing transcribed yet.'));
+  if (!lines.length && !meeting.provisionalText) target.append(textRow('', 'Nothing transcribed yet.'));
 }
 
 function render(meeting) {
@@ -135,7 +136,7 @@ function render(meeting) {
     updateSelect(byId('output-device'), meeting.outputDevices, meeting.selectedOutputDevice, 'Windows default');
     updateSelect(byId('input-device'), meeting.inputDevices, meeting.selectedInputDevice, 'Windows default');
     updateSelect(byId('translation-model'), meeting.availableModels, meeting.translationModel, 'Choose an installed model');
-    byId('translation-language').value = meeting.translationLanguage || '';
+    setTranslationLanguage(meeting.translationLanguage || '');
   }
   byId('translation-notice').textContent = meeting.translationNotice;
 }
@@ -180,12 +181,36 @@ byId('devices-form').addEventListener('submit', async (event) => {
     await refresh();
   } catch (error) { byId('status').textContent = String(error); }
 });
+// Live translation targets. The value is the name the translation model is told.
+const TRANSLATION_LANGUAGES = ['Arabic', 'Bengali', 'Chinese (Simplified)', 'Chinese (Traditional)', 'Czech', 'Danish', 'Dutch', 'English', 'Finnish', 'French', 'German', 'Greek', 'Hebrew', 'Hindi', 'Hungarian', 'Indonesian', 'Italian', 'Japanese', 'Korean', 'Norwegian', 'Persian', 'Polish', 'Portuguese (Brazil)', 'Portuguese (Portugal)', 'Romanian', 'Russian', 'Spanish', 'Swedish', 'Tagalog', 'Thai', 'Turkish', 'Ukrainian', 'Urdu', 'Vietnamese'];
+// Earlier versions took free text; common spellings map onto the list.
+const LANGUAGE_ALIASES = {portuguese: 'Portuguese (Brazil)', 'português': 'Portuguese (Brazil)', 'portugues': 'Portuguese (Brazil)', 'pt-br': 'Portuguese (Brazil)', 'pt': 'Portuguese (Brazil)', 'pt-pt': 'Portuguese (Portugal)', 'brazilian portuguese': 'Portuguese (Brazil)', chinese: 'Chinese (Simplified)', mandarin: 'Chinese (Simplified)', 'zh': 'Chinese (Simplified)', en: 'English', es: 'Spanish', 'español': 'Spanish', espanol: 'Spanish', fr: 'French', 'français': 'French', de: 'German', deutsch: 'German', it: 'Italian', ja: 'Japanese', ko: 'Korean', ru: 'Russian', farsi: 'Persian', filipino: 'Tagalog'};
+
+function canonicalLanguage(value) {
+  const key = value.trim().toLowerCase();
+  if (!key) return '';
+  return TRANSLATION_LANGUAGES.find((name) => name.toLowerCase() === key) || LANGUAGE_ALIASES[key] || value.trim();
+}
+
+function setTranslationLanguage(saved) {
+  const select = byId('translation-language');
+  const value = canonicalLanguage(saved);
+  const names = [...TRANSLATION_LANGUAGES];
+  // Keep a language saved earlier that is not on the list, so saving never drops it.
+  if (value && !names.includes(value)) names.unshift(value);
+  const options = [new Option('Off', '')];
+  for (const name of names) options.push(new Option(TRANSLATION_LANGUAGES.includes(name) ? name : `${name} (saved earlier)`, name));
+  select.replaceChildren(...options);
+  select.value = value;
+}
+setTranslationLanguage('');
+
 byId('translation-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   if (!invoke) return;
   try {
     await invoke('meeting_save_translation', {
-      language: byId('translation-language').value.trim(),
+      language: byId('translation-language').value,
       model: byId('translation-model').value,
     });
     await refresh();
