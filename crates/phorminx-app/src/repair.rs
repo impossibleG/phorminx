@@ -12,6 +12,7 @@ use phorminx_ollama::{CancellationToken, ClientTimeouts, OllamaClient, OllamaEnd
 use serde::Serialize;
 
 use crate::investigation_ocr::{OCR_MODEL_DIRECTORY, verify_installed};
+use crate::model_registry::same_model;
 use crate::settings::{RecognitionMode, SettingsStore};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -42,19 +43,6 @@ pub struct RepairInputs {
     pub embedding_model: Option<String>,
     pub assistant_model: Option<String>,
     pub ocr_ready: bool,
-}
-
-/// `name` and `name:latest` are the same Ollama model.
-fn same_model(left: &str, right: &str) -> bool {
-    let normalize = |name: &str| {
-        let name = name.trim().to_ascii_lowercase();
-        if name.contains(':') {
-            name
-        } else {
-            format!("{name}:latest")
-        }
-    };
-    normalize(left) == normalize(right)
 }
 
 fn item(

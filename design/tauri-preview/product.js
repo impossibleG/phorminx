@@ -45,6 +45,7 @@ function showRoute(route, persist = true) {
   }
   if (route === 'saved') void action('refresh');
   if (route === 'actions') void refreshActions();
+  if (route === 'models') void window.PhorminxModels?.refresh();
   if (route === 'setup') { void refreshSetup(); void refreshUpdates(); void refreshRepair(); }
   if (route === 'history' && node('history-query').value.trim()) void startHistorySearch();
   if (route === 'meeting-settings') void refreshProvider();
@@ -318,7 +319,7 @@ function renderModels(view, notice) {
     fragment.append(row);
   }
   if (!view.ollamaModels.length) fragment.append(makeElement('div', 'record-row', view.systems.find((system) => system.name === 'Ollama')?.message || 'No local models found.'));
-  node('ollama-models').replaceChildren(fragment);
+  node('ollama-models')?.replaceChildren(fragment);
   node('model-result').textContent = notice || '';
 }
 
@@ -957,3 +958,96 @@ else node('status').textContent = 'Open this page inside Phorminx.';
 if (hostInvoke) setInterval(() => { if (currentRoute === 'setup') void refreshSetup(); }, 1500);
 if (hostInvoke) setInterval(() => { if (currentRoute === 'settings' && !node('settings-updates').hidden) void refreshUpdates(); }, 1500);
 if (hostInvoke) setInterval(() => { void refreshLibrary(); }, 450);
+
+// Model fields pick from the shared registry, offering only the right kind.
+const MODEL_FILTERS = [['all', 'All'], ['installed', 'Installed'], ['language', 'Language'], ['embedding', 'Search'], ['vision', 'Vision'], ['speech', 'Speech'], ['ocr', 'Screenshot text']];
+const MODEL_TAG_LABELS = {language: 'Language', embedding: 'Search', vision: 'Vision', tools: 'Tools', speech: 'Speech', ocr: 'Screenshot text'};
+const MODEL_FAMILIES = {ollama: 'Ollama', whisper: 'Whisper', vosk: 'Vosk', ocr: 'PaddleOCR'};
+let modelFilter = 'all';
+
+function renderRegistry(entries) {
+  const query = node('model-search').value.trim().toLowerCase();
+  const list = node('model-registry');
+  const shown = entries.filter((entry) => {
+    if (modelFilter === 'installed' && !entry.installed) return false;
+    if (!['all', 'installed'].includes(modelFilter) && !entry.tags.includes(modelFilter)) return false;
+    const haystack = [entry.name, MODEL_FAMILIES[entry.family], entry.note, ...entry.tags.map((tag) => MODEL_TAG_LABELS[tag] || tag), ...entry.usedBy].join(' ').toLowerCase();
+    return !query || haystack.includes(query);
+  });
+  const rows = shown.map((entry) => {
+    const row = makeElement('div', `model-entry${entry.installed ? ' installed' : ''}`);
+    row.setAttribute('role', 'listitem');
+    const head = makeElement('div', 'model-entry-head');
+    const size = entry.sizeBytes ? ` · ${entry.sizeBytes >= 1073741824 ? `${(entry.sizeBytes / 1073741824).toFixed(1)} GB` : `${Math.round(entry.sizeBytes / 1048576)} MB`}` : '';
+    head.append(makeElement('strong', '', entry.name), makeElement('small', '', `${MODEL_FAMILIES[entry.family] || entry.family}${size} · ${entry.installed ? 'Installed' : 'Not installed'}`));
+    const tags = makeElement('div', 'model-tags');
+    for (const tag of entry.tags) tags.append(makeElement('span', 'model-tag', MODEL_TAG_LABELS[tag] || tag));
+    for (const feature of entry.usedBy) tags.append(makeElement('span', 'model-tag used', `Used by ${feature}`));
+    row.append(head, tags);
+    if (entry.note) row.append(makeElement('p', 'setting-hint', entry.note));
+    if (!entry.installed && entry.family === 'ollama') {
+      const install = makeElement('button', '', 'Install');
+      install.type = 'button';
+      install.addEventListener('click', () => void installModel(entry.name, entry.tags[0]));
+      row.append(install);
+    }
+    return row;
+  });
+  if (!rows.length) rows.push(makeElement('p', 'setting-hint', 'No model matches. Install one from Ollama by its exact name below.'));
+  list.replaceChildren(...rows);
+}
+
+function renderModelFilters() {
+  const group = node('model-filters');
+  group.replaceChildren(...MODEL_FILTERS.map(([id, label]) => {
+    const chip = makeElement('button', 'chip', label);
+    chip.type = 'button';
+    chip.setAttribute('aria-pressed', String(modelFilter === id));
+    chip.addEventListener('click', () => {
+      modelFilter = id;
+      renderModelFilters();
+      renderRegistry(window.PhorminxModels?.entries() || []);
+      group.querySelector(`[aria-pressed="true"]`)?.focus();
+    });
+    return chip;
+  }));
+}
+
+let modelPullTimer = null;
+
+async function installModel(name, expected) {
+  const status = node('model-install-status');
+  try {
+    const view = await hostInvoke('models_pull', {name, expected: expected || null});
+    status.textContent = view.message;
+    clearInterval(modelPullTimer);
+    modelPullTimer = setInterval(async () => {
+      const pull = await hostInvoke('models_pull_status');
+      status.textContent = pull.percent != null && pull.state === 'pulling' ? `${pull.message} (${pull.percent}%)` : pull.message;
+      if (pull.state !== 'pulling') {
+        clearInterval(modelPullTimer);
+        void window.PhorminxModels?.refresh();
+      }
+    }, 1000);
+  } catch (error) { status.textContent = String(error); }
+}
+
+if (window.PhorminxModels) {
+  const external = () => node('provider-kind').value !== 'ollama';
+  PhorminxModels.attach('formatting-model', {kind: 'language', empty: 'No model'});
+  PhorminxModels.attach('embedding-model', {kind: 'embedding', empty: 'Off'});
+  const answer = PhorminxModels.attach('provider-model', {kind: 'language', empty: 'Choose a model', free: external});
+  PhorminxModels.attach('provider-fallback', {kind: 'language', empty: 'No fallback'});
+  PhorminxModels.attach('translation-model', {kind: 'language', empty: 'Choose an installed model'});
+  PhorminxModels.attach('action-model', {kind: 'language', empty: 'Choose a model'});
+  node('provider-kind').addEventListener('change', () => answer?.render());
+  document.addEventListener('phorminx:models', (event) => renderRegistry(event.detail));
+  node('model-search').addEventListener('input', () => renderRegistry(PhorminxModels.entries()));
+  node('model-install-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const name = node('model-install-name').value.trim();
+    if (name) void installModel(name, null);
+  });
+  renderModelFilters();
+  void PhorminxModels.refresh();
+}
