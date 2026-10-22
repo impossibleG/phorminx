@@ -164,7 +164,12 @@ public-key text beside it is safe to share.
 1. One time only: from the developer shell, build the tool with
    `cargo build --release -p phorminx-app --features desktop,vulkan,tauri-shell,release-tools --bin phorminx_release`
    and run `phorminx_release keygen <absolute-private-key.pk8> <public-key.txt>`.
-2. Bump the version, run the library tests, and merge to `main`.
+2. Bump the version, run the library tests, and merge to `main` together with
+   the user-facing notes in `docs/releases/v<version>.md` (format in
+   [docs/releases/README.md](releases/README.md)). If the release adds or
+   changes a feature, update `docs/features/features.json` in the same pull
+   request: set `since` on new features and keep the text true to the code.
+   The website reads both files at the release tag.
 3. Build the installer with the key compiled in:
    ```powershell
    $env:PHORMINX_UPDATE_PUBLIC_KEY = (Get-Content -Raw <public-key.txt>).Trim()
@@ -183,13 +188,22 @@ public-key text beside it is safe to share.
    `Phorminx-x64-setup.exe` (so
    `https://github.com/impossibleG/phorminx/releases/latest/download/Phorminx-x64-setup.exe`
    always serves the newest build), and creates a **draft** `v0.2.1` release.
+   The release body is `docs/releases/v0.2.1.md`; the script stops if that
+   file is missing (`-GenerateNotes` uses GitHub's pull request list instead,
+   but the website changelog still needs the file).
    Review the draft on GitHub, then publish it (or re-run with `-Publish`).
    It must be a full release marked latest, not a pre-release, or both the
    updater and the website link keep pointing at the previous one.
-6. Verify: on a machine running the previous version, Settings → Updates →
+6. Publishing runs the **Notify website** workflow, which calls the Render
+   deploy hook in the `RENDER_DEPLOY_HOOK_PHORMINX` repository secret.
+   phorminx.net then rebuilds with the new version, features and changelog.
+   If the secret is unset the workflow only leaves a notice; trigger a
+   manual deploy in Render instead.
+7. Verify: on a machine running the previous version, Settings → Updates →
    Check now offers the new version, downloads it, and **Restart to update**
-   reopens the new version with settings intact.
-7. Record the sequence number used so the next release uses a larger one.
+   reopens the new version with settings intact. Check that phorminx.net
+   shows the new version and its changelog entry.
+8. Record the sequence number used so the next release uses a larger one.
 
 Alpha releases currently ship without Authenticode signing, so Windows
 SmartScreen warns on first run. Do not describe them as signed.
