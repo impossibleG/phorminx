@@ -53,6 +53,70 @@ impl MeetingTauriState {
         }))
     }
 
+    /// Points the meeting assistant (also used by Investigations), its local
+    /// fallback or live translation at `model`, keeping every other setting.
+    pub(crate) fn assign_model(&self, slot: &str, model: &str) -> Result<(), String> {
+        let snapshot = self
+            .meeting
+            .lock()
+            .map_err(|_| "Meeting state is unavailable.")?
+            .snapshot_after(u64::MAX)
+            .ok_or("Meeting settings are busy; try again.")?;
+        let mut provider = snapshot.provider.clone();
+        match slot {
+            "meetings" => {
+                provider.kind = phorminx_ui::workspace::ProviderChoice::Ollama;
+                provider.model = model.to_owned();
+                if provider.endpoint.trim().is_empty() {
+                    provider.endpoint = "http://127.0.0.1:11434".into();
+                }
+                provider.api_key.clear();
+                provider.clear_credential = false;
+                self.send(WorkspaceEvent::SaveProvider(provider))
+            }
+            "fallback" => {
+                provider.fallback_model = model.to_owned();
+                provider.api_key.clear();
+                provider.clear_credential = false;
+                self.send(WorkspaceEvent::SaveProvider(provider))
+            }
+            "translation" => self.send(WorkspaceEvent::SaveTranslation {
+                language: snapshot.translation_language.clone(),
+                model: model.to_owned(),
+            }),
+            _ => Err("Choose a feature to use this model for.".into()),
+        }
+    }
+
+    /// Stops using a model for the assistant, its fallback or translation.
+    /// Translation is turned off, since it cannot run without a model.
+    pub(crate) fn unassign_model(&self, slot: &str) -> Result<(), String> {
+        let snapshot = self
+            .meeting
+            .lock()
+            .map_err(|_| "Meeting state is unavailable.")?
+            .snapshot_after(u64::MAX)
+            .ok_or("Meeting settings are busy; try again.")?;
+        let mut provider = snapshot.provider.clone();
+        provider.api_key.clear();
+        provider.clear_credential = false;
+        match slot {
+            "meetings" => {
+                provider.model.clear();
+                self.send(WorkspaceEvent::SaveProvider(provider))
+            }
+            "fallback" => {
+                provider.fallback_model.clear();
+                self.send(WorkspaceEvent::SaveProvider(provider))
+            }
+            "translation" => self.send(WorkspaceEvent::SaveTranslation {
+                language: String::new(),
+                model: String::new(),
+            }),
+            _ => Err("That feature has no model to remove.".into()),
+        }
+    }
+
     /// Starts (or stops) dictating a message for a messaging contact.
     pub fn capture_message(
         &self,

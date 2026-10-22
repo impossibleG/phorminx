@@ -57,4 +57,20 @@ assert.deepEqual(bench.wordDiff('so um the cat', 'So the cat.'), [
 ]);
 assert.deepEqual(bench.wordDiff('', 'new'), [{ type: 'ins', text: 'new' }]);
 
+// Benchmarked models: local models only, with their headline numbers.
+const report = { runs: [
+  { ...run('f1', 'formatting', 'qwen2.5:7b', { mode: 'light', passes: 1, language: 'en', start: 'warm' }, { latency: [1.5, 's'], quality: [95, 'score'] }), backend: 'Ollama' },
+  { ...run('f2', 'formatting', 'qwen2.5:7b', { mode: 'light', passes: 2, language: 'en', start: 'warm' }, { latency: [3, 's'], quality: [96, 'score'] }), backend: 'Ollama' },
+  { ...run('m1', 'meetings', 'qwen2.5:7b', { task: 'summary', language: 'en', start: 'warm' }, { answer: [2.5, 's'] }), backend: 'Ollama' },
+  run('d1', 'dictation', 'base.en', { engine: 'accurate', language: 'en', start: 'warm' }, { wer: [0, '%'] }),
+] };
+assert.deepEqual(bench.measuredModels(report), [{ model: 'qwen2.5:7b', facts: ['Formatting 1.50 s, quality 95/100', 'meeting summary 2.50 s'] }]);
+
+// Feature chips: what a model serves now, and what it could still serve.
+assert.deepEqual(bench.assignedSlots(['Live translation', 'Formatting', 'Action: Mail', 'Investigations']), ['formatting', 'translation']);
+assert.deepEqual(bench.addableSlots(['language', 'tools'], ['formatting'], '').map((s) => s.slot), ['meetings', 'fallback', 'translation']);
+assert.deepEqual(bench.addableSlots(['language'], [], 'trans').map((s) => s.slot), ['translation']);
+assert.deepEqual(bench.addableSlots(['embedding'], [], '').map((s) => s.slot), ['search']);
+assert.deepEqual(bench.addableSlots(['vision'], [], '').map((s) => s.slot), []);
+
 console.log('benchmarks.test.js: ok');

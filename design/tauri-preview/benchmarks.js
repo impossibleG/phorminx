@@ -167,7 +167,7 @@
       const file = state.file;
       if (state.tab !== 'overview' && !features().includes(state.tab)) state.tab = 'overview';
       const colors = new Map(modelOrder(file).map((model, index) => [model, `var(--series-${(index % SLOTS) + 1})`]));
-      const ctx = { file, colors, tooltip, state, draw };
+      const ctx = { file, colors, tooltip, state, draw, options, root };
       root.replaceChildren();
       root.append(header(collection, ctx, options), verdict(file), tabs(ctx, features()));
       const panel = el('div', 'bench-panel');
@@ -180,6 +180,7 @@
       if (focus) root.querySelector(focus)?.focus();
     };
     draw();
+    return { redraw: () => draw() };
   }
 
   function header(collection, ctx, options) {
@@ -304,6 +305,8 @@
     const row = el('div', 'bench-tiles');
     for (const key of keys.filter((entry) => values.has(entry.key)).slice(0, 8)) row.append(tile(file, key, values.get(key.key)));
     panel.append(row);
+    const models = benchmarkedModels(ctx);
+    if (models) panel.append(models);
     const grid = el('div', 'bench-grid');
     const formatting = file.runs.filter((run) => run.feature === 'formatting');
     if (formatting.length) {
@@ -316,6 +319,185 @@
     }
     grid.append(trendChart(ctx));
     panel.append(grid, statusList(file));
+  }
+
+  /** Slots a model can fill, by kind; the host checks again before saving. */
+  const MODEL_SLOTS = [
+    ['formatting', 'Formatting', 'language'],
+    ['meetings', 'Meetings and investigations', 'language'],
+    ['fallback', 'Meeting fallback', 'language'],
+    ['translation', 'Live translation', 'language'],
+    ['search', 'Search', 'embedding'],
+  ];
+
+  /** The registry's "used by" labels that are model slots. */
+  const SLOT_FOR_USE = { Formatting: 'formatting', Search: 'search', Meetings: 'meetings', 'Meeting fallback': 'fallback', 'Live translation': 'translation' };
+
+  /** Slots a model currently fills, in display order. */
+  function assignedSlots(usedBy) {
+    const slots = new Set((usedBy || []).map((use) => SLOT_FOR_USE[use]).filter(Boolean));
+    return MODEL_SLOTS.filter(([slot]) => slots.has(slot)).map(([slot]) => slot);
+  }
+
+  /** Slots the model's kinds fit and it does not fill yet, matching `query`. */
+  function addableSlots(tags, assigned, query) {
+    const needle = String(query || '').trim().toLowerCase();
+    return MODEL_SLOTS
+      .filter(([slot, name, kind]) => (tags || []).includes(kind) && !assigned.includes(slot) && (!needle || name.toLowerCase().includes(needle)))
+      .map(([slot, name]) => ({ slot, name }));
+  }
+
+  /**
+   * One model's features as removable chips, plus an input that adds more
+   * from a filtered list, so one model can serve several features.
+   */
+  function featureCloud(model, entry, actions, say) {
+    const cloud = el('div', 'bench-cloud');
+    const assigned = assignedSlots(entry.usedBy);
+    const names = Object.fromEntries(MODEL_SLOTS.map(([slot, name]) => [slot, name]));
+    const chips = el('ul', 'bench-chips');
+    chips.setAttribute('aria-label', `Features using ${model}`);
+    for (const slot of assigned) {
+      const chip = el('li', 'bench-chip-tag');
+      chip.append(el('span', '', names[slot]));
+      const remove = el('button', 'bench-chip-remove', '×');
+      remove.type = 'button';
+      remove.setAttribute('aria-label', `Stop using ${model} for ${names[slot]}`);
+      remove.title = `Stop using ${model} for ${names[slot]}`;
+      remove.addEventListener('click', async () => {
+        remove.disabled = true;
+        try { say(await actions.unuse(slot, model)); } catch (error) { say(error); remove.disabled = false; }
+      });
+      chip.append(remove);
+      chips.append(chip);
+    }
+    if (!assigned.length) chips.append(el('li', 'bench-chip-empty', 'Not used by any feature'));
+    const others = (entry.usedBy || []).filter((use) => !SLOT_FOR_USE[use]);
+    const combo = el('div', 'bench-combo');
+    const input = el('input');
+    const listId = `bench-add-${model.replace(/[^a-z0-9]/gi, '-')}`;
+    input.type = 'text';
+    input.placeholder = 'Add a feature…';
+    input.autocomplete = 'off';
+    input.setAttribute('role', 'combobox');
+    input.setAttribute('aria-label', `Use ${model} for another feature`);
+    input.setAttribute('aria-controls', listId);
+    input.setAttribute('aria-expanded', 'false');
+    const options = el('ul', 'bench-combo-list');
+    options.id = listId;
+    options.setAttribute('role', 'listbox');
+    options.hidden = true;
+    let active = 0;
+    const choose = async (slot) => {
+      input.disabled = true;
+      options.hidden = true;
+      try { say(await actions.use(slot, model)); } catch (error) { say(error); input.disabled = false; }
+    };
+    const show = () => {
+      const matches = addableSlots(entry.tags, assigned, input.value);
+      active = Math.min(active, Math.max(matches.length - 1, 0));
+      options.replaceChildren(...matches.map(({ slot, name }, index) => {
+        const option = el('li', `bench-combo-option${index === active ? ' active' : ''}`, name);
+        option.id = `${listId}-${slot}`;
+        option.setAttribute('role', 'option');
+        option.setAttribute('aria-selected', String(index === active));
+        option.addEventListener('mousedown', (event) => { event.preventDefault(); void choose(slot); });
+        return option;
+      }));
+      if (!matches.length) options.append(el('li', 'bench-combo-none', assigned.length === MODEL_SLOTS.length ? 'Already used everywhere it fits.' : 'No other feature fits this model.'));
+      options.hidden = false;
+      input.setAttribute('aria-expanded', 'true');
+      input.setAttribute('aria-activedescendant', matches[active] ? `${listId}-${matches[active].slot}` : '');
+      return matches;
+    };
+    const hide = () => { options.hidden = true; input.setAttribute('aria-expanded', 'false'); };
+    input.addEventListener('focus', show);
+    input.addEventListener('input', () => { active = 0; show(); });
+    input.addEventListener('blur', hide);
+    input.addEventListener('keydown', (event) => {
+      const matches = addableSlots(entry.tags, assigned, input.value);
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        if (matches.length) active = (active + (event.key === 'ArrowDown' ? 1 : matches.length - 1)) % matches.length;
+        show();
+      } else if (event.key === 'Enter' && matches[active]) {
+        event.preventDefault();
+        void choose(matches[active].slot);
+      } else if (event.key === 'Escape') hide();
+    });
+    combo.append(input, options);
+    cloud.append(chips, combo);
+    if (others.length) cloud.append(el('small', 'bench-model-used', `Also used by ${others.join(', ')}`));
+    return cloud;
+  }
+
+  /** Local models the report measured, as {model, facts}. */
+  function measuredModels(file) {
+    return modelOrder(file)
+      .filter((model) => file.runs.some((run) => run.model === model && run.backend === 'Ollama'))
+      .map((model) => {
+        const own = file.runs.filter((run) => run.model === model);
+        const formatting = own.filter((run) => run.feature === 'formatting' && run.config.start === 'warm' && run.config.passes === 1);
+        const summary = own.filter((run) => run.feature === 'meetings' && run.config.task === 'summary' && run.config.start === 'warm');
+        const answer = own.filter((run) => run.feature === 'investigations' && run.config.task === 'answer' && run.config.start === 'warm');
+        const facts = [];
+        if (formatting.length) facts.push(`Formatting ${format(average(formatting, 'latency'), 's')}, quality ${format(average(formatting, 'quality'), 'score')}`);
+        if (summary.length) facts.push(`meeting summary ${format(average(summary, 'answer'), 's')}`);
+        if (answer.length) facts.push(`investigation answer ${format(average(answer, 'answer'), 's')}`);
+        return { model, facts };
+      });
+  }
+
+  /**
+   * The benchmarked models, with "Use for…" and "Download" when the host
+   * passes `options.models` ({entries(), use(slot, name), download(name)}).
+   */
+  function benchmarkedModels(ctx) {
+    const { file, options, colors, state, root } = ctx;
+    const models = measuredModels(file);
+    if (!models.length) return null;
+    const box = el('section', 'bench-models');
+    box.setAttribute('aria-label', 'Benchmarked models');
+    box.append(el('h3', '', 'Benchmarked models'));
+    const status = el('p', 'bench-note', state.modelStatus || '');
+    status.setAttribute('role', 'status');
+    // The list redraws when the model registry changes; the last message stays.
+    const say = (message) => {
+      state.modelStatus = String(message);
+      const live = root.querySelector('.bench-models [role="status"]');
+      if (live) live.textContent = state.modelStatus;
+    };
+    const list = el('ul', 'bench-model-list');
+    const actions = options && options.models;
+    const entries = actions ? actions.entries() : [];
+    const same = (left, right) => String(left).replace(/:latest$/, '') === String(right).replace(/:latest$/, '');
+    for (const { model, facts } of models) {
+      const item = el('li', 'bench-model');
+      item.style.setProperty('--accent', colors.get(model) || 'var(--accent)');
+      const text = el('div', 'bench-model-text');
+      text.append(el('strong', '', model), el('span', '', facts.join(' · ') || 'Measured in this report.'));
+      item.append(text);
+      if (actions) {
+        const entry = entries.find((candidate) => candidate.family === 'ollama' && same(candidate.name, model));
+        const controls = el('div', 'bench-model-actions');
+        if (!entry || !entry.installed) {
+          const download = el('button', '', 'Download');
+          download.type = 'button';
+          download.addEventListener('click', async () => {
+            download.disabled = true;
+            say(`Downloading ${model}…`);
+            try { say(await actions.download(model)); } catch (error) { say(error); download.disabled = false; }
+          });
+          controls.append(download);
+        } else {
+          controls.append(featureCloud(model, entry, actions, say));
+        }
+        item.append(controls);
+      }
+      list.append(item);
+    }
+    box.append(list, status);
+    return box;
   }
 
   function tile(file, key, value) {
@@ -839,7 +1021,7 @@
     return details;
   }
 
-  const api = { format, filterRuns, where, average, describe, wordDiff, trendPoints, modelOrder, render };
+  const api = { format, filterRuns, where, average, describe, wordDiff, trendPoints, modelOrder, measuredModels, assignedSlots, addableSlots, render };
   global.PhorminxBenchmarks = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);
