@@ -36,6 +36,98 @@ impl MeetingTauriState {
             .send(event)
     }
 
+    /// The text-only note capture used by Record-for-action and investigation
+    /// voice notes: capture state, note generation, recognized text, notice.
+    pub(crate) fn note_state(&self) -> Result<Option<(CaptureState, u64, String, String)>, String> {
+        let meeting = self
+            .meeting
+            .lock()
+            .map_err(|_| "Meeting state is unavailable.")?;
+        Ok(meeting.snapshot_after(u64::MAX).map(|snapshot| {
+            (
+                snapshot.capture,
+                snapshot.note_generation,
+                snapshot.note_text.clone(),
+                snapshot.notice.clone(),
+            )
+        }))
+    }
+
+    /// Points the meeting assistant (also used by Investigations), its local
+    /// fallback or live translation at `model`, keeping every other setting.
+    pub(crate) fn assign_model(&self, slot: &str, model: &str) -> Result<(), String> {
+        let snapshot = self
+            .meeting
+            .lock()
+            .map_err(|_| "Meeting state is unavailable.")?
+            .snapshot_after(u64::MAX)
+            .ok_or("Meeting settings are busy; try again.")?;
+        let mut provider = snapshot.provider.clone();
+        match slot {
+            "meetings" => {
+                provider.kind = phorminx_ui::workspace::ProviderChoice::Ollama;
+                provider.model = model.to_owned();
+                if provider.endpoint.trim().is_empty() {
+                    provider.endpoint = "http://127.0.0.1:11434".into();
+                }
+                provider.api_key.clear();
+                provider.clear_credential = false;
+                self.send(WorkspaceEvent::SaveProvider(provider))
+            }
+            "fallback" => {
+                provider.fallback_model = model.to_owned();
+                provider.api_key.clear();
+                provider.clear_credential = false;
+                self.send(WorkspaceEvent::SaveProvider(provider))
+            }
+            "translation" => self.send(WorkspaceEvent::SaveTranslation {
+                language: snapshot.translation_language.clone(),
+                model: model.to_owned(),
+            }),
+            _ => Err("Choose a feature to use this model for.".into()),
+        }
+    }
+
+    /// Stops using a model for the assistant, its fallback or translation.
+    /// Translation is turned off, since it cannot run without a model.
+    pub(crate) fn unassign_model(&self, slot: &str) -> Result<(), String> {
+        let snapshot = self
+            .meeting
+            .lock()
+            .map_err(|_| "Meeting state is unavailable.")?
+            .snapshot_after(u64::MAX)
+            .ok_or("Meeting settings are busy; try again.")?;
+        let mut provider = snapshot.provider.clone();
+        provider.api_key.clear();
+        provider.clear_credential = false;
+        match slot {
+            "meetings" => {
+                provider.model.clear();
+                self.send(WorkspaceEvent::SaveProvider(provider))
+            }
+            "fallback" => {
+                provider.fallback_model.clear();
+                self.send(WorkspaceEvent::SaveProvider(provider))
+            }
+            "translation" => self.send(WorkspaceEvent::SaveTranslation {
+                language: String::new(),
+                model: String::new(),
+            }),
+            _ => Err("That feature has no model to remove.".into()),
+        }
+    }
+
+    /// Starts (or stops) dictating a message for a messaging contact.
+    pub fn capture_message(
+        &self,
+        capture: crate::meeting_workspace::MessageCapture,
+    ) -> Result<(), String> {
+        self.meeting
+            .lock()
+            .map_err(|_| "Meeting state is unavailable.")?
+            .capture_message(capture)
+    }
+
     pub fn snapshot(&self, since: u64) -> Result<Option<MeetingView>, String> {
         let meeting = self
             .meeting
@@ -69,7 +161,7 @@ pub fn install_meeting_commands(
         ])
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_actions(
     state: State<'_, MeetingTauriState>,
 ) -> Result<Vec<ActionItemView>, String> {
@@ -99,7 +191,7 @@ pub(crate) struct ActionEditRequest {
     payload_prompt: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_save_action(
     action: ActionEditRequest,
     state: State<'_, MeetingTauriState>,
@@ -136,7 +228,7 @@ pub(crate) fn meeting_save_action(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_delete_action(
     id: String,
     state: State<'_, MeetingTauriState>,
@@ -154,7 +246,7 @@ pub(crate) fn meeting_delete_action(
     meeting.send(WorkspaceEvent::DeleteAction(id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_provider(
     state: State<'_, MeetingTauriState>,
 ) -> Result<ProviderView, String> {
@@ -180,7 +272,7 @@ pub(crate) struct ProviderEditRequest {
     preset: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_save_provider(
     provider: ProviderEditRequest,
     state: State<'_, MeetingTauriState>,
@@ -211,7 +303,7 @@ pub(crate) fn meeting_save_provider(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_theme(state: State<'_, MeetingTauriState>) -> Result<&'static str, String> {
     let preference = state
         .store
@@ -232,7 +324,7 @@ pub(crate) fn meeting_theme(state: State<'_, MeetingTauriState>) -> Result<&'sta
     Ok(if dark { "dark" } else { "light" })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_snapshot(
     since: Option<u64>,
     state: State<'_, MeetingTauriState>,
@@ -350,7 +442,7 @@ fn meeting_event(
     Ok(Some(event))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_layout(
     view: String,
     language: String,
@@ -379,7 +471,7 @@ pub(crate) fn meeting_layout(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_save_translation(
     language: String,
     model: String,
@@ -408,7 +500,7 @@ pub(crate) fn meeting_save_translation(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn meeting_save_devices(
     output_device: Option<String>,
     microphone_device: Option<String>,

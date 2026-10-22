@@ -1,0 +1,48 @@
+[package]
+name = "phorminx-messaging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# The real Tor transport (Arti). Without it only the in-memory transport is
+# built, which keeps protocol and engine tests fast.
+tor = ["dep:arti-client", "dep:tor-hsservice", "dep:tor-hscrypto", "dep:tor-llcrypto", "dep:tor-cell", "dep:tor-rtcompat", "dep:futures", "dep:safelog", "dep:rustls"]
+
+[dependencies]
+base64.workspace = true
+phorminx-persistence = { path = "../phorminx-persistence" }
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Shares the bundled SQLite that Arti's directory cache links against.
+rusqlite.workspace = true
+tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "net"] }
+arti-client = { version = "=0.47.0", optional = true, default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "onion-service-service", "keymgr", "experimental-api"] }
+# Restricted discovery (only contacts can find the contacts service) is still
+# marked experimental in Arti, so these versions stay pinned exactly.
+tor-hsservice = { version = "=0.47.0", optional = true, features = ["restricted-discovery"] }
+tor-hscrypto = { version = "=0.47.0", optional = true }
+tor-llcrypto = { version = "=0.47.0", optional = true }
+tor-cell = { version = "=0.47.0", optional = true }
+tor-rtcompat = { version = "=0.47.0", optional = true, features = ["tokio", "rustls"] }
+futures = { version = "=0.3.34", optional = true }
+rustls = { version = "=0.23.43", optional = true, default-features = false, features = ["ring", "std"] }
+safelog = { version = "=0.10.0", optional = true }
+
+[dev-dependencies]
+anyhow.workspace = true
+tempfile.workspace = true
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+
+[[example]]
+name = "tor_spike"
+required-features = ["tor"]
+
+[[example]]
+name = "tor_e2e"
+required-features = ["tor"]

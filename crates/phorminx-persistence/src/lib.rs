@@ -4,6 +4,14 @@
 //! without augmenting them with database paths, dictated content, or window titles.
 
 mod history;
+mod investigation;
+pub use investigation::{
+    EdgeStatus, ImageReference, InvestigationEdgeRecord, InvestigationItemKind,
+    InvestigationItemRecord, InvestigationMessageRecord, InvestigationMessageStatus,
+    InvestigationNodeRecord, InvestigationRecord, InvestigationRepository, LinkPreviewUpdate,
+    MAX_INVESTIGATION_TITLE_CHARS, MAX_ITEM_BODY_BYTES, MAX_ITEM_TITLE_CHARS, MAX_ITEM_URL_BYTES,
+    NewInvestigationItem, OcrLineRecord, PendingWork, WorkState,
+};
 mod lexicon;
 mod library;
 pub use library::{
@@ -11,19 +19,32 @@ pub use library::{
 };
 mod meeting;
 mod meeting_memory;
+mod messaging;
 pub use meeting_memory::{MeetingMemoryPassage, MeetingMemoryRepository, MeetingTitleSource};
+pub use messaging::{
+    MESSAGING_MAX_TEXT_BYTES, MESSAGING_SPARE_INVITE_EXPIRY, MessagingContactRecord,
+    MessagingDirection, MessagingIdentityRecord, MessagingInviteRecord, MessagingMessageRecord,
+    MessagingMessageState, MessagingRepository, NewMessagingContact,
+};
 mod migration;
 pub use meeting::{
     MeetingMessageRecord, MeetingMessageStatus, MeetingQuestionContext, MeetingRecord,
     MeetingRepository, MeetingSegmentRecord,
 };
 mod profile;
+mod prompt;
+mod feedback;
+pub use prompt::{
+    MAX_PROMPT_BODY_CHARS, MAX_PROMPT_NAME_CHARS, Prompt, PromptDraft, PromptRepository,
+    PromptVersion,
+};
 mod recovery;
 pub use recovery::{RecoveryRecord, RecoveryRepository};
 
 use std::ffi::OsString;
 use std::{fs, path::Path, path::PathBuf, time::Duration};
 
+pub use feedback::{FeedbackRecord, FeedbackRepository};
 pub use history::{
     DictationDraft, DictationRecord, HISTORY_PREVIEW_MAX_CHARS, HistoryRepository, HistorySummary,
     HistoryTextVariant, HistoryVariantAvailability, MAX_TERMINAL_TEXT_BYTES,
@@ -175,6 +196,14 @@ impl Persistence {
         MeetingMemoryRepository::new(&self.connection)
     }
 
+    pub fn investigations(&self) -> InvestigationRepository<'_> {
+        InvestigationRepository::new(&self.connection)
+    }
+
+    pub fn messaging(&self) -> MessagingRepository<'_> {
+        MessagingRepository::new(&self.connection)
+    }
+
     pub fn recovery(&self) -> RecoveryRepository<'_> {
         RecoveryRepository::new(&self.connection)
     }
@@ -185,6 +214,14 @@ impl Persistence {
 
     pub fn app_profiles(&self) -> AppProfileRepository<'_> {
         AppProfileRepository::new(&self.connection)
+    }
+
+    pub fn feedback(&self) -> FeedbackRepository<'_> {
+        FeedbackRepository::new(&self.connection)
+    }
+
+    pub fn prompts(&self) -> PromptRepository<'_> {
+        PromptRepository::new(&self.connection)
     }
 
     pub fn schema_version(&self) -> Result<u32> {

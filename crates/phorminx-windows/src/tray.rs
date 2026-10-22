@@ -1,5 +1,5 @@
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
@@ -12,24 +12,27 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    HICON, IDI_APPLICATION, IsWindow, KillTimer, LoadIconW, MF_SEPARATOR, MF_STRING, MSG,
-    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL, PBT_APMRESUMESTANDBY, PBT_APMRESUMESUSPEND,
-    PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, TranslateMessage, UnregisterClassW, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
-    WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_POWERBROADCAST, WM_QUIT,
-    WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW,
+    GetWindowLongPtrW, HICON, IDI_APPLICATION, IsWindow, KillTimer, LoadIconW, MF_SEPARATOR,
+    MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL, PBT_APMRESUMESTANDBY,
+    PBT_APMRESUMESUSPEND, PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW,
+    RegisterWindowMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, UnregisterClassW, WM_APP,
+    WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL,
+    WM_POWERBROADCAST, WM_QUIT, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The running tray's window, so other threads can raise a notification.
+static TRAY_WINDOW: AtomicUsize = AtomicUsize::new(0);
 
 const CLASS_NAME: PCWSTR = w!("PhorminxSystemTray");
 const ICON_ID: u32 = 1;
 const WM_TRAY: u32 = WM_APP + 20;
 const WM_STATUS: u32 = WM_APP + 21;
+const WM_BADGE: u32 = WM_APP + 22;
 const RETRY_TIMER_ID: usize = 1;
 const RETRY_INTERVAL_MS: u32 = 2_000;
 const COMMAND_SETTINGS: usize = 1;
@@ -150,7 +153,28 @@ impl SystemTray {
     pub fn shutdown(mut self) -> Result<(), TrayError> {
         self.stop()
     }
+}
 
+/// Marks the tray icon with a small red dot while `unread` is not zero (the
+/// count goes in the tooltip). Callable from any thread; returns false when
+/// the tray is not running.
+pub fn set_tray_badge(unread: u32) -> bool {
+    let bits = TRAY_WINDOW.load(Ordering::Acquire);
+    if bits == 0 {
+        return false;
+    }
+    unsafe {
+        PostMessageW(
+            Some(window(bits)),
+            WM_BADGE,
+            WPARAM(unread as usize),
+            LPARAM(0),
+        )
+    }
+    .is_ok()
+}
+
+impl SystemTray {
     fn stop(&mut self) -> Result<(), TrayError> {
         if self.thread.is_none() {
             return Ok(());
@@ -188,9 +212,26 @@ struct WindowState {
     events: Sender<TrayEvent>,
     taskbar_created: u32,
     icon: HICON,
+    /// The icon with the unread dot, while there are unread messages.
+    badge_icon: Option<HICON>,
+    unread: u32,
     icon_added: bool,
     status: TrayStatus,
     retry_timer: usize,
+}
+
+impl WindowState {
+    fn shown_icon(&self) -> HICON {
+        self.badge_icon.unwrap_or(self.icon)
+    }
+
+    fn tooltip(&self) -> String {
+        match self.unread {
+            0 => self.status.tooltip().to_owned(),
+            1 => format!("{} · 1 unread message", self.status.tooltip()),
+            n => format!("{} · {n} unread messages", self.status.tooltip()),
+        }
+    }
 }
 
 fn run_tray(events: Sender<TrayEvent>, ready_tx: mpsc::SyncSender<Result<(usize, u32), String>>) {
@@ -235,6 +276,8 @@ unsafe fn create_and_run(
         events,
         taskbar_created,
         icon,
+        badge_icon: None,
+        unread: 0,
         icon_added: false,
         status: TrayStatus::Loading,
         retry_timer: 0,
@@ -272,7 +315,9 @@ unsafe fn create_and_run(
     }
 
     let thread_id = unsafe { GetCurrentThreadId() };
+    TRAY_WINDOW.store(hwnd.0 as usize, Ordering::Release);
     if ready_tx.send(Ok((hwnd.0 as usize, thread_id))).is_err() {
+        TRAY_WINDOW.store(0, Ordering::Release);
         unsafe { remove_icon(hwnd, &mut state) };
         let _ = unsafe { DestroyWindow(hwnd) };
         let _ = unsafe { UnregisterClassW(CLASS_NAME, Some(instance)) };
@@ -294,6 +339,7 @@ unsafe fn create_and_run(
         }
     };
 
+    TRAY_WINDOW.store(0, Ordering::Release);
     unsafe { remove_icon(hwnd, &mut state) };
     if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         let _ = unsafe { DestroyWindow(hwnd) };
@@ -339,6 +385,25 @@ unsafe extern "system" fn window_procedure(
             {
                 state.status = status;
                 unsafe { update_tooltip(hwnd, state) };
+            }
+            LRESULT(0)
+        }
+        WM_BADGE => {
+            if let Some(state) = unsafe { window_state(hwnd) } {
+                let unread = u32::try_from(wparam.0).unwrap_or(u32::MAX);
+                if unread != state.unread {
+                    state.unread = unread;
+                    if let Some(old) = state.badge_icon.take() {
+                        let _ = unsafe { DestroyIcon(old) };
+                    }
+                    if unread > 0 {
+                        state.badge_icon = unsafe { badged_icon(state.icon) };
+                    }
+                    if state.icon_added {
+                        let data = notify_data(hwnd, state, NIF_ICON | NIF_TIP | NIF_SHOWTIP);
+                        let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -468,12 +533,7 @@ unsafe fn add_icon(hwnd: HWND, state: &mut WindowState) -> bool {
     if state.icon_added {
         return true;
     }
-    let mut data = notify_data(
-        hwnd,
-        state.icon,
-        state.status,
-        NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
-    );
+    let mut data = notify_data(hwnd, state, NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP);
     if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
         return false;
     }
@@ -493,7 +553,7 @@ unsafe fn update_tooltip(hwnd: HWND, state: &WindowState) {
     if !state.icon_added {
         return;
     }
-    let data = notify_data(hwnd, state.icon, state.status, NIF_TIP | NIF_SHOWTIP);
+    let data = notify_data(hwnd, state, NIF_TIP | NIF_SHOWTIP);
     let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
 }
 
@@ -501,32 +561,110 @@ unsafe fn remove_icon(hwnd: HWND, state: &mut WindowState) {
     if !state.icon_added {
         return;
     }
-    let data = notify_data(
-        hwnd,
-        state.icon,
-        state.status,
-        NOTIFY_ICON_DATA_FLAGS::default(),
-    );
+    let data = notify_data(hwnd, state, NOTIFY_ICON_DATA_FLAGS::default());
     let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
     state.icon_added = false;
+    if let Some(old) = state.badge_icon.take() {
+        let _ = unsafe { DestroyIcon(old) };
+    }
 }
 
-fn notify_data(
-    hwnd: HWND,
-    icon: HICON,
-    status: TrayStatus,
-    flags: NOTIFY_ICON_DATA_FLAGS,
-) -> NOTIFYICONDATAW {
+fn notify_data(hwnd: HWND, state: &WindowState, flags: NOTIFY_ICON_DATA_FLAGS) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: ICON_ID,
         uFlags: flags,
         uCallbackMessage: WM_TRAY,
-        hIcon: icon,
-        szTip: fixed_utf16(status.tooltip()),
+        hIcon: state.shown_icon(),
+        szTip: fixed_utf16(&state.tooltip()),
         ..Default::default()
     }
+}
+
+/// Paints the unread dot (red with a light ring) in the top-right corner of
+/// a square 32-bit premultiplied BGRA image.
+fn draw_badge(pixels: &mut [u32], size: usize) {
+    const RED: u32 = 0xFFE5_3935;
+    const RING: u32 = 0xFFFF_FFFF;
+    // Icons drawn without an alpha channel come back fully transparent.
+    if pixels.iter().all(|p| p >> 24 == 0) {
+        for p in pixels.iter_mut() {
+            *p |= 0xFF00_0000;
+        }
+    }
+    let radius = (size as f32 * 0.24).max(3.0);
+    let (cx, cy) = (size as f32 - radius - 0.5, radius + 0.5);
+    for y in 0..size {
+        for x in 0..size {
+            let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+            if d <= radius - 1.0 {
+                pixels[y * size + x] = RED;
+            } else if d <= radius {
+                pixels[y * size + x] = RING;
+            }
+        }
+    }
+}
+
+/// A copy of `base` at the small-icon size with the unread dot.
+unsafe fn badged_icon(base: HICON) -> Option<HICON> {
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateCompatibleDC, CreateDIBSection,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, HGDIOBJ, SelectObject,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateIconIndirect, DI_NORMAL, DrawIconEx, GetSystemMetrics, ICONINFO, SM_CXSMICON,
+    };
+    let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.clamp(16, 64);
+    let dc = unsafe { CreateCompatibleDC(None) };
+    if dc.is_invalid() {
+        return None;
+    }
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: size,
+            biHeight: -size,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    let icon = (|| {
+        let color =
+            unsafe { CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) }
+                .ok()?;
+        let previous = unsafe { SelectObject(dc, HGDIOBJ(color.0)) };
+        let drawn = unsafe { DrawIconEx(dc, 0, 0, base, size, size, 0, None, DI_NORMAL) };
+        if drawn.is_ok() && !bits.is_null() {
+            let count = (size * size) as usize;
+            let pixels = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u32>(), count) };
+            draw_badge(pixels, size as usize);
+        }
+        unsafe { SelectObject(dc, previous) };
+        let mask = unsafe { CreateBitmap(size, size, 1, 1, None) };
+        let icon = drawn.ok().and_then(|_| {
+            unsafe {
+                CreateIconIndirect(&ICONINFO {
+                    fIcon: true.into(),
+                    xHotspot: 0,
+                    yHotspot: 0,
+                    hbmMask: mask,
+                    hbmColor: color,
+                })
+            }
+            .ok()
+        });
+        let _ = unsafe { DeleteObject(HGDIOBJ(color.0)) };
+        let _ = unsafe { DeleteObject(HGDIOBJ(mask.0)) };
+        icon
+    })();
+    let _ = unsafe { DeleteDC(dc) };
+    icon
 }
 
 fn fixed_utf16<const N: usize>(text: &str) -> [u16; N] {
@@ -587,6 +725,21 @@ enum TrayThreadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn badge_dot_sits_in_the_top_right_and_keeps_the_rest() {
+        let size = 16;
+        let mut pixels = vec![0x8000_0080u32; size * size];
+        draw_badge(&mut pixels, size);
+        let at = |x: usize, y: usize| pixels[y * size + x];
+        assert_eq!(at(size - 3, 3), 0xFFE5_3935);
+        assert_eq!(at(2, size - 2), 0x8000_0080);
+        assert_eq!(at(0, 0), 0x8000_0080);
+        // An icon without alpha is made opaque instead of vanishing.
+        let mut flat = vec![0x0012_3456u32; size * size];
+        draw_badge(&mut flat, size);
+        assert_eq!(flat[(size - 1) * size], 0xFF12_3456);
+    }
 
     #[test]
     fn fixed_utf16_is_terminated_and_truncated() {

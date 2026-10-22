@@ -8,11 +8,22 @@ rust-version.workspace = true
 
 [features]
 default = []
-vulkan = ["phorminx-whisper/vulkan"]
+vulkan = ["phorminx-whisper/vulkan", "phorminx-app/vulkan"]
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+phorminx-app = { path = "../phorminx-app" }
+phorminx-assistant = { path = "../phorminx-assistant" }
 phorminx-audio = { path = "../phorminx-audio" }
 phorminx-core = { path = "../phorminx-core" }
+phorminx-messaging = { path = "../phorminx-messaging", features = ["tor"] }
+phorminx-ocr = { path = "../phorminx-ocr" }
+phorminx-ollama = { path = "../phorminx-ollama" }
+phorminx-persistence = { path = "../phorminx-persistence" }
+phorminx-vosk = { path = "../phorminx-vosk" }
 phorminx-whisper = { path = "../phorminx-whisper" }
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+url.workspace = true

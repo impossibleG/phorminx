@@ -27,7 +27,8 @@ function makeElement(tag, className, text) {
 
 function showRoute(route, persist = true) {
   if (currentRoute === 'settings' && route !== 'settings' && capturingShortcut) void endShortcutCapture();
-  const pageId = route === 'settings' ? 'app-settings' : route;
+  // The meeting chat log already owns id="messages", so the Messages page is #messaging.
+  const pageId = route === 'settings' ? 'app-settings' : route === 'messages' ? 'messaging' : route;
   const page = node(pageId);
   if (!page) return;
   currentRoute = route;
@@ -44,10 +45,18 @@ function showRoute(route, persist = true) {
   }
   if (route === 'saved') void action('refresh');
   if (route === 'actions') void refreshActions();
-  if (route === 'setup') { void refreshSetup(); void refreshUpdates(); }
+  if (route === 'models' || route === 'benchmarks') void window.PhorminxModels?.refresh();
+  if (route === 'setup') { void refreshSetup(); void refreshUpdates(); void refreshRepair(); }
   if (route === 'history' && node('history-query').value.trim()) void startHistorySearch();
   if (route === 'meeting-settings') void refreshProvider();
-  if (persist && hostInvoke) {
+  if (route === 'prompts') window.dispatchEvent(new Event('prompts:show'));
+  if (route === 'benchmarks') void showBenchmarks();
+  document.dispatchEvent(new CustomEvent('phorminx:route', {detail: route}));
+  window.phorminxMessages?.routeChanged(route);
+  // Prompts, Investigations, Messages and Benchmarks are pages of this window
+  // only; the host keeps the last other route.
+  if (route === 'feedback') void refreshFeedbackHistory();
+  if (persist && hostInvoke && !['prompts', 'investigations', 'messages', 'benchmarks', 'feedback'].includes(route)) {
     const hostRoute = ['live', 'saved', 'meeting-settings'].includes(route) ? 'meetings' : route === 'action-editor' ? 'actions' : route === 'lexicon-editor' ? 'lexicon' : route === 'profile-editor' ? 'profiles' : route;
     lastHostRoute = hostRoute;
     void hostInvoke('plugin:phorminx-host|host_select_route', {route: hostRoute}).catch((error) => { node('status').textContent = String(error); });
@@ -190,6 +199,8 @@ function renderHistory(view) {
     const button = makeElement('button', item.id === selectedHistoryId ? 'active' : '');
     button.type = 'button';
     button.append(makeElement('small', '', dateLabel(item.createdAtMs)), makeElement('span', '', item.preview));
+    const note = view.history.find((entry) => entry.id === item.id)?.formattingNote;
+    if (note) button.append(makeElement('em', 'record-note', note));
     button.addEventListener('click', () => { void selectHistory(item.id); });
     list.append(button);
   }
@@ -280,6 +291,23 @@ function renderProfiles(view) {
   node('profile-list').replaceChildren(fragment);
 }
 
+// Below this size (roughly a 4B model) local models tend to return plain
+// prose for Structured and Custom instructions; see the formatting bench.
+const STRUCTURED_MODEL_BYTES = 4 * 1024 * 1024 * 1024;
+
+function updateFormattingHint() {
+  const hint = node('formatting-hint');
+  const strength = node('formatting-strength').value;
+  const name = node('formatting-model').value;
+  const model = appView?.ollamaModels.find((entry) => entry.name === name);
+  const small = model?.sizeBytes && model.sizeBytes < STRUCTURED_MODEL_BYTES;
+  const restructures = strength === 'structured' || strength === 'custom';
+  hint.textContent = restructures && small
+    ? `${name} is a small model. Structured and Custom work best with a 7B-class model such as qwen2.5:7b-instruct.`
+    : '';
+  hint.hidden = !hint.textContent;
+}
+
 function renderModels(view, notice) {
   node('selected-whisper').textContent = `Selected: ${view.settings.accurateModel}`;
   node('vosk-state').textContent = view.systems.find((system) => system.name === 'Vosk')?.message || 'Checking assets…';
@@ -287,11 +315,12 @@ function renderModels(view, notice) {
   for (const model of view.ollamaModels) {
     const row = makeElement('div', 'record-row');
     const size = model.sizeBytes ? ` · ${(model.sizeBytes / 1048576).toFixed(0)} MiB` : '';
-    row.append(makeElement('small', '', model.selected ? 'SELECTED' : 'INSTALLED'), makeElement('span', '', `${model.name}${size}`));
+    const structured = model.sizeBytes && model.sizeBytes >= STRUCTURED_MODEL_BYTES ? ' · good for Structured' : '';
+    row.append(makeElement('small', '', model.selected ? 'SELECTED' : 'INSTALLED'), makeElement('span', '', `${model.name}${size}${structured}`));
     fragment.append(row);
   }
   if (!view.ollamaModels.length) fragment.append(makeElement('div', 'record-row', view.systems.find((system) => system.name === 'Ollama')?.message || 'No local models found.'));
-  node('ollama-models').replaceChildren(fragment);
+  node('ollama-models')?.replaceChildren(fragment);
   node('model-result').textContent = notice || '';
 }
 
@@ -327,6 +356,44 @@ function renderSetup(view) {
   node('setup-list').replaceChildren(fragment);
 }
 
+const REPAIR_STATES = {ok: ['✓', 'Ready'], missing: ['!', 'Missing'], unused: ['–', 'Not set up']};
+
+async function refreshRepair() {
+  if (!hostInvoke) return;
+  node('repair-status').textContent = 'Checking…';
+  try {
+    renderRepair(await hostInvoke('host_repair_status'));
+    node('repair-status').textContent = '';
+  } catch (error) { node('repair-status').textContent = String(error); }
+}
+
+function renderRepair(items) {
+  const list = node('repair-list');
+  list.replaceChildren();
+  for (const item of items) {
+    const row = makeElement('div', `repair-row repair-${item.state}`);
+    row.setAttribute('role', 'listitem');
+    const [mark, word] = REPAIR_STATES[item.state] || ['?', item.state];
+    const badge = makeElement('span', 'repair-badge', `${mark} ${word}`);
+    const text = makeElement('div', 'repair-text');
+    text.append(makeElement('small', '', item.workflow.toUpperCase()), makeElement('strong', '', item.label), makeElement('span', '', item.detail));
+    row.append(badge, text);
+    if (item.fix) {
+      const fix = makeElement('button', '', item.fix === 'setup' ? 'Run setup again' : item.fix === 'ocr' ? 'Install' : 'Open Models');
+      fix.type = 'button';
+      fix.addEventListener('click', () => {
+        if (item.fix === 'setup') node('bootstrap-consent').showModal();
+        else if (item.fix === 'models') showRoute('models');
+        else void hostInvoke('investigation_models', {kind: 'install'})
+          .then(() => { node('repair-status').textContent = 'Downloading the screenshot text models…'; })
+          .catch((error) => { node('repair-status').textContent = String(error); });
+      });
+      row.append(fix);
+    }
+    list.append(row);
+  }
+}
+
 async function refreshSetup() {
   if (!hostInvoke) return;
   try {
@@ -336,13 +403,23 @@ async function refreshSetup() {
   catch (error) { node('setup-summary').textContent = String(error); }
 }
 
+let lastBootstrapState = '';
+
 function renderBootstrap(view) {
   node('bootstrap-card').hidden = !view.available;
   if (!view.available) return;
   const working = view.state === 'working' || view.state === 'cancelling';
+  if (view.repair) {
+    node('bootstrap-label').textContent = 'REPAIR';
+    node('bootstrap-title').textContent = 'Run setup again';
+    node('bootstrap-intro').textContent = 'Reinstalls whatever is missing from the starter (speech recognition, GPU acceleration, Ollama, qwen2.5:1.5b and nomic-embed-text) and skips what is already there. Settings and saved text are kept.';
+  }
   node('bootstrap-start').disabled = working;
-  node('bootstrap-start').textContent = ['failed', 'cancelled'].includes(view.state) ? 'Retry preparation' : 'Prepare everything';
-  node('bootstrap-start').hidden = view.state === 'complete';
+  node('bootstrap-start').textContent = ['failed', 'cancelled'].includes(view.state) ? 'Retry' : view.repair ? 'Run setup again' : 'Prepare everything';
+  // A repair can always run again; the first-run starter is done once complete.
+  node('bootstrap-start').hidden = view.state === 'complete' && !view.repair;
+  if (lastBootstrapState === 'working' && view.state !== 'working') void refreshRepair();
+  lastBootstrapState = view.state;
   node('bootstrap-cancel').hidden = !working;
   node('bootstrap-cancel').disabled = view.state === 'cancelling';
   node('bootstrap-progress').textContent = working ? `Step ${view.step} of ${view.total}` : view.state === 'complete' ? 'Complete' : '';
@@ -400,6 +477,8 @@ async function selectHistory(id) {
     option.disabled = item ? !item.variants[option.value] : option.value !== 'output';
   }
   if (node('history-variant').selectedOptions[0]?.disabled) node('history-variant').value = 'output';
+  node('history-note').textContent = item?.formattingNote || '';
+  node('history-note').hidden = !item?.formattingNote;
   await loadHistoryText();
 }
 
@@ -508,6 +587,7 @@ function renderApp(view, runtimeStatus, notice) {
     node('launcher-shortcut').value = view.settings.launcherShortcut;
     node('app-theme').value = view.settings.theme;
     node('recording-mode').value = view.settings.recordingMode;
+    node('show-live-text').checked = view.settings.showLiveText !== false;
   }
   if (!dictationDirty) {
     node('recognition-mode').value = view.settings.recognitionMode;
@@ -516,6 +596,7 @@ function renderApp(view, runtimeStatus, notice) {
     node('minimum-rms').value = view.settings.minimumRms;
     node('formatting-strength').value = view.settings.formattingStrength;
     node('model-residency').value = view.settings.modelResidency;
+    node('formatting-passes').value = String(view.settings.formattingPasses || 2);
     const select = node('formatting-model');
     const options = [makeElement('option', '', 'No model')];
     options[0].value = '';
@@ -532,6 +613,7 @@ function renderApp(view, runtimeStatus, notice) {
     select.replaceChildren(...options);
     select.value = view.settings.formattingModel || '';
   }
+  updateFormattingHint();
   if (!privacyDirty) {
     node('history-retention').value = view.settings.historyRetention;
     node('embedding-model').value = view.settings.embeddingModel || '';
@@ -560,6 +642,53 @@ async function refreshApp() {
     }
   } catch (error) { node('status').textContent = String(error); }
   finally { appRefreshInFlight = false; }
+}
+
+let benchmarksShown = false;
+let benchmarksOnline = false;
+
+let benchmarksView = null;
+
+function renderBenchmarks(collection) {
+  benchmarksView = window.PhorminxBenchmarks.render(node('benchmarks-view'), collection, {
+    loadReport: (id) => hostInvoke('benchmarks_report', {id, online: benchmarksOnline}),
+    onRefresh: () => void refreshBenchmarks(),
+    models: window.PhorminxModels && {
+      entries: () => window.PhorminxModels.entries(),
+      use: async (slot, name) => {
+        const message = await hostInvoke('models_assign', {slot, name});
+        void window.PhorminxModels.refresh();
+        return message;
+      },
+      unuse: async (slot) => {
+        const message = await hostInvoke('models_unassign', {slot});
+        void window.PhorminxModels.refresh();
+        return message;
+      },
+      download: async (name) => {
+        await installModel(name, null);
+        return `Downloading ${name}. Progress shows on Models; the list updates when it is done.`;
+      },
+    },
+  });
+}
+
+async function refreshBenchmarks() {
+  try {
+    const collection = await hostInvoke('benchmarks_load', {online: true});
+    benchmarksOnline = collection.source === 'online';
+    renderBenchmarks(collection);
+  } catch (error) { node('status').textContent = String(error); }
+}
+
+// Shows the bundled results at once, then quietly checks for newer published ones.
+async function showBenchmarks() {
+  if (benchmarksShown || !hostInvoke || !window.PhorminxBenchmarks) return;
+  benchmarksShown = true;
+  try {
+    renderBenchmarks(await hostInvoke('benchmarks_load', {online: false}));
+    void refreshBenchmarks();
+  } catch (error) { benchmarksShown = false; node('status').textContent = String(error); }
 }
 
 for (const button of document.querySelectorAll('[data-route]')) {
@@ -628,6 +757,7 @@ node('setup-consent').addEventListener('close', () => {
   if (node('setup-consent').returnValue === 'confirm' && id) void startSetupAction(id, true);
 });
 node('bootstrap-start').addEventListener('click', () => node('bootstrap-consent').showModal());
+node('repair-refresh').addEventListener('click', () => void refreshRepair());
 node('bootstrap-cancel').addEventListener('click', async () => {
   try { renderBootstrap(await hostInvoke('host_cancel_bootstrap')); }
   catch (error) { node('bootstrap-message').textContent = String(error); }
@@ -762,6 +892,7 @@ node('preferences-form').addEventListener('submit', async (event) => {
       theme: node('app-theme').value,
       recordingMode: node('recording-mode').value,
       launcherShortcut: node('launcher-shortcut').value.trim(),
+      showLiveText: node('show-live-text').checked,
     });
     preferencesDirty = false;
     node('preferences-result').textContent = 'Saved.';
@@ -771,7 +902,7 @@ node('preferences-form').addEventListener('submit', async (event) => {
 node('preferences-form').addEventListener('input', () => { preferencesDirty = true; });
 node('preferences-form').addEventListener('change', () => { preferencesDirty = true; });
 node('dictation-form').addEventListener('input', () => { dictationDirty = true; });
-node('dictation-form').addEventListener('change', () => { dictationDirty = true; });
+node('dictation-form').addEventListener('change', () => { dictationDirty = true; updateFormattingHint(); });
 node('privacy-form').addEventListener('input', () => { privacyDirty = true; });
 node('privacy-form').addEventListener('change', () => { privacyDirty = true; });
 node('dictation-form').addEventListener('submit', async (event) => {
@@ -788,6 +919,7 @@ node('dictation-form').addEventListener('submit', async (event) => {
       model: node('formatting-model').value || null,
       lifecycle: node('model-residency').value,
       customInstructions: node('custom-instructions').value.trim() || null,
+      passes: Number(node('formatting-passes').value),
     });
     dictationDirty = false;
     node('dictation-result').textContent = 'Saved.';
@@ -847,3 +979,153 @@ else node('status').textContent = 'Open this page inside Phorminx.';
 if (hostInvoke) setInterval(() => { if (currentRoute === 'setup') void refreshSetup(); }, 1500);
 if (hostInvoke) setInterval(() => { if (currentRoute === 'settings' && !node('settings-updates').hidden) void refreshUpdates(); }, 1500);
 if (hostInvoke) setInterval(() => { void refreshLibrary(); }, 450);
+
+// Model fields pick from the shared registry, offering only the right kind.
+const MODEL_FILTERS = [['all', 'All'], ['installed', 'Installed'], ['language', 'Language'], ['embedding', 'Search'], ['vision', 'Vision'], ['speech', 'Speech'], ['ocr', 'Screenshot text']];
+const MODEL_TAG_LABELS = {language: 'Language', embedding: 'Search', vision: 'Vision', tools: 'Tools', speech: 'Speech', ocr: 'Screenshot text'};
+const MODEL_FAMILIES = {ollama: 'Ollama', whisper: 'Whisper', vosk: 'Vosk', ocr: 'PaddleOCR'};
+let modelFilter = 'all';
+
+function renderRegistry(entries) {
+  const query = node('model-search').value.trim().toLowerCase();
+  const list = node('model-registry');
+  const shown = entries.filter((entry) => {
+    if (modelFilter === 'installed' && !entry.installed) return false;
+    if (!['all', 'installed'].includes(modelFilter) && !entry.tags.includes(modelFilter)) return false;
+    const haystack = [entry.name, MODEL_FAMILIES[entry.family], entry.note, ...entry.tags.map((tag) => MODEL_TAG_LABELS[tag] || tag), ...entry.usedBy].join(' ').toLowerCase();
+    return !query || haystack.includes(query);
+  });
+  const rows = shown.map((entry) => {
+    const row = makeElement('div', `model-entry${entry.installed ? ' installed' : ''}`);
+    row.setAttribute('role', 'listitem');
+    const head = makeElement('div', 'model-entry-head');
+    const size = entry.sizeBytes ? ` · ${entry.sizeBytes >= 1073741824 ? `${(entry.sizeBytes / 1073741824).toFixed(1)} GB` : `${Math.round(entry.sizeBytes / 1048576)} MB`}` : '';
+    head.append(makeElement('strong', '', entry.name), makeElement('small', '', `${MODEL_FAMILIES[entry.family] || entry.family}${size} · ${entry.installed ? 'Installed' : 'Not installed'}`));
+    const tags = makeElement('div', 'model-tags');
+    for (const tag of entry.tags) tags.append(makeElement('span', 'model-tag', MODEL_TAG_LABELS[tag] || tag));
+    for (const feature of entry.usedBy) tags.append(makeElement('span', 'model-tag used', `Used by ${feature}`));
+    row.append(head, tags);
+    if (entry.note) row.append(makeElement('p', 'setting-hint', entry.note));
+    if (!entry.installed && entry.family === 'ollama') {
+      const install = makeElement('button', '', 'Install');
+      install.type = 'button';
+      install.addEventListener('click', () => void installModel(entry.name, entry.tags[0]));
+      row.append(install);
+    }
+    return row;
+  });
+  if (!rows.length) rows.push(makeElement('p', 'setting-hint', 'No model matches. Install one from Ollama by its exact name below.'));
+  list.replaceChildren(...rows);
+}
+
+function renderModelFilters() {
+  const group = node('model-filters');
+  group.replaceChildren(...MODEL_FILTERS.map(([id, label]) => {
+    const chip = makeElement('button', 'chip', label);
+    chip.type = 'button';
+    chip.setAttribute('aria-pressed', String(modelFilter === id));
+    chip.addEventListener('click', () => {
+      modelFilter = id;
+      renderModelFilters();
+      renderRegistry(window.PhorminxModels?.entries() || []);
+      group.querySelector(`[aria-pressed="true"]`)?.focus();
+    });
+    return chip;
+  }));
+}
+
+let modelPullTimer = null;
+
+async function installModel(name, expected) {
+  const status = node('model-install-status');
+  try {
+    const view = await hostInvoke('models_pull', {name, expected: expected || null});
+    status.textContent = view.message;
+    clearInterval(modelPullTimer);
+    modelPullTimer = setInterval(async () => {
+      const pull = await hostInvoke('models_pull_status');
+      status.textContent = pull.percent != null && pull.state === 'pulling' ? `${pull.message} (${pull.percent}%)` : pull.message;
+      if (pull.state !== 'pulling') {
+        clearInterval(modelPullTimer);
+        void window.PhorminxModels?.refresh();
+      }
+    }, 1000);
+  } catch (error) { status.textContent = String(error); }
+}
+
+if (window.PhorminxModels) {
+  const external = () => node('provider-kind').value !== 'ollama';
+  PhorminxModels.attach('formatting-model', {kind: 'language', empty: 'No model'});
+  PhorminxModels.attach('embedding-model', {kind: 'embedding', empty: 'Off'});
+  const answer = PhorminxModels.attach('provider-model', {kind: 'language', empty: 'Choose a model', free: external});
+  PhorminxModels.attach('provider-fallback', {kind: 'language', empty: 'No fallback'});
+  PhorminxModels.attach('translation-model', {kind: 'language', empty: 'Choose an installed model'});
+  PhorminxModels.attach('action-model', {kind: 'language', empty: 'Choose a model'});
+  node('provider-kind').addEventListener('change', () => answer?.render());
+  document.addEventListener('phorminx:models', (event) => { renderRegistry(event.detail); benchmarksView?.redraw(); });
+  node('model-search').addEventListener('input', () => renderRegistry(PhorminxModels.entries()));
+  node('model-install-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const name = node('model-install-name').value.trim();
+    if (name) void installModel(name, null);
+  });
+  renderModelFilters();
+  void PhorminxModels.refresh();
+}
+
+// Feedback: reports and comments sent from this computer, with their status.
+const FEEDBACK_STATES = {open: 'Open', solved: '✓ Solved', shared: 'Shared · waiting for the team or shown', removed: 'Taken down'};
+
+function renderFeedbackHistory(items) {
+  const rows = items.map((item) => {
+    const row = makeElement('div', `record-row feedback-row feedback-${item.status}`);
+    row.setAttribute('role', 'listitem');
+    const head = makeElement('div', 'feedback-head');
+    const sent = new Date(item.sentAtMs).toLocaleString(undefined, {dateStyle: 'medium', timeStyle: 'short'});
+    head.append(makeElement('small', '', `${item.kind === 'comment' ? 'COMMENT' : 'REPORT'} · ${sent}`), makeElement('span', 'feedback-state', FEEDBACK_STATES[item.status] || item.status));
+    const text = makeElement('p', 'feedback-text', item.text);
+    row.append(head, text);
+    if (item.resolutionNote) row.append(makeElement('p', 'feedback-note', `From the team: ${item.resolutionNote}`));
+    const actions = makeElement('div', 'feedback-actions');
+    if (item.kind === 'comment' && item.status === 'shared') {
+      const remove = makeElement('button', '', 'Take down from website');
+      remove.type = 'button';
+      remove.addEventListener('click', async () => {
+        if (!window.confirm('Remove this comment from phorminx.net for good?')) return;
+        try { await hostInvoke('feedback_remove_comment', {id: item.id}); void refreshFeedbackHistory(); }
+        catch (error) { node('feedback-status').textContent = String(error); }
+      });
+      actions.append(remove);
+    }
+    const forget = makeElement('button', '', 'Remove from this list');
+    forget.type = 'button';
+    forget.addEventListener('click', async () => {
+      try { await hostInvoke('feedback_forget', {id: item.id}); void refreshFeedbackHistory(); }
+      catch (error) { node('feedback-status').textContent = String(error); }
+    });
+    actions.append(forget);
+    row.append(actions);
+    return row;
+  });
+  if (!rows.length) rows.push(makeElement('div', 'record-row', 'Nothing sent yet. Use “New report or comment” to tell the team what happened, or what you like.'));
+  node('feedback-list').replaceChildren(...rows);
+}
+
+async function refreshFeedbackHistory() {
+  if (!hostInvoke) return;
+  try {
+    const items = await hostInvoke('feedback_history');
+    renderFeedbackHistory(items);
+    const solved = items.filter((item) => item.status === 'solved').length;
+    node('feedback-status').textContent = solved ? `${solved} solved` : '';
+  } catch (error) { node('feedback-status').textContent = String(error); }
+}
+
+node('feedback-check').addEventListener('click', async () => {
+  node('feedback-status').textContent = 'Checking with phorminx.net…';
+  try {
+    const solved = await hostInvoke('feedback_check_now');
+    await refreshFeedbackHistory();
+    node('feedback-status').textContent = solved ? `${solved} newly solved.` : 'Up to date.';
+  } catch (error) { node('feedback-status').textContent = String(error); }
+});

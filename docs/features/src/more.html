@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>More</title><link rel="stylesheet" href="style.css">
+<style>
+  .head { position: absolute; left: 96px; top: 84px; }
+  .tiles { position: absolute; left: 96px; right: 96px; top: 150px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 22px; }
+  .tile { padding: 30px 30px 32px; }
+  .tile i { display: block; width: 46px; height: 46px; margin-bottom: 22px; }
+  .tile i svg { width: 46px; height: 46px; fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+  .tile strong { display: block; margin-bottom: 10px; font-size: 26px; font-weight: 550; letter-spacing: -.02em; }
+  .tile span { color: var(--quiet); font-size: 19px; line-height: 1.45; }
+  .updates { position: absolute; left: 96px; right: 96px; bottom: 56px; display: flex; align-items: flex-start; justify-content: space-between; padding: 30px 60px; }
+  .updates .node .icon { width: 84px; height: 84px; }
+  .updates .node .icon svg { width: 42px; height: 42px; }
+  .updates .arrow { margin-top: 42px; width: 90px; }
+  .updates small { position: absolute; left: 34px; top: -12px; padding: 0 10px; background: var(--page); }
+</style></head>
+<body><div class="canvas">
+  <div class="head"><p class="eyebrow">And also</p></div>
+  <div class="tiles">
+    <div class="card tile"><i data-icon="search"></i><strong>Library search</strong><span>Exact words or local semantic search across what you kept.</span></div>
+    <div class="card tile"><i data-icon="bolt"></i><strong>Actions</strong><span>Send a dictation to any HTTP endpoint, as a template or local-AI JSON.</span></div>
+    <div class="card tile"><i data-icon="box"></i><strong>Models and setup</strong><span>Hash-verified downloads and one guided "Prepare everything".</span></div>
+    <div class="card tile"><i data-icon="refresh"></i><strong>Automatic updates</strong><span>Signed, verified, and never in the middle of a recording.</span></div>
+  </div>
+  <div class="card updates" style="position:absolute">
+    <small>How updates install</small>
+    <div class="node"><div class="icon" data-icon="signature"></div><strong>Signed manifest</strong><span>checked daily on GitHub Releases</span></div>
+    <div class="arrow"></div>
+    <div class="node"><div class="icon" data-icon="hash"></div><strong>Hash verified</strong><span>installer bytes match the signature</span></div>
+    <div class="arrow"></div>
+    <div class="node"><div class="icon" data-icon="power"></div><strong>Installs after you exit</strong><span>or while idle, never mid-recording</span></div>
+  </div>
+</div>
+<script src="common.js"></script>
+</body></html>

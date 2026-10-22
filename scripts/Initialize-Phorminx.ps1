@@ -126,7 +126,7 @@ function New-StarterSettings([string] $Digest, [long] $Bytes) {
 schema_version = 7
 
 [recognition]
-mode = "instant"
+mode = "accurate"
 model_path = "models/ggml-base.en.bin"
 instant_model_path = "models/vosk-model-small-en-us-0.15"
 instant_runtime_path = "runtime/vosk"
@@ -135,9 +135,11 @@ accurate_backend = "auto"
 language = "en"
 
 [formatting]
-strength = "balanced"
+strength = "custom"
+custom_instructions = "Turn this dictation into clear, well-organized text. Fix punctuation and grammar, remove fillers and repetition, and use short paragraphs. Use a bulleted or numbered list when the speaker lists items, steps or tasks. Keep every fact, name and number."
 ollama_model = "qwen2.5:1.5b"
-ollama_lifecycle = "balanced"
+ollama_lifecycle = "instant"
+passes = 2
 
 [formatting.ollama_model_identity]
 manifest_sha256 = "$($Digest.ToLowerInvariant())"
@@ -162,8 +164,14 @@ if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitProcess -or
     $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Run in 64-bit PowerShell on Windows x64.' }
 $appProcesses = @(Get-Process -Name 'phorminx-app' -ErrorAction SilentlyContinue)
 if ($FromApp) {
+    # Another copy installed elsewhere (a test build, say) keeps its own files;
+    # only a second instance of this same installation would conflict.
+    $hostProcess = @($appProcesses | Where-Object { $_.Id -eq $HostProcessId })
+    $sameInstall = if ($hostProcess.Count -eq 1 -and $hostProcess[0].Path) {
+        @($appProcesses | Where-Object { $_.Path -eq $hostProcess[0].Path })
+    } else { @() }
     if ($HostProcessId -le 0 -or $RunId -notmatch '^[a-zA-Z0-9-]{1,80}$' -or
-        $appProcesses.Count -ne 1 -or $appProcesses[0].Id -ne $HostProcessId) {
+        $hostProcess.Count -ne 1 -or $sameInstall.Count -ne 1) {
         throw 'Setup can run only from the single active Phorminx setup window.'
     }
 } elseif ($appProcesses.Count -gt 0) { throw 'Close Phorminx (including the tray icon), then run this command again.' }
@@ -260,7 +268,7 @@ if (Test-Path -LiteralPath $settings) {
     } finally {
         if (Test-Path -LiteralPath $temporarySettings) { Remove-Item -LiteralPath $temporarySettings }
     }
-    Write-Host 'English starter settings created: Instant dictation, balanced formatting, local semantic search.'
+    Write-Host 'English starter settings created: Accurate dictation, custom two-pass formatting with qwen2.5:1.5b, local semantic search.'
 }
 Write-Host 'Downloads and setup complete. Open Phorminx and test dictation. GPU acceleration additionally requires a compatible GPU driver; Accurate mode can fall back to CPU.'
 Write-SetupStatus 'complete' 'Starter assets installed. Existing settings were preserved where present; test recognition on this computer.' 6

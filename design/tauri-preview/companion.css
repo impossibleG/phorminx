@@ -26,3 +26,4 @@ html,body{width:100%;height:100%;overflow:hidden}
 .message .markdown code{font-family:Consolas,monospace}.message .markdown blockquote{margin:8px 0;padding-left:11px;border-left:2px solid var(--accent);color:var(--secondary)}
 .transcript-scroll,.conversation-scroll,.message .markdown pre{scrollbar-width:none;-ms-overflow-style:none}
 .transcript-scroll::-webkit-scrollbar,.conversation-scroll::-webkit-scrollbar,.message .markdown pre::-webkit-scrollbar{display:none;width:0;height:0}
+.window-frame[data-language=translation] .phrase-text .original.untranslated{display:block}

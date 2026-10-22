@@ -1,5 +1,7 @@
 //! Platform-neutral domain types and contracts for Phorminx.
 
+pub mod benchmark_report;
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -236,6 +238,38 @@ pub fn normalize_transcript(input: &str) -> String {
     normalized
 }
 
+/// Normalizes model-formatted text without destroying its layout.
+///
+/// [`normalize_transcript`] is for spoken text and joins everything into one
+/// line. Formatted output can carry paragraphs, lists and nested list items,
+/// so this keeps line breaks (at most one blank line in a row) and leading
+/// indentation, and only tidies spacing inside each line.
+pub fn normalize_formatted(input: &str) -> String {
+    let mut lines = Vec::new();
+    let mut blank_run = 0;
+    for line in input.lines() {
+        let content = normalize_transcript(line);
+        if content.is_empty() {
+            blank_run += 1;
+            if blank_run == 1 && !lines.is_empty() {
+                lines.push(String::new());
+            }
+            continue;
+        }
+        blank_run = 0;
+        let indent = line
+            .chars()
+            .take_while(|character| *character == ' ' || *character == '\t')
+            .map(|character| if character == '\t' { "    " } else { " " })
+            .collect::<String>();
+        lines.push(format!("{indent}{content}"));
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
 /// Chooses a bounded Whisper audio context for a completed utterance.
 ///
 /// Whisper uses roughly 50 encoder context units per second. Rounding to a
@@ -319,6 +353,19 @@ mod tests {
             machine.begin_dictation(),
             Err(StateError::Busy(RuntimeState::Listening))
         );
+    }
+
+    #[test]
+    fn formatted_text_keeps_lists_paragraphs_and_nesting() {
+        let model =
+            "## Plan\n\n- First item ,  done\n  - nested   point\n\n\n\nSecond   paragraph .\n\n";
+        assert_eq!(
+            normalize_formatted(model),
+            "## Plan\n\n- First item, done\n  - nested point\n\nSecond paragraph."
+        );
+        assert_eq!(normalize_formatted("\n\n  one line  \n"), "  one line");
+        assert_eq!(normalize_formatted("a\r\nb"), "a\nb");
+        assert_eq!(normalize_formatted(""), "");
     }
 
     #[test]

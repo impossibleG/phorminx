@@ -1040,3 +1040,86 @@ fn no_api_accepts_window_titles_or_full_paths() {
     assert!(fields > 0);
     assert!(!Path::new("notepad.exe").is_absolute());
 }
+
+#[test]
+fn reopening_a_current_database_does_not_wait_for_another_writer() {
+    let (directory, _database) = open_temp();
+    let path = directory.path().join("nested/phorminx.sqlite3");
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let reopened = Persistence::open_with_busy_timeout(&path, std::time::Duration::from_millis(50));
+
+    writer.execute_batch("ROLLBACK").unwrap();
+    assert!(reopened.is_ok(), "{:?}", reopened.err());
+}
+
+#[test]
+fn reopening_repairs_a_schema_written_by_an_older_build() {
+    let (directory, database) = open_temp();
+    drop(database);
+    let path = directory.path().join("nested/phorminx.sqlite3");
+    let older = rusqlite::Connection::open(&path).unwrap();
+    older
+        .execute_batch(
+            "DROP TABLE recovery_tombstones; \
+             DELETE FROM persistence_settings WHERE key = 'schema_fingerprint';",
+        )
+        .unwrap();
+    drop(older);
+
+    Persistence::open(&path).unwrap();
+
+    let check = rusqlite::Connection::open(&path).unwrap();
+    let restored: bool = check
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'recovery_tombstones')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(restored);
+}
+
+fn has_table(path: &Path, name: &str) -> bool {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn feedback_table_exists_on_a_fresh_database() {
+    let (directory, database) = open_temp();
+    drop(database);
+    assert!(has_table(
+        &directory.path().join("nested/phorminx.sqlite3"),
+        "feedback_reports"
+    ));
+}
+
+#[test]
+fn upgrading_from_a_build_without_feedback_creates_its_table() {
+    let (directory, database) = open_temp();
+    drop(database);
+    let path = directory.path().join("nested/phorminx.sqlite3");
+    // A current-version database written before feedback existed: same schema
+    // version, no feedback table, and that build's (different) fingerprint.
+    let older = rusqlite::Connection::open(&path).unwrap();
+    older
+        .execute_batch(
+            "DROP TABLE feedback_reports; \
+             UPDATE persistence_settings SET value = '0000000000000000' WHERE key = 'schema_fingerprint';",
+        )
+        .unwrap();
+    drop(older);
+    assert!(!has_table(&path, "feedback_reports"));
+
+    Persistence::open(&path).unwrap();
+
+    assert!(has_table(&path, "feedback_reports"));
+}

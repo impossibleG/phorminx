@@ -10,6 +10,9 @@ use phorminx_audio::{
 use phorminx_core::{SpeechRecognizer, TranscriptionOptions};
 use phorminx_whisper::WhisperRecognizer;
 
+mod format_bench;
+mod suite;
+
 #[derive(Debug, Parser)]
 #[command(name = "phorminx-bench")]
 #[command(about = "Phase 0 microphone and local Whisper benchmark")]
@@ -58,6 +61,44 @@ enum Command {
         audio_context: Option<u32>,
         #[arg(long)]
         save_wav: Option<PathBuf>,
+    },
+    /// Run synthetic transcripts through each formatting profile on a local
+    /// Ollama model and report raw output, validator verdict and final text.
+    FormatBench {
+        #[arg(long)]
+        model: String,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "light,balanced,strong,structured,custom"
+        )]
+        profiles: Vec<String>,
+        /// Instructions for the custom profile.
+        #[arg(long)]
+        custom: Option<String>,
+        /// Only run these samples (comma separated names).
+        #[arg(long, value_delimiter = ',')]
+        samples: Option<Vec<String>>,
+        /// Write the Markdown report here instead of standard output.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value_t = 120)]
+        timeout_seconds: u64,
+        /// Formatting passes to compare (comma separated).
+        #[arg(long, value_delimiter = ',', default_value = "1")]
+        passes: Vec<u8>,
+    },
+    /// Measure features with synthetic inputs and merge the results into
+    /// the published benchmark file (see docs/benchmarks/README.md).
+    Suite {
+        /// The published file.
+        #[arg(long, default_value = "docs/benchmarks/benchmarks.json")]
+        out: PathBuf,
+        /// Folder with model files, runtimes and generated fixtures.
+        #[arg(long)]
+        assets: PathBuf,
+        #[command(subcommand)]
+        step: SuiteStep,
     },
     /// Repeatedly exercise real default-microphone capture without retaining audio.
     #[command(hide = true)]
@@ -126,6 +167,26 @@ fn main() -> Result<()> {
             pause_ms,
             cancel_iterations,
         } => capture_soak(iterations, hold_ms, pause_ms, cancel_iterations)?,
+        Command::FormatBench {
+            model,
+            profiles,
+            custom,
+            samples,
+            output,
+            timeout_seconds,
+            passes,
+        } => format_bench::run(format_bench::BenchConfig {
+            model,
+            profiles,
+            custom,
+            samples,
+            output,
+            timeout_seconds,
+            passes,
+        })?,
+        Command::Suite { out, assets, step } => {
+            run_suite(&out, suite::Assets { root: assets }, step)?
+        }
     }
 
     Ok(())
@@ -305,4 +366,124 @@ fn ensure_parent(path: &Path) -> Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     Ok(())
+}
+
+#[derive(Debug, Subcommand)]
+enum SuiteStep {
+    /// Generate the synthetic speech and screenshots into `<assets>/fixtures`.
+    Fixtures,
+    /// Instant (Vosk) and Accurate (Whisper) on the speech fixtures.
+    Dictation {
+        #[arg(long, default_value_t = 3)]
+        repeats: u32,
+    },
+    /// Every formatting mode on each model.
+    Formatting {
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "gemma3:4b,qwen2.5:1.5b,qwen2.5:7b"
+        )]
+        models: Vec<String>,
+        #[arg(long, value_delimiter = ',', default_value = "1,2")]
+        passes: Vec<u8>,
+        #[arg(long, default_value_t = 2)]
+        repeats: u32,
+        #[arg(long, default_value_t = 2)]
+        cold_repeats: u32,
+    },
+    /// Meeting transcription, finalization and summaries.
+    Meetings {
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "gemma3:4b,qwen2.5:1.5b,qwen2.5:7b"
+        )]
+        models: Vec<String>,
+        #[arg(long, default_value_t = 3)]
+        repeats: u32,
+    },
+    /// OCR, link previews and assistant answers.
+    Investigations {
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "gemma3:4b,qwen2.5:1.5b,qwen2.5:7b"
+        )]
+        models: Vec<String>,
+        #[arg(long, default_value_t = 3)]
+        repeats: u32,
+    },
+    /// Messaging over the in-memory loopback and, with --tor, over Tor.
+    Messaging {
+        #[arg(long)]
+        tor: bool,
+        #[arg(long, default_value_t = 10)]
+        messages: u32,
+    },
+    /// Startup, settings save and idle memory of a built app.
+    App {
+        /// The built Phorminx executable; it runs on throwaway profiles.
+        #[arg(long)]
+        exe: PathBuf,
+        #[arg(long, default_value_t = 3)]
+        repeats: u32,
+    },
+    /// Copy one feature's results from another benchmark file.
+    Import {
+        #[arg(long)]
+        from: PathBuf,
+        #[arg(long)]
+        feature: String,
+    },
+    /// Add the verdict, archive the report and rebuild the history.
+    Finalize,
+}
+
+fn run_suite(out: &Path, assets: suite::Assets, step: SuiteStep) -> Result<()> {
+    match step {
+        SuiteStep::Fixtures => suite::fixtures::generate(&assets),
+        SuiteStep::Dictation { repeats } => suite::merge(
+            out,
+            suite::dictation::FEATURE,
+            suite::dictation::measure(&assets, repeats)?,
+        ),
+        SuiteStep::Formatting {
+            models,
+            passes,
+            repeats,
+            cold_repeats,
+        } => suite::merge(
+            out,
+            suite::formatting::FEATURE,
+            suite::formatting::measure(&suite::formatting::Config {
+                models,
+                passes,
+                repeats,
+                cold_repeats,
+            })?,
+        ),
+        SuiteStep::Meetings { models, repeats } => suite::merge(
+            out,
+            suite::meetings::FEATURE,
+            suite::meetings::measure(&assets, &models, repeats)?,
+        ),
+        SuiteStep::Investigations { models, repeats } => suite::merge(
+            out,
+            suite::investigations::FEATURE,
+            suite::investigations::measure(&assets, &models, repeats)?,
+        ),
+        SuiteStep::Messaging { tor, messages } => suite::merge(
+            out,
+            suite::messaging::FEATURE,
+            suite::messaging::measure(tor, messages)?,
+        ),
+        SuiteStep::App { exe, repeats } => suite::merge(
+            out,
+            suite::app::FEATURE,
+            suite::app::measure(&assets, &exe, repeats)?,
+        ),
+        SuiteStep::Import { from, feature } => suite::import(out, &from, &feature),
+        SuiteStep::Finalize => suite::finalize(out),
+    }
 }

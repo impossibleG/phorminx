@@ -1,17 +1,94 @@
 //! Explicit, review-before-send feedback. No automatic diagnostics or audio upload.
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::meeting_audio::{MeetingAudioEvent, MeetingAudioService, MeetingAudioSource};
-use crate::settings::{Settings, SettingsStore};
+use crate::review::ReformatResult;
+use crate::settings::{FormattingStrength, Settings, SettingsStore};
 
 // The apex host: www redirects there, and submissions deliberately refuse
 // redirects, so a www endpoint would never reach the service.
 const ENDPOINT: &str = "https://phorminx.net/api/v1/feedback";
 const MAX_TEXT_BYTES: usize = 12_000;
+/// Comments people choose to share on phorminx.net; the team approves them first.
+const COMMENTS_ENDPOINT: &str = "https://phorminx.net/api/v1/comments";
+const MAX_COMMENT_BYTES: usize = 2_000;
+
+/// A comment for the website: text, an optional first name, and consent.
+#[derive(Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommentSubmission {
+    schema_version: u8,
+    submission_id: String,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    consent_public: bool,
+}
+
+/// A first name or nickname: letters, digits, spaces, dots, apostrophes or
+/// hyphens, at most 40 characters. The server applies the same rule.
+fn valid_display_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.chars().count() <= 40
+        && chars.next().is_some_and(char::is_alphanumeric)
+        && chars.all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '\'' | '-'))
+}
+
+impl CommentSubmission {
+    fn new(text: &str, display_name: &str, consent: bool) -> Result<Self, String> {
+        let text = text.trim();
+        if text.is_empty() || text.len() > MAX_COMMENT_BYTES {
+            return Err("A comment must contain between 1 and 2,000 UTF-8 bytes.".into());
+        }
+        if !consent {
+            return Err("Tick the box to let phorminx.net show your comment, or send it as a report instead.".into());
+        }
+        let name = display_name.trim();
+        if !name.is_empty() && !valid_display_name(name) {
+            return Err("Use a first name or nickname: up to 40 letters, digits, spaces, dots, apostrophes or hyphens.".into());
+        }
+        Ok(Self {
+            schema_version: 1,
+            submission_id: submission_id()?,
+            text: text.into(),
+            display_name: (!name.is_empty()).then(|| name.to_owned()),
+            consent_public: true,
+        })
+    }
+}
+
+#[derive(Clone)]
+enum Outgoing {
+    Report(FeedbackSubmission),
+    Comment(CommentSubmission),
+}
+
+impl Outgoing {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Report(_) => "report",
+            Self::Comment(_) => "comment",
+        }
+    }
+    fn text(&self) -> &str {
+        match self {
+            Self::Report(request) => &request.text,
+            Self::Comment(request) => &request.text,
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -31,7 +108,8 @@ struct Diagnostics {
 
 #[derive(Deserialize)]
 struct Receipt {
-    ticket_id: String,
+    ticket_id: Option<String>,
+    comment_id: Option<String>,
 }
 
 impl FeedbackSubmission {
@@ -69,6 +147,16 @@ fn submission_id() -> Result<String, String> {
 }
 
 fn submit(request: &FeedbackSubmission) -> Result<String, String> {
+    post(ENDPOINT, request, &request.submission_id)
+}
+
+fn submit_comment(request: &CommentSubmission) -> Result<String, String> {
+    post(COMMENTS_ENDPOINT, request, &request.submission_id)
+}
+
+/// Posts `request` and returns the id the service confirmed, which must be
+/// the id that was sent.
+fn post(endpoint: &str, request: &impl Serialize, submission_id: &str) -> Result<String, String> {
     let body = serde_json::to_vec(request).map_err(|_| "Could not encode feedback.")?;
     if body.len() > 16 * 1024 {
         return Err("Feedback is too large to send. Please shorten it.".into());
@@ -79,7 +167,7 @@ fn submit(request: &FeedbackSubmission) -> Result<String, String> {
         .build()
         .new_agent();
     let mut response = agent
-        .post(ENDPOINT)
+        .post(endpoint)
         .header("Content-Type", "application/json")
         .send(body.as_slice())
         .map_err(|_| "Feedback was not confirmed. Your draft is retained; retry when the service is available.")?;
@@ -94,16 +182,16 @@ fn submit(request: &FeedbackSubmission) -> Result<String, String> {
         .map_err(|_| "The feedback receipt could not be read. Retry with the same draft.")?;
     let receipt: Receipt = serde_json::from_str(&body)
         .map_err(|_| "The feedback receipt was invalid. Retry with the same draft.")?;
-    if receipt.ticket_id != request.submission_id
-        || receipt.ticket_id.len() > 80
-        || !receipt
-            .ticket_id
+    let confirmed = receipt.ticket_id.or(receipt.comment_id).unwrap_or_default();
+    if confirmed != submission_id
+        || confirmed.len() > 80
+        || !confirmed
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
     {
         return Err("The feedback receipt was invalid. Retry with the same draft.".into());
     }
-    Ok(receipt.ticket_id)
+    Ok(confirmed)
 }
 
 #[derive(Default)]
@@ -116,8 +204,15 @@ pub struct FeedbackPanel {
     capture: Option<MeetingAudioService>,
     capture_lease: Option<crate::performance_runtime::RuntimeActivityLease>,
     stopping: bool,
-    pending: Option<FeedbackSubmission>,
+    pending: Option<Outgoing>,
     response: Option<Receiver<Result<String, String>>>,
+    /// Share as a public comment instead of a report.
+    comment: bool,
+    consent: bool,
+    display_name: String,
+    reformat: Option<Receiver<ReformatResult>>,
+    /// The local database that remembers what was sent.
+    history: Option<PathBuf>,
 }
 
 #[derive(Clone, Serialize)]
@@ -130,6 +225,10 @@ pub struct FeedbackView {
     pub recording: bool,
     pub stopping: bool,
     pub sending: bool,
+    pub comment: bool,
+    pub consent: bool,
+    pub display_name: String,
+    pub reformatting: bool,
 }
 
 impl FeedbackPanel {
@@ -142,7 +241,68 @@ impl FeedbackPanel {
             recording: self.capture.is_some(),
             stopping: self.stopping,
             sending: self.response.is_some(),
+            comment: self.comment,
+            consent: self.consent,
+            display_name: self.display_name.clone(),
+            reformatting: self.reformat.is_some(),
         }
+    }
+
+    /// Report or public comment, and the comment's consent and name.
+    pub fn set_comment(
+        &mut self,
+        comment: bool,
+        consent: bool,
+        display_name: String,
+    ) -> Result<(), String> {
+        if self.is_busy() {
+            return Err("Finish recording or sending before changing this.".into());
+        }
+        if display_name.chars().count() > 40 {
+            return Err("The name is at most 40 characters.".into());
+        }
+        if self.comment != comment || self.display_name != display_name || self.consent != consent {
+            self.pending = None;
+        }
+        self.comment = comment;
+        self.consent = consent;
+        self.display_name = display_name;
+        Ok(())
+    }
+
+    /// Tidies the draft with the local formatting model, as the review
+    /// window does, before it is sent.
+    pub fn start_reformat(
+        &mut self,
+        strength: FormattingStrength,
+        instruction: Option<&str>,
+        settings: &Settings,
+    ) -> Result<(), String> {
+        if self.is_busy() {
+            return Err("Finish recording or sending first.".into());
+        }
+        let text = self.text.trim().to_owned();
+        if text.is_empty() {
+            return Err("There is no text to reformat.".into());
+        }
+        let profile = crate::review::reformat_profile(
+            strength,
+            settings.formatting.custom_instructions.as_deref(),
+            instruction,
+        )?;
+        let settings = settings.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("phorminx-feedback-reformat".into())
+            .spawn(move || {
+                let _ = sender.send(crate::review::reformat_with_local_model(
+                    &settings, profile, text,
+                ));
+            })
+            .map_err(|_| "Reformat could not start.".to_owned())?;
+        self.reformat = Some(receiver);
+        self.notice = "Reformatting with the local model…".into();
+        Ok(())
     }
 
     pub fn update_draft(&mut self, text: String, diagnostics: bool) -> Result<(), String> {
@@ -183,34 +343,64 @@ impl FeedbackPanel {
             return Err("Finish recording or sending first.".into());
         }
         // Reuse the request ID on uncertain retries; an edited draft is a new report.
-        let unchanged = self.pending.as_ref().is_some_and(|request| {
-            request.text == self.text.trim() && request.diagnostics.is_some() == self.diagnostics
+        let unchanged = self.pending.as_ref().is_some_and(|pending| match pending {
+            Outgoing::Report(request) => {
+                !self.comment
+                    && request.text == self.text.trim()
+                    && request.diagnostics.is_some() == self.diagnostics
+            }
+            Outgoing::Comment(request) => {
+                self.comment
+                    && request.text == self.text.trim()
+                    && request.display_name.as_deref().unwrap_or_default()
+                        == self.display_name.trim()
+            }
         });
         if !unchanged {
-            self.pending = Some(FeedbackSubmission::new(
-                &self.text,
-                settings,
-                self.diagnostics,
-            )?);
+            self.pending = Some(if self.comment {
+                Outgoing::Comment(CommentSubmission::new(
+                    &self.text,
+                    &self.display_name,
+                    self.consent,
+                )?)
+            } else {
+                Outgoing::Report(FeedbackSubmission::new(
+                    &self.text,
+                    settings,
+                    self.diagnostics,
+                )?)
+            });
         }
-        if let Some(request) = self.pending.clone() {
+        if let Some(pending) = self.pending.clone() {
             let (tx, rx) = mpsc::sync_channel(1);
             std::thread::Builder::new()
                 .name("phorminx-feedback".into())
                 .spawn(move || {
-                    let _ = tx.send(submit(&request));
+                    let _ = tx.send(match &pending {
+                        Outgoing::Report(request) => submit(request),
+                        Outgoing::Comment(request) => submit_comment(request),
+                    });
                 })
                 .map_err(|_| "Could not start sending. Your draft is retained.".to_owned())?;
             self.response = Some(rx);
-            self.notice = "Sending report…".into();
+            self.notice = if self.comment {
+                "Sending comment…"
+            } else {
+                "Sending report…"
+            }
+            .into();
         }
         Ok(())
     }
     pub fn is_busy(&self) -> bool {
-        self.capture.is_some() || self.response.is_some()
+        self.capture.is_some() || self.response.is_some() || self.reformat.is_some()
     }
     pub fn open(&mut self, settings: &Settings, store: &SettingsStore, can_record: bool) {
         self.open = true;
+        self.history = store
+            .path()
+            .parent()
+            .map(|directory| directory.join("phorminx.db"));
         if self.text.is_empty() && self.capture.is_none() && self.response.is_none() && can_record {
             self.record(settings, store);
         }
@@ -292,12 +482,46 @@ impl FeedbackPanel {
             self.stopping = false;
             self.partial.clear();
         }
+        if let Some(reformat) = &self.reformat {
+            match reformat.try_recv() {
+                Ok(Ok(result)) => {
+                    self.text = result.text;
+                    self.pending = None;
+                    self.notice = match result.note {
+                        Some(note) => format!("{note}. Review it before sending."),
+                        None => "Reformatted. Review it before sending.".into(),
+                    };
+                    self.reformat = None;
+                }
+                Ok(Err(reason)) => {
+                    self.notice = format!("{reason} Your text is unchanged.");
+                    self.reformat = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.notice = "Reformat stopped unexpectedly. Your text is unchanged.".into();
+                    self.reformat = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some(response) = &self.response {
             match response.try_recv() {
-                Ok(Ok(ticket)) => {
-                    self.notice = format!("Report received. Ticket {ticket}");
+                Ok(Ok(id)) => {
+                    let sent = self.pending.take();
+                    let kind = sent.as_ref().map_or("report", Outgoing::kind);
+                    if let (Some(sent), Some(history)) = (&sent, &self.history)
+                        && let Ok(store) = phorminx_persistence::Persistence::open(history)
+                    {
+                        let _ = store.feedback().record(&id, kind, sent.text(), now_ms());
+                    }
+                    self.notice = if kind == "comment" {
+                        "Thanks! Your comment will appear on phorminx.net once the team has read it. You can remove it from Feedback.".into()
+                    } else {
+                        format!(
+                            "Report received (ticket {id}). Feedback shows its status; you will be told when it is solved."
+                        )
+                    };
                     self.text.clear();
-                    self.pending = None;
                     self.response = None;
                 }
                 Ok(Err(error)) => {
@@ -341,8 +565,10 @@ impl FeedbackPanel {
                 } else if ui.add_enabled(can_record && editing, egui::Button::new("Record report")).clicked() {
                     self.start_recording(settings, store);
                 }
-                if ui.add_enabled(editing && !self.text.trim().is_empty() && self.text.trim().len() <= MAX_TEXT_BYTES, egui::Button::new("Send report")).clicked() {
-                    if let Err(error) = self.send_report(settings) { self.notice = error; }
+                if ui.add_enabled(editing && !self.text.trim().is_empty() && self.text.trim().len() <= MAX_TEXT_BYTES, egui::Button::new("Send report")).clicked()
+                    && let Err(error) = self.send_report(settings)
+                {
+                    self.notice = error;
                 }
             });
             if !self.notice.is_empty() { ui.add_space(8.0); ui.label(&self.notice); }
@@ -396,7 +622,9 @@ mod tests {
         let settings = Settings::default();
         let mut panel = FeedbackPanel::default();
         panel.open(&settings, &store, false);
-        panel.update_draft("synthetic unsent report".into(), false).unwrap();
+        panel
+            .update_draft("synthetic unsent report".into(), false)
+            .unwrap();
         panel.close_window();
         assert!(!panel.open);
         assert_eq!(panel.snapshot().text, "synthetic unsent report");
@@ -426,6 +654,60 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn comments_need_consent_and_take_only_a_plain_name() {
+        // No Debug on submissions: their text must never reach a log.
+        assert!(
+            CommentSubmission::new("Love it", "", false)
+                .err()
+                .is_some_and(|error| error.contains("Tick the box"))
+        );
+        assert!(CommentSubmission::new(" ", "", true).is_err());
+        assert!(CommentSubmission::new(&"a".repeat(2001), "", true).is_err());
+        assert!(CommentSubmission::new("Love it", "mail me at a@b.c", true).is_err());
+        let comment = CommentSubmission::new("  Love it  ", " Ana ", true).unwrap();
+        let json = serde_json::to_value(&comment).unwrap();
+        assert_eq!(json["text"], "Love it");
+        assert_eq!(json["display_name"], "Ana");
+        assert_eq!(json["consent_public"], true);
+        let anonymous =
+            serde_json::to_value(CommentSubmission::new("Love it", "", true).unwrap()).unwrap();
+        assert!(anonymous.get("display_name").is_none());
+        assert!(COMMENTS_ENDPOINT.starts_with("https://phorminx.net/"));
+    }
+
+    #[test]
+    fn comment_mode_is_part_of_the_draft() {
+        let mut panel = FeedbackPanel::default();
+        panel.set_comment(true, true, "Ana".into()).unwrap();
+        let view = panel.snapshot();
+        assert!(view.comment && view.consent);
+        assert_eq!(view.display_name, "Ana");
+        assert!(panel.set_comment(true, true, "x".repeat(41)).is_err());
+        assert!(valid_display_name("Mary-Jo O'Neil"));
+        assert!(!valid_display_name("-dash"));
+    }
+
+    #[test]
+    fn reformat_needs_text_and_never_runs_while_sending() {
+        let mut panel = FeedbackPanel::default();
+        let settings = Settings::default();
+        assert!(
+            panel
+                .start_reformat(FormattingStrength::Balanced, None, &settings)
+                .is_err()
+        );
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        panel.text = "um so the app froze".into();
+        panel.response = Some(receiver);
+        assert!(
+            panel
+                .start_reformat(FormattingStrength::Balanced, None, &settings)
+                .is_err()
         );
     }
 

@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Prompts</title><link rel="stylesheet" href="style.css">
+<style>
+  .copy { position: absolute; left: 96px; top: 150px; width: 520px; }
+  .field { left: 680px; top: 90px; width: 880px; height: 640px; }
+  .lib { left: 690px; top: 140px; width: 820px; }
+  .notes { position: absolute; left: 96px; top: 470px; display: grid; gap: 26px; }
+  .notes .callout { position: static; white-space: normal; align-items: flex-start; max-width: 500px; }
+  .notes .callout span { font-weight: 500; color: var(--quiet); font-size: 20px; line-height: 1.4; }
+  .notes .callout span strong { color: var(--text); }
+  .pin { position: absolute; display: grid; place-items: center; width: 40px; height: 40px; border-radius: 50%; background: var(--bronze); color: #fff; font-size: 19px; font-weight: 700; box-shadow: 0 0 0 5px rgba(12,15,17,.35); }
+</style></head>
+<body><div class="canvas">
+  <div class="copy">
+    <p class="eyebrow">Prompts library</p>
+    <h2>Write an instruction once. Use it everywhere.</h2>
+  </div>
+  <div class="notes">
+    <div class="callout"><b>1</b><span><strong>Tags</strong> keep prompts findable.</span></div>
+    <div class="callout"><b>2</b><span><strong>Every save is a version</strong> you can restore.</span></div>
+    <div class="callout"><b>3</b><span><strong>Type @</strong> in formatting, profiles, the meeting assistant or Actions.</span></div>
+  </div>
+  <div class="field"></div>
+  <img class="shot lib" src="crops/prompts.png" alt="">
+  <span class="pin" id="p1">1</span><span class="pin" id="p2">2</span><span class="pin" id="p3">3</span>
+</div>
+<script src="common.js"></script>
+<script>
+  // Pin positions are fractions of the crop, set once the crop has loaded.
+  const crop = document.querySelector('.lib');
+  const place = () => {
+    const r = crop.getBoundingClientRect();
+    const at = { p1: [0.17, 0.15], p2: [0.62, 0.86], p3: [0.66, 0.30] };
+    for (const [id, [x, y]] of Object.entries(at)) {
+      const pin = document.getElementById(id);
+      pin.style.left = `${r.left + r.width * x - 20}px`;
+      pin.style.top = `${r.top + r.height * y - 20}px`;
+    }
+  };
+  crop.complete ? place() : crop.addEventListener('load', place);
+</script>
+</body></html>
