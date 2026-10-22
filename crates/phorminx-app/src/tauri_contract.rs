@@ -591,7 +591,12 @@ impl From<&WorkspaceSnapshot> for MeetingView {
             selected_input_device: value.meeting_microphone_device.clone(),
             selected_output_device: value.meeting_device.clone(),
             provisional_text: value.provisional_text.clone(),
-            transcript: value.transcript.iter().map(Into::into).collect(),
+            transcript: value
+                .transcript
+                .iter()
+                .filter(|line| !line.text.trim().is_empty())
+                .map(Into::into)
+                .collect(),
             translations: value.translations.iter().map(Into::into).collect(),
             messages: value.messages.iter().map(Into::into).collect(),
             assistant_busy: value.ai_busy,
