@@ -479,6 +479,7 @@ function openActionEditor(item = null) {
   node('action-headers').value = '';
   node('delete-action').hidden = !item;
   node('action-result').textContent = '';
+  window.PhorminxActionWizard?.open(item, {actions: knownActions, models: appView?.ollamaModels || []});
   showRoute('action-editor');
   node('action-name').focus();
 }

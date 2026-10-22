@@ -6,8 +6,10 @@
   <title>Phorminx</title>
   <link rel="stylesheet" href="preview.css">
   <link rel="stylesheet" href="product.css">
+  <link rel="stylesheet" href="action-wizard.css">
   <script src="markdown.js" defer></script>
   <script src="preview.js" defer></script>
+  <script src="action-wizard.js" defer></script>
   <script src="product.js" defer></script>
 </head>
 <body data-shell="product">
@@ -78,19 +80,48 @@
         <section id="actions" class="page" hidden><div class="page-head"><div><small>AUTOMATION</small><h1>Actions</h1></div><button id="new-action" type="button" class="primary">New action</button></div><div id="actions-list" class="record-list single-list"></div></section>
         <section id="action-editor" class="page" hidden>
           <div class="page-head"><div><small>AUTOMATION / EDITOR</small><h1 id="action-editor-title">New action</h1></div><button type="button" data-route="actions">Back to actions</button></div>
-          <form id="action-form" class="action-form">
+          <form id="action-form" class="action-form action-wizard" novalidate>
             <input id="action-id" type="hidden">
-            <label>Name<input id="action-name" maxlength="200" required placeholder="Send a note"></label>
-            <label>Launcher slot<input id="action-slot" type="number" min="1" max="9" placeholder="Optional"></label>
-            <label>Method<select id="action-method"><option>POST</option><option>GET</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select></label>
-            <label>Endpoint<input id="action-endpoint" type="url" maxlength="2048" required placeholder="https://example.com/notes"></label>
-            <label>Payload mode<select id="action-payload-mode"><option value="template">Template</option><option value="ai-json">Local AI writes JSON</option></select></label>
-            <label>Payload template<textarea id="action-template" rows="5" placeholder='{"note": "{{text}}"}'></textarea></label>
-            <label>Local model<input id="action-model" maxlength="200" placeholder="Used for AI JSON mode"></label>
-            <label>Instructions for local model<textarea id="action-prompt" rows="4" placeholder="Describe the JSON to produce"></textarea></label>
-            <label>Authorization<input id="action-auth" type="password" autocomplete="new-password" placeholder="Leave blank to retain a saved credential"></label>
-            <label>Headers (JSON object)<textarea id="action-headers" rows="3" placeholder='{"X-Token": "secret"}'></textarea></label>
-            <div class="action-form-buttons"><button type="submit" class="primary">Save action</button><button id="delete-action" type="button" hidden>Delete action</button><span id="action-result" role="status"></span></div>
+            <ol class="wizard-steps" aria-label="Action setup">
+              <li><button type="button" data-step-go="0"><span class="wizard-mark" aria-hidden="true">1</span><span class="wizard-step-text"><strong>Basics</strong><small data-step-state="0">Name and launcher key</small></span></button></li>
+              <li><button type="button" data-step-go="1"><span class="wizard-mark" aria-hidden="true">2</span><span class="wizard-step-text"><strong>Request</strong><small data-step-state="1">Method and address</small></span></button></li>
+              <li><button type="button" data-step-go="2"><span class="wizard-mark" aria-hidden="true">3</span><span class="wizard-step-text"><strong>Payload</strong><small data-step-state="2">What gets sent</small></span></button></li>
+              <li><button type="button" data-step-go="3"><span class="wizard-mark" aria-hidden="true">4</span><span class="wizard-step-text"><strong>Security</strong><small data-step-state="3">Sign-in and headers</small></span></button></li>
+            </ol>
+            <div id="action-progress" class="wizard-progress" role="progressbar" aria-label="Action setup complete" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+            <fieldset class="wizard-step" data-step="0">
+              <legend>Basics</legend>
+              <div id="action-presets" class="field wide"><span class="field-label" id="action-preset-label">Start from</span><div class="chip-row" role="group" aria-labelledby="action-preset-label"><button type="button" class="chip" data-preset="webhook">Any webhook</button><button type="button" class="chip" data-preset="slack">Slack</button><button type="button" class="chip" data-preset="discord">Discord</button><button type="button" class="chip" data-preset="zapier">Zapier or Make</button></div><span class="field-hint">Fills the method, address and payload. You can change everything after.</span></div>
+              <label class="wide">Name<input id="action-name" maxlength="120" required placeholder="Send to my notes" autocomplete="off"><span class="field-hint" data-hint="name"></span></label>
+              <div class="field wide"><span class="field-label" id="action-slot-label">Launcher key</span><div id="action-slot-choices" class="chip-row" role="radiogroup" aria-labelledby="action-slot-label"></div><input id="action-slot" type="hidden"><span class="field-hint" data-hint="slot"></span></div>
+            </fieldset>
+            <fieldset class="wizard-step" data-step="1" hidden>
+              <legend>Request</legend>
+              <div class="field wide"><span class="field-label" id="action-method-label">Method</span><div id="action-method-choices" class="segmented" role="radiogroup" aria-labelledby="action-method-label"></div><select id="action-method" hidden><option>POST</option><option>GET</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select><span class="field-hint" data-hint="method"></span></div>
+              <label class="wide">Endpoint<input id="action-endpoint" type="url" inputmode="url" maxlength="2048" required spellcheck="false" autocomplete="off" placeholder="https://example.com/notes"><span class="field-hint" data-hint="endpoint"></span></label>
+            </fieldset>
+            <fieldset class="wizard-step" data-step="2" hidden>
+              <legend>Payload</legend>
+              <div class="field wide"><span class="field-label" id="action-mode-label">What to send</span><div id="action-mode-choices" class="mode-cards" role="radiogroup" aria-labelledby="action-mode-label"><button type="button" role="radio" data-mode="template"><strong>Template</strong><span>Your JSON, with what you said filled in.</span></button><button type="button" role="radio" data-mode="ai-json"><strong>Local AI writes JSON</strong><span>A model on this computer turns what you said into JSON.</span></button></div><select id="action-payload-mode" hidden><option value="template">Template</option><option value="ai-json">Local AI writes JSON</option></select><span class="field-hint" data-hint="mode"></span></div>
+              <div class="field wide" data-mode-panel="template">
+                <div class="editor-head"><span class="field-label" id="action-template-label">Payload template</span><div class="editor-tools"><span>Insert</span><button type="button" class="var-pill" data-insert-var="text">Transcript</button><button type="button" class="var-pill" data-insert-var="delivery_id">Delivery ID</button><button type="button" id="action-template-format">Format JSON</button></div></div>
+                <div id="action-template-editor" class="template-editor" contenteditable="true" role="textbox" aria-multiline="true" aria-labelledby="action-template-label" aria-describedby="action-template-hint" spellcheck="false"></div>
+                <div id="action-var-menu" class="var-menu" role="listbox" aria-label="Variables" hidden></div>
+                <textarea id="action-template" hidden></textarea>
+                <span id="action-template-hint" class="field-hint" data-hint="template"></span>
+              </div>
+              <label data-mode-panel="ai-json" hidden>Local model<input id="action-model" list="action-model-options" maxlength="200" placeholder="for example qwen2.5:7b" spellcheck="false" autocomplete="off"><datalist id="action-model-options"></datalist><span class="field-hint" data-hint="model"></span></label>
+              <label class="wide" data-mode-panel="ai-json" hidden>Instructions for local model<textarea id="action-prompt" rows="5" placeholder="Describe the JSON to produce"></textarea><span class="field-hint" data-hint="prompt"></span></label>
+            </fieldset>
+            <fieldset class="wizard-step" data-step="3" hidden>
+              <legend>Security</legend>
+              <div class="field wide"><span class="field-label" id="action-auth-label">Authorization</span>
+                <div class="auth-row"><select id="action-auth-scheme" aria-label="Authorization type"></select><span class="auth-inputs" data-auth="token"><input id="action-auth-token" type="password" autocomplete="new-password" spellcheck="false" aria-labelledby="action-auth-label" placeholder="Paste the token"></span><span class="auth-inputs" data-auth="basic" hidden><input id="action-auth-user" autocomplete="off" spellcheck="false" aria-label="User name" placeholder="User name"><input id="action-auth-password" type="password" autocomplete="new-password" aria-label="Password" placeholder="Password"></span><button id="action-auth-reveal" type="button" aria-pressed="false">Show</button></div>
+                <input id="action-auth" type="hidden"><span class="field-hint" data-hint="auth"></span></div>
+              <div class="field wide"><span class="field-label">Headers</span><div id="action-header-rows" class="header-rows"></div><div class="header-tools"><button id="action-header-add" type="button">Add header</button></div><textarea id="action-headers" hidden></textarea><datalist id="action-header-names"><option value="X-API-Key"><option value="Accept"><option value="User-Agent"><option value="X-Request-Source"></datalist><span class="field-hint" data-hint="headers"></span></div>
+              <div class="field wide"><span class="field-label">Review</span><dl id="action-review" class="wizard-review"></dl></div>
+            </fieldset>
+            <div class="wizard-nav"><button id="action-back" type="button">Back</button><button id="delete-action" type="button" hidden>Delete action</button><span id="action-result" role="status"></span><button id="action-next" type="button" class="primary">Next</button><button id="action-save" type="submit" class="primary">Save action</button></div>
           </form>
         </section>
         <section id="setup" class="page" hidden>
