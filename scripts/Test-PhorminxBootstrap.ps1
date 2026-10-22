@@ -89,7 +89,7 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $downloadTarget)) 'Corrupt download was promoted.'
     $settings = New-StarterSettings ('sha256:' + ('A' * 64)) 12345
     Assert-True ($settings.Contains('manifest_sha256 = "' + ('a' * 64) + '"')) 'Digest normalization failed.'
-    Assert-True ($settings.Contains('mode = "instant"')) 'Starter recognition mode missing.'
+    Assert-True ($settings.Contains('mode = "accurate"')) 'Starter recognition mode missing.'
     Assert-Throws { New-StarterSettings 'invalid' 123 } 'Invalid model digest accepted.'
     Assert-Throws { New-StarterSettings ('a' * 64) 0 } 'Invalid model size accepted.'
     function Get-AuthenticodeSignature { param($LiteralPath) return $script:testSignature }
@@ -100,7 +100,7 @@ try {
     Assert-Throws { Assert-SignedInstaller 'synthetic.exe' '(^|, )O=Ollama Inc\.(,|$)' } 'Unsigned installer accepted.'
     # Validate the exact generated TOML using Python if available (no third-party packages).
     if (Get-Command python -ErrorAction SilentlyContinue) {
-        $settings | python -c "import sys,tomllib; s=tomllib.loads(sys.stdin.read()); assert s['schema_version'] == 7; assert s['formatting']['ollama_model_identity']['bytes'] == 12345; assert s['search']['embedding_model'] == 'nomic-embed-text:latest'"
+        $settings | python -c "import sys,tomllib; s=tomllib.loads(sys.stdin.read()); assert s['schema_version'] == 7; assert s['formatting']['ollama_model_identity']['bytes'] == 12345; assert s['search']['embedding_model'] == 'nomic-embed-text:latest'; f = s['formatting']; assert f['strength'] == 'custom' and f['custom_instructions'] and f['ollama_lifecycle'] == 'instant' and f['passes'] == 2"
         if ($LASTEXITCODE -ne 0) { throw 'Generated TOML failed validation.' }
     }
     Write-Host 'PASS: parse, extraction/rerun, five unsafe archive cases, cache reuse, bad length/hash, corrupt download, publisher/signature checks, model identity and starter TOML. No installers or model pulls were run.'

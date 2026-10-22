@@ -1,0 +1,13 @@
+[package]
+name = "phorminx-ocr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+image.workspace = true
+rten.workspace = true
+rten-tensor.workspace = true
+thiserror.workspace = true

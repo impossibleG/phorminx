@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Assistant</title><link rel="stylesheet" href="style.css">
+<style>
+  .copy { position: absolute; left: 96px; top: 170px; width: 560px; }
+  .facts { margin: 40px 0 0; padding: 0; list-style: none; display: grid; gap: 16px; }
+  .facts li { display: flex; gap: 14px; align-items: baseline; font-size: 22px; color: var(--quiet); }
+  .facts li::before { content: ""; flex: none; width: 10px; height: 10px; background: var(--bronze); transform: translateY(-2px); }
+  .field { left: 700px; top: 80px; width: 860px; height: 650px; }
+  .answer { left: 720px; top: 150px; width: 780px; }
+</style></head>
+<body><div class="canvas">
+  <div class="copy">
+    <p class="eyebrow">Companion assistant</p>
+    <h2>Ask what you missed, while the call continues.</h2>
+    <ul class="facts">
+      <li>Answers include the transcript captured so far.</li>
+      <li>Capture keeps running while it thinks.</li>
+      <li>Local Ollama by default, or OpenAI or Anthropic with your own key.</li>
+    </ul>
+  </div>
+  <div class="field"></div>
+  <img class="shot answer" src="crops/answer.png" alt="">
+</div>
+<script src="common.js"></script>
+</body></html>

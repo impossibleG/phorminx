@@ -44,6 +44,7 @@ function renderTranscript(meeting) {
   const translated = new Map(meeting.translations.map((line) => [`${line.startSample}:${line.endSample}`, line]));
   const rows = document.createDocumentFragment();
   for (const line of meeting.transcript) {
+    if (!line.text.trim()) continue;
     const article = document.createElement('article');
     article.className = 'phrase';
     const source = document.createElement('div');
@@ -52,8 +53,9 @@ function renderTranscript(meeting) {
     appendText(source, line.source === 'microphone' ? 'you' : '', label, 'span');
     const content = document.createElement('div');
     content.className = 'phrase-text';
-    appendText(content, 'original', line.text);
     const translation = translated.get(`${line.startSample}:${line.endSample}`);
+    // Without a translation the original is the only text, so it shows in every view.
+    appendText(content, translation ? 'original' : 'original untranslated', line.text);
     if (translation) appendText(content, 'translation', translation.text);
     else if (meeting.translationLanguage && frame.dataset.language !== 'original') appendText(content, 'pending', 'Translating…');
     article.append(source, content);

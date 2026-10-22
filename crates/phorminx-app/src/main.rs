@@ -15,6 +15,8 @@ use phorminx_app::incremental::{
     BoundaryKind, CHUNK_OVERLAP, IncrementalPlanner, MergeExpectation, SILENCE_PROBE_DURATION,
     merge_overlapping, strip_known_non_speech_annotations,
 };
+use phorminx_app::lifecycle::{LifecycleLog, error_chain, profile_instance_scope};
+use phorminx_app::launcher_messaging::LauncherMessaging;
 use phorminx_app::model::{
     ModelDownload, ModelDownloadEvent, identify_pinned_model, model_for_variant,
 };
@@ -24,6 +26,10 @@ use phorminx_app::performance_runtime::{
 #[cfg(not(feature = "tauri-shell"))]
 use phorminx_app::product_shell::ProductShell;
 use phorminx_app::product_shell::{ProductShellControl, ProductShellEvent};
+use phorminx_app::review::{
+    ReviewSeed, fallback_label, formatting_fallback_note, formatting_summary, passes_warning,
+};
+use phorminx_app::runtime::text_for_insertion;
 use phorminx_app::runtime::{
     AppIo, AppRuntime, FinishedAudio, InsertDisposition, ReleaseTiming, RuntimeNotice, UiStatus,
 };
@@ -47,8 +53,8 @@ use phorminx_core::{
     normalize_transcript,
 };
 use phorminx_ollama::{
-    CancellationToken, ClientTimeouts, DocumentFormatDisposition, FormatProfile, FormatResult,
-    KeepAlive, ModelName, OllamaClient, OllamaEndpoint, SelectionPolicy,
+    CancellationToken, ClientTimeouts, DocumentFormatDisposition, FormatProfile, KeepAlive,
+    ModelName, OllamaClient, OllamaEndpoint, SelectionPolicy,
 };
 use phorminx_persistence::{
     AppProfile, CasePolicy, DictationDraft, ExecutableIdentity, FormattingStyle,
@@ -66,13 +72,13 @@ use phorminx_whisper::{
 use phorminx_windows::{
     ClipboardOnlyReason, GlobalHoldHotkey, HistoryItem, HistoryWindow, HistoryWindowEvent,
     HoldEvent, InsertionOutcome, LexiconCasePolicy, LexiconDraft, LexiconItem, LexiconWindow,
-    LexiconWindowEvent, OverlayStatus, ProfileFormatting, ProfileInsertion, ProfileItem,
-    ProfileWindow, ProfileWindowEvent, SettingsAccurateBackend, SettingsAccurateModel,
-    SettingsForm, SettingsFormatting, SettingsHistoryRetention, SettingsOllamaLifecycle,
-    SettingsRecognitionMode, SettingsRecordingMode, SettingsWindow, SettingsWindowEvent,
-    SingleInstance, SingleInstanceError, StatusOverlay, SystemTray, TargetSnapshot, TrayEvent,
-    TrayStatus, activate_existing_window, choose_zip_archive, copy_and_maybe_paste,
-    set_launch_at_login,
+    LexiconWindowEvent, OverlayEvent, OverlayStatus, ProfileFormatting, ProfileInsertion,
+    ProfileItem, ProfileWindow, ProfileWindowEvent, ReplaceOutcome, SettingsAccurateBackend,
+    SettingsAccurateModel, SettingsForm, SettingsFormatting, SettingsHistoryRetention,
+    SettingsOllamaLifecycle, SettingsRecognitionMode, SettingsRecordingMode, SettingsWindow,
+    SettingsWindowEvent, SingleInstance, SingleInstanceError, StatusOverlay, SystemTray,
+    TargetSnapshot, TrayEvent, TrayStatus, activate_existing_window, choose_zip_archive,
+    copy_and_maybe_paste, replace_inserted_text, set_launch_at_login,
 };
 
 #[cfg(feature = "desktop")]
@@ -107,7 +113,18 @@ struct Cli {
     /// Open the branded setup experience without starting a recording engine.
     #[arg(long, conflicts_with = "smoke_test")]
     setup: bool,
+    /// Set by a settings restart: wait for the previous process to release
+    /// its instance slot instead of focusing it and exiting.
+    #[arg(long, hide = true)]
+    restarted: bool,
 }
+
+/// How long a restarted process waits for its predecessor to finish cleanup.
+const RESTART_SLOT_WAIT: Duration = Duration::from_secs(30);
+/// Cleanup after the event loop must not strand a requested restart.
+const SHUTDOWN_WATCHDOG: Duration = Duration::from_secs(12);
+/// The review panel behind the pill's Expand button lives in the Tauri shell.
+const REVIEW_PANEL_AVAILABLE: bool = cfg!(feature = "tauri-shell");
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum FormattingCli {
@@ -152,9 +169,48 @@ fn report_fatal_error(error: &anyhow::Error) {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let instance = match SingleInstance::acquire() {
+    let default_settings_path = SettingsStore::default_for_current_user()
+        .ok()
+        .map(|store| store.path().to_path_buf());
+    let requested_settings_path = match cli.config.as_ref() {
+        Some(path) => SettingsStore::new(path.clone())
+            .ok()
+            .map(|store| store.path().to_path_buf()),
+        None => default_settings_path.clone(),
+    };
+    let startup_clock = Instant::now();
+    let lifecycle = requested_settings_path
+        .as_deref()
+        .and_then(LifecycleLog::for_settings);
+    let instance_scope = match (&requested_settings_path, &default_settings_path) {
+        (Some(requested), Some(default)) => profile_instance_scope(requested, default),
+        (Some(requested), None) => profile_instance_scope(requested, Path::new("")),
+        (None, _) => None,
+    };
+    record_lifecycle(
+        lifecycle.as_ref(),
+        &format!(
+            "event=runtime_start version={} restarted={} isolated_profile={}",
+            phorminx_app::updates::current_version(),
+            cli.restarted,
+            instance_scope.is_some()
+        ),
+    );
+    let acquired = if cli.restarted {
+        SingleInstance::acquire_waiting(instance_scope.as_deref(), RESTART_SLOT_WAIT)
+    } else {
+        SingleInstance::acquire_for_profile(instance_scope.as_deref())
+    };
+    let instance = match acquired {
         Ok(instance) => instance,
         Err(SingleInstanceError::AlreadyRunning) => {
+            record_lifecycle(
+                lifecycle.as_ref(),
+                &format!(
+                    "event=runtime_start_deferred reason=already_running restarted={}",
+                    cli.restarted
+                ),
+            );
             for _ in 0..20 {
                 if activate_existing_window() {
                     return Ok(());
@@ -198,6 +254,13 @@ fn run() -> Result<()> {
             settings_store.path().display()
         )
     })?;
+    record_startup_phase(lifecycle.as_ref(), startup_clock, "settings");
+    for note in settings.preserved.notes() {
+        record_lifecycle(
+            lifecycle.as_ref(),
+            &format!("event=settings_compatibility note={note:?}"),
+        );
+    }
     if let Some(language) = cli.language {
         settings.recognition.language = language;
     }
@@ -266,6 +329,7 @@ fn run() -> Result<()> {
             model,
             shutting_down,
             instance,
+            lifecycle,
         );
     }
     let verified_variant = if settings.recognition.mode == RecognitionMode::Accurate {
@@ -293,22 +357,8 @@ fn run() -> Result<()> {
         None
     };
 
-    let effective_microphone = match settings.recognition.microphone.as_deref() {
-        Some(selected)
-            if input_devices()
-                .map(|devices| devices.iter().any(|device| device.name == selected))
-                .unwrap_or(false) =>
-        {
-            Some(selected.to_owned())
-        }
-        Some(_) => {
-            eprintln!(
-                "dictation_id=0 state=Starting event=saved_microphone_unavailable recovery=windows_default"
-            );
-            None
-        }
-        None => None,
-    };
+    record_startup_phase(lifecycle.as_ref(), startup_clock, "model_verified");
+    let mut effective_microphone = resolve_effective_microphone(&settings);
 
     let database_path = settings_store
         .path()
@@ -327,6 +377,7 @@ fn run() -> Result<()> {
         .lexicon()
         .list()
         .context("failed to load the personal lexicon")?;
+    record_startup_phase(lifecycle.as_ref(), startup_clock, "database");
     let worker_formatting = WorkerFormatting::from_settings(&settings)?;
     let mut dictation_context = DictationContext::global(&settings, verified_variant)?;
 
@@ -363,12 +414,14 @@ fn run() -> Result<()> {
                 model,
                 shutting_down,
                 instance,
+                lifecycle,
             )
             .with_context(|| format!("Instant recovery setup failed after: {error}"));
         }
         Err(error) => return Err(error),
     };
 
+    record_startup_phase(lifecycle.as_ref(), startup_clock, "recognizer");
     let mut applied_interaction = settings.interaction.clone();
     let hotkey = GlobalHoldHotkey::start_with_bindings(phorminx_windows::ShortcutBindings::parse(
         &applied_interaction.launcher_shortcut,
@@ -377,6 +430,9 @@ fn run() -> Result<()> {
     .context("failed to install the global hotkey")?;
     let mut launcher_open = false;
     let mut launcher_action_configs: Vec<phorminx_assistant::ActionConfig> = Vec::new();
+    let mut launcher_messaging = LauncherMessaging::load(&persistence);
+    let mut launcher_layout = launcher_messaging.layout(&[]);
+    hotkey.set_messaging_slot(launcher_layout.panel_key());
     let mut launcher_recording = false;
     let capture = ExtendedCaptureFactory::new(ExtendedCaptureConfig::new(
         settings_store
@@ -438,12 +494,14 @@ fn run() -> Result<()> {
             .context("failed to start the product shell")?,
         )
     };
+    record_startup_phase(lifecycle.as_ref(), startup_clock, "window");
     let mut settings_window = None;
     let mut history_window = None;
     let mut lexicon_window = None;
     let mut profile_window = None;
     let mut model_download = None;
     let mut restart_requested = false;
+    let mut last_dictation: Option<LastDictation> = None;
     let mut last_shell_status = UiRuntimeStatus::Ready;
     let workloads = production_workload_coordinator();
     let mut active_dictation_activity: Option<RuntimeActivityLease> = None;
@@ -502,6 +560,7 @@ fn run() -> Result<()> {
                     effective_microphone.as_deref(),
                     &mut dictation_context,
                     &settings,
+                    &persistence,
                     &capture,
                     &workloads,
                     &mut active_dictation_activity,
@@ -514,6 +573,31 @@ fn run() -> Result<()> {
                         .list()
                         .context("failed to reload the personal lexicon")?,
                 )?;
+            }
+            Ok(ShellAction::ReviewReplace(text)) => {
+                handle_review_replace(last_dictation.as_mut(), &text, product_shell.as_ref());
+            }
+            Ok(ShellAction::LiveSettings { formatting }) => {
+                effective_microphone = resolve_effective_microphone(&settings);
+                if formatting
+                    && let Err(error) = apply_live_formatting(
+                        &settings,
+                        &worker,
+                        &runtime,
+                        &mut dictation_context,
+                        verified_variant,
+                    )
+                {
+                    record_lifecycle(
+                        lifecycle.as_ref(),
+                        &format!(
+                            "event=live_formatting_failed recovery=restart error=\"{}\"",
+                            error_chain(&error)
+                        ),
+                    );
+                    restart_requested = true;
+                    break Ok(());
+                }
             }
             Ok(ShellAction::Continue) => {}
             Err(error) => break Err(error),
@@ -584,6 +668,7 @@ fn run() -> Result<()> {
                     effective_microphone.as_deref(),
                     &mut dictation_context,
                     &settings,
+                    &persistence,
                     &capture,
                     &workloads,
                     &mut active_dictation_activity,
@@ -596,6 +681,31 @@ fn run() -> Result<()> {
                         .list()
                         .context("failed to reload the personal lexicon")?,
                 )?;
+            }
+            Ok(ShellAction::ReviewReplace(text)) => {
+                handle_review_replace(last_dictation.as_mut(), &text, product_shell.as_ref());
+            }
+            Ok(ShellAction::LiveSettings { formatting }) => {
+                effective_microphone = resolve_effective_microphone(&settings);
+                if formatting
+                    && let Err(error) = apply_live_formatting(
+                        &settings,
+                        &worker,
+                        &runtime,
+                        &mut dictation_context,
+                        verified_variant,
+                    )
+                {
+                    record_lifecycle(
+                        lifecycle.as_ref(),
+                        &format!(
+                            "event=live_formatting_failed recovery=restart error=\"{}\"",
+                            error_chain(&error)
+                        ),
+                    );
+                    restart_requested = true;
+                    break Ok(());
+                }
             }
             Ok(ShellAction::Continue) => {}
             Err(error) => break Err(error),
@@ -623,10 +733,19 @@ fn run() -> Result<()> {
                         })
                         .map(|config| config.actions)
                         .unwrap_or_default();
+                    let action_keys: Vec<u8> = launcher_action_configs
+                        .iter()
+                        .filter_map(|a| a.launcher_slot)
+                        .collect();
+                    launcher_messaging = LauncherMessaging::load(&persistence);
+                    launcher_layout = launcher_messaging.layout(&action_keys);
+                    hotkey.set_messaging_slot(launcher_layout.panel_key());
+                    overlay.set_launcher_contacts(None)?;
                     overlay.set_launcher_actions(
                         launcher_action_configs
                             .iter()
                             .filter_map(|a| a.launcher_slot.map(|slot| (slot, a.name.clone())))
+                            .chain(launcher_layout.main_rows())
                             .collect(),
                     )?;
                     // The hook already armed selection atomically. Reopening it
@@ -652,6 +771,28 @@ fn run() -> Result<()> {
             Ok(HoldEvent::LauncherDismissed) => {
                 launcher_open = false;
                 overlay.set(OverlayStatus::Hidden)?;
+                overlay.set_launcher_contacts(None)?;
+                Err(RecvTimeoutError::Timeout)
+            }
+            Ok(HoldEvent::LauncherContacts) => {
+                // The hook keeps the launcher open as the messaging contacts panel.
+                overlay.set_launcher_contacts(Some(launcher_messaging.panel_rows()))?;
+                overlay.set(launcher_overlay_status(&settings))?;
+                Err(RecvTimeoutError::Timeout)
+            }
+            Ok(HoldEvent::LauncherContact(key)) => {
+                hotkey.set_launcher_open(false)?;
+                launcher_open = false;
+                overlay.set(OverlayStatus::Hidden)?;
+                overlay.set_launcher_contacts(None)?;
+                if let (Some(shell), Some(contact_id)) = (
+                    product_shell.as_ref(),
+                    launcher_messaging.contact_for_key(key),
+                ) {
+                    shell
+                        .send(ProductShellControl::MessageContact { contact_id })
+                        .map_err(anyhow::Error::msg)?;
+                }
                 Err(RecvTimeoutError::Timeout)
             }
             Ok(action @ (HoldEvent::LauncherMeetings | HoldEvent::LauncherAction(_))) => {
@@ -665,7 +806,16 @@ fn run() -> Result<()> {
                             .iter()
                             .find(|a| a.launcher_slot == Some(slot))
                             .cloned()
-                            .map(ProductShellControl::TriggerAction),
+                            .map(ProductShellControl::TriggerAction)
+                            .or_else(|| {
+                                (launcher_layout.page_key() == Some(slot))
+                                    .then_some(ProductShellControl::OpenMessages)
+                            })
+                            .or_else(|| {
+                                launcher_layout.promoted_contact(slot).map(|contact_id| {
+                                    ProductShellControl::MessageContact { contact_id }
+                                })
+                            }),
                         _ => Some(ProductShellControl::StartMeeting),
                     };
                     if let Some(control) = control {
@@ -817,6 +967,8 @@ fn run() -> Result<()> {
                 | HoldEvent::LauncherDictate { .. }
                 | HoldEvent::LauncherMeetings
                 | HoldEvent::LauncherAction(_)
+                | HoldEvent::LauncherContacts
+                | HoldEvent::LauncherContact(_)
                 | HoldEvent::LauncherDismissed,
             ) => unreachable!("launcher events are normalized above"),
             Err(RecvTimeoutError::Disconnected) => {
@@ -876,6 +1028,7 @@ fn run() -> Result<()> {
                     effective_microphone.as_deref(),
                     &mut dictation_context,
                     &settings,
+                    &persistence,
                     &capture,
                     &workloads,
                     &mut active_dictation_activity,
@@ -888,6 +1041,31 @@ fn run() -> Result<()> {
                         .list()
                         .context("failed to reload the personal lexicon")?,
                 )?;
+            }
+            Ok(ShellAction::ReviewReplace(text)) => {
+                handle_review_replace(last_dictation.as_mut(), &text, product_shell.as_ref());
+            }
+            Ok(ShellAction::LiveSettings { formatting }) => {
+                effective_microphone = resolve_effective_microphone(&settings);
+                if formatting
+                    && let Err(error) = apply_live_formatting(
+                        &settings,
+                        &worker,
+                        &runtime,
+                        &mut dictation_context,
+                        verified_variant,
+                    )
+                {
+                    record_lifecycle(
+                        lifecycle.as_ref(),
+                        &format!(
+                            "event=live_formatting_failed recovery=restart error=\"{}\"",
+                            error_chain(&error)
+                        ),
+                    );
+                    restart_requested = true;
+                    break Ok(());
+                }
             }
             Ok(ShellAction::Continue) => {}
             Err(error) => break Err(error),
@@ -942,6 +1120,17 @@ fn run() -> Result<()> {
                         audio_duration.as_millis(),
                         compute_time.as_millis()
                     );
+                }
+                Ok(WorkerEvent::LivePreview { id, text }) => {
+                    if settings.interaction.show_live_text
+                        && runtime.active_id() == Some(id)
+                        && matches!(
+                            runtime.state(),
+                            RuntimeState::Listening | RuntimeState::FinalizingAudio
+                        )
+                    {
+                        let _ = overlay.set_live_text(Some(&text));
+                    }
                 }
                 Ok(WorkerEvent::InstantCommitted {
                     id,
@@ -1041,6 +1230,17 @@ fn run() -> Result<()> {
                             processed.transcript
                         }
                     });
+                    let insertion_target = runtime.active_target().copied();
+                    let formatting_note = processed_for_history
+                        .as_ref()
+                        .and_then(|processed| formatting_fallback_note(&processed.warnings));
+                    if processed_for_history.is_some() {
+                        // Posted before the result status, so the Inserted
+                        // pill is laid out with the note and Expand button.
+                        let _ = overlay.set_note(formatting_note);
+                        let _ =
+                            overlay.offer_expand(REVIEW_PANEL_AVAILABLE && product_shell.is_some());
+                    }
                     let insertion_started_at = Instant::now();
                     let notices = {
                         let mut io = ProductionIo {
@@ -1061,6 +1261,23 @@ fn run() -> Result<()> {
                     if is_current && let Some(processed) = processed_for_history.as_ref() {
                         let outcome = terminal_outcome(&notices);
                         if outcome.is_success() {
+                            last_dictation = Some(LastDictation {
+                                text: text_for_insertion(
+                                    dictation_context.runtime_formatting,
+                                    &processed.transcript.text,
+                                ),
+                                target: insertion_target
+                                    .filter(|_| outcome == TerminalOutcome::Inserted),
+                                strength: settings.formatting.strength,
+                                custom_instructions: settings
+                                    .formatting
+                                    .custom_instructions
+                                    .as_deref()
+                                    .map(|text| {
+                                        phorminx_app::prompts::resolve_with(&persistence, text).text
+                                    }),
+                                formatting_note: formatting_summary(&processed.warnings),
+                            });
                             worker.recovery.discard(completed.id.0);
                             if let Some(lifecycle) = processed.lifecycle {
                                 eprintln!(
@@ -1125,6 +1342,18 @@ fn run() -> Result<()> {
             }
         }
 
+        while let Ok(event) = overlay.events().try_recv() {
+            match event {
+                OverlayEvent::ExpandRequested => {
+                    if let (Some(last), Some(shell)) =
+                        (last_dictation.as_ref(), product_shell.as_ref())
+                    {
+                        let _ = shell.send(ProductShellControl::OpenReview(Box::new(last.seed())));
+                    }
+                }
+            }
+        }
+
         // Worker ownership ACKs must win over resource-pressure observation.
         // Otherwise an ACK already queued at the exact rolling-buffer boundary
         // can lose to an avoidable automatic backlog stop.
@@ -1165,6 +1394,11 @@ fn run() -> Result<()> {
 
     println!("Shutting down Phorminx.");
     let mut final_error = run_result.err();
+    let restart = RestartClaim::default();
+    let watchdog = ShutdownWatchdog::arm(
+        lifecycle.clone(),
+        restart_requested.then(|| (settings_store.path().to_path_buf(), restart.clone())),
+    );
     drop(runtime);
     if let Some(shell) = product_shell.take() {
         preserve_first_error(
@@ -1232,24 +1466,319 @@ fn run() -> Result<()> {
             .shutdown()
             .context("failed to stop the status overlay"),
     );
-    eprintln!(
-        "event=runtime_exit restart_requested={} cleanup_error={}",
-        restart_requested,
-        final_error.is_some()
+    watchdog.disarm();
+    finish_runtime_exit(
+        lifecycle.as_ref(),
+        restart_requested.then_some(&restart),
+        final_error,
+        instance,
+        settings_store.path(),
+    )
+}
+
+/// Ensures at most one replacement process is spawned, whether by the normal
+/// exit path or by the shutdown watchdog.
+#[derive(Clone, Default)]
+struct RestartClaim(Arc<AtomicBool>);
+
+impl RestartClaim {
+    fn claim(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+}
+
+/// Bounds post-loop cleanup. If a component hangs while stopping, a
+/// requested restart is still spawned and this process exits.
+struct ShutdownWatchdog {
+    disarm: Option<Sender<()>>,
+}
+
+impl ShutdownWatchdog {
+    fn arm(lifecycle: Option<LifecycleLog>, restart: Option<(PathBuf, RestartClaim)>) -> Self {
+        Self::arm_with(SHUTDOWN_WATCHDOG, lifecycle, restart, |code| {
+            std::process::exit(code)
+        })
+    }
+
+    fn arm_with(
+        timeout: Duration,
+        lifecycle: Option<LifecycleLog>,
+        restart: Option<(PathBuf, RestartClaim)>,
+        exit: impl FnOnce(i32) + Send + 'static,
+    ) -> Self {
+        let (disarm, disarmed) = mpsc::channel::<()>();
+        let spawned = thread::Builder::new()
+            .name("phorminx-shutdown-watchdog".to_owned())
+            .spawn(move || {
+                if !matches!(
+                    disarmed.recv_timeout(timeout),
+                    Err(RecvTimeoutError::Timeout)
+                ) {
+                    return;
+                }
+                record_lifecycle(
+                    lifecycle.as_ref(),
+                    &format!(
+                        "event=runtime_cleanup_timeout timeout_ms={} restart_requested={}",
+                        timeout.as_millis(),
+                        restart.is_some()
+                    ),
+                );
+                let mut code = 1;
+                if let Some((settings_path, claim)) = restart
+                    && claim.claim()
+                {
+                    // The replacement waits for this process's instance slot,
+                    // which Windows releases when the process exits below.
+                    match restart_with_settings(&settings_path) {
+                        Ok(pid) => {
+                            code = 0;
+                            record_lifecycle(
+                                lifecycle.as_ref(),
+                                &format!("event=runtime_restart_spawned pid={pid} by=watchdog"),
+                            );
+                        }
+                        Err(error) => record_lifecycle(
+                            lifecycle.as_ref(),
+                            &format!(
+                                "event=runtime_restart_failed by=watchdog error=\"{}\"",
+                                error_chain(&error)
+                            ),
+                        ),
+                    }
+                }
+                exit(code);
+            });
+        Self {
+            disarm: spawned.ok().map(|_| disarm),
+        }
+    }
+
+    fn disarm(mut self) {
+        if let Some(disarm) = self.disarm.take() {
+            let _ = disarm.send(());
+        }
+    }
+}
+
+/// Final step of every runtime exit. A requested restart is honoured even
+/// when cleanup reported an error: that error is logged locally, and the user
+/// gets their app back instead of a closed tray icon with no explanation.
+fn finish_runtime_exit(
+    lifecycle: Option<&LifecycleLog>,
+    restart: Option<&RestartClaim>,
+    final_error: Option<anyhow::Error>,
+    instance: SingleInstance,
+    settings_path: &Path,
+) -> Result<()> {
+    finish_runtime_exit_with(
+        lifecycle,
+        restart,
+        final_error,
+        move || drop(instance),
+        || restart_with_settings(settings_path),
+    )
+}
+
+fn finish_runtime_exit_with(
+    lifecycle: Option<&LifecycleLog>,
+    restart: Option<&RestartClaim>,
+    mut final_error: Option<anyhow::Error>,
+    release_instance: impl FnOnce(),
+    spawn_replacement: impl FnOnce() -> Result<u32>,
+) -> Result<()> {
+    record_lifecycle(
+        lifecycle,
+        &format!(
+            "event=runtime_exit restart_requested={} cleanup_error={}",
+            restart.is_some(),
+            final_error.is_some()
+        ),
     );
-    if final_error.is_none() && restart_requested {
-        // The replacement process acquires this same mutex during startup. Release
-        // our guard before spawning it so a settings restart cannot reject itself.
-        drop(instance);
-        preserve_first_error(
-            &mut final_error,
-            restart_with_settings(settings_store.path()),
+    if let Some(error) = final_error.as_ref() {
+        record_lifecycle(
+            lifecycle,
+            &format!("event=runtime_exit_error error=\"{}\"", error_chain(error)),
         );
     }
-    match final_error {
-        Some(error) => Err(error),
-        None => Ok(()),
+    let Some(restart) = restart else {
+        return final_error.map_or(Ok(()), Err);
+    };
+    // The replacement process acquires this same mutex during startup. Release
+    // our guard before spawning it so a settings restart cannot reject itself.
+    release_instance();
+    if !restart.claim() {
+        return Ok(());
     }
+    match spawn_replacement() {
+        Ok(pid) => {
+            record_lifecycle(
+                lifecycle,
+                &format!("event=runtime_restart_spawned pid={pid} by=exit"),
+            );
+            // The cleanup error is in the lifecycle log. Reporting it as a
+            // fatal startup failure would cover the app that is reopening.
+            Ok(())
+        }
+        Err(error) => {
+            record_lifecycle(
+                lifecycle,
+                &format!(
+                    "event=runtime_restart_failed by=exit error=\"{}\"",
+                    error_chain(&error)
+                ),
+            );
+            preserve_first_error(&mut final_error, Err(error));
+            final_error.map_or(Ok(()), Err)
+        }
+    }
+}
+
+/// Time since launch at each startup step, so a slow open can be traced to
+/// the step that caused it.
+fn record_startup_phase(lifecycle: Option<&LifecycleLog>, started: Instant, phase: &str) {
+    record_lifecycle(
+        lifecycle,
+        &format!(
+            "event=startup_phase phase={phase} ms={}",
+            started.elapsed().as_millis()
+        ),
+    );
+}
+
+fn record_lifecycle(lifecycle: Option<&LifecycleLog>, event: &str) {
+    eprintln!("{event}");
+    if let Some(log) = lifecycle {
+        log.record(event);
+    }
+}
+
+/// The last successful dictation, kept for the review panel.
+struct LastDictation {
+    /// Exactly what was inserted or put on the clipboard.
+    text: String,
+    /// Set only when the text was pasted into a control Replace can update.
+    target: Option<TargetSnapshot>,
+    strength: FormattingStrength,
+    custom_instructions: Option<String>,
+    formatting_note: Option<String>,
+}
+
+impl LastDictation {
+    fn seed(&self) -> ReviewSeed {
+        ReviewSeed {
+            text: self.text.clone(),
+            can_replace: self.target.is_some(),
+            strength: self.strength,
+            custom_instructions: self.custom_instructions.clone(),
+            formatting_note: self.formatting_note.clone(),
+        }
+    }
+}
+
+/// Replaces the last pasted text only when it is still there, unchanged and
+/// unambiguous; otherwise the new text goes to the clipboard instead.
+fn handle_review_replace(
+    last: Option<&mut LastDictation>,
+    replacement: &str,
+    shell: Option<&ProductShell>,
+) {
+    let (notice, replaced) = match last {
+        None => ("There is no recent dictation to replace.".to_owned(), false),
+        Some(last) => match last.target {
+            None => (
+                copy_instead(
+                    replacement,
+                    "This dictation was not pasted into an editable field.",
+                ),
+                false,
+            ),
+            Some(target) => match replace_inserted_text(target, &last.text, replacement) {
+                ReplaceOutcome::Replaced => {
+                    last.text = replacement.to_owned();
+                    ("Replaced the pasted text.".to_owned(), true)
+                }
+                ReplaceOutcome::TextChanged => (
+                    copy_instead(
+                        replacement,
+                        "The pasted text was edited since, so it was left alone.",
+                    ),
+                    false,
+                ),
+                ReplaceOutcome::TargetUnavailable => (
+                    copy_instead(replacement, "That window is no longer available."),
+                    false,
+                ),
+            },
+        },
+    };
+    eprintln!("dictation_id=0 state=Idle event=review_replace replaced={replaced}");
+    if let Some(shell) = shell {
+        let _ = shell.send(ProductShellControl::ReviewResult {
+            notice,
+            replaced_text: replaced.then(|| replacement.to_owned()),
+        });
+    }
+}
+
+fn copy_instead(text: &str, reason: &str) -> String {
+    match copy_and_maybe_paste(None, text) {
+        Ok(_) => format!("{reason} The new text was copied instead."),
+        Err(_) => format!("{reason} Copy the new text manually."),
+    }
+}
+
+fn resolve_effective_microphone(settings: &Settings) -> Option<String> {
+    match settings.recognition.microphone.as_deref() {
+        Some(selected)
+            if input_devices()
+                .map(|devices| devices.iter().any(|device| device.name == selected))
+                .unwrap_or(false) =>
+        {
+            Some(selected.to_owned())
+        }
+        Some(_) => {
+            eprintln!(
+                "dictation_id=0 state=Starting event=saved_microphone_unavailable recovery=windows_default"
+            );
+            None
+        }
+        None => None,
+    }
+}
+
+/// Copies the saved fields that the running process reads live. Recognition
+/// fields other than speech level and microphone need a restart and are
+/// deliberately left untouched here.
+fn apply_live_preferences(settings: &mut Settings, persisted: Settings, formatting: bool) {
+    settings.interaction = persisted.interaction;
+    settings.search = persisted.search;
+    settings.appearance = persisted.appearance;
+    settings.privacy = persisted.privacy;
+    settings.startup = persisted.startup;
+    settings.recognition.minimum_rms = persisted.recognition.minimum_rms;
+    settings.recognition.microphone = persisted.recognition.microphone;
+    if formatting {
+        settings.formatting = persisted.formatting;
+    }
+}
+
+/// Swaps AI formatting in the running worker. The next dictation picks up the
+/// new settings; one already in flight finishes with the formatting it began.
+fn apply_live_formatting(
+    settings: &Settings,
+    worker: &TranscriptionWorker,
+    runtime: &AppRuntime<TargetSnapshot, ExtendedRecording>,
+    dictation_context: &mut DictationContext,
+    verified_variant: Option<AccurateModelVariant>,
+) -> Result<()> {
+    let formatting = WorkerFormatting::from_settings(settings)?;
+    let context = DictationContext::global(settings, verified_variant)?;
+    worker.reconfigure_formatting(formatting)?;
+    if runtime.is_clean_idle() {
+        *dictation_context = context;
+    }
+    Ok(())
 }
 
 fn prepare_effective_settings(settings: &mut Settings) -> Result<()> {
@@ -1298,6 +1827,7 @@ fn setup_shell_vosk_probe() -> UiVoskProbe {
     UiVoskProbe::FullValidation
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_setup_mode(
     overlay: StatusOverlay,
     tray: SystemTray,
@@ -1306,6 +1836,7 @@ fn run_setup_mode(
     model: PathBuf,
     shutting_down: Arc<AtomicBool>,
     instance: SingleInstance,
+    lifecycle: Option<LifecycleLog>,
 ) -> Result<()> {
     show_shell_status(&overlay, &tray, OverlayStatus::Error, TrayStatus::Error);
     let database_path = settings_store
@@ -1362,7 +1893,9 @@ fn run_setup_mode(
                 ShellAction::Continue
                 | ShellAction::Resume
                 | ShellAction::TestDictation
-                | ShellAction::ReloadAliases,
+                | ShellAction::ReloadAliases
+                | ShellAction::LiveSettings { .. }
+                | ShellAction::ReviewReplace(_),
             ) => {
                 thread::sleep(Duration::from_millis(25));
             }
@@ -1371,6 +1904,11 @@ fn run_setup_mode(
     };
 
     let mut final_error = run_result.err();
+    let restart = RestartClaim::default();
+    let watchdog = ShutdownWatchdog::arm(
+        lifecycle.clone(),
+        restart_requested.then(|| (settings_store.path().to_path_buf(), restart.clone())),
+    );
     if let Some(shell) = product_shell.take() {
         preserve_first_error(
             &mut final_error,
@@ -1425,20 +1963,17 @@ fn run_setup_mode(
             .shutdown()
             .context("failed to stop the status overlay"),
     );
-    if final_error.is_none() && restart_requested {
-        drop(instance);
-        preserve_first_error(
-            &mut final_error,
-            restart_with_settings(settings_store.path()),
-        );
-    }
-    match final_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    watchdog.disarm();
+    finish_runtime_exit(
+        lifecycle.as_ref(),
+        restart_requested.then_some(&restart),
+        final_error,
+        instance,
+        settings_store.path(),
+    )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ShellAction {
     Continue,
     Quit,
@@ -1446,6 +1981,12 @@ enum ShellAction {
     Resume,
     TestDictation,
     ReloadAliases,
+    /// Saved settings that the running process applies without a restart.
+    LiveSettings {
+        formatting: bool,
+    },
+    /// The review panel asked to replace the last pasted text.
+    ReviewReplace(String),
 }
 
 fn launcher_overlay_status(settings: &Settings) -> OverlayStatus {
@@ -1693,16 +2234,19 @@ fn poll_shell_events(
                 }
                 Ok(ProductShellEvent::RuntimeReloadRequested(mutation)) => match mutation {
                     UiMutation::SettingsSaved => return Ok(ShellAction::Restart),
+                    UiMutation::FormattingSaved => {
+                        let persisted = settings_store
+                            .load()
+                            .context("failed to reload formatting preferences")?;
+                        apply_live_preferences(settings, persisted, true);
+                        return Ok(ShellAction::LiveSettings { formatting: true });
+                    }
                     UiMutation::ShortcutsSaved | UiMutation::SearchSaved => {
                         let persisted = settings_store
                             .load()
                             .context("failed to reload shortcut preferences")?;
-                        settings.interaction = persisted.interaction;
-                        settings.search = persisted.search;
-                        settings.appearance = persisted.appearance;
-                        settings.privacy = persisted.privacy;
-                        settings.startup = persisted.startup;
-                        settings.recognition.minimum_rms = persisted.recognition.minimum_rms;
+                        apply_live_preferences(settings, persisted, false);
+                        return Ok(ShellAction::LiveSettings { formatting: false });
                     }
                     UiMutation::LexiconSaved { .. }
                     | UiMutation::LexiconDeleted { .. }
@@ -1733,6 +2277,9 @@ fn poll_shell_events(
                     }
                 }
                 Ok(ProductShellEvent::QuitRequested) => return Ok(ShellAction::Quit),
+                Ok(ProductShellEvent::ReviewReplace(text)) => {
+                    return Ok(ShellAction::ReviewReplace(text));
+                }
                 Ok(ProductShellEvent::Hidden) => {}
                 Ok(ProductShellEvent::Failed(message)) => {
                     eprintln!("product_shell_failed error={message}");
@@ -2247,6 +2794,7 @@ fn settings_form(
             FormattingStrength::Light => SettingsFormatting::Light,
             FormattingStrength::Balanced => SettingsFormatting::Balanced,
             FormattingStrength::Strong => SettingsFormatting::Strong,
+            FormattingStrength::Structured => SettingsFormatting::Structured,
             FormattingStrength::Custom => SettingsFormatting::Custom,
         },
         custom_instructions: settings
@@ -2359,6 +2907,7 @@ fn profile_item(profile: AppProfile) -> ProfileItem {
             FormattingStyle::Light => ProfileFormatting::Light,
             FormattingStyle::Balanced => ProfileFormatting::Balanced,
             FormattingStyle::Strong => ProfileFormatting::Strong,
+            FormattingStyle::Structured => ProfileFormatting::Structured,
             FormattingStyle::Custom => ProfileFormatting::Custom,
         },
         custom_instructions: profile.custom_instructions,
@@ -2381,6 +2930,7 @@ fn app_profile(item: ProfileItem) -> Result<AppProfile> {
             ProfileFormatting::Light => FormattingStyle::Light,
             ProfileFormatting::Balanced => FormattingStyle::Balanced,
             ProfileFormatting::Strong => FormattingStyle::Strong,
+            ProfileFormatting::Structured => FormattingStyle::Structured,
             ProfileFormatting::Custom => FormattingStyle::Custom,
         },
         custom_instructions: item.custom_instructions,
@@ -2425,6 +2975,7 @@ fn apply_settings_form(
         SettingsFormatting::Light => FormattingStrength::Light,
         SettingsFormatting::Balanced => FormattingStrength::Balanced,
         SettingsFormatting::Strong => FormattingStrength::Strong,
+        SettingsFormatting::Structured => FormattingStrength::Structured,
         SettingsFormatting::Custom => FormattingStrength::Custom,
     };
     candidate.formatting.custom_instructions = if form.custom_instructions.trim().is_empty() {
@@ -2495,7 +3046,10 @@ fn verify_settings_model_selection(
 ) -> Result<()> {
     if matches!(
         candidate.formatting.strength,
-        FormattingStrength::Balanced | FormattingStrength::Strong | FormattingStrength::Custom
+        FormattingStrength::Balanced
+            | FormattingStrength::Strong
+            | FormattingStrength::Structured
+            | FormattingStrength::Custom
     ) && candidate.formatting.ollama_model_identity.is_none()
     {
         let selected = candidate
@@ -2536,15 +3090,21 @@ fn user_safe_settings_error(error: &anyhow::Error) -> String {
     error.to_string()
 }
 
-fn restart_with_settings(settings_path: &Path) -> Result<()> {
+fn restart_with_settings(settings_path: &Path) -> Result<u32> {
     let executable = std::env::current_exe().context("failed to locate the Phorminx executable")?;
     let child = Command::new(executable)
-        .arg("--config")
-        .arg(settings_path)
+        .args(restart_arguments(settings_path))
         .spawn()
         .context("failed to restart Phorminx")?;
-    eprintln!("event=runtime_restart_spawned pid={}", child.id());
-    Ok(())
+    Ok(child.id())
+}
+
+fn restart_arguments(settings_path: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        "--config".into(),
+        settings_path.as_os_str().to_owned(),
+        "--restarted".into(),
+    ]
 }
 
 fn preserve_first_error(first: &mut Option<anyhow::Error>, result: Result<()>) {
@@ -2844,6 +3404,12 @@ impl AppIo for ProductionIo<'_> {
     }
 
     fn show_status(&mut self, status: UiStatus) -> Result<(), String> {
+        if status == UiStatus::Listening {
+            // A new dictation: drop the previous live text, note and Expand.
+            let _ = self.overlay.set_live_text(None);
+            let _ = self.overlay.set_note(None);
+            let _ = self.overlay.offer_expand(false);
+        }
         let (overlay_status, tray_status) = match status {
             UiStatus::Ready => (OverlayStatus::Ready, TrayStatus::Ready),
             UiStatus::Listening => (OverlayStatus::Listening, TrayStatus::Listening),
@@ -3115,6 +3681,7 @@ fn handle_test_dictation(
     microphone: Option<&str>,
     context: &mut DictationContext,
     settings: &Settings,
+    persistence: &Persistence,
     capture: &ExtendedCaptureFactory,
     workloads: &Arc<WorkloadCoordinator>,
     active_dictation_activity: &mut Option<RuntimeActivityLease>,
@@ -3128,6 +3695,7 @@ fn handle_test_dictation(
             );
         }
         *context = DictationContext::global(settings, context.verified_variant)?;
+        context.resolve_prompts(persistence);
         runtime.configure_next_dictation(
             context.language.clone(),
             context.runtime_formatting,
@@ -3391,8 +3959,66 @@ struct TranscriptionWorker {
 #[derive(Default)]
 struct InstantPump {
     active_id: Option<DictationId>,
+    /// The worker accepted this dictation's recognizer request.
+    begun: bool,
     degraded: bool,
     submitted_through: u64,
+    /// A batch the worker had no room for yet. The capture keeps every sample
+    /// until the recognizer commits it, so a busy worker only delays the live
+    /// stream; it is retried on the next tick, in order, before new audio.
+    pending: Option<InstantBatch>,
+}
+
+/// One contiguous span of live audio for the Instant recognizer.
+#[derive(Debug, PartialEq)]
+struct InstantBatch {
+    samples: Vec<f32>,
+    sample_rate: u32,
+    dropped_samples: u64,
+}
+
+/// What happened when the pump handed something to the worker.
+#[derive(Debug, PartialEq)]
+enum InstantSend<T> {
+    Sent,
+    /// The worker's queue was full (it can stall for a few hundred ms while
+    /// Vosk finalizes an endpoint); the value comes back for a retry.
+    Busy(T),
+    Unavailable,
+}
+
+impl InstantPump {
+    fn reset_for(&mut self, id: DictationId) -> Option<DictationId> {
+        self.begun = false;
+        self.degraded = false;
+        self.submitted_through = 0;
+        self.pending = None;
+        self.active_id.replace(id)
+    }
+
+    /// Submits `batch` at the current stream position. Returns false when the
+    /// stream should stop for this tick (worker busy) or for good (degraded).
+    fn submit(
+        &mut self,
+        batch: InstantBatch,
+        send: impl FnOnce(u64, InstantBatch) -> InstantSend<InstantBatch>,
+    ) -> bool {
+        let count = batch.samples.len() as u64;
+        match send(self.submitted_through, batch) {
+            InstantSend::Sent => {
+                self.submitted_through = self.submitted_through.saturating_add(count);
+                true
+            }
+            InstantSend::Busy(batch) => {
+                self.pending = Some(batch);
+                false
+            }
+            InstantSend::Unavailable => {
+                self.degraded = true;
+                false
+            }
+        }
+    }
 }
 
 fn poll_instant_transcription(
@@ -3421,39 +4047,48 @@ fn poll_instant_transcription(
     let Some(recording) = runtime.active_recording_mut() else {
         return;
     };
-    if pump.active_id != Some(id) {
-        if let Some(stale) = pump.active_id.replace(id) {
-            let _ = worker.cancel_incremental(stale);
-        }
-        pump.degraded = false;
-        pump.submitted_through = 0;
-        if !worker.instant_begin(
+    if pump.active_id != Some(id)
+        && let Some(stale) = pump.reset_for(id)
+    {
+        let _ = worker.cancel_incremental(stale);
+    }
+    if !pump.begun && !pump.degraded {
+        match worker.instant_begin(
             id,
             recording.sample_rate(),
             recording.ownership_acknowledger(),
         ) {
-            pump.degraded = true;
+            InstantSend::Sent => pump.begun = true,
+            // Retried next tick; nothing is drained until the session exists.
+            InstantSend::Busy(()) => return,
+            InstantSend::Unavailable => pump.degraded = true,
         }
     }
     if pump.degraded {
         return;
     }
+    if let Some(batch) = pump.pending.take()
+        && !pump.submit(batch, |start, batch| worker.instant_audio(id, start, batch))
+    {
+        if pump.degraded {
+            worker.degrade_instant(id);
+        }
+        return;
+    }
     match recording.drain_streaming(16_384) {
         Ok(batch) => {
-            let sample_count = batch.samples.len() as u64;
-            if sample_count != 0 {
-                if worker.instant_audio(
-                    id,
-                    pump.submitted_through,
-                    batch.samples,
-                    batch.sample_rate,
-                    batch.dropped_samples,
-                ) {
-                    pump.submitted_through = pump.submitted_through.saturating_add(sample_count);
-                } else {
-                    pump.degraded = true;
-                    worker.degrade_instant(id);
-                }
+            if !batch.samples.is_empty()
+                && !pump.submit(
+                    InstantBatch {
+                        samples: batch.samples,
+                        sample_rate: batch.sample_rate,
+                        dropped_samples: batch.dropped_samples,
+                    },
+                    |start, batch| worker.instant_audio(id, start, batch),
+                )
+                && pump.degraded
+            {
+                worker.degrade_instant(id);
             }
         }
         Err(error) => {
@@ -3503,6 +4138,66 @@ struct InstantSession {
     /// decoder can re-read the lexical boundary at a forced rollover.
     uncommitted_audio: Vec<f32>,
     ownership_acknowledger: Option<OwnershipAcknowledger>,
+    /// Last live text sent to the overlay and when, to send only changes at
+    /// a bounded rate.
+    preview: InstantPreview,
+}
+
+#[derive(Default)]
+struct InstantPreview {
+    text: String,
+    checked_at: Option<Instant>,
+}
+
+const INSTANT_PREVIEW_INTERVAL: Duration = Duration::from_millis(150);
+/// Live audio batches queued for the Instant worker. At the pump's ~25 ms
+/// cadence this is well over a second of stall before the pump has to wait.
+const INSTANT_AUDIO_QUEUE: usize = 64;
+const INSTANT_DRAIN_GAP_WARNING: Duration = Duration::from_millis(150);
+/// Single Vosk calls slower than this are logged: the live audio channel holds
+/// only a few hundred milliseconds while the worker is busy.
+const SLOW_INSTANT_STEP: Duration = Duration::from_millis(100);
+
+/// Committed words followed by the decoder's current partial hypothesis.
+fn instant_preview_text(committed: &str, partial: &str) -> String {
+    match (committed.trim(), partial.trim()) {
+        ("", partial) => partial.to_owned(),
+        (committed, "") => committed.to_owned(),
+        (committed, partial) => format!("{committed} {partial}"),
+    }
+}
+
+fn send_instant_preview(
+    session: &mut InstantSession,
+    id: DictationId,
+    results: &Sender<WorkerEvent>,
+) {
+    if session.degraded
+        || session
+            .preview
+            .checked_at
+            .is_some_and(|checked| checked.elapsed() < INSTANT_PREVIEW_INTERVAL)
+    {
+        return;
+    }
+    // Throttle every partial-result call, not only the ones that change the
+    // text: in silence nothing changes, and each call costs decoder time.
+    session.preview.checked_at = Some(Instant::now());
+    let started = Instant::now();
+    let partial = session.recognizer.partial_text().unwrap_or_default();
+    if started.elapsed() > SLOW_INSTANT_STEP {
+        eprintln!(
+            "dictation_id={} state=Listening event=instant_partial_slow ms={}",
+            id.0,
+            started.elapsed().as_millis()
+        );
+    }
+    let text = instant_preview_text(&session.ownership.text, &partial);
+    if text.is_empty() || text == session.preview.text {
+        return;
+    }
+    session.preview.text = text.clone();
+    let _ = results.send(WorkerEvent::LivePreview { id, text });
 }
 
 #[derive(Default)]
@@ -3580,7 +4275,9 @@ impl TranscriptionWorker {
         let worker_recovery = recovery.clone();
         let (command_tx, command_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
-        let (instant_audio_tx, instant_audio_rx) = mpsc::sync_channel(8);
+        // Vosk can spend a few hundred milliseconds finalizing an endpoint in
+        // silence; the queue absorbs that, and the pump retries when full.
+        let (instant_audio_tx, instant_audio_rx) = mpsc::sync_channel(INSTANT_AUDIO_QUEUE);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let cancellations = Arc::new(CancellationRegistry::default());
         let worker_cancellations = Arc::clone(&cancellations);
@@ -3641,8 +4338,8 @@ impl TranscriptionWorker {
                         None
                     }
                 };
-                let formatting = formatting;
-                let mut ollama = formatting.model.as_ref().map(|_| production_ollama_client());
+                let mut formatting = formatting;
+                let mut ollama = formatting.model.as_ref().map(|_| formatting_ollama_client());
                 let ollama_activity = if formatting.uses_ollama() {
                     production_workload_coordinator()
                         .try_begin(RuntimeActivityKind::OllamaModelPin)
@@ -3651,6 +4348,7 @@ impl TranscriptionWorker {
                     None
                 };
                 if formatting.uses_ollama() {
+                    let identity_started = Instant::now();
                     // Starting a verified local daemon does not authorize a
                     // model. The exact saved identity is checked immediately
                     // below before any transcript can be sent.
@@ -3661,9 +4359,9 @@ impl TranscriptionWorker {
                         formatting.model_identity.as_ref(),
                         ollama_activity.as_ref(),
                     ) {
-                        (Some(client), Some(model), Some(identity), Some(_activity)) => {
+                        (Some(_), Some(model), Some(identity), Some(_activity)) => {
                             installed_ollama_identity_matches(
-                                client,
+                                &production_ollama_client(),
                                 model,
                                 identity,
                                 &CancellationToken::new(),
@@ -3677,6 +4375,10 @@ impl TranscriptionWorker {
                             "dictation_id=0 state=Starting event=ollama_identity_unverified recovery=deterministic"
                         );
                     }
+                    eprintln!(
+                        "dictation_id=0 state=Starting event=ollama_identity_checked verified={verified} ms={}",
+                        identity_started.elapsed().as_millis()
+                    );
                 }
                 if ready_tx.send(Ok(readiness)).is_err() {
                     return;
@@ -3687,12 +4389,17 @@ impl TranscriptionWorker {
                 // this verified resident formatting session is active. An
                 // external Ollama client can still mutate the tag; a restart
                 // re-runs the identity probe before formatting is enabled.
-                let _ollama_activity = ollama_activity;
+                // A live formatting change replaces the lease and re-probes.
+                let mut ollama_lease = ollama_activity;
                 let mut aliases = aliases;
                 let mut incremental_sessions: HashMap<DictationId, PartialAccumulator> = HashMap::new();
                 let mut instant_sessions: HashMap<DictationId, InstantSession> = HashMap::new();
                 let mut checkpoint_clock = phorminx_app::text_recovery::CheckpointClock::default();
-                let mut recovery_probe: Option<Receiver<bool>> = None;
+                // Each probe is tagged with the formatting generation it
+                // verified, so a result for a replaced model is discarded.
+                let mut recovery_probe: Option<(u64, Receiver<bool>)> = None;
+                let mut formatting_generation = 0_u64;
+                let mut last_instant_drain = Instant::now();
                 let mut last_recovery_attempt: Option<Instant> = None;
                 if formatting.uses_ollama()
                     && let (Some(client), Some(model)) = (&ollama, &formatting.model)
@@ -3726,11 +4433,11 @@ impl TranscriptionWorker {
                     // A daemon missing at launch or stopped later must not
                     // disable AI formatting until Phorminx restarts. Recovery
                     // runs off-thread so it cannot stall live audio draining.
-                    if let Some(probe) = recovery_probe.as_ref() {
+                    if let Some((generation, probe)) = recovery_probe.as_ref() {
                         match probe.try_recv() {
                             Ok(verified) => {
-                                if verified {
-                                    ollama = Some(production_ollama_client());
+                                if verified && *generation == formatting_generation {
+                                    ollama = Some(formatting_ollama_client());
                                     eprintln!("dictation_id=0 event=ollama_recovery_ready");
                                 }
                                 recovery_probe = None;
@@ -3740,7 +4447,7 @@ impl TranscriptionWorker {
                         }
                     }
                     if ollama.is_none() && formatting.uses_ollama()
-                        && _ollama_activity.is_some() && recovery_probe.is_none()
+                        && ollama_lease.is_some() && recovery_probe.is_none()
                         && last_recovery_attempt.is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
                         && let (Some(model), Some(identity)) = (formatting.model.clone(), formatting.model_identity.clone())
                     {
@@ -3753,8 +4460,15 @@ impl TranscriptionWorker {
                                 && installed_ollama_identity_matches(&production_ollama_client(), &model, &identity, &CancellationToken::new());
                             let _ = tx.send(verified);
                         }).is_ok() {
-                            recovery_probe = Some(rx);
+                            recovery_probe = Some((formatting_generation, rx));
                         }
+                    }
+                    let drain_gap = last_instant_drain.elapsed();
+                    if drain_gap > INSTANT_DRAIN_GAP_WARNING && !instant_sessions.is_empty() {
+                        eprintln!(
+                            "dictation_id=0 state=Listening event=instant_drain_gap ms={}",
+                            drain_gap.as_millis()
+                        );
                     }
                     drain_instant_audio(
                         &recognizer,
@@ -3762,6 +4476,7 @@ impl TranscriptionWorker {
                         &mut instant_sessions,
                         &result_tx,
                     );
+                    last_instant_drain = Instant::now();
                     for (id, session) in &instant_sessions {
                         worker_recovery.checkpoint(&mut checkpoint_clock, id.0, &session.ownership.text, false);
                     }
@@ -3829,6 +4544,12 @@ impl TranscriptionWorker {
                             worker_cancellations.end_partial(partial_id);
                             if let Some(session) = incremental_sessions.get(&partial_id) {
                                 worker_recovery.checkpoint(&mut checkpoint_clock, partial_id.0, &session.text, false);
+                                if !session.text.trim().is_empty() {
+                                    let _ = result_tx.send(WorkerEvent::LivePreview {
+                                        id: partial_id,
+                                        text: session.text.clone(),
+                                    });
+                                }
                             }
                             if let WorkerEvent::PartialCompleted {
                                 committed_through: Some(frontier),
@@ -4050,6 +4771,7 @@ impl TranscriptionWorker {
                                             ownership: InstantTranscriptOwnership::default(),
                                             uncommitted_audio: Vec::new(),
                                             ownership_acknowledger: None,
+                                            preview: InstantPreview::default(),
                                         },
                                     );
                                 }
@@ -4060,6 +4782,26 @@ impl TranscriptionWorker {
                             }
                         }
                         WorkerCommand::ReloadAliases(updated) => aliases = updated,
+                        WorkerCommand::ReconfigureFormatting(updated) => {
+                            // No model is trusted until the off-thread probe
+                            // above re-verifies the exact saved identity.
+                            // Dictations in that window keep deterministic text.
+                            formatting_generation = formatting_generation.wrapping_add(1);
+                            ollama = None;
+                            recovery_probe = None;
+                            last_recovery_attempt = None;
+                            ollama_lease = None;
+                            if updated.uses_ollama() {
+                                ollama_lease = production_workload_coordinator()
+                                    .try_begin(RuntimeActivityKind::OllamaModelPin)
+                                    .ok();
+                            }
+                            eprintln!(
+                                "dictation_id=0 state=Idle event=formatting_reconfigured uses_ollama={}",
+                                updated.uses_ollama()
+                            );
+                            formatting = *updated;
+                        }
                         WorkerCommand::Shutdown => break,
                     }
                 }
@@ -4152,20 +4894,18 @@ impl TranscriptionWorker {
         id: DictationId,
         sample_rate: u32,
         ownership_acknowledger: OwnershipAcknowledger,
-    ) -> bool {
-        if self
-            .instant_audio
-            .try_send(InstantAudioCommand::Begin {
-                id,
-                sample_rate,
-                ownership_acknowledger,
-            })
-            .is_err()
-        {
-            let _ = self.commands.send(WorkerCommand::DegradeInstant { id });
-            false
-        } else {
-            true
+    ) -> InstantSend<()> {
+        match self.instant_audio.try_send(InstantAudioCommand::Begin {
+            id,
+            sample_rate,
+            ownership_acknowledger,
+        }) {
+            Ok(()) => InstantSend::Sent,
+            Err(mpsc::TrySendError::Full(_)) => InstantSend::Busy(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                let _ = self.commands.send(WorkerCommand::DegradeInstant { id });
+                InstantSend::Unavailable
+            }
         }
     }
 
@@ -4173,28 +4913,33 @@ impl TranscriptionWorker {
         &self,
         id: DictationId,
         start_sample: u64,
-        samples: Vec<f32>,
-        sample_rate: u32,
-        dropped_samples: u64,
-    ) -> bool {
-        if samples.is_empty() {
-            return true;
+        batch: InstantBatch,
+    ) -> InstantSend<InstantBatch> {
+        if batch.samples.is_empty() {
+            return InstantSend::Sent;
         }
-        if self
-            .instant_audio
-            .try_send(InstantAudioCommand::Audio {
-                id,
-                start_sample,
+        match self.instant_audio.try_send(InstantAudioCommand::Audio {
+            id,
+            start_sample,
+            samples: batch.samples,
+            sample_rate: batch.sample_rate,
+            dropped_samples: batch.dropped_samples,
+        }) {
+            Ok(()) => InstantSend::Sent,
+            Err(mpsc::TrySendError::Full(InstantAudioCommand::Audio {
                 samples,
                 sample_rate,
                 dropped_samples,
-            })
-            .is_err()
-        {
-            let _ = self.commands.send(WorkerCommand::DegradeInstant { id });
-            false
-        } else {
-            true
+                ..
+            })) => InstantSend::Busy(InstantBatch {
+                samples,
+                sample_rate,
+                dropped_samples,
+            }),
+            Err(_) => {
+                let _ = self.commands.send(WorkerCommand::DegradeInstant { id });
+                InstantSend::Unavailable
+            }
         }
     }
 
@@ -4217,6 +4962,12 @@ impl TranscriptionWorker {
 
     fn shutdown(mut self) -> Result<()> {
         self.stop()
+    }
+
+    fn reconfigure_formatting(&self, formatting: WorkerFormatting) -> Result<()> {
+        self.commands
+            .send(WorkerCommand::ReconfigureFormatting(Box::new(formatting)))
+            .map_err(|_| anyhow!("transcription worker is unavailable"))
     }
 
     fn reload_aliases(&self, aliases: Vec<LexiconEntry>) -> Result<()> {
@@ -4433,6 +5184,7 @@ enum WorkerCommand {
         id: DictationId,
     },
     ReloadAliases(Vec<LexiconEntry>),
+    ReconfigureFormatting(Box<WorkerFormatting>),
     Shutdown,
 }
 
@@ -4460,6 +5212,11 @@ enum WorkerEvent {
     },
     /// Vosk has transferred ownership of every finalized endpoint through this
     /// absolute canonical sample. The main loop may now evict that audio.
+    /// Recognized text so far for the overlay; never persisted.
+    LivePreview {
+        id: DictationId,
+        text: String,
+    },
     InstantCommitted {
         id: DictationId,
         committed_through: u64,
@@ -4525,7 +5282,14 @@ fn drain_instant_audio(
                 if sessions.contains_key(&id) {
                     continue;
                 }
-                match model.session(sample_rate) {
+                let created_at = Instant::now();
+                let created = model.session(sample_rate);
+                eprintln!(
+                    "dictation_id={} state=Listening event=instant_session_created ms={}",
+                    id.0,
+                    created_at.elapsed().as_millis()
+                );
+                match created {
                     Ok(recognizer) => {
                         sessions.insert(
                             id,
@@ -4541,6 +5305,7 @@ fn drain_instant_audio(
                                 ownership: InstantTranscriptOwnership::default(),
                                 uncommitted_audio: Vec::new(),
                                 ownership_acknowledger: Some(ownership_acknowledger),
+                                preview: InstantPreview::default(),
                             },
                         );
                     }
@@ -4578,7 +5343,16 @@ fn drain_instant_audio(
                 }
                 let started = Instant::now();
                 let accepted = session.recognizer.accept_f32(&samples);
-                session.inference_time += started.elapsed();
+                let accept_time = started.elapsed();
+                session.inference_time += accept_time;
+                if accept_time > SLOW_INSTANT_STEP {
+                    eprintln!(
+                        "dictation_id={} state=Listening event=instant_accept_slow ms={} samples={}",
+                        id.0,
+                        accept_time.as_millis(),
+                        samples.len()
+                    );
+                }
                 match accepted {
                     Ok(outcome) => {
                         let absolute_accepted = session
@@ -4620,6 +5394,7 @@ fn drain_instant_audio(
                         {
                             mark_instant_degraded(session, id, "rollover_failed", results);
                         }
+                        send_instant_preview(session, id, results);
                     }
                     Err(_) => {
                         mark_instant_degraded(session, id, "decoder_failed", results);
@@ -6441,7 +7216,24 @@ impl DictationContext {
     ) -> Result<Self> {
         let context = Self::global(settings, verified_variant)?;
         let executable = target.and_then(TargetSnapshot::executable_name);
-        Self::for_executable(context, executable, persistence, settings)
+        let mut context = Self::for_executable(context, executable, persistence, settings)?;
+        context.resolve_prompts(persistence);
+        Ok(context)
+    }
+
+    /// Replaces prompt references in custom instructions with each prompt's
+    /// latest text, so library edits apply to the next dictation.
+    fn resolve_prompts(&mut self, persistence: &Persistence) {
+        if let FormatProfile::Custom(instructions) = &self.formatting.profile {
+            let resolved = phorminx_app::prompts::resolve_with(persistence, instructions);
+            if !resolved.missing.is_empty() {
+                eprintln!(
+                    "dictation_id=0 state=Idle event=prompt_missing count={}",
+                    resolved.missing.len()
+                );
+            }
+            self.formatting.profile = FormatProfile::Custom(resolved.text);
+        }
     }
 
     fn for_executable(
@@ -6491,6 +7283,7 @@ impl DictationContext {
             FormattingStyle::Light => RuntimeFormatting::Light,
             FormattingStyle::Balanced => RuntimeFormatting::Balanced,
             FormattingStyle::Strong => RuntimeFormatting::Strong,
+            FormattingStyle::Structured => RuntimeFormatting::Structured,
             FormattingStyle::Custom => RuntimeFormatting::Custom,
         };
         context.formatting.profile = match profile.formatting_style {
@@ -6498,6 +7291,7 @@ impl DictationContext {
             FormattingStyle::Light => FormatProfile::Light,
             FormattingStyle::Balanced => FormatProfile::Balanced,
             FormattingStyle::Strong => FormatProfile::Strong,
+            FormattingStyle::Structured => FormatProfile::Structured,
             FormattingStyle::Custom => FormatProfile::Custom(
                 profile
                     .custom_instructions
@@ -6522,6 +7316,7 @@ struct WorkerFormatting {
     model: Option<ModelName>,
     model_identity: Option<OllamaModelIdentity>,
     keep_alive: KeepAlive,
+    passes: u8,
 }
 
 impl WorkerFormatting {
@@ -6531,6 +7326,7 @@ impl WorkerFormatting {
             FormattingStrength::Light => FormatProfile::Light,
             FormattingStrength::Balanced => FormatProfile::Balanced,
             FormattingStrength::Strong => FormatProfile::Strong,
+            FormattingStrength::Structured => FormatProfile::Structured,
             FormattingStrength::Custom => FormatProfile::Custom(
                 settings
                     .formatting
@@ -6549,7 +7345,10 @@ impl WorkerFormatting {
         let model_identity = settings.formatting.ollama_model_identity.clone();
         if matches!(
             &profile,
-            FormatProfile::Balanced | FormatProfile::Strong | FormatProfile::Custom(_)
+            FormatProfile::Balanced
+                | FormatProfile::Strong
+                | FormatProfile::Structured
+                | FormatProfile::Custom(_)
         ) && (model.is_none() || model_identity.is_none())
         {
             return Err(anyhow!(
@@ -6566,13 +7365,17 @@ impl WorkerFormatting {
             model,
             model_identity,
             keep_alive,
+            passes: settings.formatting.passes,
         })
     }
 
     fn uses_ollama(&self) -> bool {
         matches!(
             &self.profile,
-            FormatProfile::Balanced | FormatProfile::Strong | FormatProfile::Custom(_)
+            FormatProfile::Balanced
+                | FormatProfile::Strong
+                | FormatProfile::Structured
+                | FormatProfile::Custom(_)
         )
     }
 }
@@ -6631,7 +7434,10 @@ fn process_transcript(
     let (selected, cleaned_text) = match &formatting.profile {
         FormatProfile::Raw => (raw_text.clone(), None),
         FormatProfile::Light => (normalized_text.clone(), None),
-        FormatProfile::Balanced | FormatProfile::Strong | FormatProfile::Custom(_) => {
+        FormatProfile::Balanced
+        | FormatProfile::Strong
+        | FormatProfile::Structured
+        | FormatProfile::Custom(_) => {
             match (
                 ollama.filter(|_| _ollama_compute.is_some()),
                 formatting.model.as_ref(),
@@ -6662,19 +7468,24 @@ fn process_transcript(
                             }
                         }
                     } else {
-                        match client.format(
+                        let outcome = client.format_passes(
                             model,
                             &normalized_text,
                             &formatting.profile,
                             formatting.keep_alive.clone(),
                             cancel,
-                        ) {
-                            FormatResult::Formatted { text, .. } => (text.clone(), Some(text)),
-                            FormatResult::Fallback { reason, .. } => {
+                            formatting.passes,
+                        );
+                        if outcome.requested > 1 {
+                            warnings.push(passes_warning(outcome.completed, outcome.requested));
+                        }
+                        match (outcome.completed, outcome.failure) {
+                            (0, Some(reason)) => {
                                 warnings
-                                    .push(format!("ollama_fallback:{}", fallback_reason(&reason)));
+                                    .push(format!("ollama_fallback:{}", fallback_label(&reason)));
                                 (normalized_text.clone(), None)
                             }
+                            _ => (outcome.text.clone(), Some(outcome.text)),
                         }
                     }
                 }
@@ -6728,16 +7539,6 @@ fn document_disposition(disposition: DocumentFormatDisposition) -> &'static str 
         DocumentFormatDisposition::Cancelled => "cancelled",
         DocumentFormatDisposition::ServiceLost => "service_lost",
         DocumentFormatDisposition::SourceFallbackOutputLimit => "output_limit",
-    }
-}
-
-fn fallback_reason(reason: &phorminx_ollama::FallbackReason) -> &'static str {
-    match reason {
-        phorminx_ollama::FallbackReason::RawProfile => "raw_profile",
-        phorminx_ollama::FallbackReason::PromptRejected(_) => "prompt_rejected",
-        phorminx_ollama::FallbackReason::Cancelled => "cancelled",
-        phorminx_ollama::FallbackReason::ServiceUnavailable(_) => "service_unavailable",
-        phorminx_ollama::FallbackReason::OutputRejected(_) => "output_rejected",
     }
 }
 
@@ -6888,6 +7689,25 @@ fn retention_policy(retention: HistoryRetention) -> RetentionPolicy {
     }
 }
 
+/// Generation is not streamed, so response headers arrive only after the
+/// whole answer, and a cold model load (about ten seconds for a 7B model)
+/// comes first. The old five-second limit made most restructuring requests
+/// time out and fall back to unformatted text. Cancellation is observed while
+/// waiting, so a long limit does not delay Quit.
+fn formatting_ollama_client() -> OllamaClient {
+    OllamaClient::new(
+        OllamaEndpoint::default(),
+        ClientTimeouts {
+            connect: Duration::from_secs(1),
+            response_headers: Duration::from_secs(45),
+            response_body: Duration::from_secs(10),
+            overall: Duration::from_secs(60),
+        },
+    )
+    .expect("the fixed formatting Ollama timeout policy is valid")
+}
+
+/// Short limits for discovery and identity probes, which never generate.
 fn production_ollama_client() -> OllamaClient {
     OllamaClient::new(
         OllamaEndpoint::default(),
@@ -8174,6 +8994,7 @@ mod composition_tests {
         )
         .unwrap();
         let formatting = WorkerFormatting {
+            passes: 1,
             profile: FormatProfile::Strong,
             model: Some(ModelName::parse("qwen2.5:3b").unwrap()),
             model_identity: Some(OllamaModelIdentity::new("a".repeat(64), 1_000).unwrap()),
@@ -8383,6 +9204,7 @@ mod composition_tests {
                 recognized.clone(),
                 "en",
                 &WorkerFormatting {
+                    passes: 1,
                     profile: profile.clone(),
                     model: None,
                     model_identity: None,
@@ -9372,6 +10194,7 @@ mod composition_tests {
             transcript("timed"),
             "en",
             &WorkerFormatting {
+                passes: 1,
                 profile: FormatProfile::Raw,
                 model: None,
                 model_identity: None,
@@ -9438,6 +10261,7 @@ mod composition_tests {
             transcript("private transient text"),
             "en",
             &WorkerFormatting {
+                passes: 1,
                 profile: FormatProfile::Raw,
                 model: None,
                 model_identity: None,
@@ -9683,5 +10507,164 @@ mod composition_tests {
         let rendered = user_safe_settings_error(&error);
         assert_eq!(rendered, "Settings could not be saved.");
         assert!(!rendered.contains(&private.display().to_string()));
+    }
+
+    #[test]
+    fn busy_instant_worker_delays_live_audio_without_degrading() {
+        fn batch(value: f32, len: usize) -> InstantBatch {
+            InstantBatch {
+                samples: vec![value; len],
+                sample_rate: 16_000,
+                dropped_samples: 0,
+            }
+        }
+        let mut pump = InstantPump::default();
+        let mut delivered = Vec::new();
+        assert!(pump.submit(batch(1.0, 400), |start, sent| {
+            delivered.push((start, sent.samples.len()));
+            InstantSend::Sent
+        }));
+        // Vosk is finalizing an endpoint and the queue is full: the batch
+        // comes back and waits for the next tick instead of ending the
+        // dictation, which is what made quiet starts report "no speech".
+        assert!(!pump.submit(batch(2.0, 300), |_, held| InstantSend::Busy(held)));
+        assert!(!pump.degraded);
+        let held = pump.pending.take().unwrap();
+        assert_eq!(held.samples, vec![2.0; 300]);
+        assert!(pump.submit(held, |start, sent| {
+            delivered.push((start, sent.samples.len()));
+            InstantSend::Sent
+        }));
+        assert!(pump.submit(batch(3.0, 200), |start, sent| {
+            delivered.push((start, sent.samples.len()));
+            InstantSend::Sent
+        }));
+        assert_eq!(delivered, [(0, 400), (400, 300), (700, 200)]);
+
+        // A new dictation starts from a clean stream.
+        pump.pending = Some(batch(9.0, 5));
+        assert_eq!(pump.reset_for(DictationId(2)), None);
+        assert!(pump.pending.is_none() && !pump.begun && pump.submitted_through == 0);
+
+        // Only a worker that is gone ends the live stream.
+        assert!(!pump.submit(batch(4.0, 10), |_, _| InstantSend::Unavailable));
+        assert!(pump.degraded);
+    }
+
+    #[test]
+    fn requested_restart_survives_a_cleanup_error_and_is_logged() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = LifecycleLog::for_settings(&directory.path().join("settings.toml")).unwrap();
+        let released = Cell::new(false);
+        let spawned = Cell::new(false);
+        let claim = RestartClaim::default();
+        let result = finish_runtime_exit_with(
+            Some(&log),
+            Some(&claim),
+            Some(anyhow!("failed to stop the global hotkey")),
+            || released.set(true),
+            || {
+                assert!(
+                    released.get(),
+                    "the instance slot is released before spawning"
+                );
+                spawned.set(true);
+                Ok(4242)
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "a reopening app must not raise the fatal dialog"
+        );
+        assert!(spawned.get());
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert!(text.contains("event=runtime_exit restart_requested=true cleanup_error=true"));
+        assert!(text.contains("failed to stop the global hotkey"));
+        assert!(text.contains("event=runtime_restart_spawned pid=4242 by=exit"));
+    }
+
+    #[test]
+    fn quit_without_restart_keeps_reporting_cleanup_errors() {
+        let spawned = Cell::new(false);
+        let result = finish_runtime_exit_with(
+            None,
+            None,
+            Some(anyhow!("cleanup failed")),
+            || {},
+            || {
+                spawned.set(true);
+                Ok(1)
+            },
+        );
+        assert!(result.is_err());
+        assert!(!spawned.get());
+        assert!(finish_runtime_exit_with(None, None, None, || {}, || Ok(1)).is_ok());
+    }
+
+    #[test]
+    fn failed_restart_spawn_is_reported_and_only_claimed_once() {
+        let claim = RestartClaim::default();
+        let result =
+            finish_runtime_exit_with(None, Some(&claim), None, || {}, || Err(anyhow!("denied")));
+        assert!(result.unwrap_err().to_string().contains("denied"));
+
+        // The watchdog already spawned a replacement: the exit path must not
+        // start a second one.
+        let claim = RestartClaim::default();
+        assert!(claim.claim());
+        let spawned = Cell::new(false);
+        finish_runtime_exit_with(
+            None,
+            Some(&claim),
+            None,
+            || {},
+            || {
+                spawned.set(true);
+                Ok(1)
+            },
+        )
+        .unwrap();
+        assert!(!spawned.get());
+    }
+
+    #[test]
+    fn restarted_process_waits_for_the_same_profile() {
+        let arguments = restart_arguments(Path::new(r"C:\QA\settings.toml"));
+        assert_eq!(
+            arguments,
+            [
+                std::ffi::OsString::from("--config"),
+                r"C:\QA\settings.toml".into(),
+                "--restarted".into()
+            ]
+        );
+        let cli = Cli::try_parse_from(
+            std::iter::once(std::ffi::OsString::from("phorminx")).chain(arguments),
+        )
+        .unwrap();
+        assert!(cli.restarted);
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(Path::new(r"C:\QA\settings.toml"))
+        );
+    }
+
+    #[test]
+    fn shutdown_watchdog_exits_only_when_cleanup_hangs() {
+        let (exited_tx, exited_rx) = mpsc::channel();
+        let watchdog =
+            ShutdownWatchdog::arm_with(Duration::from_millis(50), None, None, move |code| {
+                let _ = exited_tx.send(code);
+            });
+        assert_eq!(exited_rx.recv_timeout(Duration::from_secs(5)), Ok(1));
+        watchdog.disarm();
+
+        let (exited_tx, exited_rx) = mpsc::channel();
+        let watchdog =
+            ShutdownWatchdog::arm_with(Duration::from_millis(200), None, None, move |code| {
+                let _ = exited_tx.send(code);
+            });
+        watchdog.disarm();
+        assert!(exited_rx.recv_timeout(Duration::from_millis(500)).is_err());
     }
 }

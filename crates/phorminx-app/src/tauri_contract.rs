@@ -135,6 +135,8 @@ pub struct HistoryItemView {
     pub language: Option<String>,
     pub target_app: Option<String>,
     pub duration_ms: Option<u64>,
+    /// Why AI formatting did not apply, when it did not.
+    pub formatting_note: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -185,6 +187,7 @@ impl From<&crate::ui_bridge::UiProfileItem> for ProfileDetailView {
                 phorminx_persistence::FormattingStyle::Light => "light",
                 phorminx_persistence::FormattingStyle::Balanced => "balanced",
                 phorminx_persistence::FormattingStyle::Strong => "strong",
+                phorminx_persistence::FormattingStyle::Structured => "structured",
                 phorminx_persistence::FormattingStyle::Custom => "custom",
             },
             custom_instructions: value.custom_instructions.clone(),
@@ -211,8 +214,10 @@ pub struct AppSettingsView {
     pub formatting_strength: String,
     pub formatting_model: Option<String>,
     pub model_residency: String,
+    pub formatting_passes: u8,
     pub recording_mode: String,
     pub launcher_shortcut: String,
+    pub show_live_text: bool,
     pub direct_shortcut: Option<String>,
     pub theme: String,
     pub history_retention: String,
@@ -295,6 +300,7 @@ impl From<&UiSnapshot> for AppView {
                     language: item.language.clone(),
                     target_app: item.target_executable.clone(),
                     duration_ms: item.audio_duration_ms,
+                    formatting_note: crate::review::formatting_summary(&item.warnings),
                 })
                 .collect(),
             lexicon: value
@@ -335,8 +341,10 @@ impl From<&UiSnapshot> for AppView {
                 formatting_model: settings.formatting.ollama_model.clone(),
                 model_residency: format!("{:?}", settings.formatting.ollama_lifecycle)
                     .to_lowercase(),
+                formatting_passes: settings.formatting.passes,
                 recording_mode: format!("{:?}", settings.interaction.recording_mode).to_lowercase(),
                 launcher_shortcut: settings.interaction.launcher_shortcut.clone(),
+                show_live_text: settings.interaction.show_live_text,
                 direct_shortcut: settings.interaction.direct_dictation_shortcut.clone(),
                 theme: format!("{:?}", settings.appearance.theme).to_lowercase(),
                 history_retention: match settings.privacy.history_retention {
@@ -583,7 +591,12 @@ impl From<&WorkspaceSnapshot> for MeetingView {
             selected_input_device: value.meeting_microphone_device.clone(),
             selected_output_device: value.meeting_device.clone(),
             provisional_text: value.provisional_text.clone(),
-            transcript: value.transcript.iter().map(Into::into).collect(),
+            transcript: value
+                .transcript
+                .iter()
+                .filter(|line| !line.text.trim().is_empty())
+                .map(Into::into)
+                .collect(),
             translations: value.translations.iter().map(Into::into).collect(),
             messages: value.messages.iter().map(Into::into).collect(),
             assistant_busy: value.ai_busy,

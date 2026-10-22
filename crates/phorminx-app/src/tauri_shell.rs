@@ -22,6 +22,7 @@ use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder};
 use crate::feedback::{FeedbackPanel, FeedbackView};
 use crate::library_search::{LibrarySearchConfig, LibrarySearchWorker, embedding_identity};
 use crate::product_shell::{ProductShellControl, ProductShellEvent};
+use crate::review::ReviewPanel;
 use crate::settings::{
     AccurateBackendPreference, AccurateModelVariant, AppearancePreference, FormattingStrength,
     HistoryRetention, OllamaLifecycle, OllamaModelIdentity, RecognitionMode, RecordingMode,
@@ -29,7 +30,9 @@ use crate::settings::{
 };
 use crate::setup_center::{BenchmarkUnavailable, SetupCenter};
 use crate::tauri_contract::{AppView, LibrarySearchView, ProfileDetailView, SetupView};
+use crate::tauri_investigations::InvestigationTauriState;
 use crate::tauri_meetings::{MeetingTauriState, open_companion};
+use crate::tauri_messaging::MessagingHost;
 use crate::update_center::{UpdateCenter, UpdateView};
 use crate::ui_bridge::{
     DEFAULT_HISTORY_LIMIT, UiBridge, UiCommand, UiCommandOutcome, UiEffect, UiHistoryVariant,
@@ -59,6 +62,9 @@ struct HostState {
     route: Mutex<UiRoute>,
     status: Mutex<UiRuntimeStatus>,
     notice: Mutex<String>,
+    review: Mutex<ReviewPanel>,
+    /// A prompt another window asked the main window to open for editing.
+    prompt_focus: Mutex<Option<i64>>,
     events: Sender<ProductShellEvent>,
 }
 
@@ -66,6 +72,8 @@ struct HostState {
 #[serde(rename_all = "camelCase")]
 struct BootstrapView {
     available: bool,
+    /// Phorminx is already set up: the starter runs again as a repair.
+    repair: bool,
     state: String,
     message: String,
     step: u8,
@@ -90,18 +98,21 @@ struct BootstrapCenter {
 }
 
 impl BootstrapCenter {
-    fn new(status_path: PathBuf, available: bool) -> Self {
+    /// `first_run` is a new installation; otherwise the same starter runs
+    /// as a repair, reinstalling only what is missing.
+    fn new(status_path: PathBuf, first_run: bool) -> Self {
         Self {
             child: None,
             run_id: String::new(),
             status_path,
             view: BootstrapView {
-                available,
+                available: true,
+                repair: !first_run,
                 state: "idle".into(),
-                message: if available {
+                message: if first_run {
                     "Install the recommended local starter in one guided run.".into()
                 } else {
-                    "To run the complete starter setup, open Prepare Phorminx from the Start menu.".into()
+                    "Reinstall anything missing from the starter: speech recognition, GPU acceleration, Ollama and the starter models. Your settings and saved text are kept.".into()
                 },
                 step: 0,
                 total: 6,
@@ -111,7 +122,6 @@ impl BootstrapCenter {
     }
 
     fn start(&mut self) -> Result<(), String> {
-        if !self.view.available { return Err("Open Prepare Phorminx from the Start menu.".into()); }
         if self.child.is_some() { return Err("Starter setup is already running.".into()); }
         let executable = std::env::current_exe().map_err(|_| "Could not locate Phorminx.")?;
         let script = executable.parent().ok_or("Could not locate Phorminx.")?
@@ -195,7 +205,7 @@ impl BootstrapCenter {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_app_snapshot(state: State<'_, HostState>) -> Result<AppView, String> {
     let mut bridge = state
         .bridge
@@ -219,14 +229,14 @@ fn host_app_snapshot(state: State<'_, HostState>) -> Result<AppView, String> {
     Ok(AppView::from(&snapshot))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_input_devices() -> Result<Vec<String>, String> {
     input_devices()
         .map(|devices| devices.into_iter().map(|device| device.name).collect())
         .map_err(|_| "Microphone devices could not be listed.".to_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_history_text(
     id: i64,
     variant: Option<String>,
@@ -247,7 +257,7 @@ fn host_history_text(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_library_search(
     query: String,
     semantic: bool,
@@ -265,7 +275,7 @@ fn host_library_search(
     Ok(generation)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_library_update(state: State<'_, HostState>) -> Result<Option<LibrarySearchView>, String> {
     let library = state.library.lock().map_err(|_| "Search is unavailable.")?;
     Ok(library
@@ -274,7 +284,7 @@ fn host_library_update(state: State<'_, HostState>) -> Result<Option<LibrarySear
         .map(Into::into))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_select_route(route: String, state: State<'_, HostState>) -> Result<(), String> {
     let route = match route.as_str() {
         "home" => UiRoute::Home,
@@ -292,11 +302,12 @@ fn host_select_route(route: String, state: State<'_, HostState>) -> Result<(), S
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_preferences(
     theme: String,
     recording_mode: String,
     launcher_shortcut: String,
+    show_live_text: Option<bool>,
     state: State<'_, HostState>,
 ) -> Result<(), String> {
     let theme = match theme.as_str() {
@@ -321,6 +332,9 @@ fn host_save_preferences(
     candidate.appearance.theme = theme;
     candidate.interaction.recording_mode = recording_mode;
     candidate.interaction.launcher_shortcut = launcher_shortcut;
+    if let Some(show_live_text) = show_live_text {
+        candidate.interaction.show_live_text = show_live_text;
+    }
     let readiness = state
         .readiness
         .lock()
@@ -340,7 +354,7 @@ fn host_save_preferences(
         .map_err(|_| "Settings were saved, but the runtime could not be notified.".to_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_custom_instructions(state: State<'_, HostState>) -> Result<Option<String>, String> {
     Ok(state
         .bridge
@@ -352,7 +366,7 @@ fn host_custom_instructions(state: State<'_, HostState>) -> Result<Option<String
         .clone())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_dictation_settings(
     mode: String,
     backend: String,
@@ -363,6 +377,7 @@ fn host_save_dictation_settings(
     model: Option<String>,
     lifecycle: String,
     custom_instructions: Option<String>,
+    passes: Option<u8>,
     state: State<'_, HostState>,
 ) -> Result<(), String> {
     let mode = match mode.as_str() {
@@ -381,6 +396,7 @@ fn host_save_dictation_settings(
         "light" => FormattingStrength::Light,
         "balanced" => FormattingStrength::Balanced,
         "strong" => FormattingStrength::Strong,
+        "structured" => FormattingStrength::Structured,
         "custom" => FormattingStrength::Custom,
         _ => return Err("Choose a supported formatting strength.".into()),
     };
@@ -413,6 +429,9 @@ fn host_save_dictation_settings(
     candidate.recognition.language = language;
     candidate.recognition.minimum_rms = minimum_rms;
     candidate.formatting.strength = strength;
+    if let Some(passes) = passes {
+        candidate.formatting.passes = passes;
+    }
     candidate.formatting.ollama_lifecycle = lifecycle;
     candidate.formatting.custom_instructions = custom_instructions;
     let selected = model.filter(|model| !model.trim().is_empty());
@@ -449,7 +468,7 @@ fn host_save_dictation_settings(
     state.execute(UiCommand::SaveSettings(candidate))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_privacy_settings(
     retention: String,
     embedding_model: Option<String>,
@@ -576,7 +595,7 @@ fn dispatch_settings_outcome(
         .map_err(|_| "The change was saved, but the runtime could not be notified.".to_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_lexicon(
     id: Option<i64>,
     canonical: String,
@@ -605,12 +624,12 @@ fn host_save_lexicon(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_delete_lexicon(id: i64, state: State<'_, HostState>) -> Result<(), String> {
     state.execute(UiCommand::DeleteLexicon(id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_profile_detail(
     executable: String,
     state: State<'_, HostState>,
@@ -624,7 +643,7 @@ fn host_profile_detail(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_save_profile(
     original_executable: Option<String>,
     executable: String,
@@ -640,6 +659,7 @@ fn host_save_profile(
         "light" => FormattingStyle::Light,
         "balanced" => FormattingStyle::Balanced,
         "strong" => FormattingStyle::Strong,
+        "structured" => FormattingStyle::Structured,
         "custom" => FormattingStyle::Custom,
         _ => return Err("Choose a supported formatting style.".into()),
     };
@@ -660,12 +680,12 @@ fn host_save_profile(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_delete_profile(executable: String, state: State<'_, HostState>) -> Result<(), String> {
     state.execute(UiCommand::DeleteProfile(executable))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_setup_snapshot(
     app: tauri::AppHandle,
     state: State<'_, HostState>,
@@ -707,7 +727,7 @@ fn host_setup_snapshot(
     Ok(view)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_start_setup_action(
     id: String,
     consent_confirmed: bool,
@@ -738,7 +758,7 @@ fn host_start_setup_action(
     center.start(&id).map_err(str::to_owned)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_bootstrap_snapshot(app: tauri::AppHandle, state: State<'_, HostState>) -> Result<BootstrapView, String> {
     let mut bootstrap = state.bootstrap.lock().map_err(|_| "Starter setup is unavailable.")?;
     let completed = bootstrap.poll()?;
@@ -751,9 +771,8 @@ fn host_bootstrap_snapshot(app: tauri::AppHandle, state: State<'_, HostState>) -
     Ok(view)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_start_bootstrap(state: State<'_, HostState>) -> Result<BootstrapView, String> {
-    if !state.bootstrap_allowed { return Err("Open Prepare Phorminx from the Start menu to run the full starter.".into()); }
     let readiness = state.readiness.lock().map_err(|_| "Readiness is unavailable.")?.clone();
     let busy = state.setup.lock().map_err(|_| "Setup is unavailable.")?.as_ref()
         .is_some_and(|center| center.snapshot(&readiness).actions.iter().any(|action| action.running));
@@ -763,14 +782,129 @@ fn host_start_bootstrap(state: State<'_, HostState>) -> Result<BootstrapView, St
     Ok(bootstrap.view.clone())
 }
 
+/// The repair checklist: what each workflow needs and whether it is there.
 #[tauri::command]
+async fn host_repair_status(state: State<'_, HostState>) -> Result<Vec<crate::repair::RepairItem>, String> {
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::repair::check(&store))
+        .await
+        .map_err(|_| "The repair check could not run.".to_owned())
+}
+
+/// Every model Phorminx can use, with its kinds and the features using it.
+#[tauri::command]
+async fn models_registry(state: State<'_, HostState>) -> Result<Vec<crate::model_registry::RegistryEntry>, String> {
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::model_registry::list(&store))
+        .await
+        .map_err(|_| "The model list could not be read.".to_owned())
+}
+
+/// Installs an Ollama model by exact name; `expected` is the kind needed.
+#[tauri::command]
+fn models_pull(name: String, expected: Option<String>) -> Result<crate::model_registry::PullView, String> {
+    crate::model_registry::start_pull(&name, expected.as_deref())
+}
+
+#[tauri::command]
+fn models_pull_status() -> crate::model_registry::PullView {
+    crate::model_registry::pull_status()
+}
+
+/// Stops using a model for one feature; the feature falls back to its
+/// default, and the returned note says what that is.
+#[tauri::command(async)]
+fn models_unassign(slot: String, app: tauri::AppHandle, state: State<'_, HostState>) -> Result<String, String> {
+    match slot.as_str() {
+        "formatting" | "search" => {
+            let mut candidate = state
+                .bridge
+                .lock()
+                .map_err(|_| "Settings are unavailable.")?
+                .settings()
+                .clone();
+            let note = if slot == "formatting" {
+                candidate.formatting.ollama_model = None;
+                candidate.formatting.ollama_model_identity = None;
+                // Only Light formatting works without a local model.
+                if !matches!(candidate.formatting.strength, FormattingStrength::Raw | FormattingStrength::Light) {
+                    candidate.formatting.strength = FormattingStrength::Light;
+                }
+                "Formatting no longer uses a local model; dictation gets Light formatting."
+            } else {
+                candidate.search.embedding_model = None;
+                "Search no longer uses a model; it finds exact words only."
+            };
+            state.execute(UiCommand::SaveSettings(candidate))?;
+            Ok(note.into())
+        }
+        "meetings" | "fallback" | "translation" => {
+            app.state::<MeetingTauriState>().unassign_model(&slot)?;
+            Ok(match slot.as_str() {
+                "meetings" => "The meeting and investigation assistant has no model until you choose one.",
+                "fallback" => "The meeting assistant has no fallback model.",
+                _ => "Live translation is off until you choose a model.",
+            }
+            .into())
+        }
+        _ => Err("That feature has no model to remove.".into()),
+    }
+}
+
+/// "Use for…": points one feature at an installed model of the right kind,
+/// through the same settings and meeting paths as the Settings pages.
+#[tauri::command(async)]
+fn models_assign(
+    slot: String,
+    name: String,
+    app: tauri::AppHandle,
+    state: State<'_, HostState>,
+) -> Result<String, String> {
+    let entries = crate::model_registry::list(&state.store);
+    let entry = crate::model_registry::check_assignable(&entries, &slot, &name)?;
+    let feature = match slot.as_str() {
+        "formatting" | "search" => {
+            let mut candidate = state
+                .bridge
+                .lock()
+                .map_err(|_| "Settings are unavailable.")?
+                .settings()
+                .clone();
+            if slot == "formatting" {
+                candidate.formatting.ollama_model_identity = Some(
+                    OllamaModelIdentity::new(
+                        entry.digest.as_deref().ok_or("The model has no verified digest.")?,
+                        entry.size_bytes.ok_or("The model has no verified size.")?,
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
+                candidate.formatting.ollama_model = Some(entry.name.clone());
+            } else {
+                candidate.search.embedding_model = Some(entry.name.clone());
+            }
+            state.execute(UiCommand::SaveSettings(candidate))?;
+            if slot == "formatting" { "Formatting" } else { "Search" }
+        }
+        other => {
+            app.state::<MeetingTauriState>().assign_model(other, &entry.name)?;
+            match other {
+                "meetings" => "The meeting and investigation assistant",
+                "fallback" => "The meeting fallback",
+                _ => "Live translation",
+            }
+        }
+    };
+    Ok(format!("{feature} now uses {}.", entry.name))
+}
+
+#[tauri::command(async)]
 fn host_cancel_bootstrap(state: State<'_, HostState>) -> Result<BootstrapView, String> {
     let mut bootstrap = state.bootstrap.lock().map_err(|_| "Starter setup is unavailable.")?;
     bootstrap.cancel_after_step()?;
     Ok(bootstrap.view.clone())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_cancel_setup_action(id: String, state: State<'_, HostState>) -> Result<(), String> {
     state
         .setup
@@ -799,7 +933,7 @@ fn update_idle(app: &tauri::AppHandle) -> bool {
     runtime_idle && meeting_idle
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_update_snapshot(app: tauri::AppHandle, state: State<'_, HostState>) -> Result<UpdateView, String> {
     let idle = update_idle(&app);
     let mut updates = state.updates.lock().map_err(|_| "Updates are unavailable.")?;
@@ -807,7 +941,7 @@ fn host_update_snapshot(app: tauri::AppHandle, state: State<'_, HostState>) -> R
     Ok(updates.snapshot())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_update_action(kind: String, enabled: Option<bool>, app: tauri::AppHandle, state: State<'_, HostState>) -> Result<UpdateView, String> {
     let idle = update_idle(&app);
     let mut updates = state.updates.lock().map_err(|_| "Updates are unavailable.")?;
@@ -828,7 +962,7 @@ fn host_update_action(kind: String, enabled: Option<bool>, app: tauri::AppHandle
     Ok(updates.snapshot())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_snapshot(state: State<'_, HostState>) -> Result<HostView, String> {
     Ok(HostView {
         route: format!(
@@ -852,7 +986,7 @@ fn host_snapshot(state: State<'_, HostState>) -> Result<HostView, String> {
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_action(kind: String, state: State<'_, HostState>) -> Result<(), String> {
     let event = match kind.as_str() {
         "test-dictation" => ProductShellEvent::TestDictation,
@@ -880,7 +1014,7 @@ fn host_action(kind: String, state: State<'_, HostState>) -> Result<(), String> 
         .map_err(|_| "The dictation host is unavailable.".into())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_select_whisper_model(
     manifest_id: String,
     state: State<'_, HostState>,
@@ -893,7 +1027,7 @@ fn host_select_whisper_model(
         .map_err(|_| "The model manager is unavailable.".into())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn host_install_vosk(state: State<'_, HostState>) -> Result<(), String> {
     state
         .events
@@ -901,7 +1035,7 @@ fn host_install_vosk(state: State<'_, HostState>) -> Result<(), String> {
         .map_err(|_| "The model manager is unavailable.".into())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn feedback_snapshot(state: State<'_, HostState>) -> Result<FeedbackView, String> {
     let mut feedback = state
         .feedback
@@ -911,20 +1045,187 @@ fn feedback_snapshot(state: State<'_, HostState>) -> Result<FeedbackView, String
     Ok(feedback.snapshot())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn feedback_update(
     text: String,
     diagnostics: bool,
+    comment: Option<bool>,
+    consent: Option<bool>,
+    display_name: Option<String>,
     state: State<'_, HostState>,
 ) -> Result<(), String> {
+    let mut feedback = state
+        .feedback
+        .lock()
+        .map_err(|_| "Feedback is unavailable.")?;
+    feedback.update_draft(text, diagnostics)?;
+    feedback.set_comment(
+        comment.unwrap_or(false),
+        consent.unwrap_or(false),
+        display_name.unwrap_or_default(),
+    )
+}
+
+/// The review window's controls in the feedback window: tidy the draft with
+/// the local formatting model before sending it.
+#[tauri::command(async)]
+fn feedback_reformat(
+    strength: String,
+    instruction: Option<String>,
+    state: State<'_, HostState>,
+) -> Result<(), String> {
+    let strength = match strength.as_str() {
+        "light" => FormattingStrength::Light,
+        "balanced" => FormattingStrength::Balanced,
+        "strong" => FormattingStrength::Strong,
+        "structured" => FormattingStrength::Structured,
+        "custom" => FormattingStrength::Custom,
+        _ => return Err("Choose a supported formatting.".into()),
+    };
+    let settings = state.store.load().map_err(|error| error.to_string())?;
+    let instruction = match instruction.filter(|text| !text.trim().is_empty()) {
+        Some(instruction) => Some(
+            state
+                .bridge
+                .lock()
+                .map_err(|_| "Prompts are unavailable.")?
+                .resolve_instructions(&instruction)
+                .text,
+        ),
+        None => None,
+    };
     state
         .feedback
         .lock()
         .map_err(|_| "Feedback is unavailable.")?
-        .update_draft(text, diagnostics)
+        .start_reformat(strength, instruction.as_deref(), &settings)
+}
+
+fn feedback_database(state: &HostState) -> Result<PathBuf, String> {
+    state
+        .store
+        .path()
+        .parent()
+        .map(|directory| directory.join("phorminx.db"))
+        .ok_or_else(|| "Your feedback history is unavailable.".to_owned())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedbackHistoryItem {
+    id: String,
+    kind: String,
+    sent_at_ms: i64,
+    text: String,
+    status: String,
+    resolution_note: Option<String>,
+    resolved_at_ms: Option<i64>,
+    checked_at_ms: Option<i64>,
+}
+
+/// Reports and comments sent from this computer, newest first.
+#[tauri::command]
+async fn feedback_history(state: State<'_, HostState>) -> Result<Vec<FeedbackHistoryItem>, String> {
+    let database = feedback_database(&state)?;
+    tauri::async_runtime::spawn_blocking(move || crate::feedback_status::history(&database))
+        .await
+        .map_err(|_| "Your feedback history could not be read.".to_owned())?
+        .map(|records| {
+            records
+                .into_iter()
+                .map(|record| FeedbackHistoryItem {
+                    id: record.id,
+                    kind: record.kind,
+                    sent_at_ms: record.sent_at_ms,
+                    text: record.text,
+                    status: record.status,
+                    resolution_note: record.resolution_note,
+                    resolved_at_ms: record.resolved_at_ms,
+                    checked_at_ms: record.checked_at_ms,
+                })
+                .collect()
+        })
+}
+
+/// Asks phorminx.net about every open report now; returns how many were solved.
+#[tauri::command]
+async fn feedback_check_now(app: tauri::AppHandle, state: State<'_, HostState>) -> Result<usize, String> {
+    let database = feedback_database(&state)?;
+    let resolved = tauri::async_runtime::spawn_blocking({
+        let database = database.clone();
+        move || crate::feedback_status::check(&database, true)
+    })
+    .await
+    .map_err(|_| "The status check could not run.".to_owned())??;
+    announce_resolved(&app, &database, &resolved);
+    Ok(resolved.len())
 }
 
 #[tauri::command]
+async fn feedback_forget(id: String, state: State<'_, HostState>) -> Result<(), String> {
+    let database = feedback_database(&state)?;
+    tauri::async_runtime::spawn_blocking(move || crate::feedback_status::forget(&database, &id))
+        .await
+        .map_err(|_| "That item could not be removed.".to_owned())?
+}
+
+#[tauri::command]
+async fn feedback_remove_comment(id: String, state: State<'_, HostState>) -> Result<(), String> {
+    let database = feedback_database(&state)?;
+    tauri::async_runtime::spawn_blocking(move || crate::feedback_status::remove_comment(&database, &id))
+        .await
+        .map_err(|_| "The comment could not be removed.".to_owned())?
+}
+
+/// Tells the user, once per report, that the team solved it.
+fn announce_resolved(app: &tauri::AppHandle, database: &std::path::Path, resolved: &[crate::feedback_status::Resolved]) {
+    for item in resolved {
+        let detail = match &item.note {
+            Some(note) => format!("\"{}\" · {note}", item.preview),
+            None => format!("\"{}\"", item.preview),
+        };
+        show_notice_toast(app, "Your report was resolved", &detail);
+        crate::feedback_status::mark_notified(database, &item.id);
+    }
+}
+
+/// A small, unfocused corner notice that closes itself.
+fn show_notice_toast(app: &tauri::AppHandle, title: &str, detail: &str) {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1;
+    let label = format!("notice-toast-{sequence}");
+    let payload = serde_json::json!({ "title": title, "detail": detail, "error": false });
+    let (width, height) = (380.0, 92.0);
+    let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("tauri-preview/toast.html".into()))
+        .title("Phorminx")
+        .inner_size(width, height)
+        .resizable(false)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focused(false)
+        .initialization_script(format!("window.__PHORMINX_TOAST__ = {payload};"));
+    if let Ok(Some(monitor)) = app.primary_monitor() {
+        let scale = monitor.scale_factor();
+        let area = monitor.work_area();
+        let x = area.position.x as f64 / scale + area.size.width as f64 / scale - width - 18.0;
+        let y = area.position.y as f64 / scale + area.size.height as f64 / scale - height - 18.0;
+        builder = builder.position(x, y);
+    }
+    if builder.build().is_ok() {
+        let handle = app.clone();
+        let _ = thread::Builder::new()
+            .name("phorminx-notice-toast".into())
+            .spawn(move || {
+                thread::sleep(Duration::from_secs(8));
+                if let Some(window) = handle.get_webview_window(&label) {
+                    let _ = window.destroy();
+                }
+            });
+    }
+}
+
+#[tauri::command(async)]
 fn feedback_action(kind: String, state: State<'_, HostState>) -> Result<(), String> {
     let mut feedback = state
         .feedback
@@ -955,6 +1256,29 @@ fn feedback_action(kind: String, state: State<'_, HostState>) -> Result<(), Stri
 #[tauri::command]
 async fn host_open_feedback(app: tauri::AppHandle, state: State<'_, HostState>) -> Result<(), String> {
     present_feedback(&app, &state, false)
+}
+
+/// Published benchmark results: the bundled copy, or a read-only refresh
+/// from the repository when `online` is set.
+#[tauri::command]
+async fn benchmarks_load(online: bool) -> Result<crate::benchmarks::BenchmarkCollection, String> {
+    if !online {
+        return Ok(crate::benchmarks::bundled());
+    }
+    tauri::async_runtime::spawn_blocking(crate::benchmarks::refreshed)
+        .await
+        .map_err(|_| "Benchmarks are unavailable.".to_owned())
+}
+
+/// One archived benchmark report for the report picker.
+#[tauri::command]
+async fn benchmarks_report(
+    id: String,
+    online: bool,
+) -> Result<phorminx_core::benchmark_report::BenchmarkFile, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::benchmarks::report(&id, online))
+        .await
+        .map_err(|_| "Benchmarks are unavailable.".to_owned())?
 }
 
 pub struct TauriShell {
@@ -1057,6 +1381,8 @@ fn run_shell(
 ) -> Result<(), String> {
     let bridge =
         UiBridge::open(store.clone(), &database_path).map_err(|error| error.to_string())?;
+    // Starts the engine only; Tor stays off until the user enables messaging.
+    let messaging = MessagingHost::start(&store, &database_path);
     let library = LibrarySearchWorker::spawn(database_path).ok();
     let initial_readiness = UiReadinessSnapshot::checking(bridge.settings(), &store);
     let setup = SetupCenter::open(store.clone(), Arc::new(BenchmarkUnavailable)).ok();
@@ -1065,6 +1391,7 @@ fn run_shell(
     let bootstrap = BootstrapCenter::new(
         store.resolve_asset_path(std::path::Path::new("setup-status.json")), bootstrap_allowed);
     let meeting = MeetingTauriState::start(store.clone())?;
+    let investigations = InvestigationTauriState::start(store.clone());
     let host = HostState {
         bridge: Mutex::new(bridge),
         store,
@@ -1079,6 +1406,8 @@ fn run_shell(
         route: Mutex::new(initial_route),
         status: Mutex::new(initial_status),
         notice: Mutex::new(String::new()),
+        review: Mutex::new(ReviewPanel::default()),
+        prompt_focus: Mutex::new(None),
         events: events.clone(),
     };
     let stopping = Arc::new(AtomicBool::new(false));
@@ -1089,7 +1418,9 @@ fn run_shell(
     let result = tauri::Builder::default()
         .any_thread()
         .manage(meeting)
+        .manage(investigations)
         .manage(host)
+        .manage(messaging)
         .invoke_handler(tauri::generate_handler![
             crate::tauri_meetings::meeting_snapshot,
             crate::tauri_meetings::meeting_actions,
@@ -1102,6 +1433,28 @@ fn run_shell(
             crate::tauri_meetings::meeting_save_translation,
             crate::tauri_meetings::meeting_save_devices,
             crate::tauri_meetings::meeting_theme,
+            crate::tauri_investigations::investigation_overview,
+            crate::tauri_investigations::investigation_create,
+            crate::tauri_investigations::investigation_rename,
+            crate::tauri_investigations::investigation_delete,
+            crate::tauri_investigations::investigation_set_active,
+            crate::tauri_investigations::investigation_detail,
+            crate::tauri_investigations::investigation_search,
+            crate::tauri_investigations::investigation_add_text,
+            crate::tauri_investigations::investigation_add_image,
+            crate::tauri_investigations::investigation_update_item,
+            crate::tauri_investigations::investigation_delete_item,
+            crate::tauri_investigations::investigation_retry,
+            crate::tauri_investigations::investigation_image,
+            crate::tauri_investigations::investigation_ocr_lines,
+            crate::tauri_investigations::investigation_diagram,
+            crate::tauri_investigations::investigation_save_layout,
+            crate::tauri_investigations::investigation_export,
+            crate::tauri_investigations::investigation_models,
+            crate::tauri_investigations::investigation_capture_shortcut,
+            crate::tauri_investigations::investigation_capture_clipboard,
+            crate::tauri_investigations::investigation_voice,
+            crate::tauri_investigations::investigation_assistant,
             host_snapshot,
             host_app_snapshot,
             host_input_devices,
@@ -1124,6 +1477,12 @@ fn run_shell(
             host_bootstrap_snapshot,
             host_start_bootstrap,
             host_cancel_bootstrap,
+            host_repair_status,
+            models_registry,
+            models_pull,
+            models_pull_status,
+            models_assign,
+            models_unassign,
             host_update_snapshot,
             host_update_action,
             host_action,
@@ -1132,15 +1491,68 @@ fn run_shell(
             feedback_snapshot,
             feedback_update,
             feedback_action,
+            feedback_reformat,
+            feedback_history,
+            feedback_check_now,
+            feedback_forget,
+            feedback_remove_comment,
             host_open_feedback,
+            review_snapshot,
+            review_reformat,
+            review_copy,
+            review_replace,
+            review_close,
+            prompts_list,
+            prompt_versions,
+            prompt_save,
+            prompt_restore,
+            prompt_usages,
+            prompt_delete,
+            prompt_open,
+            prompt_take_focus,
+            crate::tauri_messaging::host_messaging_snapshot,
+            crate::tauri_messaging::host_messaging_enable,
+            crate::tauri_messaging::host_messaging_disable,
+            crate::tauri_messaging::host_messaging_set_name,
+            crate::tauri_messaging::host_messaging_invite,
+            crate::tauri_messaging::host_messaging_redeem,
+            crate::tauri_messaging::host_messaging_conversation,
+            crate::tauri_messaging::host_messaging_send,
+            crate::tauri_messaging::host_messaging_focus,
+            crate::tauri_messaging::host_messaging_contact,
+            crate::tauri_messaging::host_messaging_launcher_key,
+            crate::tauri_messaging::host_messaging_dictate,
+            crate::tauri_messaging::host_messaging_draft,
+            crate::tauri_messaging::host_messaging_draft_action,
+            crate::tauri_messaging::host_messaging_arrival,
+            crate::tauri_messaging::host_messaging_arrival_open,
+            crate::tauri_messaging::host_messaging_arrival_notice,
+            benchmarks_load,
+            benchmarks_report,
         ])
         .setup(move |app| {
+            // Once an hour, ask about open reports not checked for a day.
+            if let Some(database) = app.state::<HostState>().store.path().parent().map(|directory| directory.join("phorminx.db")) {
+                let handle = app.handle().clone();
+                let _ = thread::Builder::new()
+                    .name("phorminx-feedback-status".into())
+                    .spawn(move || loop {
+                        thread::sleep(Duration::from_secs(60));
+                        if let Ok(resolved) = crate::feedback_status::check(&database, false) {
+                            announce_resolved(&handle, &database, &resolved);
+                        }
+                        thread::sleep(Duration::from_secs(59 * 60));
+                    });
+            }
             if !initially_visible {
                 if let Some(window) = app.get_webview_window("main") {
                     window.hide()?;
                 }
             }
             let handle = app.handle().clone();
+            crate::tauri_investigations::install_quick_capture(&handle);
+            app.state::<MessagingHost>()
+                .spawn_draft_listener(handle.clone());
             spawn_readiness_probe(handle.clone(), loaded_whisper, initial_vosk_probe)
                 .map_err(|error| tauri::Error::Anyhow(anyhow::anyhow!(error)))?;
             let stopping = stopping_for_setup.clone();
@@ -1166,6 +1578,10 @@ fn run_shell(
                     {
                         feedback.close_window();
                     }
+                } else if window.label() == REVIEW_WINDOW {
+                    if let Ok(mut review) = window.app_handle().state::<HostState>().review.lock() {
+                        review.close();
+                    }
                 } else {
                     api.prevent_close();
                     let _ = window.hide();
@@ -1175,7 +1591,14 @@ fn run_shell(
                 }
             }
         })
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!())
+        // `Builder::run` ends in tao's `EventLoop::run`, which calls
+        // `process::exit` when the loop stops. That killed the whole process
+        // on Quit, before the runtime could clean up or relaunch after a
+        // settings save. `run_return` hands control back to the caller.
+        .map(|app| {
+            app.run_return(|_, _| {});
+        });
     stopping.store(true, Ordering::Release);
     if let Some(pump) = pump.lock().map_err(|_| "Control slot unavailable.")?.take() {
         let _ = pump.join();
@@ -1289,6 +1712,15 @@ fn control_loop(
                 if let Ok(mut current) = host.status.lock() {
                     *current = status;
                 }
+                crate::tauri_investigations::set_runtime_busy(
+                    &app,
+                    matches!(
+                        status,
+                        UiRuntimeStatus::Listening
+                            | UiRuntimeStatus::Transcribing
+                            | UiRuntimeStatus::Refining
+                    ),
+                );
                 if let Ok(library) = host.library.lock()
                     && let Some(worker) = library.as_ref()
                 {
@@ -1330,6 +1762,38 @@ fn control_loop(
             ProductShellControl::ActivationBlocked(_) => {
                 host.notice("That action is unavailable right now.")
             }
+            ProductShellControl::OpenReview(seed) => {
+                if let Ok(mut review) = host.review.lock() {
+                    review.open(*seed);
+                }
+                if open_review(&app).is_err() {
+                    host.notice("The review panel could not be opened.");
+                }
+            }
+            ProductShellControl::ReviewResult {
+                notice,
+                replaced_text,
+            } => {
+                if let Ok(mut review) = host.review.lock() {
+                    if let Some(text) = replaced_text.as_deref() {
+                        review.replaced(text);
+                    }
+                    review.set_notice(notice);
+                }
+            }
+            ProductShellControl::OpenMessages => {
+                app.state::<MessagingHost>().request_page();
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            }
+            ProductShellControl::MessageContact { contact_id } => {
+                if let Err(error) = app.state::<MessagingHost>().dictate(&app, contact_id) {
+                    host.notice(&error);
+                }
+            }
             ProductShellControl::Quit => {
                 app.exit(0);
                 break;
@@ -1346,6 +1810,301 @@ fn focus_route(app: &tauri::AppHandle, host: &HostState, route: UiRoute) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptView {
+    id: i64,
+    name: String,
+    tags: Vec<String>,
+    body: String,
+    version: i64,
+    updated_at_ms: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptVersionView {
+    version: i64,
+    name: String,
+    body: String,
+    created_at_ms: i64,
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+#[tauri::command(async)]
+fn prompts_list(state: State<'_, HostState>) -> Result<Vec<PromptView>, String> {
+    let prompts = state
+        .bridge
+        .lock()
+        .map_err(|_| "Prompts are unavailable.")?
+        .prompts()
+        .map_err(|error| error.to_string())?;
+    Ok(prompts
+        .into_iter()
+        .map(|prompt| PromptView {
+            id: prompt.id,
+            name: prompt.name,
+            tags: prompt.tags,
+            body: prompt.body,
+            version: prompt.version,
+            updated_at_ms: prompt.updated_at_ms,
+        })
+        .collect())
+}
+
+#[tauri::command(async)]
+fn prompt_versions(id: i64, state: State<'_, HostState>) -> Result<Vec<PromptVersionView>, String> {
+    let versions = state
+        .bridge
+        .lock()
+        .map_err(|_| "Prompts are unavailable.")?
+        .prompt_versions(id)
+        .map_err(|error| error.to_string())?;
+    Ok(versions
+        .into_iter()
+        .map(|version| PromptVersionView {
+            version: version.version,
+            name: version.name,
+            body: version.body,
+            created_at_ms: version.created_at_ms,
+        })
+        .collect())
+}
+
+#[tauri::command(async)]
+fn prompt_save(
+    id: Option<i64>,
+    name: String,
+    tags: Vec<String>,
+    body: String,
+    state: State<'_, HostState>,
+) -> Result<i64, String> {
+    state
+        .bridge
+        .lock()
+        .map_err(|_| "Prompts are unavailable.")?
+        .save_prompt(
+            id,
+            &phorminx_persistence::PromptDraft { name, tags, body },
+            now_ms(),
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(async)]
+fn prompt_restore(id: i64, version: i64, state: State<'_, HostState>) -> Result<(), String> {
+    state
+        .bridge
+        .lock()
+        .map_err(|_| "Prompts are unavailable.")?
+        .restore_prompt(id, version, now_ms())
+        .map_err(|error| error.to_string())
+}
+
+/// Every place that refers to the prompt, so deleting it can warn first.
+#[tauri::command(async)]
+fn prompt_usages(id: i64, state: State<'_, HostState>) -> Result<Vec<String>, String> {
+    let mut bridge = state.bridge.lock().map_err(|_| "Prompts are unavailable.")?;
+    bridge.reload_settings().map_err(|error| error.to_string())?;
+    let mut usages = bridge.prompt_usages(id).map_err(|error| error.to_string())?;
+    let prompt = bridge
+        .prompts()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|prompt| prompt.id == id);
+    drop(bridge);
+    if let Some(prompt) = prompt
+        && let Some(directory) = state.store.path().parent()
+        && let Ok(config) =
+            phorminx_assistant::ConfigStore::new(directory.join("assistant.json")).load()
+    {
+        usages.extend(crate::prompts::assistant_usages(&config, &prompt));
+    }
+    Ok(usages)
+}
+
+#[tauri::command(async)]
+fn prompt_delete(id: i64, state: State<'_, HostState>) -> Result<(), String> {
+    state
+        .bridge
+        .lock()
+        .map_err(|_| "Prompts are unavailable.")?
+        .delete_prompt(id)
+        .map_err(|error| error.to_string())
+}
+
+/// Opens a prompt in the main window's Prompts page, from any window.
+#[tauri::command(async)]
+fn prompt_open(id: i64, app: tauri::AppHandle, state: State<'_, HostState>) -> Result<(), String> {
+    *state.prompt_focus.lock().map_err(|_| "Prompts are unavailable.")? = Some(id);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    Ok(())
+}
+
+#[tauri::command(async)]
+fn prompt_take_focus(state: State<'_, HostState>) -> Result<Option<i64>, String> {
+    Ok(state
+        .prompt_focus
+        .lock()
+        .map_err(|_| "Prompts are unavailable.")?
+        .take())
+}
+
+const REVIEW_WINDOW: &str = "review";
+
+fn open_review(app: &tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(REVIEW_WINDOW) {
+        window.show().map_err(|_| "Review could not be shown.")?;
+        window
+            .set_focus()
+            .map_err(|_| "Review could not be focused.")?;
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(
+        app,
+        REVIEW_WINDOW,
+        WebviewUrl::App("tauri-preview/review.html".into()),
+    )
+    .title("Phorminx · Review")
+    .inner_size(560.0, 460.0)
+    .min_inner_size(400.0, 340.0)
+    .resizable(true)
+    .always_on_top(true)
+    .focused(true)
+    .build()
+    .map_err(|_| "Review could not be opened.")?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewWindowView {
+    revision: u64,
+    text: String,
+    strength: &'static str,
+    can_replace: bool,
+    busy: bool,
+    formatting_note: Option<String>,
+    notice: String,
+}
+
+fn strength_name(strength: FormattingStrength) -> &'static str {
+    match strength {
+        FormattingStrength::Raw => "raw",
+        FormattingStrength::Light => "light",
+        FormattingStrength::Balanced => "balanced",
+        FormattingStrength::Strong => "strong",
+        FormattingStrength::Structured => "structured",
+        FormattingStrength::Custom => "custom",
+    }
+}
+
+#[tauri::command(async)]
+fn review_snapshot(state: State<'_, HostState>) -> Result<ReviewWindowView, String> {
+    let view = state
+        .review
+        .lock()
+        .map_err(|_| "Review is unavailable.")?
+        .snapshot();
+    Ok(ReviewWindowView {
+        revision: view.revision,
+        text: view.text,
+        strength: strength_name(view.strength),
+        can_replace: view.can_replace,
+        busy: view.busy,
+        formatting_note: view.formatting_note,
+        notice: view.notice,
+    })
+}
+
+#[tauri::command(async)]
+fn review_reformat(
+    text: String,
+    strength: String,
+    instruction: Option<String>,
+    state: State<'_, HostState>,
+) -> Result<Option<String>, String> {
+    let strength = match strength.as_str() {
+        "light" => FormattingStrength::Light,
+        "balanced" => FormattingStrength::Balanced,
+        "strong" => FormattingStrength::Strong,
+        "structured" => FormattingStrength::Structured,
+        "custom" => FormattingStrength::Custom,
+        _ => return Err("Choose a supported formatting.".into()),
+    };
+    let settings = state.store.load().map_err(|error| error.to_string())?;
+    let instruction = match instruction {
+        Some(instruction) => Some(
+            state
+                .bridge
+                .lock()
+                .map_err(|_| "Prompts are unavailable.")?
+                .resolve_instructions(&instruction)
+                .text,
+        ),
+        None => None,
+    };
+    state
+        .review
+        .lock()
+        .map_err(|_| "Review is unavailable.")?
+        .start_reformat(
+            &text,
+            strength,
+            instruction.as_deref(),
+            move |profile, text| crate::review::reformat_with_local_model(&settings, profile, text),
+        )?;
+    Ok(None)
+}
+
+#[tauri::command(async)]
+fn review_copy(text: String, state: State<'_, HostState>) -> Result<Option<String>, String> {
+    if text.trim().is_empty() {
+        return Err("There is no text to copy.".into());
+    }
+    phorminx_windows::copy_and_maybe_paste(None, &text)
+        .map_err(|_| "The clipboard is unavailable. Try again.")?;
+    let notice = "Copied. Paste it wherever you need it.".to_owned();
+    if let Ok(mut review) = state.review.lock() {
+        review.set_notice(notice.clone());
+    }
+    Ok(Some(notice))
+}
+
+#[tauri::command(async)]
+fn review_replace(text: String, state: State<'_, HostState>) -> Result<Option<String>, String> {
+    if text.trim().is_empty() {
+        return Err("There is no text to insert.".into());
+    }
+    state
+        .events
+        .send(ProductShellEvent::ReviewReplace(text))
+        .map_err(|_| "Phorminx could not reach the pasted text.")?;
+    Ok(None)
+}
+
+#[tauri::command(async)]
+fn review_close(app: tauri::AppHandle, state: State<'_, HostState>) -> Result<(), String> {
+    if let Ok(mut review) = state.review.lock() {
+        review.close();
+    }
+    if let Some(window) = app.get_webview_window(REVIEW_WINDOW) {
+        let _ = window.destroy();
+    }
+    Ok(())
 }
 
 fn open_feedback(app: &tauri::AppHandle) -> Result<(), String> {

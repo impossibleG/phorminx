@@ -17,7 +17,7 @@ pub use action_payload::{
 };
 pub use config::{AssistantConfig, ConfigStore};
 pub use provider::{ChatMessage, ChatRole, ProviderConfig, ProviderKind, stream_chat};
-pub use secret::{ExposedSecret, ProtectedSecret};
+pub use secret::{ExposedSecret, ProtectedBytes, ProtectedSecret};
 
 use std::net::{Shutdown, TcpStream};
 use std::sync::{

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Dictation</title><link rel="stylesheet" href="style.css">
+<style>
+  .head { position: absolute; left: 96px; top: 84px; width: 1400px; }
+  .flow { position: absolute; left: 96px; right: 96px; top: 330px; display: flex; align-items: flex-start; justify-content: space-between; }
+  .keys { display: flex; gap: 10px; height: 104px; align-items: center; }
+  .modes { position: absolute; left: 96px; right: 96px; bottom: 70px; display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+  .modes .card { display: grid; grid-template-columns: auto 1fr; gap: 6px 22px; align-items: baseline; padding: 26px 34px; }
+  .modes small { grid-column: 1 / -1; }
+  .modes strong { font-size: 34px; font-weight: 500; letter-spacing: -.03em; }
+  .modes span { color: var(--quiet); font-size: 21px; }
+  .modes em { grid-column: 1 / -1; font-style: normal; color: var(--text); font-size: 20px; }
+</style></head>
+<body><div class="canvas">
+  <div class="head">
+    <p class="eyebrow">Dictation</p>
+    <h2>Press, speak, and it is typed where you were.</h2>
+  </div>
+  <div class="flow">
+    <div class="node"><div class="keys"><span class="key">Ctrl</span><span class="key">Alt</span><span class="key">Space</span></div><strong>Open the launcher</strong><span>or a direct dictation shortcut</span></div>
+    <div class="arrow"></div>
+    <div class="node"><div class="icon" data-icon="mic"></div><strong>Speak</strong><span>live text shows in the status pill</span></div>
+    <div class="arrow"></div>
+    <div class="node"><div class="icon" data-icon="chip"></div><strong>Recognized locally</strong><span>transcribed while you talk</span></div>
+    <div class="arrow"></div>
+    <div class="node"><div class="icon" data-icon="sparkle"></div><strong>Formatted</strong><span>optional local Ollama model</span></div>
+    <div class="arrow"></div>
+    <div class="node"><div class="icon" data-icon="cursor"></div><strong>Inserted</strong><span>into the app you are using</span></div>
+  </div>
+  <div class="modes">
+    <div class="card"><small>Instant mode</small><strong>Vosk</strong><span>Fastest. A resident recognizer, ready the moment you speak.</span></div>
+    <div class="card"><small>Accurate mode</small><strong>Whisper</strong><span>Most accurate. Optional Vulkan GPU acceleration.</span></div>
+  </div>
+</div>
+<script src="common.js"></script>
+</body></html>

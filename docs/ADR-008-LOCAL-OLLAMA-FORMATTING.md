@@ -18,3 +18,44 @@ The high-level formatting operation is fail-open for dictation: any cancellation
 - Cancellation latency during a blocked network call is bounded by configured timeouts rather than immediate.
 - Fake loopback HTTP-server tests exercise protocol behavior without internet access or an Ollama installation.
 
+## Amendment (October 2026): formatting that actually reorganizes
+
+Custom formatting rarely changed anything visible. A formatting bench
+(`phorminx-bench format-bench --model <tag> --custom "<instructions>"`) runs
+synthetic dictations through every profile against a local model and prints
+the raw model output, the validator verdict and the inserted text. It showed
+four separate causes:
+
+- The runtime passed every AI result through the spoken-text normalizer,
+  which joins all whitespace into one line. Lists and paragraphs were
+  flattened before insertion. AI output now uses a layout-preserving
+  normalizer (`normalize_formatted`): line breaks, one blank line between
+  paragraphs and list indentation survive.
+- The desktop client allowed 5 seconds overall and 4 seconds for response
+  headers. Generation is not streamed, so headers arrive after the whole
+  answer, and a cold 7B load alone takes about 10 seconds. Formatting
+  requests now allow 45 seconds for headers (60 overall), discovery and
+  identity probes keep the short limits, and the request runs on a helper
+  thread so cancellation is observed while waiting.
+- Plain numbers are compared by value: "12500" may become "$12,500" and "14"
+  may become "14th", but not "12,000" or "fourteen". List markers the model
+  adds, Markdown links and bold around a protected value are not counted as
+  changes. Versions, times, URLs and identifiers still match exactly.
+- The prompt listed protected values as "value (N occurrence(s))" lines and
+  framed the transcript with BEGIN/END markers; small models copied both into
+  the answer. The transcript is now wrapped in `<transcript>` tags, the
+  values are listed inline in the system prompt, output that echoes the
+  scaffolding is rejected as commentary, and the prompt states that the reply
+  must stay in the dictation's language.
+
+A **Structured** profile reorganizes the dictation into Markdown lists,
+headings and short paragraphs. Structured and Custom may restructure, so
+they allow more growth (4x + 1 KiB). Bench results on one machine:
+qwen2.5:7b-instruct formatted 30/30 cases (23/30 before, with generous
+timeouts); qwen2.5:1.5b passed validation but returned plain prose for
+Structured and Custom, so the Models page recommends a 7B-class model for
+those profiles.
+
+When formatting falls back, the reason is stored with the dictation
+(`ollama_fallback:*`) and shown as a short note in the status pill, in
+History and in the review panel.

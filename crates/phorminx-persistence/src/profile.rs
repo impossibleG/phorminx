@@ -32,6 +32,7 @@ pub enum FormattingStyle {
     Light,
     Balanced,
     Strong,
+    Structured,
     Custom,
 }
 
@@ -42,6 +43,7 @@ impl FormattingStyle {
             Self::Light => "light",
             Self::Balanced => "balanced",
             Self::Strong => "strong",
+            Self::Structured => "structured",
             Self::Custom => "custom",
         }
     }
@@ -52,6 +54,7 @@ impl FormattingStyle {
             "light" => Ok(Self::Light),
             "balanced" => Ok(Self::Balanced),
             "strong" => Ok(Self::Strong),
+            "structured" => Ok(Self::Structured),
             "custom" => Ok(Self::Custom),
             _ => Err(invalid_enum("formatting_style")),
         }

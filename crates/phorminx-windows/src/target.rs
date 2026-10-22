@@ -31,6 +31,11 @@ impl TargetSnapshot {
         unsafe { capture_target() }
     }
 
+    /// The focused control captured at activation, as raw handle bits.
+    pub(crate) fn focus_bits(self) -> usize {
+        self.focus
+    }
+
     pub(crate) fn is_current(self) -> bool {
         Self::capture() == Some(self)
     }

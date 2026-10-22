@@ -694,15 +694,14 @@ fn stable_instant_prefix(
         )
     } else if terminal.text.trim().is_empty() {
         (cutoff, String::new())
-    } else if let Some(first) = terminal.words.first() {
+    } else {
+        // Never acknowledge text that Vosk did not timestamp. The capture
+        // still owns it, and the replacement recognizer will read it again.
+        let first = terminal.words.first()?;
         (
             cutoff.min(origin.saturating_add(first.start_sample)),
             String::new(),
         )
-    } else {
-        // Never acknowledge text that Vosk did not timestamp. The capture
-        // still owns it, and the replacement recognizer will read it again.
-        return None;
     };
     (through > origin && through <= cutoff).then_some((through, text))
 }

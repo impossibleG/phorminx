@@ -569,6 +569,7 @@ impl UiProfileItem {
             FormattingStyle::Light => "Light",
             FormattingStyle::Balanced => "Balanced",
             FormattingStyle::Strong => "Strong",
+            FormattingStyle::Structured => "Structured",
             FormattingStyle::Custom => "Custom",
         };
         let language = self.language.as_deref().unwrap_or("Default language");
@@ -645,6 +646,9 @@ pub enum UiEffect {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UiMutation {
     SettingsSaved,
+    /// Formatting changed but recognition did not: the runtime swaps its
+    /// formatting in place instead of restarting the process.
+    FormattingSaved,
     /// Input-only changes are applied without reloading recognition models.
     ShortcutsSaved,
     /// Search, appearance and startup changes do not alter the speech pipeline.
@@ -813,6 +817,97 @@ impl UiBridge {
         Ok(())
     }
 
+    pub fn prompts(&self) -> Result<Vec<phorminx_persistence::Prompt>, UiBridgeError> {
+        self.persistence.prompts().list().map_err(prompt_error)
+    }
+
+    pub fn prompt_versions(
+        &self,
+        id: i64,
+    ) -> Result<Vec<phorminx_persistence::PromptVersion>, UiBridgeError> {
+        self.persistence
+            .prompts()
+            .versions(id)
+            .map_err(prompt_error)
+    }
+
+    /// Creates a prompt (`id` is `None`) or saves its next version.
+    pub fn save_prompt(
+        &self,
+        id: Option<i64>,
+        draft: &phorminx_persistence::PromptDraft,
+        now_ms: i64,
+    ) -> Result<i64, UiBridgeError> {
+        let prompts = self.persistence.prompts();
+        match id {
+            None => prompts.create(draft, now_ms).map_err(prompt_error),
+            Some(id) => match prompts.save(id, draft, now_ms).map_err(prompt_error)? {
+                true => Ok(id),
+                false => Err(UiBridgeError::not_found("prompt")),
+            },
+        }
+    }
+
+    pub fn restore_prompt(&self, id: i64, version: i64, now_ms: i64) -> Result<(), UiBridgeError> {
+        match self
+            .persistence
+            .prompts()
+            .restore(id, version, now_ms)
+            .map_err(prompt_error)?
+        {
+            true => Ok(()),
+            false => Err(UiBridgeError::not_found("prompt_version")),
+        }
+    }
+
+    pub fn delete_prompt(&self, id: i64) -> Result<(), UiBridgeError> {
+        self.persistence
+            .prompts()
+            .delete(id)
+            .map(|_| ())
+            .map_err(prompt_error)
+    }
+
+    /// Where a prompt is referenced among the instructions this bridge owns:
+    /// dictation formatting and application profiles. Meeting and Action
+    /// instructions live in the assistant configuration; see
+    /// [`crate::prompts::assistant_usages`].
+    pub fn prompt_usages(&self, id: i64) -> Result<Vec<String>, UiBridgeError> {
+        let Some(prompt) = self.persistence.prompts().get(id).map_err(prompt_error)? else {
+            return Ok(Vec::new());
+        };
+        let mut usages = Vec::new();
+        if self
+            .settings
+            .formatting
+            .custom_instructions
+            .as_deref()
+            .is_some_and(|text| crate::prompts::refers_to(text, &prompt))
+        {
+            usages.push("Dictation custom formatting".to_owned());
+        }
+        for profile in self
+            .persistence
+            .app_profiles()
+            .list()
+            .map_err(UiBridgeError::persistence)?
+        {
+            if profile
+                .custom_instructions
+                .as_deref()
+                .is_some_and(|text| crate::prompts::refers_to(text, &prompt))
+            {
+                usages.push(format!("Profile for {}", profile.executable.as_str()));
+            }
+        }
+        Ok(usages)
+    }
+
+    /// Instructions with every prompt reference replaced by its latest text.
+    pub fn resolve_instructions(&self, text: &str) -> crate::prompts::Resolved {
+        crate::prompts::resolve_with(&self.persistence, text)
+    }
+
     pub fn history_text(
         &self,
         id: i64,
@@ -977,13 +1072,12 @@ impl UiBridge {
                 effects: Vec::new(),
             });
         }
-        // Speech level and preferences unrelated to the recognizer can change
-        // without a model reload. Retention is committed to the local database
-        // below; neither edit needs a speech model or an Ollama probe.
-        let mut recognition_without_speech_level = candidate.recognition.clone();
-        recognition_without_speech_level.minimum_rms = self.settings.recognition.minimum_rms;
+        // Speech level, microphone and preferences unrelated to the recognizer
+        // can change without a model reload. Retention is committed to the
+        // local database below; none of these needs a speech model or an
+        // Ollama probe.
         if candidate != self.settings
-            && recognition_without_speech_level == self.settings.recognition
+            && same_recognizer(&candidate, &self.settings)
             && candidate.formatting == self.settings.formatting
         {
             let mutation = if candidate.interaction != self.settings.interaction {
@@ -1010,84 +1104,91 @@ impl UiBridge {
         {
             return self.commit_settings(candidate, now_ms, UiMutation::SearchSaved);
         }
-        match candidate.recognition.mode {
-            crate::settings::RecognitionMode::Accurate => {
-                let resolved_model = self
-                    .store
-                    .resolve_model_path(&candidate.recognition.model_path);
-                if !resolved_model.is_file() {
-                    return Err(UiBridgeError::validation(
-                        "model_path",
-                        "Select an existing Whisper model file.",
-                    ));
-                }
-                let verified_variant = identify_pinned_model(&resolved_model).map_err(|_| {
-                    UiBridgeError::validation(
-                        "model_path",
-                        "The Whisper model could not be verified.",
-                    )
-                })?;
-                if candidate.recognition.accurate_model != AccurateModelVariant::Custom {
-                    model_for_variant(candidate.recognition.accurate_model).map_err(|_| {
-                        UiBridgeError::validation(
-                            "model_path",
-                            "The pinned Whisper model is unavailable.",
-                        )
-                    })?;
-                    if verified_variant != Some(candidate.recognition.accurate_model) {
+        // The recognizer in use was verified when it was saved and is verified
+        // again when the runtime loads it. Re-verifying it here would load the
+        // Vosk model or hash the Whisper file on every save, which takes from
+        // half a second to many seconds on a cold disk.
+        if !same_recognizer(&candidate, &self.settings) {
+            match candidate.recognition.mode {
+                crate::settings::RecognitionMode::Accurate => {
+                    let resolved_model = self
+                        .store
+                        .resolve_model_path(&candidate.recognition.model_path);
+                    if !resolved_model.is_file() {
                         return Err(UiBridgeError::validation(
                             "model_path",
-                            "Download and verify the selected pinned Whisper model before switching.",
+                            "Select an existing Whisper model file.",
                         ));
                     }
-                }
-                if verified_variant.is_some_and(|variant| {
-                    !variant.supports_language(&candidate.recognition.language)
-                }) {
-                    return Err(UiBridgeError::validation(
-                        "language",
-                        "Select a multilingual Whisper model for this language.",
-                    ));
-                }
-            }
-            crate::settings::RecognitionMode::Instant => {
-                let runtime = self
-                    .store
-                    .resolve_asset_path(&candidate.recognition.instant_runtime_path);
-                let model = self
-                    .store
-                    .resolve_asset_path(&candidate.recognition.instant_model_path);
-                match phorminx_vosk::inspect(&runtime, &model, &candidate.recognition.language) {
-                    phorminx_vosk::Readiness::Ready { .. } => {}
-                    phorminx_vosk::Readiness::MissingRuntime { .. } => {
-                        return Err(UiBridgeError::validation(
-                            "instant_runtime_path",
-                            "Select a local Vosk runtime bundle containing libvosk.dll.",
-                        ));
+                    let verified_variant =
+                        identify_pinned_model(&resolved_model).map_err(|_| {
+                            UiBridgeError::validation(
+                                "model_path",
+                                "The Whisper model could not be verified.",
+                            )
+                        })?;
+                    if candidate.recognition.accurate_model != AccurateModelVariant::Custom {
+                        model_for_variant(candidate.recognition.accurate_model).map_err(|_| {
+                            UiBridgeError::validation(
+                                "model_path",
+                                "The pinned Whisper model is unavailable.",
+                            )
+                        })?;
+                        if verified_variant != Some(candidate.recognition.accurate_model) {
+                            return Err(UiBridgeError::validation(
+                                "model_path",
+                                "Download and verify the selected pinned Whisper model before switching.",
+                            ));
+                        }
                     }
-                    phorminx_vosk::Readiness::MissingModel { .. } => {
-                        return Err(UiBridgeError::validation(
-                            "instant_model_path",
-                            "Select an unpacked local Vosk model directory.",
-                        ));
-                    }
-                    phorminx_vosk::Readiness::UnsupportedLanguage { .. } => {
+                    if verified_variant.is_some_and(|variant| {
+                        !variant.supports_language(&candidate.recognition.language)
+                    }) {
                         return Err(UiBridgeError::validation(
                             "language",
-                            "Instant mode currently supports en and pt-br.",
+                            "Select a multilingual Whisper model for this language.",
                         ));
                     }
-                    phorminx_vosk::Readiness::IncompatibleModelLanguage { .. } => {
-                        return Err(UiBridgeError::validation(
-                            "instant_model_path",
-                            "Choose a Vosk model whose official directory name matches the selected language.",
-                        ));
-                    }
-                    phorminx_vosk::Readiness::LoadFailed { .. } => {
-                        return Err(UiBridgeError::validation(
-                            "instant_runtime_path",
-                            "The selected Vosk runtime could not be loaded.",
-                        ));
+                }
+                crate::settings::RecognitionMode::Instant => {
+                    let runtime = self
+                        .store
+                        .resolve_asset_path(&candidate.recognition.instant_runtime_path);
+                    let model = self
+                        .store
+                        .resolve_asset_path(&candidate.recognition.instant_model_path);
+                    match phorminx_vosk::inspect(&runtime, &model, &candidate.recognition.language) {
+                        phorminx_vosk::Readiness::Ready { .. } => {}
+                        phorminx_vosk::Readiness::MissingRuntime { .. } => {
+                            return Err(UiBridgeError::validation(
+                                "instant_runtime_path",
+                                "Select a local Vosk runtime bundle containing libvosk.dll.",
+                            ));
+                        }
+                        phorminx_vosk::Readiness::MissingModel { .. } => {
+                            return Err(UiBridgeError::validation(
+                                "instant_model_path",
+                                "Select an unpacked local Vosk model directory.",
+                            ));
+                        }
+                        phorminx_vosk::Readiness::UnsupportedLanguage { .. } => {
+                            return Err(UiBridgeError::validation(
+                                "language",
+                                "Instant mode currently supports en and pt-br.",
+                            ));
+                        }
+                        phorminx_vosk::Readiness::IncompatibleModelLanguage { .. } => {
+                            return Err(UiBridgeError::validation(
+                                "instant_model_path",
+                                "Choose a Vosk model whose official directory name matches the selected language.",
+                            ));
+                        }
+                        phorminx_vosk::Readiness::LoadFailed { .. } => {
+                            return Err(UiBridgeError::validation(
+                                "instant_runtime_path",
+                                "The selected Vosk runtime could not be loaded.",
+                            ));
+                        }
                     }
                 }
             }
@@ -1166,7 +1267,12 @@ impl UiBridge {
             });
         }
 
-        self.commit_settings(candidate, now_ms, UiMutation::SettingsSaved)
+        let mutation = if same_recognizer(&candidate, &self.settings) {
+            UiMutation::FormattingSaved
+        } else {
+            UiMutation::SettingsSaved
+        };
+        self.commit_settings(candidate, now_ms, mutation)
     }
 
     fn commit_settings(
@@ -1203,10 +1309,31 @@ impl UiBridge {
     }
 }
 
+/// True when both settings load the same speech recognizer. Speech level and
+/// microphone are read per dictation, so they never need a model reload.
+fn same_recognizer(candidate: &Settings, current: &Settings) -> bool {
+    let mut recognition = candidate.recognition.clone();
+    recognition.minimum_rms = current.recognition.minimum_rms;
+    recognition.microphone = current.recognition.microphone.clone();
+    recognition == current.recognition
+}
+
+fn prompt_error(error: phorminx_persistence::PersistenceError) -> UiBridgeError {
+    match error {
+        phorminx_persistence::PersistenceError::Validation { field, reason } => {
+            UiBridgeError::validation(field, reason)
+        }
+        other => UiBridgeError::persistence(other),
+    }
+}
+
 fn requires_ollama(strength: FormattingStrength) -> bool {
     matches!(
         strength,
-        FormattingStrength::Balanced | FormattingStrength::Strong | FormattingStrength::Custom
+        FormattingStrength::Balanced
+            | FormattingStrength::Strong
+            | FormattingStrength::Structured
+            | FormattingStrength::Custom
     )
 }
 
@@ -1885,6 +2012,34 @@ mod tests {
     }
 
     #[test]
+    fn formatting_saves_never_reload_the_unchanged_recognizer() {
+        // Regression: every save loaded the Vosk model (or hashed the Whisper
+        // file) on the window thread, which hung the app on a cold disk.
+        // Missing assets prove the unchanged recognizer is not touched.
+        let mut test = TestBridge::new();
+        let mut instant = test.bridge.settings().clone();
+        instant.recognition.mode = crate::settings::RecognitionMode::Instant;
+        test.bridge.store.save(&instant).unwrap();
+        test.bridge.reload_settings().unwrap();
+        let readiness = test.readiness();
+
+        let mut candidate = test.bridge.settings().clone();
+        candidate.formatting.passes = 3;
+        test.bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+            .unwrap();
+        assert_eq!(test.bridge.store.load().unwrap().formatting.passes, 3);
+
+        let mut changed = test.bridge.settings().clone();
+        changed.recognition.language = "pt-br".into();
+        assert!(matches!(
+            test.bridge
+                .execute(UiCommand::SaveSettings(changed), &readiness, 11),
+            Err(error) if error.to_string().contains("Vosk runtime")
+        ));
+    }
+
+    #[test]
     fn inactive_custom_instructions_persist_when_recognition_is_unavailable() {
         let mut test = TestBridge::new();
         fs::remove_file(&test.bridge.settings().recognition.model_path).unwrap();
@@ -2054,6 +2209,66 @@ mod tests {
     }
 
     #[test]
+    fn formatting_changes_apply_live_and_recognizer_changes_restart() {
+        let mut test = TestBridge::new();
+        let readiness = test.readiness();
+
+        let mut candidate = test.bridge.settings().clone();
+        candidate.formatting.strength = FormattingStrength::Strong;
+        candidate.formatting.ollama_model = Some("qwen2.5:3b".to_owned());
+        let outcome = test
+            .bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+            .unwrap();
+        assert_eq!(outcome.mutation, UiMutation::FormattingSaved);
+        assert_eq!(outcome.effects, [UiEffect::ReloadRuntime]);
+
+        let mut candidate = test.bridge.settings().clone();
+        candidate.formatting.strength = FormattingStrength::Custom;
+        candidate.formatting.custom_instructions = Some("Use bullet points.".to_owned());
+        let outcome = test
+            .bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 11)
+            .unwrap();
+        assert_eq!(outcome.mutation, UiMutation::FormattingSaved);
+
+        // Formatting combined with a recognizer change still needs the model
+        // reload that only a restart provides.
+        let mut candidate = test.bridge.settings().clone();
+        candidate.formatting.strength = FormattingStrength::Light;
+        candidate.recognition.language = "pt-br".to_owned();
+        let outcome = test
+            .bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 12)
+            .unwrap();
+        assert_eq!(outcome.mutation, UiMutation::SettingsSaved);
+    }
+
+    #[test]
+    fn microphone_change_is_live_without_model_readiness() {
+        let mut test = TestBridge::new();
+        fs::remove_file(&test.bridge.settings().recognition.model_path).unwrap();
+        let readiness = UiReadinessSnapshot::checking(test.bridge.settings(), &test.bridge.store);
+        let mut candidate = test.bridge.settings().clone();
+        candidate.recognition.microphone = Some("USB headset".to_owned());
+        let outcome = test
+            .bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+            .unwrap();
+        assert_eq!(outcome.mutation, UiMutation::SearchSaved);
+        assert_eq!(
+            test.bridge
+                .store
+                .load()
+                .unwrap()
+                .recognition
+                .microphone
+                .as_deref(),
+            Some("USB headset")
+        );
+    }
+
+    #[test]
     fn disabling_history_clears_existing_records() {
         let mut test = TestBridge::new();
         test.bridge
@@ -2154,6 +2369,94 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.field, Some("executable"));
         assert_eq!(test.bridge.persistence.lexicon().list().unwrap(), []);
+    }
+
+    #[test]
+    fn prompt_references_save_verbatim_in_every_instruction_field_and_resolve() {
+        let mut test = TestBridge::new();
+        let readiness = test.readiness();
+        let draft = |name: &str, body: &str| phorminx_persistence::PromptDraft {
+            name: name.into(),
+            tags: Vec::new(),
+            body: body.into(),
+        };
+        let lists = test
+            .bridge
+            .save_prompt(None, &draft("Lists", "Use bullets."), 1)
+            .unwrap();
+        let text = "Keep names. @[Lists] @[Gone]";
+
+        // Dictation custom instructions.
+        let mut candidate = test.bridge.settings().clone();
+        candidate.formatting.custom_instructions = Some(text.into());
+        test.bridge
+            .execute(UiCommand::SaveSettings(candidate), &readiness, 10)
+            .unwrap();
+        let saved = test.bridge.store.load().unwrap();
+        assert_eq!(saved.formatting.custom_instructions.as_deref(), Some(text));
+
+        // An application profile.
+        test.bridge
+            .execute(
+                UiCommand::SaveProfile(UiProfileDraft {
+                    original_executable: None,
+                    executable: "code.exe".to_owned(),
+                    formatting_style: FormattingStyle::Custom,
+                    custom_instructions: Some(text.into()),
+                    language: None,
+                    insertion_preference: InsertionPreference::Automatic,
+                    deny: false,
+                }),
+                &readiness,
+                11,
+            )
+            .unwrap();
+        let profiles = test.bridge.persistence.app_profiles().list().unwrap();
+        assert_eq!(profiles[0].custom_instructions.as_deref(), Some(text));
+
+        // Meeting instructions and an Action, which live in assistant.json.
+        let mut config = phorminx_assistant::AssistantConfig {
+            preset: text.into(),
+            ..Default::default()
+        };
+        config.actions.push(phorminx_assistant::ActionConfig {
+            id: "notes".into(),
+            name: "Notes".into(),
+            endpoint: "http://127.0.0.1:9/notes".into(),
+            payload_prompt: text.into(),
+            ..Default::default()
+        });
+        let store = phorminx_assistant::ConfigStore::new(test.root.join("assistant.json"));
+        store.save(&config).unwrap();
+        let config = store.load().unwrap();
+
+        let resolved = test.bridge.resolve_instructions(text);
+        assert_eq!(resolved.text, "Keep names. Use bullets.");
+        assert_eq!(resolved.missing, ["Gone"]);
+        for stored in [&config.preset, &config.actions[0].payload_prompt] {
+            assert_eq!(test.bridge.resolve_instructions(stored), resolved);
+        }
+        assert_eq!(
+            test.bridge.prompt_usages(lists).unwrap(),
+            ["Dictation custom formatting", "Profile for code.exe"]
+        );
+        let prompt = test.bridge.prompts().unwrap().remove(0);
+        assert_eq!(
+            crate::prompts::assistant_usages(&config, &prompt),
+            [
+                "Meeting assistant instructions",
+                "Action \u{201c}Notes\u{201d}"
+            ]
+        );
+
+        // Editing the prompt changes every field from the next use on.
+        test.bridge
+            .save_prompt(Some(lists), &draft("Lists", "Use numbered steps."), 2)
+            .unwrap();
+        assert_eq!(
+            test.bridge.resolve_instructions(text).text,
+            "Keep names. Use numbered steps."
+        );
     }
 
     #[test]

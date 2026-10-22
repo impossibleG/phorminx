@@ -1,0 +1,16 @@
+/* Same tokens as the main window; follows the app theme, not just the OS. */
+:root{--bg:#101416;--surface:#171b1e;--line:#394046;--fg:#e8e5dd;--muted:#a8adb0;--faint:#858c90;--accent:#c69767;--on-accent:#0e1113}
+:root[data-theme="light"]{--bg:#f4f1eb;--surface:#f7f5f0;--line:#a5a39d;--fg:#202326;--muted:#555b60;--faint:#6b7075;--accent:#815026;--on-accent:#fff}
+html,body{background:var(--bg);color:var(--fg)}
+.review{display:flex;flex-direction:column;gap:12px;height:100%;padding:20px 22px}
+.review header small{font-size:9px;letter-spacing:.12em;color:var(--accent)}
+.review h1{font-size:19px;font-weight:500;margin:6px 0 0}
+#review-status{margin:0;font-size:12px;color:var(--muted);min-height:16px}
+#review-text{flex:1;min-height:80px;resize:none;width:100%;border:1px solid var(--line);border-radius:4px;background:var(--surface);color:var(--fg);padding:10px 11px;font:13px/1.5 "Segoe UI",Arial,sans-serif}
+#review-text:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.review footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:auto}
+.review footer span{font-size:10px;color:var(--faint)}
+.review footer div{display:flex;gap:8px}
+.review button{background:var(--surface);color:var(--fg);border-color:var(--line)}
+.review button:hover{border-color:var(--accent)}
+.review .primary{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}

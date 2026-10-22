@@ -47,7 +47,23 @@ mod transport_tests;
 enum Command {
     Event(Box<WorkspaceEvent>),
     Action(Box<ActionConfig>),
+    Message(MessageCapture),
     Shutdown,
+}
+/// A dictated message for a messaging contact. Recording reuses the action
+/// capture path; instead of an HTTP delivery, the transcript is handed back
+/// for the user to review before anything is sent.
+pub struct MessageCapture {
+    pub contact_id: i64,
+    pub contact_name: String,
+    pub drafts: mpsc::Sender<MessageDraft>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MessageDraft {
+    Recording { contact_id: i64 },
+    Ready { contact_id: i64, text: String },
+    Empty { contact_id: i64 },
+    Failed { contact_id: i64, message: String },
 }
 enum JobEvent {
     Delta(u64, String),
@@ -56,59 +72,148 @@ enum JobEvent {
     Delivered(Result<(), String>),
 }
 pub struct MeetingWorkspace {
-    commands: mpsc::SyncSender<Command>,
+    store: SettingsStore,
+    worker: Mutex<Worker>,
     snapshot: Arc<Mutex<WorkspaceSnapshot>>,
-    thread: Option<thread::JoinHandle<()>>,
+    /// Why the last worker stopped, for the message shown instead of "busy".
+    failure: Arc<Mutex<Option<String>>>,
+    lifecycle: Option<crate::lifecycle::LifecycleLog>,
 }
+struct Worker {
+    commands: mpsc::SyncSender<Command>,
+    thread: Option<thread::JoinHandle<()>>,
+    restarts: VecDeque<Instant>,
+}
+/// How long a command may wait for room in a full queue before giving up.
+const QUEUE_PATIENCE: Duration = Duration::from_millis(1_500);
+/// A worker that keeps failing is not restarted more often than this.
+const MAX_RESTARTS: usize = 3;
+const RESTART_WINDOW: Duration = Duration::from_secs(300);
 impl MeetingWorkspace {
     pub fn start(store: SettingsStore) -> Result<Self, String> {
-        let (commands, rx) = mpsc::sync_channel(32);
         let snapshot = Arc::new(Mutex::new(WorkspaceSnapshot::default()));
-        let shared = Arc::clone(&snapshot);
-        let thread = thread::Builder::new()
-            .name("phorminx-meeting-workspace".into())
-            .spawn(move || match Host::new(store) {
-                Ok(mut host) => host.run(rx, shared),
-                Err(message) => {
-                    if let Ok(mut snapshot) = shared.lock() {
-                        snapshot.notice = message;
-                        snapshot.revision = 1;
-                    }
-                }
-            })
-            .map_err(|_| "The meeting workspace could not start.".to_owned())?;
+        let failure = Arc::new(Mutex::new(None));
+        let lifecycle = crate::lifecycle::LifecycleLog::for_settings(store.path());
+        let worker = spawn_worker(store.clone(), Arc::clone(&snapshot), Arc::clone(&failure))?;
         Ok(Self {
-            commands,
+            store,
+            worker: Mutex::new(worker),
             snapshot,
-            thread: Some(thread),
+            failure,
+            lifecycle,
         })
     }
     pub fn send(&self, event: WorkspaceEvent) -> Result<(), String> {
-        self.commands
-            .try_send(Command::Event(Box::new(event)))
-            .map_err(|_| "The workspace is busy. Please try again.".into())
+        self.dispatch(Command::Event(Box::new(event)))
     }
     pub fn trigger_saved_action(&self, action: ActionConfig) -> Result<(), String> {
-        self.commands
-            .try_send(Command::Action(Box::new(action)))
-            .map_err(|_| "The workspace is busy. Please try again.".into())
+        self.dispatch(Command::Action(Box::new(action)))
+    }
+    /// Starts dictating a message for a contact, or stops the recording when
+    /// it is already capturing for that contact.
+    pub fn capture_message(&self, capture: MessageCapture) -> Result<(), String> {
+        self.dispatch(Command::Message(capture))
+    }
+    /// Hands `command` to the worker. A full queue is waited out briefly; a
+    /// worker that stopped (it could not open its storage, or crashed) is
+    /// restarted and the reason logged, so callers never see a vague "busy".
+    fn dispatch(&self, mut command: Command) -> Result<(), String> {
+        let mut worker = self
+            .worker
+            .lock()
+            .map_err(|_| "Meetings is unavailable. Restart Phorminx.")?;
+        let started = Instant::now();
+        loop {
+            match worker.commands.try_send(command) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Full(back)) => {
+                    if started.elapsed() >= QUEUE_PATIENCE {
+                        self.log("event=meeting_worker_queue_full");
+                        return Err(
+                            "Meetings is still finishing earlier work. Try again in a moment."
+                                .into(),
+                        );
+                    }
+                    command = back;
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(mpsc::TrySendError::Disconnected(back)) => {
+                    command = back;
+                    self.restart(&mut worker)?;
+                }
+            }
+        }
+    }
+    fn restart(&self, worker: &mut Worker) -> Result<(), String> {
+        let panicked = worker
+            .thread
+            .take()
+            .is_some_and(|thread| thread.join().is_err());
+        let reason = self
+            .failure
+            .lock()
+            .ok()
+            .and_then(|mut failure| failure.take())
+            .unwrap_or_else(|| {
+                if panicked {
+                    "an internal error".into()
+                } else {
+                    "it stopped unexpectedly".into()
+                }
+            });
+        self.log(&format!("event=meeting_worker_stopped reason={reason:?}"));
+        let now = Instant::now();
+        worker
+            .restarts
+            .retain(|at| now.duration_since(*at) < RESTART_WINDOW);
+        if worker.restarts.len() >= MAX_RESTARTS {
+            return Err(format!(
+                "Meetings could not start: {reason}. Restart Phorminx, and send feedback if this keeps happening."
+            ));
+        }
+        // A panic may have poisoned the shared snapshot; the next worker owns it.
+        self.snapshot.clear_poison();
+        let mut restarts = std::mem::take(&mut worker.restarts);
+        restarts.push_back(now);
+        *worker = spawn_worker(
+            self.store.clone(),
+            Arc::clone(&self.snapshot),
+            Arc::clone(&self.failure),
+        )?;
+        worker.restarts = restarts;
+        self.log("event=meeting_worker_restarted");
+        Ok(())
+    }
+    fn log(&self, event: &str) {
+        eprintln!("{event}");
+        if let Some(log) = &self.lifecycle {
+            log.record(event);
+        }
     }
     pub fn request_shutdown(&self) -> Result<(), String> {
-        if self
+        let worker = self
+            .worker
+            .lock()
+            .map_err(|_| "Waiting for the meeting workspace to accept shutdown.")?;
+        if worker
             .thread
             .as_ref()
             .is_none_or(|thread| thread.is_finished())
         {
             return Ok(());
         }
-        self.commands
+        worker
+            .commands
             .try_send(Command::Shutdown)
             .map_err(|_| "Waiting for the meeting workspace to accept shutdown.".into())
     }
     pub fn is_finished(&self) -> bool {
-        self.thread
-            .as_ref()
-            .is_none_or(|thread| thread.is_finished())
+        self.worker.lock().map_or(true, |worker| {
+            worker
+                .thread
+                .as_ref()
+                .is_none_or(|thread| thread.is_finished())
+        })
     }
     pub fn snapshot_after(&self, revision: u64) -> Option<WorkspaceSnapshot> {
         self.snapshot
@@ -118,13 +223,61 @@ impl MeetingWorkspace {
             .map(|s| s.clone())
     }
 }
+/// Starts the coordinator thread. A startup failure or a panic is recorded in
+/// `failure` and the snapshot notice before the thread ends.
+fn spawn_worker(
+    store: SettingsStore,
+    snapshot: Arc<Mutex<WorkspaceSnapshot>>,
+    failure: Arc<Mutex<Option<String>>>,
+) -> Result<Worker, String> {
+    let (commands, rx) = mpsc::sync_channel(32);
+    let thread = thread::Builder::new()
+        .name("phorminx-meeting-workspace".into())
+        .spawn(move || {
+            let note = |message: String| {
+                if let Ok(mut failure) = failure.lock() {
+                    *failure = Some(message.clone());
+                }
+                let mut shared = snapshot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                shared.notice = message;
+                shared.revision = shared.revision.saturating_add(1);
+            };
+            match Host::new(store) {
+                Ok(mut host) => {
+                    let shared = Arc::clone(&snapshot);
+                    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        host.run(rx, shared)
+                    }));
+                    if let Err(panic) = run {
+                        let detail = panic
+                            .downcast_ref::<&str>()
+                            .map(|text| (*text).to_owned())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown".into());
+                        note(format!("an internal error ({detail})"));
+                    }
+                }
+                Err(message) => note(message),
+            }
+        })
+        .map_err(|_| "The meeting workspace could not start.".to_owned())?;
+    Ok(Worker {
+        commands,
+        thread: Some(thread),
+        restarts: VecDeque::new(),
+    })
+}
 impl Drop for MeetingWorkspace {
     fn drop(&mut self) {
         // Product window close only hides it. Actual application shutdown drains the
         // explicitly stopped audio tail before allowing the process to exit.
-        let _ = self.commands.send(Command::Shutdown);
-        if let Some(worker) = self.thread.take() {
-            let _ = worker.join();
+        if let Ok(worker) = self.worker.get_mut() {
+            let _ = worker.commands.send(Command::Shutdown);
+            if let Some(thread) = worker.thread.take() {
+                let _ = thread.join();
+            }
         }
     }
 }
@@ -201,6 +354,7 @@ struct Host {
     cutoff_question: Option<String>,
     cutoff_request: Option<u64>,
     action_capture: Option<ActionConfig>,
+    message_capture: Option<(i64, mpsc::Sender<MessageDraft>)>,
     memory: Option<crate::meeting_memory::MeetingMemoryWorker>,
     search_generation: u64,
     last_memory_poll: Instant,
@@ -229,7 +383,9 @@ impl Host {
             .parent()
             .ok_or("Settings directory unavailable.")?;
         let config_store = ConfigStore::new(directory.join("assistant.json"));
-        let config = config_store.load().map_err(|e| e.to_string())?;
+        let config = config_store
+            .load()
+            .map_err(|e| format!("the meeting assistant settings could not be read ({e})"))?;
         let db = Persistence::open_with_busy_timeout(
             directory.join("phorminx.db"),
             Duration::from_millis(50),
@@ -264,6 +420,7 @@ impl Host {
             cutoff_question: None,
             cutoff_request: None,
             action_capture: None,
+            message_capture: None,
             memory: None,
             search_generation: 0,
             last_memory_poll: Instant::now() - Duration::from_secs(2),
@@ -308,9 +465,20 @@ impl Host {
                             self.view.notice = message;
                         }
                     }
+                    Ok(Command::Message(capture)) => {
+                        let (contact_id, drafts) = (capture.contact_id, capture.drafts.clone());
+                        if let Err(message) = self.trigger_message(capture) {
+                            let _ = drafts.send(MessageDraft::Failed {
+                                contact_id,
+                                message: message.clone(),
+                            });
+                            self.view.notice = message;
+                        }
+                    }
                     Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                         shutting_down = true;
                         self.action_capture = None;
+                        self.message_capture = None;
                         self.view.capture_action = None;
                         if let Some(memory) = &self.memory {
                             memory.set_paused(true);
@@ -680,6 +848,7 @@ impl Host {
             }
             WorkspaceEvent::CancelActionCapture => {
                 self.action_capture = None;
+                self.message_capture = None;
                 self.view.notice = "Action cancelled. Nothing will be sent.".into();
                 if self.note_capture
                     && let Some(audio) = &self.audio
@@ -802,6 +971,7 @@ impl Host {
         self.cutoff_question = None;
         self.cutoff_request = None;
         self.action_capture = None;
+        self.message_capture = None;
         self.view.capture_action = None;
         self.view.transcript_offset = 0;
         self.view.total_segments = 0;
@@ -1012,11 +1182,15 @@ impl Host {
                     }
                     self.view.note_text.push_str(text.trim());
                 }
-                self.view.transcript.push(MeetingLine {
-                    start_sample,
-                    end_sample,
-                    text,
-                });
+                // Silence still owns its samples in the saved ledger, but it is
+                // not a line anyone can read.
+                if !text.trim().is_empty() {
+                    self.view.transcript.push(MeetingLine {
+                        start_sample,
+                        end_sample,
+                        text,
+                    });
+                }
                 if self.view.transcript.len() > VISIBLE_SEGMENTS {
                     self.view.transcript.remove(0);
                 }
@@ -1065,6 +1239,14 @@ impl Host {
                         self.deliver_config(action, text)?;
                     }
                 }
+                if let Some((contact_id, drafts)) = self.message_capture.take() {
+                    let text = self.view.note_text.trim().to_string();
+                    let _ = drafts.send(if text.is_empty() {
+                        MessageDraft::Empty { contact_id }
+                    } else {
+                        MessageDraft::Ready { contact_id, text }
+                    });
+                }
             }
             MeetingAudioEvent::Error { message } => {
                 if !self.view.ai_busy {
@@ -1075,6 +1257,12 @@ impl Host {
                 self.view.auto_commentary_notice =
                     "Automatic commentary stopped because recording ended.".into();
                 self.action_capture = None;
+                if let Some((contact_id, drafts)) = self.message_capture.take() {
+                    let _ = drafts.send(MessageDraft::Failed {
+                        contact_id,
+                        message: message.clone(),
+                    });
+                }
                 if let Some(request) = self.cutoff_request.take() {
                     self.view.chat_error_id = request;
                 }
@@ -1128,6 +1316,34 @@ impl Host {
         self.action_capture = Some(action);
         self.view.notice =
             "Recording your action. Stop to send, or Cancel to discard this attempt.".into();
+        Ok(())
+    }
+    fn trigger_message(&mut self, capture: MessageCapture) -> Result<(), String> {
+        if self
+            .message_capture
+            .as_ref()
+            .is_some_and(|(id, _)| *id == capture.contact_id)
+        {
+            if let Some(audio) = &self.audio {
+                audio.stop()?;
+                self.view.capture = CaptureState::Stopping;
+            }
+            return Ok(());
+        }
+        if self.audio.is_some() || self.view.delivery_busy {
+            return Err("Finish the current recording or action before starting another.".into());
+        }
+        let title = format!("Message to {}", capture.contact_name);
+        self.start_capture(CaptureSource::Microphone, None, title, true)?;
+        self.view.capture_action = Some(format!("Message to {}", capture.contact_name));
+        self.view.capture_action_endpoint = String::new();
+        let _ = capture.drafts.send(MessageDraft::Recording {
+            contact_id: capture.contact_id,
+        });
+        self.message_capture = Some((capture.contact_id, capture.drafts));
+        self.view.notice =
+            "Recording your message. Stop to review it before sending, or Cancel to discard."
+                .into();
         Ok(())
     }
     fn invalidate_meeting_memory(&mut self) {
@@ -1291,7 +1507,7 @@ impl Host {
             return Err("Automatic commentary paused because this transcript portion exceeds the local context budget. It remains available for a manual question.".into());
         }
         self.cancel_answer();
-        let (mut messages, omitted) = build_context(&self.config.preset, &self.view.messages);
+        let (mut messages, omitted) = build_context(&self.resolved_preset(), &self.view.messages);
         messages.push(ChatMessage {
             role: ChatRole::User,
             content: question_content(AUTO_COMMENTARY_PROMPT, &context),
@@ -1453,7 +1669,7 @@ impl Host {
             .ok_or("There is no submitted message to retry.")?;
         self.preflight_message(&latest.text)?;
         self.cancel_answer();
-        let (messages, omitted) = build_context(&self.config.preset, &self.view.messages);
+        let (messages, omitted) = build_context(&self.resolved_preset(), &self.view.messages);
         let generation = self.runs.begin().ok_or("Answer generation exhausted.")?;
         self.view.messages.push(ChatLine {
             role: "Assistant".into(),
@@ -1701,7 +1917,7 @@ impl Host {
             context_text: context,
             context_samples: context_start.zip(cutoff),
         });
-        let (messages, omitted) = build_context(&self.config.preset, &self.view.messages);
+        let (messages, omitted) = build_context(&self.resolved_preset(), &self.view.messages);
         let generation = self.runs.begin().ok_or("Answer generation exhausted.")?;
         self.view.messages.push(ChatLine {
             role: "Assistant".into(),
@@ -2323,6 +2539,11 @@ impl Host {
         self.view.notice = "Action saved. Nothing has been sent.".into();
         Ok(())
     }
+    /// Meeting instructions with prompt references replaced by the latest
+    /// prompt text.
+    fn resolved_preset(&self) -> String {
+        crate::prompts::resolve_with(&self.db, &self.config.preset).text
+    }
     fn deliver(&mut self, id: String, text: String) -> Result<(), String> {
         if self.delivery_cancel.is_some() {
             return Err("A delivery is already in progress.".into());
@@ -2336,11 +2557,12 @@ impl Host {
             .ok_or("Select a saved action.")?;
         self.deliver_config(action, text)
     }
-    fn deliver_config(&mut self, action: ActionConfig, text: String) -> Result<(), String> {
+    fn deliver_config(&mut self, mut action: ActionConfig, text: String) -> Result<(), String> {
         if self.delivery_cancel.is_some() {
             return Err("A delivery is already in progress.".into());
         }
         action.validate().map_err(|e| e.to_string())?;
+        action.payload_prompt = crate::prompts::resolve_with(&self.db, &action.payload_prompt).text;
         if text.trim().is_empty() {
             return Err("Write or dictate a note before sending.".into());
         }

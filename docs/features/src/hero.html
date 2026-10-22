@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Hero</title><link rel="stylesheet" href="style.css">
+<style>
+  .copy { position: absolute; left: 96px; top: 150px; width: 600px; }
+  .copy h1 { font-size: 84px; }
+  .field { left: 760px; top: 70px; width: 900px; height: 660px; }
+  .frame { position: absolute; overflow: hidden; border: 1px solid #2a2f32; box-shadow: 0 40px 80px rgba(12, 15, 17, .38); }
+  :root[data-theme="light"] .frame { border-color: #d1cec5; box-shadow: 0 40px 80px rgba(12, 15, 17, .22); }
+  .frame img { display: block; }
+  .main { left: 700px; top: 96px; width: 800px; height: 380px; }
+  .main img { width: 1160px; margin: -520px 0 0 -20px; }
+  .companion { left: 1000px; top: 330px; width: 540px; height: 410px; }
+  .companion img { width: 820px; margin-left: -6px; }
+</style></head>
+<body><div class="canvas">
+  <div class="copy">
+    <p class="eyebrow">Phorminx · Voice, disciplined.</p>
+    <h1>Your voice, written and translated on your own PC.</h1>
+    <p class="sub">Dictate into any app, transcribe both sides of a meeting with live translation, and ask an assistant what was said. Recognition runs locally.</p>
+  </div>
+  <div class="field"></div>
+  <div class="frame main"><img data-themed src="crops/home-dark.png" alt=""></div>
+  <div class="frame companion"><img data-themed src="crops/companion-dark.png" alt=""></div>
+</div>
+<script src="common.js"></script>
+<script>
+  for (const img of document.querySelectorAll('img[data-themed]')) img.src = img.src.replace('-dark.', `-${document.documentElement.dataset.theme}.`);
+</script>
+</body></html>
