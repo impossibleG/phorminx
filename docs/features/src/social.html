@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Social preview</title><link rel="stylesheet" href="style.css">
+<style>
+  /* 1280x640 for GitHub; ?size=web gives 1200x630 for phorminx.net. Text stays
+     in the left half so a centred crop to ~1200x630 keeps it whole. */
+  body, .canvas { width: var(--w); height: var(--h); }
+  .canvas { background: var(--limestone); color: var(--ink); }
+  .brand { position: absolute; left: 72px; top: 64px; display: flex; align-items: center; gap: 18px; font-size: 21px; font-weight: 650; letter-spacing: .2em; }
+  .brand img { width: 46px; height: 46px; }
+  h1 { position: absolute; left: 72px; top: 150px; width: 560px; font-size: 66px; font-weight: 450; line-height: .98; letter-spacing: -.05em; }
+  .chips { position: absolute; left: 72px; top: 400px; width: 560px; display: flex; flex-wrap: wrap; gap: 10px; }
+  .chips span { padding: 9px 15px; border: 1.5px solid #cbc7bd; background: #faf8f2; font-size: 18px; font-weight: 600; color: #3a3d40; }
+  .chips span::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 10px; background: var(--bronze); transform: translateY(-2px); }
+  .foot { position: absolute; left: 72px; bottom: 58px; color: var(--bronze); font-size: 18px; font-weight: 650; letter-spacing: .16em; }
+  .field { left: calc(var(--w) - 600px); top: 60px; width: 640px; height: calc(var(--h) - 100px); }
+  .frame { position: absolute; overflow: hidden; border: 1px solid #2a2f32; box-shadow: 0 30px 60px rgba(12, 15, 17, .28); }
+  .frame img { display: block; }
+  .main { left: calc(var(--w) - 600px); top: 110px; width: 640px; height: 330px; }
+  .main img { width: 960px; margin: -430px 0 0 -10px; }
+  .companion { left: calc(var(--w) - 470px); top: 300px; width: 460px; height: 340px; }
+  .companion img { width: 700px; margin-left: -4px; }
+</style></head>
+<body><div class="canvas">
+  <div class="field"></div>
+  <div class="frame main"><img src="crops/home-dark.png" alt=""></div>
+  <div class="frame companion"><img src="crops/companion-dark.png" alt=""></div>
+  <div class="brand"><img src="../../../design/brand/png/app/phorminx-app-256.png" alt="">PHORMINX</div>
+  <h1>Your voice, written and translated on your own PC.</h1>
+  <div class="chips"><span>Dictation</span><span>Live translation</span><span>Meeting assistant</span><span>Investigations</span></div>
+  <p class="foot">FREE AND OPEN SOURCE FOR WINDOWS</p>
+</div>
+<script src="common.js"></script>
+<script>
+  const web = new URLSearchParams(location.search).get('size') === 'web';
+  document.documentElement.style.setProperty('--w', web ? '1200px' : '1280px');
+  document.documentElement.style.setProperty('--h', web ? '630px' : '640px');
+</script>
+</body></html>

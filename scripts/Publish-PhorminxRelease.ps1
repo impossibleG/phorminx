@@ -8,7 +8,11 @@ param(
     [Parameter(Mandatory)] [string] $PrivateKeyPath,
     [string] $InstallerDirectory,
     [string] $ReleaseTool,
+    # Defaults to docs/releases/v<Version>.md, which phorminx.net also reads.
     [string] $NotesFile,
+    # Use GitHub's generated pull request list instead of a notes file.
+    # Explicit only: the website changelog still needs the notes file.
+    [switch] $GenerateNotes,
     # Without -Publish the GitHub Release stays a draft for review.
     [switch] $Publish
 )
@@ -26,6 +30,14 @@ if ([string]::IsNullOrWhiteSpace($ReleaseTool)) {
 }
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "Publish only stable versions such as 0.2.0; the updater ignores pre-releases."
+}
+if (-not $GenerateNotes) {
+    if ([string]::IsNullOrWhiteSpace($NotesFile)) {
+        $NotesFile = Join-Path $repositoryRoot "docs\releases\v$Version.md"
+    }
+    if (-not (Test-Path -LiteralPath $NotesFile -PathType Leaf)) {
+        throw "Release notes not found: $NotesFile. Write docs/releases/v$Version.md (see docs/releases/README.md) and merge it before publishing, or pass -GenerateNotes."
+    }
 }
 foreach ($required in @($PrivateKeyPath, $ReleaseTool)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
@@ -80,7 +92,7 @@ $arguments = @(
     "--title", "Phorminx $Version",
     "--latest"
 )
-if ([string]::IsNullOrWhiteSpace($NotesFile)) {
+if ($GenerateNotes) {
     $arguments += @("--generate-notes")
 } else {
     $arguments += @("--notes-file", $NotesFile)
