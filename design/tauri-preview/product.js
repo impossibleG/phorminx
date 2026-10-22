@@ -55,7 +55,8 @@ function showRoute(route, persist = true) {
   window.phorminxMessages?.routeChanged(route);
   // Prompts, Investigations, Messages and Benchmarks are pages of this window
   // only; the host keeps the last other route.
-  if (persist && hostInvoke && !['prompts', 'investigations', 'messages', 'benchmarks'].includes(route)) {
+  if (route === 'feedback') void refreshFeedbackHistory();
+  if (persist && hostInvoke && !['prompts', 'investigations', 'messages', 'benchmarks', 'feedback'].includes(route)) {
     const hostRoute = ['live', 'saved', 'meeting-settings'].includes(route) ? 'meetings' : route === 'action-editor' ? 'actions' : route === 'lexicon-editor' ? 'lexicon' : route === 'profile-editor' ? 'profiles' : route;
     lastHostRoute = hostRoute;
     void hostInvoke('plugin:phorminx-host|host_select_route', {route: hostRoute}).catch((error) => { node('status').textContent = String(error); });
@@ -1070,3 +1071,60 @@ if (window.PhorminxModels) {
   renderModelFilters();
   void PhorminxModels.refresh();
 }
+
+// Feedback: reports and comments sent from this computer, with their status.
+const FEEDBACK_STATES = {open: 'Open', solved: '✓ Solved', shared: 'Shared · waiting for the team or shown', removed: 'Taken down'};
+
+function renderFeedbackHistory(items) {
+  const rows = items.map((item) => {
+    const row = makeElement('div', `record-row feedback-row feedback-${item.status}`);
+    row.setAttribute('role', 'listitem');
+    const head = makeElement('div', 'feedback-head');
+    const sent = new Date(item.sentAtMs).toLocaleString(undefined, {dateStyle: 'medium', timeStyle: 'short'});
+    head.append(makeElement('small', '', `${item.kind === 'comment' ? 'COMMENT' : 'REPORT'} · ${sent}`), makeElement('span', 'feedback-state', FEEDBACK_STATES[item.status] || item.status));
+    const text = makeElement('p', 'feedback-text', item.text);
+    row.append(head, text);
+    if (item.resolutionNote) row.append(makeElement('p', 'feedback-note', `From the team: ${item.resolutionNote}`));
+    const actions = makeElement('div', 'feedback-actions');
+    if (item.kind === 'comment' && item.status === 'shared') {
+      const remove = makeElement('button', '', 'Take down from website');
+      remove.type = 'button';
+      remove.addEventListener('click', async () => {
+        if (!window.confirm('Remove this comment from phorminx.net for good?')) return;
+        try { await hostInvoke('feedback_remove_comment', {id: item.id}); void refreshFeedbackHistory(); }
+        catch (error) { node('feedback-status').textContent = String(error); }
+      });
+      actions.append(remove);
+    }
+    const forget = makeElement('button', '', 'Remove from this list');
+    forget.type = 'button';
+    forget.addEventListener('click', async () => {
+      try { await hostInvoke('feedback_forget', {id: item.id}); void refreshFeedbackHistory(); }
+      catch (error) { node('feedback-status').textContent = String(error); }
+    });
+    actions.append(forget);
+    row.append(actions);
+    return row;
+  });
+  if (!rows.length) rows.push(makeElement('div', 'record-row', 'Nothing sent yet. Use “New report or comment” to tell the team what happened, or what you like.'));
+  node('feedback-list').replaceChildren(...rows);
+}
+
+async function refreshFeedbackHistory() {
+  if (!hostInvoke) return;
+  try {
+    const items = await hostInvoke('feedback_history');
+    renderFeedbackHistory(items);
+    const solved = items.filter((item) => item.status === 'solved').length;
+    node('feedback-status').textContent = solved ? `${solved} solved` : '';
+  } catch (error) { node('feedback-status').textContent = String(error); }
+}
+
+node('feedback-check').addEventListener('click', async () => {
+  node('feedback-status').textContent = 'Checking with phorminx.net…';
+  try {
+    const solved = await hostInvoke('feedback_check_now');
+    await refreshFeedbackHistory();
+    node('feedback-status').textContent = solved ? `${solved} newly solved.` : 'Up to date.';
+  } catch (error) { node('feedback-status').textContent = String(error); }
+});
