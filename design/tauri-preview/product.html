@@ -11,6 +11,7 @@
   <link rel="stylesheet" href="benchmarks.css">
   <script src="markdown.js" defer></script>
   <script src="benchmarks.js" defer></script>
+  <script src="model-picker.js" defer></script>
   <script src="preview.js" defer></script>
   <script src="instruction-field.js" defer></script>
   <script src="product.js" defer></script>
@@ -108,9 +109,10 @@
         </section>
         <section id="models" class="page" hidden>
           <div class="page-head"><div><small>LOCAL COMPUTE</small><h1>Models</h1></div></div>
+          <div class="setting-card model-registry"><small>ALL MODELS</small><h2>Find a model</h2><p class="setting-hint">Installed models and suggestions, tagged by what they can do and which features use them. Model fields elsewhere only offer models of the right kind.</p><input id="model-search" type="search" placeholder="Search models, kinds or features" aria-label="Search models"><div id="model-filters" class="model-filters" role="group" aria-label="Show"></div><div id="model-registry" class="model-registry-list" role="list"></div><form id="model-install-form" class="model-install"><label for="model-install-name">Install from Ollama by exact name</label><div class="model-install-row"><input id="model-install-name" placeholder="for example qwen2.5:7b" autocomplete="off" spellcheck="false"><button type="submit">Install</button></div><p class="setting-hint">Browse more models on <a href="https://ollama.com/search" target="_blank" rel="noreferrer">ollama.com/search</a>, then install one here by its exact name. Phorminx checks what kind of model it is once it is installed.</p><p id="model-install-status" role="status"></p></form></div>
           <div class="model-grid"><div class="setting-card"><small>SPEECH / ACCURATE</small><h2>Whisper</h2><p id="selected-whisper">Checking selection…</p><div class="model-choices"><button type="button" data-whisper-model="whisper-tiny-en-f16">Tiny · English</button><button type="button" data-whisper-model="whisper-base-en-f16">Base · English</button><button type="button" data-whisper-model="whisper-tiny-multilingual-f16">Tiny · Multilingual</button><button type="button" data-whisper-model="whisper-base-multilingual-f16">Base · Multilingual</button></div></div><div class="setting-card"><small>SPEECH / INSTANT</small><h2>Vosk</h2><p id="vosk-state">Checking assets…</p><button id="install-vosk" type="button">Install verified assets</button></div></div>
           <div class="setting-card inv-ocr-card" data-ocr-card><small>SCREENSHOTS / TEXT</small><h2>Screenshot text recognition</h2><p data-ocr-message>Checking local text models…</p><div class="inv-ocr-progress" hidden><span></span></div><div class="inv-ocr-actions"><button type="button" class="primary" data-ocr-install>Download verified models</button><button type="button" data-ocr-remove hidden>Remove</button></div><p class="inv-ocr-fineprint">PaddleOCR PP-OCRv4 detection and PP-OCRv5 Latin recognition (English, Spanish and 30 more), Apache-2.0, run on this computer. Pinned files are verified by SHA-256 before use.</p></div>
-          <div class="setting-card model-ollama"><small>LOCAL LANGUAGE MODELS</small><h2>Ollama</h2><p class="setting-hint">Structured and Custom formatting reorganize what you said, which needs a 7B-class model such as qwen2.5:7b-instruct. Smaller models are fast for Light, Balanced and Strong but tend to ignore restructuring instructions.</p><div id="ollama-models"></div></div>
+          <div class="setting-card model-ollama"><small>LOCAL LANGUAGE MODELS</small><h2>Ollama</h2><p class="setting-hint">Structured and Custom formatting reorganize what you said, which needs a 7B-class model such as qwen2.5:7b-instruct. Smaller models are fast for Light, Balanced and Strong but tend to ignore restructuring instructions.</p></div>
           <p id="model-result" role="status"></p>
         </section>
         <section id="benchmarks" class="page" hidden>

@@ -791,6 +791,26 @@ async fn host_repair_status(state: State<'_, HostState>) -> Result<Vec<crate::re
         .map_err(|_| "The repair check could not run.".to_owned())
 }
 
+/// Every model Phorminx can use, with its kinds and the features using it.
+#[tauri::command]
+async fn models_registry(state: State<'_, HostState>) -> Result<Vec<crate::model_registry::RegistryEntry>, String> {
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::model_registry::list(&store))
+        .await
+        .map_err(|_| "The model list could not be read.".to_owned())
+}
+
+/// Installs an Ollama model by exact name; `expected` is the kind needed.
+#[tauri::command]
+fn models_pull(name: String, expected: Option<String>) -> Result<crate::model_registry::PullView, String> {
+    crate::model_registry::start_pull(&name, expected.as_deref())
+}
+
+#[tauri::command]
+fn models_pull_status() -> crate::model_registry::PullView {
+    crate::model_registry::pull_status()
+}
+
 #[tauri::command(async)]
 fn host_cancel_bootstrap(state: State<'_, HostState>) -> Result<BootstrapView, String> {
     let mut bootstrap = state.bootstrap.lock().map_err(|_| "Starter setup is unavailable.")?;
@@ -1205,6 +1225,9 @@ fn run_shell(
             host_start_bootstrap,
             host_cancel_bootstrap,
             host_repair_status,
+            models_registry,
+            models_pull,
+            models_pull_status,
             host_update_snapshot,
             host_update_action,
             host_action,
