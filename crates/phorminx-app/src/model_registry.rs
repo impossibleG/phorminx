@@ -44,6 +44,10 @@ pub struct RegistryEntry {
     pub used_by: Vec<String>,
     /// A short reason to pick it, for curated models.
     pub note: String,
+    /// Installed Ollama manifest digest.
+    pub digest: Option<String>,
+    /// The exact build the published benchmarks measured, when there is one.
+    pub benchmarked_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -86,6 +90,75 @@ const CURATED: &[(&str, &[&str], &str)] = &[
         "Search across history and meetings; the starter model.",
     ),
 ];
+
+/// The builds the published benchmarks measured: name, manifest digest, bytes.
+/// Installing one of these names reports whether Ollama delivered the same
+/// build or a newer one.
+pub const BENCHMARKED: &[(&str, &str, u64)] = &[
+    (
+        "qwen2.5:7b",
+        "845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e",
+        4_683_087_332,
+    ),
+    (
+        "gemma3:4b",
+        "a2af6cc3eb7fa8be8504abaf9b04e88f17a119ec3f04a3addf55f92841195f5a",
+        3_338_801_804,
+    ),
+    (
+        "qwen2.5:1.5b",
+        "65ec06548149b04c096a120e4a6da9d4017ea809c91734ea5631e89f96ddc57b",
+        986_061_892,
+    ),
+    (
+        "nomic-embed-text:latest",
+        "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
+        274_302_450,
+    ),
+];
+
+fn benchmarked_digest(name: &str) -> Option<String> {
+    BENCHMARKED
+        .iter()
+        .find(|(pinned, _, _)| same_model(pinned, name))
+        .map(|(_, digest, _)| (*digest).to_owned())
+}
+
+/// The kind of model a feature slot needs.
+pub fn slot_kind(slot: &str) -> Option<&'static str> {
+    match slot {
+        "formatting" | "meetings" | "fallback" | "translation" => Some(LANGUAGE),
+        "search" => Some(EMBEDDING),
+        _ => None,
+    }
+}
+
+/// The installed entry for `name` when it can serve `slot`, or why not.
+pub fn check_assignable(
+    entries: &[RegistryEntry],
+    slot: &str,
+    name: &str,
+) -> Result<RegistryEntry, String> {
+    let kind = slot_kind(slot).ok_or("Choose a feature to use this model for.")?;
+    let entry = entries
+        .iter()
+        .find(|entry| entry.family == "ollama" && same_model(&entry.name, name))
+        .ok_or_else(|| format!("{name} is not available. Download it first."))?;
+    if !entry.installed {
+        return Err(format!("{name} is not installed yet. Download it first."));
+    }
+    if !entry.tags.contains(&kind) {
+        let wanted = if kind == EMBEDDING {
+            "search (embedding)"
+        } else {
+            kind
+        };
+        return Err(format!(
+            "{name} is not a {wanted} model, so it cannot be used there."
+        ));
+    }
+    Ok(entry.clone())
+}
 
 /// `name` and `name:latest` are the same Ollama model.
 pub fn same_model(left: &str, right: &str) -> bool {
@@ -260,6 +333,8 @@ pub fn list(store: &SettingsStore) -> Vec<RegistryEntry> {
                 installed: true,
                 size_bytes: model.size,
                 note: String::new(),
+                benchmarked_digest: benchmarked_digest(model.name.as_str()),
+                digest: model.digest.clone(),
             });
         }
     }
@@ -278,6 +353,8 @@ pub fn list(store: &SettingsStore) -> Vec<RegistryEntry> {
             size_bytes: None,
             used_by: used_by(&uses, name, "ollama"),
             note: (*note).to_owned(),
+            digest: None,
+            benchmarked_digest: benchmarked_digest(name),
         });
     }
 
@@ -298,6 +375,8 @@ pub fn list(store: &SettingsStore) -> Vec<RegistryEntry> {
             ),
             name: spec.file_name,
             family: "whisper",
+            digest: None,
+            benchmarked_digest: None,
             tags: vec![SPEECH],
         });
     }
@@ -309,6 +388,8 @@ pub fn list(store: &SettingsStore) -> Vec<RegistryEntry> {
         entries.push(RegistryEntry {
             name: choice.directory.to_owned(),
             family: "vosk",
+            digest: None,
+            benchmarked_digest: None,
             tags: vec![SPEECH],
             installed: selected || models.join(choice.directory).is_dir(),
             size_bytes: Some(choice.bytes),
@@ -320,6 +401,8 @@ pub fn list(store: &SettingsStore) -> Vec<RegistryEntry> {
     entries.push(RegistryEntry {
         name: "PaddleOCR latin".into(),
         family: "ocr",
+        digest: None,
+        benchmarked_digest: None,
         tags: vec![OCR],
         installed: ocr_installed,
         size_bytes: Some(crate::investigation_ocr::total_download_bytes()),
@@ -415,7 +498,11 @@ pub fn start_pull(name: &str, expected: Option<&str>) -> Result<PullView, String
                     (Some(found), Some(expected)) if !kinds_from_capabilities(&found).contains(&expected.as_str()) => {
                         format!("{name} is installed, but it is not a {expected} model, so it will not appear where a {expected} model is needed.")
                     }
-                    _ => format!("{name} is installed."),
+                    _ => match (benchmarked_digest(&name), installed_digest(&name)) {
+                        (Some(pinned), Some(found)) if pinned == found => format!("{name} is installed: the same build the benchmarks measured."),
+                        (Some(_), Some(_)) => format!("{name} is installed. It is a newer build than the one the benchmarks measured."),
+                        _ => format!("{name} is installed."),
+                    },
                 },
             };
             set_pull(|view| {
@@ -426,6 +513,26 @@ pub fn start_pull(name: &str, expected: Option<&str>) -> Result<PullView, String
         })
         .map_err(|_| "Installing could not start.".to_owned())?;
     Ok(pull_status())
+}
+
+fn installed_digest(name: &str) -> Option<String> {
+    OllamaClient::new(
+        OllamaEndpoint::default(),
+        ClientTimeouts {
+            connect: Duration::from_millis(500),
+            response_headers: Duration::from_secs(3),
+            response_body: Duration::from_secs(3),
+            overall: Duration::from_secs(4),
+        },
+    )
+    .ok()?
+    .discover(&CancellationToken::new())
+    .ok()?
+    .models()
+    .iter()
+    .find(|model| same_model(model.name.as_str(), name))?
+    .digest
+    .clone()
 }
 
 /// Ollama's pull, streamed for progress.
@@ -479,6 +586,68 @@ fn pull(name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use phorminx_assistant::ActionConfig;
+
+    fn ollama(name: &str, tags: &[&'static str], installed: bool) -> RegistryEntry {
+        RegistryEntry {
+            name: name.into(),
+            family: "ollama",
+            tags: tags.to_vec(),
+            installed,
+            size_bytes: Some(1),
+            used_by: Vec::new(),
+            note: String::new(),
+            digest: Some("d".into()),
+            benchmarked_digest: benchmarked_digest(name),
+        }
+    }
+
+    #[test]
+    fn only_the_right_kind_of_installed_model_can_be_assigned() {
+        let entries = [
+            ollama("qwen2.5:7b", &[LANGUAGE, TOOLS], true),
+            ollama("nomic-embed-text:latest", &[EMBEDDING], true),
+            ollama("gemma3:4b", &[LANGUAGE, VISION], false),
+        ];
+        assert_eq!(
+            check_assignable(&entries, "formatting", "qwen2.5:7b")
+                .unwrap()
+                .name,
+            "qwen2.5:7b"
+        );
+        assert!(check_assignable(&entries, "search", "nomic-embed-text").is_ok());
+        assert!(
+            check_assignable(&entries, "search", "qwen2.5:7b")
+                .unwrap_err()
+                .contains("not a search")
+        );
+        assert!(
+            check_assignable(&entries, "meetings", "nomic-embed-text:latest")
+                .unwrap_err()
+                .contains("not a language")
+        );
+        assert!(
+            check_assignable(&entries, "translation", "gemma3:4b")
+                .unwrap_err()
+                .contains("Download it first")
+        );
+        assert!(check_assignable(&entries, "dictation", "qwen2.5:7b").is_err());
+        assert!(check_assignable(&entries, "fallback", "llama3:70b").is_err());
+    }
+
+    #[test]
+    fn benchmarked_builds_are_pinned_by_digest() {
+        assert_eq!(benchmarked_digest("qwen2.5:7b").unwrap().len(), 64);
+        assert!(benchmarked_digest("nomic-embed-text").is_some());
+        assert!(benchmarked_digest("llama3.2:1b").is_none());
+        assert!(
+            BENCHMARKED
+                .iter()
+                .all(|(name, digest, bytes)| checked_name(name).is_ok()
+                    && digest.len() == 64
+                    && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && *bytes > 0)
+        );
+    }
 
     #[test]
     fn capabilities_become_kinds() {
