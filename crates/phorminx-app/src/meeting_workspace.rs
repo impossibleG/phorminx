@@ -835,6 +835,45 @@ impl Host {
                 self.refresh_config();
                 Ok(())
             }
+            WorkspaceEvent::SetTranslationEnabled(enabled) => {
+                if enabled
+                    && (self.config.translation_language.is_empty()
+                        || self.config.translation_model.is_empty())
+                {
+                    return Err(
+                        "Choose a translation language and model in Meeting settings first.".into(),
+                    );
+                }
+                let mut config = self.config.clone();
+                config.translation_paused = !enabled;
+                if enabled && config.companion_translation_view == "original" {
+                    config.companion_translation_view = "both".into();
+                }
+                self.config_store.save(&config).map_err(|e| e.to_string())?;
+                self.config = config;
+                self.refresh_config();
+                // Recording continues either way; only the translation worker
+                // starts or stops. Phrases already translated stay visible.
+                if !enabled {
+                    self.translation = None;
+                    self.view.translation_notice = "Translation is off.".into();
+                } else if self.audio.is_some() && !self.note_capture && self.translation.is_none() {
+                    match translation::Worker::start(
+                        self.config.translation_language.clone(),
+                        self.config.translation_model.clone(),
+                    ) {
+                        Ok(worker) => {
+                            self.translation = Some(worker);
+                            self.view.translation_notice =
+                                "Translation is on from the next phrase.".into();
+                        }
+                        Err(message) => self.view.translation_notice = message,
+                    }
+                } else {
+                    self.view.translation_notice.clear();
+                }
+                Ok(())
+            }
             WorkspaceEvent::TriggerAction(id) => self.trigger_action(&id),
             WorkspaceEvent::TriggerActionSlot(slot) => {
                 let id = self
@@ -1079,7 +1118,8 @@ impl Host {
             }
         }
         self.capture_lease = Some(lease);
-        if !note && !self.config.translation_language.is_empty() {
+        if !note && !self.config.translation_language.is_empty() && !self.config.translation_paused
+        {
             match translation::Worker::start(
                 self.config.translation_language.clone(),
                 self.config.translation_model.clone(),
@@ -2370,6 +2410,7 @@ impl Host {
         self.view.companion_split_fraction = self.config.companion_split_fraction;
         self.view.translation_language = self.config.translation_language.clone();
         self.view.translation_model = self.config.translation_model.clone();
+        self.view.translation_paused = self.config.translation_paused;
         self.view.meeting_source = CaptureSource::Both;
         self.view.meeting_device = if self.config.meeting_microphone && !self.config.meeting_both {
             None

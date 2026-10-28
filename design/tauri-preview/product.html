@@ -11,6 +11,7 @@
   <link rel="stylesheet" href="benchmarks.css">
   <link rel="stylesheet" href="action-wizard.css">
   <script src="markdown.js" defer></script>
+  <script src="transcript-lines.js" defer></script>
   <script src="benchmarks.js" defer></script>
   <script src="model-picker.js" defer></script>
   <script src="preview.js" defer></script>
@@ -322,9 +323,10 @@
           </div>
         </section>
         <section id="live" class="page" hidden>
-          <div class="page-head"><div><small>MEETINGS / LIVE</small><h1>Live session</h1></div><div class="head-actions"><button id="start" type="button" class="primary">Start meeting</button><button id="stop" type="button">Finish</button><button id="companion" type="button">Open companion</button></div></div>
+          <div class="page-head"><div><small>MEETINGS / LIVE</small><h1>Live session</h1></div><div class="head-actions"><span id="meeting-state" class="meeting-state" role="status"></span><button id="start" type="button" class="primary">Start meeting</button><button id="stop" type="button">Finish</button><button id="companion" type="button">Open companion</button></div></div>
+          <div id="meeting-saved" class="meeting-saved" role="status" hidden><strong>Meeting saved.</strong><span id="meeting-saved-title"></span><button id="meeting-saved-open" type="button">Open in Saved sessions</button><button id="meeting-saved-close" type="button" aria-label="Dismiss">×</button></div>
           <div class="meeting-tabs" role="tablist" aria-label="Meetings"><button class="active" type="button" role="tab" aria-selected="true" data-route="live">Live session</button><button type="button" role="tab" aria-selected="false" data-route="saved">Saved sessions</button><button type="button" role="tab" aria-selected="false" data-route="meeting-settings">Meeting settings</button></div>
-          <div class="live-grid"><section class="pane"><h2>Transcript</h2><div id="transcript" class="scroll-content" role="log"></div></section><section class="pane"><div class="pane-head"><h2>Assistant</h2><button id="commentary" type="button" aria-pressed="false">Commentary off</button></div><div id="messages" class="scroll-content" role="log"></div><form id="ask"><input id="question" aria-label="Ask about this meeting" placeholder="Ask about this meeting…" autocomplete="off"><button type="submit">Send</button></form></section></div>
+          <div class="live-grid"><section class="pane"><h2>Transcript</h2><div id="transcript" class="scroll-content" role="log"></div></section><section class="pane"><div class="pane-head"><h2>Assistant</h2><div class="pane-toggles"><button id="translation" type="button" aria-pressed="false">Translation off</button><button id="commentary" type="button" aria-pressed="false">Commentary off</button></div></div><div id="messages" class="scroll-content" role="log"></div><form id="ask"><input id="question" aria-label="Ask about this meeting" placeholder="Ask about this meeting…" autocomplete="off"><button type="submit">Send</button></form></section></div>
         </section>
         <section id="saved" class="page" hidden>
           <div class="page-head"><div><small>MEETINGS / LIBRARY</small><h1>Saved sessions</h1></div><form id="search"><input id="query" aria-label="Search saved sessions" placeholder="Search sessions…"><button type="submit">Search</button></form></div>

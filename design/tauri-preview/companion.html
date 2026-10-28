@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="../meeting-showcase/styles.css">
   <link rel="stylesheet" href="companion.css">
   <script src="markdown.js" defer></script>
+  <script src="transcript-lines.js" defer></script>
   <script src="companion.js" defer></script>
 </head>
 <body>
@@ -25,7 +26,8 @@
         <div class="view-choices"><button type="button" data-room-tab="transcript">Transcript</button><button type="button" data-room-tab="together" class="active">Together</button><button type="button" data-room-tab="assistant">Assistant</button></div>
         <div class="nav-tools">
           <div class="language-tabs" role="group" aria-label="Transcript language"><button type="button" data-language-choice="original">Original</button><button type="button" data-language-choice="both" class="active">Both</button><button type="button" data-language-choice="translation" id="translation-choice">Translation</button></div>
-          <div class="commentary-control"><span>Commentary</span><button type="button" id="commentary" class="switch" role="switch" aria-checked="false" aria-label="Commentary"><i></i></button></div>
+          <div class="commentary-control translation-control" id="translation-control"><span>Translation<em id="translation-detail"></em></span><button type="button" id="translation" class="switch" role="switch" aria-checked="false" aria-label="Translation"><i></i></button></div>
+          <div class="commentary-control"><span>Commentary<em id="commentary-detail"></em></span><select id="commentary-interval" aria-label="How often commentary runs" title="How often commentary runs"><option value="15">15 s</option><option value="30">30 s</option><option value="60">1 min</option><option value="120">2 min</option></select><button type="button" id="commentary" class="switch" role="switch" aria-checked="false" aria-label="Commentary"><i></i></button></div>
         </div>
       </nav>
       <div class="room" id="room">
@@ -36,6 +38,7 @@
           <form class="composer" id="composer"><label class="sr-only" for="question">Ask about this meeting</label><div class="composer-field"><input id="question" type="text" autocomplete="off" placeholder="Ask about this meeting…"><button type="submit" aria-label="Send question">↗</button></div></form>
         </section>
       </div>
+      <div class="end-card" id="end-card" role="status" hidden><strong>Meeting saved</strong><span>Find it in Phorminx under Meetings › Saved sessions.</span><button type="button" id="end-close">Close companion</button></div>
       <div class="status-strip" id="status-strip" role="status"></div>
     </div>
   </div>

@@ -114,6 +114,7 @@ pub struct SavedMeeting {
 pub struct WorkspaceSnapshot {
     pub translation_language: String,
     pub translation_model: String,
+    pub translation_paused: bool,
     pub translations: Vec<TranslationLine>,
     pub translation_notice: String,
     pub meeting_source: CaptureSource,
@@ -187,6 +188,7 @@ pub enum WorkspaceEvent {
         language: String,
         model: String,
     },
+    SetTranslationEnabled(bool),
     SaveCapturePreferences {
         source: CaptureSource,
         device: Option<String>,

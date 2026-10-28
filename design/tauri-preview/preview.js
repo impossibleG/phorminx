@@ -40,39 +40,96 @@ function textRow(label, text) {
   return row;
 }
 
+const SOURCE_LABELS = {microphone: 'YOU', computer: 'COMPUTER'};
+
 function renderTranscript(meeting, target) {
   const fragment = document.createDocumentFragment();
   const translations = new Map(meeting.translations.map((line) => [`${line.startSample}:${line.endSample}`, line]));
-  const lines = meeting.transcript.filter((line) => line.text.trim());
-  for (const line of lines) {
-    const source = line.source === 'microphone' ? 'MICROPHONE' : line.source === 'computer' ? 'COMPUTER' : 'CONVERSATION';
-    fragment.append(textRow(source, line.text));
+  let shown = 0;
+  for (const line of meeting.transcript) {
+    // Times stay in the saved text; the transcript shows only who spoke and what.
+    const parts = transcriptParts(line.text, line.source);
     const translation = translations.get(`${line.startSample}:${line.endSample}`);
-    if (translation) {
-      const row = document.createElement('div');
-      row.className = 'translation';
-      row.textContent = translation.text;
-      fragment.append(row);
-    }
+    const translated = translation ? translationParts(translation.text, parts.length) : [];
+    parts.forEach((part, index) => {
+      shown += 1;
+      fragment.append(textRow(SOURCE_LABELS[part.source] || 'CONVERSATION', part.text));
+      if (translated[index]) {
+        const row = document.createElement('div');
+        row.className = 'translation';
+        row.textContent = translated[index];
+        fragment.append(row);
+      }
+    });
   }
-  if (target === byId('transcript') && meeting.provisionalText) {
+  const provisional = target === byId('transcript') && meeting.provisionalText
+    ? transcriptParts(meeting.provisionalText, '').map((part) => part.text).join(' ')
+    : '';
+  if (provisional) {
     const row = document.createElement('div');
     row.className = 'provisional';
-    row.textContent = meeting.provisionalText;
+    row.textContent = provisional;
     fragment.append(row);
   }
   target.replaceChildren(fragment);
-  if (!lines.length && !meeting.provisionalText) target.append(textRow('', 'Nothing transcribed yet.'));
+  if (!shown && !provisional) target.append(textRow('', 'Nothing transcribed yet.'));
+}
+
+function clock(samples) {
+  const seconds = Math.floor(samples / 16000);
+  return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+// Start and Finish answer the click at once; the snapshot then confirms.
+let pendingCapture = '';
+let pendingSince = 0;
+let lastCapture = 'idle';
+let savedSessionId = null;
+
+function renderCaptureControls(meeting) {
+  if (pendingCapture === 'starting' && meeting.capture !== 'idle') pendingCapture = '';
+  if (pendingCapture === 'stopping' && meeting.capture === 'idle') pendingCapture = '';
+  // A start that failed reports through the notice and never leaves idle.
+  if (pendingCapture && Date.now() - pendingSince > 10000) pendingCapture = '';
+  const capture = pendingCapture || meeting.capture;
+  const start = byId('start');
+  const stop = byId('stop');
+  start.disabled = capture !== 'idle';
+  start.textContent = capture === 'starting' ? 'Starting…' : capture === 'idle' ? 'Start meeting' : 'Recording';
+  start.classList.toggle('busy', capture === 'starting');
+  stop.disabled = capture === 'idle' || capture === 'stopping';
+  stop.textContent = capture === 'stopping' ? 'Finishing…' : 'Finish';
+  stop.classList.toggle('busy', capture === 'stopping');
+  const state = byId('meeting-state');
+  state.textContent = capture === 'listening' ? `Recording ${clock(meeting.capturedSamples)}`
+    : capture === 'starting' ? 'Starting…'
+    : capture === 'stopping' ? 'Saving the last words…' : '';
+  state.classList.toggle('recording', capture === 'listening');
+  state.classList.toggle('busy', capture === 'starting' || capture === 'stopping');
+  // A meeting that just ended in this window gets a saved notice with a way to it.
+  if (lastCapture !== 'idle' && meeting.capture === 'idle' && meeting.sessionId && meeting.historyEnabled) {
+    savedSessionId = meeting.sessionId;
+    byId('meeting-saved-title').textContent = meeting.title || 'Untitled session';
+    byId('meeting-saved').hidden = false;
+  }
+  if (meeting.capture !== 'idle') byId('meeting-saved').hidden = true;
+  lastCapture = meeting.capture;
 }
 
 function render(meeting) {
   if (document.body.dataset.shell !== 'product') {
     byId('status').textContent = `${meeting.capture} · ${meeting.notice || meeting.translationNotice || 'Local meeting worker ready'}`;
   }
-  byId('start').disabled = meeting.capture !== 'idle';
-  byId('stop').disabled = meeting.capture === 'idle';
+  renderCaptureControls(meeting);
+  const translation = byId('translation');
+  translation.textContent = meeting.translationActive ? `Translation on · ${meeting.translationLanguage}` : 'Translation off';
+  translation.setAttribute('aria-pressed', String(meeting.translationActive));
+  translation.title = meeting.translationLanguage && meeting.translationModel
+    ? `${meeting.translationLanguage} · ${meeting.translationModel}`
+    : 'Choose a language and model in Meeting settings';
   byId('commentary').textContent = meeting.autoCommentaryEnabled ? 'Commentary on' : 'Commentary off';
   byId('commentary').setAttribute('aria-pressed', String(meeting.autoCommentaryEnabled));
+  byId('commentary').title = meeting.commentaryModel ? `Commentary with ${meeting.commentaryModel}` : 'Choose a local Ollama model in Meeting settings';
   const nextTranscriptKey = JSON.stringify([meeting.transcript, meeting.translations, meeting.provisionalText]);
   if (nextTranscriptKey !== transcriptKey) {
     transcriptKey = nextTranscriptKey;
@@ -165,8 +222,28 @@ for (const button of document.querySelectorAll('[data-route]')) {
     if (button.dataset.route === 'saved') void action('refresh');
   });
 }
-byId('start').addEventListener('click', () => { void action('start'); });
-byId('stop').addEventListener('click', () => { void action('stop'); });
+byId('start').addEventListener('click', async () => {
+  pendingCapture = 'starting';
+  pendingSince = Date.now();
+  byId('meeting-saved').hidden = true;
+  byId('start').disabled = true;
+  byId('start').textContent = 'Starting…';
+  if (!await action('start')) { pendingCapture = ''; byId('start').disabled = false; byId('start').textContent = 'Start meeting'; }
+});
+byId('stop').addEventListener('click', async () => {
+  pendingCapture = 'stopping';
+  pendingSince = Date.now();
+  byId('stop').disabled = true;
+  byId('stop').textContent = 'Finishing…';
+  if (!await action('stop')) pendingCapture = '';
+});
+byId('translation').addEventListener('click', () => { void action('translation'); });
+byId('meeting-saved-close').addEventListener('click', () => { byId('meeting-saved').hidden = true; });
+byId('meeting-saved-open').addEventListener('click', () => {
+  byId('meeting-saved').hidden = true;
+  if (typeof showRoute === 'function') showRoute('saved');
+  if (savedSessionId) void action('select', String(savedSessionId));
+});
 byId('companion').addEventListener('click', () => { void action('companion'); });
 byId('commentary').addEventListener('click', () => { void action('commentary'); });
 byId('search').addEventListener('submit', (event) => { event.preventDefault(); void action('search', byId('query').value.trim()); });
