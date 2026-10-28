@@ -412,11 +412,16 @@ pub struct MeetingView {
     pub microphone_muted: bool,
     pub computer_audio_muted: bool,
     pub auto_commentary_enabled: bool,
+    pub auto_commentary_interval_secs: u32,
+    /// The local model commentary uses; empty when commentary cannot run.
+    pub commentary_model: String,
     pub companion_view: &'static str,
     pub companion_translation_view: &'static str,
     pub companion_split_fraction: u16,
     pub translation_language: String,
     pub translation_model: String,
+    /// Translation is configured and not switched off.
+    pub translation_active: bool,
     pub translation_notice: String,
     pub input_devices: Vec<String>,
     pub output_devices: Vec<String>,
@@ -571,6 +576,14 @@ impl From<&WorkspaceSnapshot> for MeetingView {
             microphone_muted: value.microphone_muted,
             computer_audio_muted: value.computer_audio_muted,
             auto_commentary_enabled: value.auto_commentary_enabled,
+            auto_commentary_interval_secs: value.auto_commentary_interval_secs,
+            commentary_model: if value.provider.kind
+                == phorminx_ui::workspace::ProviderChoice::Ollama
+            {
+                value.provider.model.clone()
+            } else {
+                String::new()
+            },
             companion_view: match value.companion_view {
                 CompanionView::Transcript => "transcript",
                 CompanionView::Assistant => "assistant",
@@ -584,6 +597,7 @@ impl From<&WorkspaceSnapshot> for MeetingView {
             companion_split_fraction: value.companion_split_fraction,
             translation_language: value.translation_language.clone(),
             translation_model: value.translation_model.clone(),
+            translation_active: !value.translation_language.is_empty() && !value.translation_paused,
             translation_notice: value.translation_notice.clone(),
             input_devices: value.input_devices.clone(),
             output_devices: value.output_devices.clone(),

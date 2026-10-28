@@ -58,6 +58,35 @@ fn enabling_translation_shows_both_languages_by_default() {
 }
 
 #[test]
+fn translation_switch_pauses_and_resumes_without_losing_its_settings() {
+    let mut f = fixture();
+    assert!(
+        f.host
+            .handle(WorkspaceEvent::SetTranslationEnabled(true))
+            .is_err(),
+        "an unconfigured translation cannot be switched on"
+    );
+    f.host
+        .handle(WorkspaceEvent::SaveTranslation {
+            language: "Brazilian Portuguese".into(),
+            model: "qwen2.5:1.5b".into(),
+        })
+        .unwrap();
+    f.host
+        .handle(WorkspaceEvent::SetTranslationEnabled(false))
+        .unwrap();
+    assert!(f.host.config.translation_paused);
+    assert!(f.host.view.translation_paused);
+    assert_eq!(f.host.config.translation_language, "Brazilian Portuguese");
+    assert!(f.host.translation.is_none());
+    f.host
+        .handle(WorkspaceEvent::SetTranslationEnabled(true))
+        .unwrap();
+    assert!(!f.host.config.translation_paused);
+    assert_eq!(f.host.config.translation_model, "qwen2.5:1.5b");
+}
+
+#[test]
 #[ignore = "requires a running local Ollama server and an installed translation model"]
 fn native_meeting_segment_reaches_visible_translation_and_saved_session() {
     let mut f = fixture();
