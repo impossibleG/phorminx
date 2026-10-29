@@ -310,13 +310,26 @@
             <form id="messaging-enable-form" class="messaging-enable"><label>Your name, as contacts see it<input id="messaging-name" maxlength="64" required autocomplete="off" placeholder="e.g. mau"></label><button type="submit" class="primary">Turn on messaging</button></form>
           </div>
           <div id="messaging-on" class="messaging-layout" hidden>
-            <div class="messaging-contacts"><div id="messaging-contacts" class="record-list" aria-label="Contacts"></div><button id="messaging-settings-open" type="button" class="messaging-settings-open">Messaging settings</button></div>
+            <aside class="messaging-contacts" aria-label="Contacts"><div class="messaging-contacts-head"><small>CONTACTS</small><button id="messaging-contacts-hide" type="button" class="messaging-icon" title="Hide contacts" aria-label="Hide contacts">‹</button></div><div id="messaging-contacts" class="record-list"></div><button id="messaging-settings-open" type="button" class="messaging-settings-open">Messaging settings</button></aside>
             <section class="messaging-conversation">
-              <div id="messaging-empty" class="messaging-empty"><strong>No conversation selected</strong><p>Add a contact by pasting their invite, or copy yours and send it to them any way you like. Each invite works once and expires after 24 hours.</p></div>
+              <button id="messaging-contacts-show" type="button" class="messaging-icon messaging-contacts-show" title="Show contacts" aria-label="Show contacts" aria-controls="messaging-contacts">›</button>
+              <div id="messaging-empty" class="messaging-empty"><strong>No conversation open</strong><p>Pick someone on the left, or exchange invites to add someone new. An invite works once and expires after 24 hours.</p></div>
               <div id="messaging-thread" class="messaging-thread" hidden>
-                <div class="messaging-thread-head"><div><h2 id="messaging-thread-name"></h2><small id="messaging-thread-state"></small></div><div class="messaging-thread-actions"><button id="messaging-rename" type="button">Rename</button><button id="messaging-keys" type="button">Keys</button><button id="messaging-block" type="button">Block</button><button id="messaging-clear" type="button">Delete history</button><button id="messaging-remove" type="button">Remove</button></div></div>
-                <div id="messaging-log" class="messaging-log scroll-content" role="log" aria-live="polite"></div>
-                <form id="messaging-compose" class="messaging-compose"><textarea id="messaging-text" rows="2" maxlength="4000" placeholder="Write a message. Enter sends, Shift+Enter adds a line."></textarea><div class="messaging-compose-buttons"><button id="messaging-dictate" type="button" title="Dictate, then review before sending">Dictate</button><button type="submit" class="primary">Send</button></div></form>
+                <div class="messaging-thread-head"><button id="messaging-person" type="button" class="messaging-person" aria-expanded="false" aria-controls="messaging-details" title="Contact details"><span id="messaging-thread-name"></span><small id="messaging-thread-state"></small></button></div>
+                <div class="messaging-thread-body">
+                  <div class="messaging-thread-main">
+                    <div id="messaging-log" class="messaging-log scroll-content" role="log" aria-live="polite"></div>
+                    <form id="messaging-compose" class="messaging-compose"><textarea id="messaging-text" rows="2" maxlength="4000" placeholder="Message"></textarea><div class="messaging-compose-buttons"><button id="messaging-dictate" type="button" title="Speak, then review before it is sent">Dictate</button><button type="submit" class="primary">Send</button></div><small class="messaging-compose-hint">Enter sends · Shift+Enter new line</small></form>
+                  </div>
+                  <aside id="messaging-details" class="messaging-details" aria-label="Contact details" hidden>
+                    <div class="messaging-details-head"><small>CONTACT</small><button id="messaging-details-close" type="button" class="messaging-icon" title="Close" aria-label="Close details">×</button></div>
+                    <h2 id="messaging-details-name"></h2>
+                    <p id="messaging-details-meta" class="messaging-details-meta"></p>
+                    <form id="messaging-rename-form" class="messaging-details-group"><label>Name you see<input id="messaging-rename-input" maxlength="64" autocomplete="off"></label><button type="submit">Save name</button></form>
+                    <div class="messaging-details-group"><span class="messaging-details-label">Launcher</span><p id="messaging-details-keys"></p><button id="messaging-keys" type="button">Change keys</button></div>
+                    <div class="messaging-details-group messaging-details-danger"><span class="messaging-details-label">Privacy</span><button id="messaging-block" type="button">Block</button><button id="messaging-clear" type="button">Delete history</button><button id="messaging-remove" type="button" class="danger">Remove contact</button></div>
+                  </aside>
+                </div>
               </div>
             </section>
           </div>

@@ -150,8 +150,8 @@ main :is(.page,.record-list,.record-detail,.scroll-content,.session-list,.recent
 .messaging-result{font-size:11px;color:#a8adb0;min-height:16px;margin:9px 0 0}
 .messaging-off{max-width:620px;margin-top:22px}.messaging-off p{font-size:12px;line-height:1.6;color:#a8adb0}
 .messaging-enable{display:flex;align-items:end;gap:12px;margin-top:14px}.messaging-enable label{display:flex;flex-direction:column;gap:7px;flex:1;color:#a8adb0;font-size:11px}.messaging-enable input{width:100%;background:#101416;color:#e8e5dd;border:1px solid #394046;border-radius:4px;padding:9px 10px}.messaging-enable .primary{background:#c69767;color:#0e1113;border-color:#c69767}
-.messaging-layout{display:grid;grid-template-columns:minmax(200px,30%) minmax(0,1fr);gap:1px;flex:1;min-height:0;margin-top:11px;background:#30363b;border:1px solid #30363b}
-.messaging-contacts{display:flex;flex-direction:column;min-height:0;background:#111517}.messaging-contacts .record-list{flex:1}
+.messaging-layout{display:grid;grid-template-columns:minmax(180px,240px) minmax(0,1fr);gap:1px;flex:1;min-height:0;margin-top:11px;background:#30363b;border:1px solid #30363b}
+.messaging-contacts{display:flex;flex-direction:column;min-height:0;background:#111517}.messaging-contacts .record-list{flex:1}.messaging-contacts .record-list button{border:0;border-left:2px solid transparent;border-radius:0;padding:12px 16px}.messaging-contacts .record-list button.active{border-left-color:#c69767}
 .record-list .messaging-contact{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:2px 8px}
 .messaging-contact-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}.messaging-contact small{grid-column:1;margin:0}.messaging-contact .nav-badge{grid-column:2;grid-row:1/3;margin:0}
 .messaging-contact.blocked .messaging-contact-name{color:#858c90;text-decoration:line-through}
@@ -160,8 +160,29 @@ main :is(.page,.record-list,.record-detail,.scroll-content,.session-list,.recent
 .messaging-conversation{display:flex;flex-direction:column;min-height:0;background:#151a1d}
 .messaging-empty{margin:auto;max-width:360px;text-align:center;color:#a8adb0;font-size:12px;line-height:1.6;padding:24px}.messaging-empty strong{color:#e8e5dd;font-weight:500;font-size:14px}
 .messaging-thread{display:flex;flex-direction:column;min-height:0;flex:1}.messaging-thread[hidden]{display:none}
-.messaging-thread-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;border-bottom:1px solid #30363b}.messaging-thread-head h2{font-size:15px;font-weight:500;margin:0}.messaging-thread-head small{color:#858c90;font-size:10px}
-.messaging-thread-actions{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end}
+.messaging-thread-head{display:flex;align-items:center;min-height:52px;padding:8px 16px;border-bottom:1px solid #30363b}
+.messaging-person{display:flex;align-items:baseline;gap:10px;max-width:100%;border:0!important;background:transparent!important;padding:6px 0!important;color:#e8e5dd!important;text-align:left}
+.messaging-person span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px;font-weight:500}.messaging-person span::after{content:'⌄';display:inline-block;margin-left:7px;color:#858c90;font-size:12px;transition:transform .15s}
+.messaging-person[aria-expanded="true"] span::after{transform:rotate(180deg)}.messaging-person:hover span::after{color:#c69767}
+.messaging-person small{color:#7d9d80;font-size:10px;white-space:nowrap}
+/* The contacts column folds away; a quiet chevron brings it back. */
+.messaging-contacts-head{display:flex;align-items:center;justify-content:space-between;padding:10px 10px 10px 18px;border-bottom:1px solid #30363b}.messaging-contacts-head small{color:#858c90;font-size:9px;letter-spacing:.14em}
+.messaging-icon{width:28px;height:28px;padding:0!important;display:grid;place-items:center;border-color:transparent!important;background:transparent!important;color:#858c90!important;font-size:16px!important;line-height:1}.messaging-icon:hover{color:#c69767!important;border-color:#394046!important}
+.messaging-conversation{position:relative}.messaging-contacts-show{display:none!important;position:absolute;top:12px;left:10px;z-index:1}
+.messaging-layout.contacts-hidden{grid-template-columns:minmax(0,1fr)}.messaging-layout.contacts-hidden .messaging-contacts{display:none}
+.messaging-layout.contacts-hidden .messaging-contacts-show{display:grid!important}.messaging-layout.contacts-hidden .messaging-thread-head{padding-left:46px}
+/* Contact details: one panel beside the conversation, opened from the name. */
+.messaging-thread-body{display:flex;flex:1;min-height:0}.messaging-thread-main{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}
+.messaging-details{width:260px;flex:none;overflow-y:auto;padding:16px 20px 22px;border-left:1px solid #30363b;background:#111517;scrollbar-width:none}
+.messaging-details-head{display:flex;align-items:center;justify-content:space-between;margin-right:-8px}.messaging-details-head small{color:#c69767;font-size:9px;letter-spacing:.14em}
+.messaging-details h2{font-size:19px;font-weight:450;margin:10px 0 4px;overflow-wrap:anywhere}.messaging-details-meta{margin:0;color:#858c90;font-size:11px;line-height:1.5}
+.messaging-details-group{display:flex;flex-direction:column;align-items:flex-start;gap:8px;margin-top:16px;padding-top:14px;border-top:1px solid #30363b}
+.messaging-details-group label,.messaging-details-label{display:flex;flex-direction:column;gap:7px;width:100%;color:#858c90;font-size:9px;letter-spacing:.14em;text-transform:uppercase}
+.messaging-details-group input{width:100%;background:#101416;letter-spacing:0;text-transform:none;font-size:12px;padding:8px 10px}
+.messaging-details-group p{margin:0;color:#a8adb0;font-size:12px;line-height:1.5}
+.messaging-details-danger{gap:2px}.messaging-details-danger .messaging-details-label{margin-bottom:4px}.messaging-details-danger button{width:100%;text-align:left;border-color:transparent!important;background:transparent!important;padding:6px 0!important;font-size:12px!important;color:#a8adb0}.messaging-details-danger button:hover{color:#e8e5dd}.messaging-details .danger{color:#e09a8c}.messaging-details .danger:hover{border-color:#e09a8c}
+.messaging-compose{flex-wrap:wrap}.messaging-compose-hint{flex-basis:100%;margin-top:-4px;color:#6f767a;font-size:9px}
+@media(max-width:900px){.messaging-details{position:absolute;right:0;top:52px;bottom:0;z-index:2;box-shadow:-12px 0 30px #0006}}
 .messaging-log{display:flex;flex-direction:column;gap:9px}
 .messaging-message{max-width:78%;padding:9px 12px;border-radius:8px;background:#22282c;align-self:flex-start}.messaging-message.outgoing{align-self:flex-end;background:#3a2e22}
 .messaging-message p{margin:0;font-size:13px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
@@ -179,7 +200,10 @@ main :is(.page,.record-list,.record-detail,.scroll-content,.session-list,.recent
 :root[data-theme="light"] .messaging-layout{background:#b9b7b0;border-color:#b9b7b0}
 :root[data-theme="light"] .messaging-contacts,:root[data-theme="light"] .messaging-conversation{background:#f7f5f0;color:#202326}
 :root[data-theme="light"] .messaging-message{background:#eae7e0}:root[data-theme="light"] .messaging-message.outgoing{background:#ead9c4}
-:root[data-theme="light"] .messaging-thread-head,:root[data-theme="light"] .messaging-compose{border-color:#b9b7b0}
+:root[data-theme="light"] .messaging-thread-head,:root[data-theme="light"] .messaging-compose,:root[data-theme="light"] .messaging-contacts-head,:root[data-theme="light"] .messaging-details,:root[data-theme="light"] .messaging-details-group{border-color:#b9b7b0}
+:root[data-theme="light"] .messaging-details{background:#eae7e0}:root[data-theme="light"] .messaging-details-group input{background:#f7f5f0;color:#202326;border-color:#a5a39d}
+:root[data-theme="light"] .messaging-person{color:#202326!important}:root[data-theme="light"] .messaging-person small{color:#1d7a4f}:root[data-theme="light"] .messaging-details .danger{color:#9b3a28}:root[data-theme="light"] .messaging-details-danger button{color:#555b60}:root[data-theme="light"] .messaging-details-danger button:hover{color:#202326}
+:root[data-theme="light"] .messaging-details-head small{color:#815026}:root[data-theme="light"] .messaging-icon:hover{color:#815026!important}
 :root[data-theme="light"] .messaging-compose textarea,:root[data-theme="light"] .messaging-enable input,:root[data-theme="light"] .messaging-dialog textarea,:root[data-theme="light"] .messaging-dialog select,:root[data-theme="light"] .messaging-dialog input{background:#f7f5f0;color:#202326;border-color:#a5a39d}
 :root[data-theme="light"] .messaging-dialog{background:#eae7e0;color:#202326;border-color:#b9b7b0}
 :root[data-theme="light"] .messaging-empty strong{color:#202326}

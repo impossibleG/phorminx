@@ -16,6 +16,9 @@
   let conversationKey = '';
   // The result line is showing loading or failure text, not a user action's.
   let statusShown = true;
+  // Which contact the details panel last filled its rename field for.
+  let detailsFor = null;
+  const contactsHiddenKey = 'phorminx.messaging.contactsHidden';
 
   const networkText = {
     disabled: 'Off',
@@ -90,11 +93,41 @@
     $('messaging-thread').hidden = !contact;
     if (contact) {
       $('messaging-thread-name').textContent = contact.name;
-      $('messaging-thread-state').textContent = contact.nickname && contact.nickname !== contact.displayName ? `Calls themself ${contact.displayName}` : '';
-      $('messaging-block').textContent = contact.blocked ? 'Unblock' : 'Block';
+      $('messaging-thread-state').textContent = contact.blocked ? 'Blocked' : contact.connected ? 'Connected' : '';
       $('messaging-text').disabled = contact.blocked;
       $('messaging-dictate').disabled = contact.blocked;
+      renderDetails(contact);
+    } else {
+      showDetails(false);
     }
+  }
+
+  function renderDetails(contact) {
+    $('messaging-details-name').textContent = contact.name;
+    const meta = [];
+    if (contact.nickname && contact.nickname !== contact.displayName) meta.push(`Calls themself ${contact.displayName}`);
+    meta.push(contact.blocked ? 'Blocked' : contact.connected ? 'Connected over Tor' : 'Not connected right now');
+    $('messaging-details-meta').textContent = meta.join(' · ');
+    const keys = [];
+    if (contact.contactsSlot) keys.push(`Key ${contact.contactsSlot} in the contacts panel`);
+    if (contact.mainSlot) keys.push(`key ${contact.mainSlot} on the main launcher`);
+    $('messaging-details-keys').textContent = keys.length ? `${keys.join(', ')}.` : 'No launcher key yet.';
+    $('messaging-block').textContent = contact.blocked ? 'Unblock' : 'Block';
+    const input = $('messaging-rename-input');
+    if (detailsFor !== contact.id || document.activeElement !== input) input.value = contact.nickname || '';
+    input.placeholder = contact.displayName;
+    detailsFor = contact.id;
+  }
+
+  function showDetails(open) {
+    $('messaging-details').hidden = !open;
+    $('messaging-person').setAttribute('aria-expanded', String(open));
+  }
+
+  function showContacts(open) {
+    $('messaging-on').classList.toggle('contacts-hidden', !open);
+    try { localStorage.setItem(contactsHiddenKey, open ? '0' : '1'); } catch (_) { /* best effort */ }
+    (open ? $('messaging-contacts-hide') : $('messaging-contacts-show')).focus();
   }
 
   async function loadConversation(force = false) {
@@ -233,12 +266,22 @@
     catch (error) { result(String(error)); }
   });
 
-  $('messaging-rename').addEventListener('click', () => {
-    const contact = selected();
-    if (!contact) return;
-    const name = window.prompt(`Name for ${contact.displayName} (leave empty to use theirs)`, contact.nickname || '');
-    if (name === null) return;
-    void act('rename', {nickname: name.trim() || null});
+  $('messaging-person').addEventListener('click', () => { showDetails($('messaging-details').hidden); });
+  $('messaging-details-close').addEventListener('click', () => { showDetails(false); $('messaging-person').focus(); });
+  $('messaging-contacts-hide').addEventListener('click', () => showContacts(false));
+  $('messaging-contacts-show').addEventListener('click', () => showContacts(true));
+  try { $('messaging-on').classList.toggle('contacts-hidden', localStorage.getItem(contactsHiddenKey) === '1'); } catch (_) { /* best effort */ }
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || !visible || $('messaging-details').hidden || document.querySelector('dialog[open]')) return;
+    showDetails(false);
+    $('messaging-person').focus();
+  });
+
+  $('messaging-rename-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const name = $('messaging-rename-input').value.trim();
+    $('messaging-rename-input').blur();
+    void act('rename', {nickname: name || null});
   });
   $('messaging-block').addEventListener('click', () => {
     const contact = selected();
@@ -255,6 +298,7 @@
     if (!contact || !window.confirm(`Remove ${contact.name} and your history with them? You will need a new invite to talk again.`)) return;
     await act('remove');
     selectedId = null;
+    showDetails(false);
     render();
   });
 

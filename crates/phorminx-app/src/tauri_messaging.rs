@@ -620,7 +620,10 @@ pub(crate) fn host_messaging_launcher_key(
     Ok(())
 }
 
-#[tauri::command]
+// Async: it opens the review window, and building a webview from a command
+// that runs on the main thread deadlocks on Windows (tauri#4121). The window
+// came up blank and the whole app stopped responding.
+#[tauri::command(async)]
 pub(crate) fn host_messaging_dictate(
     contact_id: i64,
     app: tauri::AppHandle,
@@ -692,7 +695,8 @@ pub(crate) fn host_messaging_draft(state: State<'_, MessagingHost>) -> Result<Dr
 
 /// Review window actions: `stop` ends the recording, `send` sends the edited
 /// text, `discard` cancels the recording or drops the draft.
-#[tauri::command]
+// Async for the same reason as `host_messaging_dictate`: it closes a window.
+#[tauri::command(async)]
 pub(crate) fn host_messaging_draft_action(
     kind: String,
     text_body: Option<String>,
