@@ -10,7 +10,11 @@ param(
     [switch] $Cpu,
     # Local QA only: build without the release-signing public key, which
     # disables update checks in the resulting app.
-    [switch] $AllowMissingUpdateKey
+    [switch] $AllowMissingUpdateKey,
+    # Local QA only: compile in the reinstall-qa feature, so "Reinstall
+    # Phorminx" installs the local installer named by PHORMINX_QA_INSTALLER
+    # instead of downloading the signed release. Never for publishing.
+    [switch] $QaReinstall
 )
 
 $ErrorActionPreference = "Stop"
@@ -43,6 +47,10 @@ if ($Version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
 }
 $numericVersion = ([regex]::Match($Version, '^(\d+)\.(\d+)\.(\d+)')).Groups[1..3].Value -join '.'
 $numericVersion += '.0'
+
+if ($QaReinstall -and (-not [string]::IsNullOrWhiteSpace($env:PHORMINX_UPDATE_PUBLIC_KEY) -or $RequireSignedBinary)) {
+    throw "-QaReinstall builds are local QA builds. Clear PHORMINX_UPDATE_PUBLIC_KEY and do not combine it with -RequireSignedBinary."
+}
 
 # The updater trusts only manifests signed by this key, and it is compiled in.
 # A release built without it would silently never update again.
@@ -128,6 +136,10 @@ if (-not $SkipBuild) {
     $env:CMAKE_C_FLAGS_RELEASE = "/MT /O2 /Ob2 /DNDEBUG"
     $env:CMAKE_CXX_FLAGS_RELEASE = "/MT /O2 /Ob2 /DNDEBUG"
     $features = if ($Cpu) { "desktop,tauri-shell" } else { "desktop,vulkan,tauri-shell" }
+    if ($QaReinstall) {
+        Write-Warning "Building a reinstall QA binary. Do not publish it."
+        $features += ",reinstall-qa"
+    }
     $shortBuildDrive = Mount-ShortBuildDrive -BackingDirectory $releaseTargetDirectory
     try {
         $env:CARGO_TARGET_DIR = "$shortBuildDrive\"

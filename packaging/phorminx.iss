@@ -70,6 +70,7 @@ Source: "..\scripts\Initialize-Phorminx.ps1"; DestDir: "{app}\setup"; Flags: ign
 [Icons]
 Name: "{group}\Phorminx"; Filename: "{app}\phorminx-app.exe"; WorkingDir: "{app}"
 Name: "{group}\Prepare Phorminx"; Filename: "{app}\phorminx-app.exe"; Parameters: "--setup"; WorkingDir: "{app}"
+Name: "{group}\Repair Phorminx"; Filename: "{app}\phorminx-app.exe"; Parameters: "--reinstall"; WorkingDir: "{app}"; Comment: "Reinstall Phorminx and reset its settings. Your history, meetings and messages are kept."
 Name: "{autodesktop}\Phorminx"; Filename: "{app}\phorminx-app.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 Name: "{group}\Uninstall Phorminx"; Filename: "{uninstallexe}"
 
