@@ -961,7 +961,9 @@ mod tests {
         assert_eq!(latest_status(data.path()).as_deref(), Some("installed"));
 
         let outcome = restore(data.path(), &listed[0].id).unwrap();
-        assert_eq!(outcome.models, vec!["qwen2.5:7b".to_owned()]);
+        // The formatting model, plus the default semantic-search embedder.
+        assert!(outcome.models.contains(&"qwen2.5:7b".to_owned()), "{:?}", outcome.models);
+        assert!(outcome.models.iter().all(|model| !model.is_empty()));
         assert_eq!(std::fs::read_to_string(data.path().join("settings.toml")).unwrap(), saved);
         // The defaults it replaced are kept in the backup, and so is the original.
         let replaced = std::fs::read_dir(&backup)
@@ -1077,7 +1079,7 @@ mod tests {
             "/c exit 3".to_owned()
         };
         let plan = plan(root, &installer, &args);
-        std::fs::create_dir_all(&plan.backup_dir.join("state")).unwrap();
+        std::fs::create_dir_all(plan.backup_dir.join("state")).unwrap();
         let status = helper_command(&plan).unwrap().status().unwrap();
         assert_eq!(status.success(), succeed);
         plan
