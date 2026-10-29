@@ -156,7 +156,7 @@ fn native_manual_answer_and_commentary_reach_the_companion() {
     assert!(!f.host.view.messages.last().unwrap().text.trim().is_empty());
 
     f.host
-        .submit_auto_commentary("The client asked for a Friday deadline.".into())
+        .submit_auto_commentary("The client asked for a Friday deadline.".into(), 0)
         .unwrap();
     complete_native_answer(&mut f.host);
     assert_eq!(f.host.view.messages.last().unwrap().status, "complete");
@@ -358,7 +358,7 @@ fn automatic_commentary_is_local_and_has_no_saved_fake_user_message() {
     f.host.config.provider.kind = ProviderKind::OpenAi;
     assert!(
         f.host
-            .submit_auto_commentary("private meeting text".into())
+            .submit_auto_commentary("private meeting text".into(), 0)
             .is_err()
     );
     assert!(f.host.pending.is_none());
@@ -366,7 +366,7 @@ fn automatic_commentary_is_local_and_has_no_saved_fake_user_message() {
 
     f.host.config.provider.kind = ProviderKind::Ollama;
     f.host
-        .submit_auto_commentary("The client asked for a timeline.".into())
+        .submit_auto_commentary("The client asked for a timeline.".into(), 0)
         .unwrap();
     let pending = f.host.pending.as_ref().unwrap();
     assert_eq!(pending.provider.kind, ProviderKind::Ollama);

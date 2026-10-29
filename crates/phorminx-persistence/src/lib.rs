@@ -19,6 +19,11 @@ pub use library::{
 };
 mod meeting;
 mod meeting_memory;
+mod meeting_plan;
+pub use meeting_plan::{
+    MAX_PLAN_ITEM_CHARS, MAX_PLAN_ITEMS, MAX_PLAN_TEXT_BYTES, MAX_PLAN_TITLE_CHARS, MeetingPlanDraft,
+    MeetingPlanItem, MeetingPlanRecord, MeetingPlanRepository,
+};
 mod messaging;
 pub use meeting_memory::{MeetingMemoryPassage, MeetingMemoryRepository, MeetingTitleSource};
 pub use messaging::{
@@ -194,6 +199,10 @@ impl Persistence {
 
     pub fn meeting_memory(&self) -> MeetingMemoryRepository<'_> {
         MeetingMemoryRepository::new(&self.connection)
+    }
+
+    pub fn meeting_plans(&self) -> MeetingPlanRepository<'_> {
+        MeetingPlanRepository::new(&self.connection)
     }
 
     pub fn investigations(&self) -> InvestigationRepository<'_> {

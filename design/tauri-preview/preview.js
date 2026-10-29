@@ -116,7 +116,83 @@ function renderCaptureControls(meeting) {
   lastCapture = meeting.capture;
 }
 
+
+// Commentary is set apart from answers: it can be dismissed, and a suggested
+// important item ("PIN:") becomes a button.
+const dismissedCommentary = new Set();
+
+function commentaryRow(line, items) {
+  const row = document.createElement('div');
+  row.className = 'line commentary';
+  const head = document.createElement('div');
+  head.className = 'commentary-head';
+  const heading = document.createElement('small');
+  heading.textContent = 'COMMENTARY';
+  const dismiss = document.createElement('button');
+  dismiss.type = 'button';
+  dismiss.className = 'commentary-dismiss';
+  dismiss.textContent = 'Dismiss';
+  dismiss.addEventListener('click', () => { dismissedCommentary.add(line.text); messagesKey = ''; void refreshNow(); });
+  head.append(heading, dismiss);
+  const parts = commentaryParts(line.text);
+  const answer = document.createElement('div');
+  answer.className = 'markdown';
+  answer.append(renderMarkdown(parts.body));
+  row.append(head, answer);
+  for (const pin of parts.pins) row.append(pinButton(pin, items));
+  return row;
+}
+
+function pinButton(pin, items) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'pin-suggestion';
+  const pinned = hasItem(items, pin);
+  button.disabled = pinned;
+  button.textContent = pinned ? `Pinned · ${pin}` : `+ Pin as important · ${pin}`;
+  button.addEventListener('click', () => { void action('pin-item', pin); });
+  return button;
+}
+
+let itemsKey = '';
+let currentItems = [];
+
+function renderItems(meeting) {
+  const style = byId('commentary-style');
+  if (!style.options.length) for (const [value, label] of COMMENTARY_STYLES) style.append(new Option(label, value));
+  if (document.activeElement !== style) style.value = meeting.commentaryStyle || '';
+  const nextKey = JSON.stringify([meeting.importantItems, meeting.planTitle]);
+  if (nextKey === itemsKey) return;
+  itemsKey = nextKey;
+  currentItems = meeting.importantItems || [];
+  byId('live-plan-title').textContent = meeting.planTitle ? `· ${meeting.planTitle}` : '';
+  const list = document.createDocumentFragment();
+  currentItems.forEach((item, index) => {
+    const chip = document.createElement('li');
+    chip.classList.toggle('done', item.done);
+    const check = document.createElement('input');
+    check.type = 'checkbox';
+    check.checked = item.done;
+    check.setAttribute('aria-label', `Covered: ${item.text}`);
+    check.addEventListener('change', () => saveItems(currentItems.map((other, at) => (at === index ? {...other, done: check.checked} : other))));
+    const text = document.createElement('span');
+    text.textContent = item.text;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.textContent = '×';
+    remove.setAttribute('aria-label', `Remove ${item.text}`);
+    remove.addEventListener('click', () => saveItems(currentItems.filter((_, at) => at !== index)));
+    chip.append(check, text, remove);
+    list.append(chip);
+  });
+  byId('live-items-list').replaceChildren(list);
+  byId('live-items').classList.toggle('empty', !currentItems.length);
+}
+
+function saveItems(items) { void action('items', JSON.stringify(items)); }
+
 function render(meeting) {
+  window.phorminxMeeting = meeting;
   if (document.body.dataset.shell !== 'product') {
     byId('status').textContent = `${meeting.capture} · ${meeting.notice || meeting.translationNotice || 'Local meeting worker ready'}`;
   }
@@ -135,13 +211,17 @@ function render(meeting) {
     transcriptKey = nextTranscriptKey;
     renderTranscript(meeting, byId('transcript'));
   }
-  const nextMessagesKey = JSON.stringify(meeting.messages);
+  renderItems(meeting);
+  const nextMessagesKey = JSON.stringify([meeting.messages, meeting.importantItems, [...dismissedCommentary]]);
   if (nextMessagesKey !== messagesKey) {
     messagesKey = nextMessagesKey;
     const messages = document.createDocumentFragment();
     for (const line of meeting.messages) {
+      if (line.kind === 'commentary' && dismissedCommentary.has(line.text)) continue;
       if (line.role === 'You' || !line.text) {
         messages.append(textRow(line.role.toUpperCase(), line.text || (line.status === 'waiting' ? 'Thinking…' : '')));
+      } else if (line.kind === 'commentary') {
+        messages.append(commentaryRow(line, meeting.importantItems));
       } else {
         const row = document.createElement('div');
         row.className = 'line';
@@ -208,6 +288,8 @@ async function refresh() {
   finally { refreshInFlight = false; }
 }
 
+async function refreshNow() { revision = -1; await refresh(); }
+
 async function action(kind, value) {
   if (!invoke) { byId('status').textContent = 'Tauri bridge unavailable.'; return false; }
   try { await invoke('meeting_action', {kind, value: value ?? null}); await refresh(); return true; }
@@ -246,6 +328,13 @@ byId('meeting-saved-open').addEventListener('click', () => {
 });
 byId('companion').addEventListener('click', () => { void action('companion'); });
 byId('commentary').addEventListener('click', () => { void action('commentary'); });
+byId('commentary-style').addEventListener('change', (event) => { void action('commentary-style', event.target.value); });
+byId('live-item-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const input = byId('live-item-text');
+  const text = input.value.trim();
+  if (text && await action('pin-item', text)) input.value = '';
+});
 byId('search').addEventListener('submit', (event) => { event.preventDefault(); void action('search', byId('query').value.trim()); });
 byId('devices-form').addEventListener('submit', async (event) => {
   event.preventDefault();

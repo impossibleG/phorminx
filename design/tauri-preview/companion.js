@@ -12,6 +12,9 @@ let finishRequested = false;
 let sawRecording = false;
 const CAPTURE_LABELS = {idle: 'ENDED', starting: 'STARTING…', listening: 'RECORDING', stopping: 'FINISHING…'};
 let conversationKey = '';
+let itemsKey = '';
+let currentItems = [];
+const dismissed = new Set();
 
 function persistLayout() {
   if (!invoke) return;
@@ -87,22 +90,43 @@ function renderTranscript(meeting) {
 }
 
 function renderConversation(meeting) {
-  const nextKey = JSON.stringify(meeting.messages);
+  const nextKey = JSON.stringify([meeting.messages, meeting.importantItems]);
   if (nextKey === conversationKey) return;
   conversationKey = nextKey;
   const follow = nearBottom(conversation);
   const rows = document.createDocumentFragment();
   for (const line of meeting.messages) {
+    const commentary = line.kind === 'commentary';
+    if (commentary && dismissed.has(line.text)) continue;
     const article = document.createElement('article');
-    article.className = line.role === 'You' ? 'message from-you' : 'message from-phorminx';
-    appendText(article, '', line.role === 'You' ? 'YOU' : 'PHORMINX', 'small');
+    article.className = line.role === 'You' ? 'message from-you' : commentary ? 'message from-phorminx commentary' : 'message from-phorminx';
+    const label = appendText(article, '', line.role === 'You' ? 'YOU' : commentary ? 'COMMENTARY' : 'PHORMINX', 'small');
+    if (commentary) {
+      const dismiss = document.createElement('button');
+      dismiss.type = 'button';
+      dismiss.className = 'dismiss';
+      dismiss.textContent = 'Dismiss';
+      dismiss.addEventListener('click', () => { dismissed.add(line.text); article.remove(); });
+      label.append(dismiss);
+    }
+    const parts = commentary ? commentaryParts(line.text) : {body: line.text, pins: []};
     if (line.role === 'You' || !line.text) {
       appendText(article, '', line.text || (line.status === 'waiting' ? 'Thinking…' : ''), 'p');
     } else {
       const answer = document.createElement('div');
       answer.className = 'markdown';
-      answer.append(renderMarkdown(line.text));
+      answer.append(renderMarkdown(parts.body));
       article.append(answer);
+    }
+    for (const pin of parts.pins) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'pin-suggestion';
+      const pinned = hasItem(meeting.importantItems, pin);
+      button.disabled = pinned;
+      button.textContent = pinned ? `Pinned · ${pin}` : `+ Pin as important · ${pin}`;
+      button.addEventListener('click', () => { void action('pin-item', pin).catch(() => {}); });
+      article.append(button);
     }
     if (line.status === 'failed' || line.status === 'stopped') appendText(article, 'status', line.status, 'div');
     rows.append(article);
@@ -110,6 +134,41 @@ function renderConversation(meeting) {
   conversation.replaceChildren(rows);
   if (follow) conversation.scrollTop = conversation.scrollHeight;
 }
+
+function renderItems(meeting) {
+  const style = byId('commentary-style');
+  if (!style.options.length) for (const [value, label] of COMMENTARY_STYLES) style.append(new Option(label, value));
+  if (document.activeElement !== style) style.value = meeting.commentaryStyle || '';
+  const nextKey = JSON.stringify([meeting.importantItems, meeting.planTitle]);
+  if (nextKey === itemsKey) return;
+  itemsKey = nextKey;
+  currentItems = meeting.importantItems || [];
+  const open = currentItems.filter((item) => !item.done).length;
+  byId('items-count').textContent = currentItems.length ? ` ${open}/${currentItems.length}` : '';
+  byId('items-plan').textContent = meeting.planTitle || '';
+  const rows = document.createDocumentFragment();
+  currentItems.forEach((item, index) => {
+    const row = document.createElement('li');
+    row.classList.toggle('done', item.done);
+    const label = document.createElement('label');
+    const check = document.createElement('input');
+    check.type = 'checkbox';
+    check.checked = item.done;
+    check.addEventListener('change', () => saveItems(currentItems.map((other, at) => (at === index ? {...other, done: check.checked} : other))));
+    label.append(check, document.createTextNode(item.text));
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.textContent = '×';
+    remove.setAttribute('aria-label', `Remove ${item.text}`);
+    remove.addEventListener('click', () => saveItems(currentItems.filter((_, at) => at !== index)));
+    row.append(label, remove);
+    rows.append(row);
+  });
+  byId('items-list').replaceChildren(rows);
+  if (!currentItems.length) appendText(byId('items-list'), 'empty', 'No items yet. Add what must not be forgotten; the assistant keeps them in mind.', 'li');
+}
+
+function saveItems(items) { void action('items', JSON.stringify(items)).catch(() => {}); }
 
 function render(meeting) {
   if (!layoutInitialized) {
@@ -163,6 +222,7 @@ function render(meeting) {
   const language = meeting.translationLanguage || 'Translation';
   byId('translation-choice').textContent = language;
   byId('status-strip').textContent = meeting.notice || meeting.translationNotice || '';
+  renderItems(meeting);
   renderTranscript(meeting);
   renderConversation(meeting);
 }
@@ -208,6 +268,20 @@ byId('computer').addEventListener('click', () => { void action('mute-computer').
 byId('commentary').addEventListener('click', () => { void action('commentary').catch(() => {}); });
 byId('hide').addEventListener('click', () => { void action('hide-companion').catch(() => {}); });
 byId('translation').addEventListener('click', () => { void action('translation').catch(() => {}); });
+byId('commentary-style').addEventListener('change', (event) => { void action('commentary-style', event.target.value).catch(() => {}); });
+byId('items-toggle').addEventListener('click', () => {
+  const drawer = byId('items-drawer');
+  drawer.hidden = !drawer.hidden;
+  byId('items-toggle').setAttribute('aria-expanded', String(!drawer.hidden));
+  if (!drawer.hidden) byId('items-text').focus();
+});
+byId('items-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const input = byId('items-text');
+  const text = input.value.trim();
+  if (!text) return;
+  try { await action('pin-item', text); input.value = ''; } catch (_) { /* The notice explains. */ }
+});
 byId('commentary-interval').addEventListener('change', (event) => { void action('commentary-interval', event.target.value).catch(() => {}); });
 byId('end-close').addEventListener('click', () => { void action('hide-companion').catch(() => {}); });
 byId('finish').addEventListener('click', () => {

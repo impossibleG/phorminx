@@ -101,6 +101,8 @@ pub struct ChatLine {
     pub role: String,
     pub text: String,
     pub status: String,
+    /// "commentary" for automatic comments; empty for answers and questions.
+    pub kind: String,
     pub context_text: String,
     pub context_samples: Option<(u64, u64)>,
 }
@@ -127,6 +129,11 @@ pub struct WorkspaceSnapshot {
     pub auto_commentary_enabled: bool,
     pub auto_commentary_interval_secs: u32,
     pub auto_commentary_notice: String,
+    pub commentary_style: String,
+    /// The meeting plan in use: important items, instructions and briefing.
+    pub plan_id: Option<i64>,
+    pub plan_title: String,
+    pub important_items: Vec<(String, bool)>,
     pub companion_view: CompanionView,
     pub companion_translation_view: TranslationView,
     pub companion_split_fraction: u16,
@@ -189,6 +196,15 @@ pub enum WorkspaceEvent {
         model: String,
     },
     SetTranslationEnabled(bool),
+    /// Use this plan for the next meeting (None detaches it).
+    SetMeetingPlan(Option<i64>),
+    /// The plan was edited elsewhere; read it again.
+    ReloadMeetingPlan,
+    /// Replace the important items of the current meeting, creating a plan
+    /// for it when there is none.
+    SetLiveItems(Vec<(String, bool)>),
+    AddLiveItem(String),
+    SetCommentaryStyle(String),
     SaveCapturePreferences {
         source: CaptureSource,
         device: Option<String>,

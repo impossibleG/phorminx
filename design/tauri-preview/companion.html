@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="companion.css">
   <script src="markdown.js" defer></script>
   <script src="transcript-lines.js" defer></script>
+  <script src="meeting-items.js" defer></script>
   <script src="companion.js" defer></script>
 </head>
 <body>
@@ -20,16 +21,17 @@
           <button id="mic" type="button" aria-pressed="true"><i></i><span>Mic</span><em>on</em></button>
           <button id="computer" type="button" aria-pressed="true"><i></i><span>Computer</span><em>on</em></button>
         </div>
-        <div class="window-actions"><button type="button" id="hide">Hide</button><button type="button" id="finish" class="finish">Finish</button></div>
+        <div class="window-actions"><button type="button" id="items-toggle" aria-expanded="false" aria-controls="items-drawer">Items<em id="items-count"></em></button><button type="button" id="hide">Hide</button><button type="button" id="finish" class="finish">Finish</button></div>
       </header>
       <nav class="room-tabs" aria-label="Companion views">
         <div class="view-choices"><button type="button" data-room-tab="transcript">Transcript</button><button type="button" data-room-tab="together" class="active">Together</button><button type="button" data-room-tab="assistant">Assistant</button></div>
         <div class="nav-tools">
           <div class="language-tabs" role="group" aria-label="Transcript language"><button type="button" data-language-choice="original">Original</button><button type="button" data-language-choice="both" class="active">Both</button><button type="button" data-language-choice="translation" id="translation-choice">Translation</button></div>
           <div class="commentary-control translation-control" id="translation-control"><span>Translation<em id="translation-detail"></em></span><button type="button" id="translation" class="switch" role="switch" aria-checked="false" aria-label="Translation"><i></i></button></div>
-          <div class="commentary-control"><span>Commentary<em id="commentary-detail"></em></span><select id="commentary-interval" aria-label="How often commentary runs" title="How often commentary runs"><option value="15">15 s</option><option value="30">30 s</option><option value="60">1 min</option><option value="120">2 min</option></select><button type="button" id="commentary" class="switch" role="switch" aria-checked="false" aria-label="Commentary"><i></i></button></div>
+          <div class="commentary-control"><span>Commentary<em id="commentary-detail"></em></span><select id="commentary-style" aria-label="Commentary focus" title="What commentary focuses on"></select><select id="commentary-interval" aria-label="How often commentary runs" title="How often commentary runs"><option value="15">15 s</option><option value="30">30 s</option><option value="60">1 min</option><option value="120">2 min</option></select><button type="button" id="commentary" class="switch" role="switch" aria-checked="false" aria-label="Commentary"><i></i></button></div>
         </div>
       </nav>
+      <aside class="items-drawer" id="items-drawer" aria-label="Important items" hidden><div class="items-drawer-head"><small>IMPORTANT ITEMS</small><span id="items-plan"></span></div><ul id="items-list" class="items-list"></ul><form id="items-form" class="items-form"><input id="items-text" maxlength="500" placeholder="Add an important item…" aria-label="Add an important item" autocomplete="off"><button type="submit">Add</button></form></aside>
       <div class="room" id="room">
         <section class="transcript-pane" aria-label="Transcript"><div class="transcript-scroll" id="transcript-scroll" role="log" aria-live="polite"></div></section>
         <div class="divider" id="divider" role="separator" aria-label="Resize transcript and assistant" aria-orientation="vertical" tabindex="0" title="Drag to resize; double-click to reset"><span></span></div>

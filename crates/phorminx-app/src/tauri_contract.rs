@@ -415,6 +415,10 @@ pub struct MeetingView {
     pub auto_commentary_interval_secs: u32,
     /// The local model commentary uses; empty when commentary cannot run.
     pub commentary_model: String,
+    pub commentary_style: String,
+    pub plan_id: Option<i64>,
+    pub plan_title: String,
+    pub important_items: Vec<ImportantItemView>,
     pub companion_view: &'static str,
     pub companion_translation_view: &'static str,
     pub companion_split_fraction: u16,
@@ -435,6 +439,13 @@ pub struct MeetingView {
     pub assistant_busy: bool,
     pub active_answer_model: String,
     pub notice: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportantItemView {
+    pub text: String,
+    pub done: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -542,6 +553,7 @@ pub struct ChatLineView {
     pub role: String,
     pub text: String,
     pub status: String,
+    pub kind: String,
 }
 
 impl From<&ChatLine> for ChatLineView {
@@ -550,6 +562,7 @@ impl From<&ChatLine> for ChatLineView {
             role: value.role.clone(),
             text: value.text.clone(),
             status: value.status.clone(),
+            kind: value.kind.clone(),
         }
     }
 }
@@ -584,6 +597,17 @@ impl From<&WorkspaceSnapshot> for MeetingView {
             } else {
                 String::new()
             },
+            commentary_style: value.commentary_style.clone(),
+            plan_id: value.plan_id,
+            plan_title: value.plan_title.clone(),
+            important_items: value
+                .important_items
+                .iter()
+                .map(|(text, done)| ImportantItemView {
+                    text: text.clone(),
+                    done: *done,
+                })
+                .collect(),
             companion_view: match value.companion_view {
                 CompanionView::Transcript => "transcript",
                 CompanionView::Assistant => "assistant",
