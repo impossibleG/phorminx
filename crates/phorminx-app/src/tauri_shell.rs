@@ -1421,7 +1421,10 @@ fn run_shell(
         .manage(investigations)
         .manage(host)
         .manage(messaging)
+        .manage(crate::tauri_keep_awake::KeepAwakeState::default())
         .invoke_handler(tauri::generate_handler![
+            crate::tauri_keep_awake::keep_awake_snapshot,
+            crate::tauri_keep_awake::keep_awake_set,
             crate::tauri_meetings::meeting_snapshot,
             crate::tauri_meetings::meeting_actions,
             crate::tauri_meetings::meeting_save_action,

@@ -10,6 +10,7 @@
   <link rel="stylesheet" href="investigations.css">
   <link rel="stylesheet" href="benchmarks.css">
   <link rel="stylesheet" href="action-wizard.css">
+  <link rel="stylesheet" href="keep-awake.css">
   <script src="markdown.js" defer></script>
   <script src="transcript-lines.js" defer></script>
   <script src="benchmarks.js" defer></script>
@@ -22,6 +23,7 @@
   <script src="investigation-model.js" defer></script>
   <script src="investigations.js" defer></script>
   <script src="messages.js" defer></script>
+  <script src="keep-awake.js" defer></script>
 </head>
 <body data-shell="product">
   <div class="shell">
@@ -34,6 +36,7 @@
         <button type="button" data-route="actions">Actions</button>
         <button type="button" data-route="messages">Messages<span id="messages-badge" class="nav-badge" hidden></span></button>
         <button type="button" data-route="investigations">Investigations</button>
+        <button type="button" data-route="keep-awake">Keep awake<span id="keep-awake-badge" class="nav-dot" title="Keeping your PC awake" hidden></span></button>
         <span class="side-group" aria-hidden="true">YOUR WORDS</span>
         <button type="button" data-route="history">History</button>
         <button type="button" data-route="lexicon">Lexicon</button>
@@ -177,6 +180,19 @@
           <div id="setup-updates-card" class="setting-card"><small>NEW FEATURES</small><h2>Keep Phorminx current</h2><label class="check-row"><input id="setup-auto-updates" type="checkbox" checked>Keep getting tested new features automatically</label><p>Phorminx checks signed GitHub Releases daily and installs a verified update when Phorminx restarts, or after you have been away for 30 minutes with nothing recording. Turn this off here or later in Settings → Updates.</p><p id="setup-update-note" role="status"></p></div>
           <div class="setting-card inv-ocr-card" data-ocr-card><small>OPTIONAL / INVESTIGATIONS</small><h2>Screenshot text recognition</h2><p data-ocr-message>Checking local text models…</p><div class="inv-ocr-progress" hidden><span></span></div><div class="inv-ocr-actions"><button type="button" data-ocr-install>Download verified models</button><button type="button" data-ocr-remove hidden>Remove</button></div></div>
           <small id="repair-label">INDIVIDUAL REPAIR</small><div class="setup-intro"><strong id="setup-stage">Inspecting this machine</strong><p id="setup-summary">Reading local capabilities…</p></div><div id="setup-list" class="record-list single-list"></div>
+        </section>
+        <section id="keep-awake" class="page" hidden>
+          <div class="page-head"><div><small>POWER</small><h1>Keep awake</h1></div></div>
+          <div id="keep-awake-panel" class="keep-awake-panel" data-active="false">
+            <small>STATUS</small>
+            <div id="keep-awake-state" class="big-state" role="status">Off</div>
+            <p id="keep-awake-timer" class="keep-awake-timer"></p>
+            <button id="keep-awake-toggle" type="button" aria-pressed="false">Turn on</button>
+            <label class="check-row"><input id="keep-awake-screen" type="checkbox" checked>Keep the screen on too</label>
+            <p id="keep-awake-message" class="keep-awake-message" role="status"></p>
+            <p id="keep-awake-totals" class="keep-awake-totals"></p>
+            <p class="setting-hint">While this is on, Windows will not go to sleep on its own, so long AI jobs and downloads keep running. Your Windows power settings are not changed and nothing moves your mouse. It switches off when you turn it off or close Phorminx. Closing a laptop lid or pressing the power button still puts the PC to sleep.</p>
+          </div>
         </section>
         <section id="feedback" class="page" hidden>
           <div class="page-head"><div><small>REPORTS / COMMENTS</small><h1>Feedback</h1></div><button id="open-feedback" type="button" class="primary">New report or comment</button></div>

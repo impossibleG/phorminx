@@ -17,6 +17,8 @@ mod hotkey;
 #[cfg(windows)]
 mod insertion;
 #[cfg(windows)]
+mod keep_awake;
+#[cfg(windows)]
 mod lexicon_window;
 #[cfg(windows)]
 mod ollama;
@@ -62,6 +64,8 @@ pub use history_window::{HistoryItem, HistoryWindow, HistoryWindowError, History
 pub use hotkey::{GlobalHoldHotkey, HoldEvent, HotkeyError, set_global_shortcut_capture};
 #[cfg(windows)]
 pub use insertion::{ClipboardOnlyReason, InsertionOutcome, copy_and_maybe_paste};
+#[cfg(windows)]
+pub use keep_awake::{KeepAwake, KeepAwakeError};
 #[cfg(windows)]
 pub use lexicon_window::{
     LexiconCasePolicy, LexiconDraft, LexiconItem, LexiconWindow, LexiconWindowError,
