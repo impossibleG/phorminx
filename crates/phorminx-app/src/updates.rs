@@ -16,11 +16,11 @@ const MAX_PACKAGE: u64 = 512 * 1024 * 1024;
 const MAX_SEQUENCE: u64 = 9_007_199_254_740_991;
 static STAGE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn package_matches(path: &Path, release: &Release) -> bool {
+pub(crate) fn package_matches(path: &Path, release: &Release) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return false;
     };
@@ -51,7 +51,7 @@ fn package_matches(path: &Path, release: &Release) -> bool {
     hex(&hash.finalize()) == release.sha256
 }
 
-fn reject_links(path: &Path) -> Result<(), UpdateError> {
+pub(crate) fn reject_links(path: &Path) -> Result<(), UpdateError> {
     for ancestor in path.ancestors() {
         match std::fs::symlink_metadata(ancestor) {
             Ok(metadata) => {
@@ -158,6 +158,41 @@ pub fn verify(
     current: &str,
     highest_sequence: u64,
 ) -> Result<VerifiedCheck, UpdateError> {
+    let (release, newer) = verify_release(envelope, key, now, current, highest_sequence)?;
+    Ok(VerifiedCheck {
+        highest_sequence: release.sequence,
+        release: newer.then_some(release),
+    })
+}
+
+/// The same checks as [`verify`] for an explicit reinstall: the signed
+/// release may also be the installed version, never an older one. The
+/// rollback floor applies unchanged.
+pub fn verify_for_reinstall(
+    envelope: &[u8],
+    key: &[u8],
+    now: u64,
+    current: &str,
+    highest_sequence: u64,
+) -> Result<Release, UpdateError> {
+    let (release, _) = verify_release(envelope, key, now, current, highest_sequence)?;
+    let version =
+        semver::Version::parse(&release.version).map_err(|_| UpdateError::InvalidMetadata)?;
+    let current = semver::Version::parse(current).map_err(|_| UpdateError::InvalidMetadata)?;
+    if version < current {
+        return Err(UpdateError::InvalidMetadata);
+    }
+    Ok(release)
+}
+
+/// Returns the authenticated release and whether it is newer than `current`.
+fn verify_release(
+    envelope: &[u8],
+    key: &[u8],
+    now: u64,
+    current: &str,
+    highest_sequence: u64,
+) -> Result<(Release, bool), UpdateError> {
     if envelope.len() > MAX_ENVELOPE || key.len() != 32 {
         return Err(UpdateError::InvalidMetadata);
     }
@@ -200,14 +235,23 @@ pub fn verify(
     {
         return Err(UpdateError::InvalidMetadata);
     }
-    Ok(VerifiedCheck {
-        highest_sequence: release.sequence,
-        release: (version > current).then_some(release),
-    })
+    Ok((release, version > current))
 }
 
 pub fn check(highest_sequence: u64) -> Result<VerifiedCheck, UpdateError> {
     let key = configured_key()?;
+    let (bytes, now) = fetch_envelope()?;
+    verify(&bytes, &key, now, current_version(), highest_sequence)
+}
+
+/// Fetch and verify the latest signed release for an explicit reinstall.
+pub fn check_for_reinstall(highest_sequence: u64) -> Result<Release, UpdateError> {
+    let key = configured_key()?;
+    let (bytes, now) = fetch_envelope()?;
+    verify_for_reinstall(&bytes, &key, now, current_version(), highest_sequence)
+}
+
+fn fetch_envelope() -> Result<(Vec<u8>, u64), UpdateError> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
         .max_redirects(5)
@@ -227,12 +271,21 @@ pub fn check(highest_sequence: u64) -> Result<VerifiedCheck, UpdateError> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| UpdateError::InvalidMetadata)?
         .as_secs();
-    verify(&bytes, &key, now, current_version(), highest_sequence)
+    Ok((bytes, now))
 }
 
 /// The caller passes only a release returned by verify/check and a private app
 /// staging directory. Download and hashing are background work, never capture work.
 pub fn stage(release: &Release, directory: &Path) -> Result<PathBuf, UpdateError> {
+    stage_with_progress(release, directory, &|_| {})
+}
+
+/// [`stage`], reporting the bytes received so far as the download proceeds.
+pub fn stage_with_progress(
+    release: &Release,
+    directory: &Path,
+    progress: &dyn Fn(u64),
+) -> Result<PathBuf, UpdateError> {
     if !download_url_allowed(&release.download_url)
         || release.bytes == 0
         || release.bytes > MAX_PACKAGE
@@ -290,6 +343,7 @@ pub fn stage(release: &Release, directory: &Path) -> Result<PathBuf, UpdateError
                 break;
             }
             received += n as u64;
+            progress(received);
             if received > release.bytes {
                 return Err(UpdateError::Package);
             }
@@ -458,6 +512,27 @@ mod tests {
             verify(&bytes, &key, 1500, "2.0.0", 9).unwrap().release,
             None
         );
+    }
+    #[test]
+    fn reinstall_accepts_same_version_but_never_older_or_below_floor() {
+        let (bytes, key) = signed(&release());
+        // The installed version itself is a valid reinstall target...
+        assert_eq!(verify_for_reinstall(&bytes, &key, 1500, "1.2.0", 9).unwrap(), release());
+        // ...as is a newer one.
+        assert_eq!(verify_for_reinstall(&bytes, &key, 1500, "1.1.0", 0).unwrap(), release());
+        // Never a downgrade, never below the rollback floor, never unsigned or expired.
+        assert!(verify_for_reinstall(&bytes, &key, 1500, "1.2.1", 0).is_err());
+        assert!(verify_for_reinstall(&bytes, &key, 1500, "1.2.0", 10).is_err());
+        assert!(verify_for_reinstall(&bytes, &[0; 32], 1500, "1.2.0", 0).is_err());
+        assert!(verify_for_reinstall(&bytes, &key, 2000, "1.2.0", 0).is_err());
+        let mut tampered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut forged = release();
+        forged.version = "1.2.0".into();
+        forged.download_url = "https://evil.example/a.exe".into();
+        tampered["payload"] = STANDARD.encode(serde_json::to_vec(&forged).unwrap()).into();
+        assert!(verify_for_reinstall(&serde_json::to_vec(&tampered).unwrap(), &key, 1500, "1.2.0", 0).is_err());
+        // The ordinary update check still ignores the same version.
+        assert_eq!(verify(&bytes, &key, 1500, "1.2.0", 9).unwrap().release, None);
     }
     #[test]
     fn qa_stage_reuses_verified_package_without_network_and_rejects_corruption() {
