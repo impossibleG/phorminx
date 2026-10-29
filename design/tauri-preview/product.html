@@ -220,84 +220,102 @@
           </div>
         </section>
         <section id="investigations" class="page" hidden>
-          <div class="page-head inv-head">
-            <div class="inv-head-title"><small>INVESTIGATIONS</small><h1 id="inv-title">Investigations</h1></div>
-            <div class="head-actions">
-              <select id="inv-picker" aria-label="Open an investigation"></select>
-              <button id="inv-new" type="button">New</button>
-              <button id="inv-active" type="button" aria-pressed="false" title="Quick capture sends the clipboard to this investigation">Capture here</button>
-              <div class="inv-menu-wrap"><button id="inv-more" type="button" aria-haspopup="menu" aria-expanded="false">More</button>
-                <div id="inv-more-menu" class="inv-menu" role="menu" hidden>
-                  <button type="button" role="menuitem" data-inv-menu="rename">Rename</button>
-                  <button type="button" role="menuitem" data-inv-menu="export">Export as Markdown</button>
-                  <button type="button" role="menuitem" data-inv-menu="capture-settings">Quick-capture shortcut</button>
-                  <button type="button" role="menuitem" data-inv-menu="delete" class="danger">Delete investigation</button>
-                </div>
+          <div id="inv-list-view" class="inv-view">
+            <div class="page-head"><div><small>INVESTIGATIONS</small><h1>Investigations</h1></div><div class="head-actions"><button id="inv-new" type="button" class="primary">New investigation</button></div></div>
+            <div id="inv-list" class="record-list single-list inv-list" role="list" aria-label="Investigations"></div>
+            <div id="inv-empty" class="inv-empty" hidden>
+              <div class="inv-empty-card"><small>START</small><h2>Collect everything about one question in one place.</h2><p>Screenshots, links, notes and voice notes, in order, with a diagram to connect them. Everything stays on this computer.</p>
+                <form id="inv-start" class="inv-start"><input id="inv-start-title" maxlength="200" placeholder="Name it, e.g. Supplier contract review" aria-label="Investigation name"><button type="submit" class="primary">Start investigation</button></form>
               </div>
             </div>
           </div>
-          <div class="meeting-tabs inv-tabs" role="tablist" aria-label="Investigation views">
-            <button class="active" type="button" role="tab" aria-selected="true" data-inv-view="chronology">Chronology</button>
-            <button type="button" role="tab" aria-selected="false" data-inv-view="diagram">Diagram</button>
-            <span class="inv-tab-spacer"></span>
-            <button id="inv-assistant-toggle" type="button" class="inv-assistant-toggle" aria-pressed="true">Assistant</button>
-          </div>
-          <div id="inv-empty" class="inv-empty" hidden>
-            <div class="inv-empty-card"><small>START</small><h2>Collect everything about one question in one place.</h2><p>Paste screenshots, links and text, add voice notes, and connect them on a diagram. Everything stays on this computer.</p>
-              <form id="inv-start" class="inv-start"><input id="inv-start-title" maxlength="200" placeholder="Name it, e.g. Supplier contract review" aria-label="Investigation name"><button type="submit" class="primary">Start investigation</button></form>
-            </div>
-          </div>
-          <div id="inv-body" class="inv-body" hidden>
-            <div class="inv-main">
-              <div id="inv-chronology" class="inv-chronology">
-                <form id="inv-capture" class="inv-capture">
-                  <textarea id="inv-capture-text" rows="2" maxlength="262144" placeholder="Type a note or paste a link… Paste or drop screenshots anywhere on this page." aria-label="New note"></textarea>
-                  <div class="inv-capture-actions">
-                    <button type="submit" class="primary">Add note</button>
-                    <button id="inv-voice" type="button" class="inv-voice" aria-pressed="false"><span class="inv-mic" aria-hidden="true"></span><span id="inv-voice-label">Voice note</span></button>
-                    <button id="inv-paste" type="button">Add clipboard</button>
-                    <button id="inv-file" type="button">Add image…</button>
-                    <input id="inv-file-input" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" multiple hidden>
-                    <span id="inv-capture-hint" class="inv-capture-hint"></span>
-                  </div>
-                  <div id="inv-voice-live" class="inv-voice-live" hidden><span class="inv-rec-dot" aria-hidden="true"></span><span id="inv-voice-text">Listening…</span></div>
-                </form>
-                <div class="inv-filters">
-                  <div class="inv-chips" role="group" aria-label="Show cards of type">
-                    <button type="button" class="active" aria-pressed="true" data-inv-filter="all">All</button><button type="button" aria-pressed="false" data-inv-filter="note">Notes</button><button type="button" aria-pressed="false" data-inv-filter="text">Text</button><button type="button" aria-pressed="false" data-inv-filter="image">Screenshots</button><button type="button" aria-pressed="false" data-inv-filter="link">Links</button><button type="button" aria-pressed="false" data-inv-filter="voice">Voice</button><button type="button" aria-pressed="false" data-inv-filter="answer">Answers</button>
-                  </div>
-                  <input id="inv-search" type="search" maxlength="300" placeholder="Find exact words…" aria-label="Search this investigation">
-                </div>
-                <div id="inv-timeline" class="inv-timeline" role="list" aria-label="Chronology"></div>
+          <div id="inv-detail-view" class="inv-view" hidden>
+            <div class="page-head inv-head">
+              <div class="inv-head-title">
+                <button id="inv-back" type="button" class="inv-back">Investigations</button>
+                <h1><span id="inv-live" class="inv-live" title="Capturing here" hidden></span><span id="inv-title" class="inv-title" role="button" tabindex="0" title="Rename">Investigation</span></h1>
               </div>
-              <div id="inv-diagram" class="inv-diagram" hidden>
-                <aside class="inv-tray" aria-label="Unplaced cards"><div class="inv-tray-head"><small>UNPLACED</small><span id="inv-tray-count"></span></div><p class="inv-tray-hint">New cards wait here. Drag one onto the canvas, or choose Place.</p><div id="inv-tray-list" class="inv-tray-list"></div></aside>
-                <div id="inv-canvas-wrap" class="inv-canvas-wrap">
-                  <div class="inv-canvas-toolbar">
-                    <button id="inv-add-concept" type="button">Add concept</button>
-                    <button id="inv-suggest" type="button" title="Ask the assistant to propose connections. Nothing is connected until you accept.">Suggest connections</button>
-                    <button id="inv-dismiss-suggestions" type="button" hidden>Dismiss suggestions</button>
-                    <span class="inv-tab-spacer"></span>
-                    <button id="inv-zoom-out" type="button" aria-label="Zoom out">−</button><button id="inv-zoom-fit" type="button">Fit</button><button id="inv-zoom-in" type="button" aria-label="Zoom in">+</button>
+              <div class="head-actions">
+                <button id="inv-play" type="button" class="inv-play" aria-pressed="false" title="Launcher captures and the quick-capture shortcut land in the investigation that is capturing">Capture here</button>
+                <button id="inv-ask-toggle" type="button" class="inv-ask-toggle" aria-pressed="false">Ask</button>
+                <div class="inv-menu-wrap"><button id="inv-more" type="button" aria-haspopup="menu" aria-expanded="false">More</button>
+                  <div id="inv-more-menu" class="inv-menu" role="menu" hidden>
+                    <button type="button" role="menuitem" data-inv-menu="export">Export as Markdown</button>
+                    <button type="button" role="menuitem" data-inv-menu="capture-settings">Quick-capture shortcut</button>
+                    <button type="button" role="menuitem" data-inv-menu="delete" class="danger">Delete investigation</button>
                   </div>
-                  <svg id="inv-canvas" class="inv-canvas" role="application" aria-label="Investigation diagram"><defs><pattern id="inv-grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" class="inv-grid-dot"></circle></pattern></defs><rect id="inv-canvas-bg" class="inv-canvas-bg" width="100%" height="100%"></rect><g id="inv-viewport"><g id="inv-edges"></g><path id="inv-link-preview" class="inv-edge inv-edge-draft" d=""></path><g id="inv-nodes"></g></g></svg>
-                  <div id="inv-node-menu" class="inv-menu inv-node-menu" role="menu" hidden>
-                    <button type="button" role="menuitem" data-node-add="note">Note</button>
-                    <button type="button" role="menuitem" data-node-add="link">Link</button>
-                    <button type="button" role="menuitem" data-node-add="image">Image…</button>
-                    <button type="button" role="menuitem" data-node-add="voice">Voice note</button>
-                    <button type="button" role="menuitem" data-node-add="concept">Concept</button>
-                  </div>
-                  <p class="inv-canvas-hint">Drag the background to pan and scroll to zoom. Drag from a node’s lower dot onto another node to connect them. Delete removes the selection.</p>
                 </div>
               </div>
             </div>
-            <aside id="inv-assistant" class="inv-assistant" aria-label="Investigation assistant">
-              <div class="inv-assistant-head"><div><small>ASSISTANT</small><span id="inv-provider"></span></div><button id="inv-clear-chat" type="button" title="Clear this conversation">Clear</button></div>
-              <div id="inv-messages" class="inv-messages" role="log"></div>
-              <p id="inv-assistant-notice" class="inv-assistant-notice" role="status"></p>
-              <form id="inv-ask" class="inv-ask"><textarea id="inv-question" rows="2" maxlength="4000" placeholder="Ask about this investigation…" aria-label="Ask about this investigation"></textarea><div class="inv-ask-actions"><span class="inv-ask-hint">Answers cite cards like [#12].</span><button id="inv-stop-answer" type="button" hidden>Stop</button><button type="submit" class="primary">Ask</button></div></form>
-            </aside>
+            <div class="meeting-tabs inv-tabs" role="tablist" aria-label="Investigation views">
+              <button class="active" type="button" role="tab" aria-selected="true" data-inv-view="chronology">Chronology</button>
+              <button type="button" role="tab" aria-selected="false" data-inv-view="diagram">Diagram</button>
+            </div>
+            <div id="inv-body" class="inv-body no-assistant">
+              <div class="inv-main">
+                <div id="inv-chronology" class="inv-chronology">
+                  <div class="inv-toolbar">
+                    <label class="inv-search"><span class="inv-search-icon" aria-hidden="true"></span><input id="inv-search" type="search" maxlength="300" placeholder="Search" aria-label="Search this investigation"></label>
+                    <div id="inv-filter" class="inv-segmented" role="group" aria-label="Show cards of type"></div>
+                  </div>
+                  <div id="inv-voice-live" class="inv-voice-live" hidden><span class="inv-rec-dot" aria-hidden="true"></span><span id="inv-voice-text">Listening…</span><button id="inv-voice-stop" type="button">Stop</button></div>
+                  <div id="inv-timeline" class="inv-timeline" role="list" aria-label="Chronology"></div>
+                </div>
+                <div id="inv-diagram" class="inv-diagram" hidden>
+                  <aside id="inv-tray" class="inv-tray" aria-label="Unplaced cards">
+                    <button id="inv-tray-toggle" type="button" class="inv-tray-head" aria-expanded="true" title="Hide the unplaced cards"><small>UNPLACED</small><span id="inv-tray-count"></span></button>
+                    <p class="inv-tray-hint">New cards wait here. Drag one onto the canvas, or choose Place.</p>
+                    <div id="inv-tray-list" class="inv-tray-list"></div>
+                  </aside>
+                  <div id="inv-canvas-wrap" class="inv-canvas-wrap">
+                    <div class="inv-canvas-toolbar">
+                      <button id="inv-add-concept" type="button">Add concept</button>
+                      <button id="inv-suggest" type="button" title="Ask the assistant to propose connections. Nothing is connected until you accept.">Suggest connections</button>
+                      <button id="inv-dismiss-suggestions" type="button" hidden>Dismiss suggestions</button>
+                      <span class="inv-tab-spacer"></span>
+                      <button id="inv-zoom-out" type="button" aria-label="Zoom out">−</button><button id="inv-zoom-fit" type="button">Fit</button><button id="inv-zoom-in" type="button" aria-label="Zoom in">+</button>
+                    </div>
+                    <svg id="inv-canvas" class="inv-canvas" role="application" aria-label="Investigation diagram"><defs><pattern id="inv-grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" class="inv-grid-dot"></circle></pattern></defs><rect id="inv-canvas-bg" class="inv-canvas-bg" width="100%" height="100%"></rect><g id="inv-viewport"><g id="inv-edges"></g><path id="inv-link-preview" class="inv-edge inv-edge-draft" d=""></path><g id="inv-nodes"></g></g></svg>
+                    <div id="inv-node-menu" class="inv-menu inv-node-menu" role="menu" hidden>
+                      <button type="button" role="menuitem" data-node-add="note">Note</button>
+                      <button type="button" role="menuitem" data-node-add="link">Link</button>
+                      <button type="button" role="menuitem" data-node-add="image">Image…</button>
+                      <button type="button" role="menuitem" data-node-add="voice">Voice note</button>
+                      <button type="button" role="menuitem" data-node-add="concept">Concept</button>
+                    </div>
+                    <p class="inv-canvas-hint">Drag the background to pan and scroll to zoom. Drag from a node’s lower dot onto another node to connect them. Delete removes the selection.</p>
+                  </div>
+                </div>
+                <button id="inv-add" type="button" class="inv-fab" aria-label="Add to this investigation" aria-expanded="false" aria-controls="inv-sheet"></button>
+                <div id="inv-sheet" class="inv-sheet" role="dialog" aria-label="Add to this investigation" hidden>
+                  <div class="inv-sheet-tabs" role="tablist" aria-label="What to add">
+                    <button type="button" role="tab" aria-selected="true" data-inv-sheet="note">Note</button>
+                    <button type="button" role="tab" aria-selected="false" data-inv-sheet="link">Link</button>
+                  </div>
+                  <form id="inv-capture" class="inv-capture">
+                    <textarea id="inv-capture-text" rows="4" maxlength="262144" placeholder="Write a note" aria-label="New note"></textarea>
+                    <div id="inv-link-fields" class="inv-link-fields" hidden>
+                      <input id="inv-link-url" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="https://" aria-label="Link">
+                      <textarea id="inv-link-note" rows="2" maxlength="262144" placeholder="Why it matters (optional)" aria-label="Note about the link"></textarea>
+                    </div>
+                    <div class="inv-sheet-actions">
+                      <button id="inv-voice" type="button" class="inv-voice"><span class="inv-mic" aria-hidden="true"></span>Voice note</button>
+                      <button id="inv-paste" type="button">Clipboard</button>
+                      <button id="inv-file" type="button">Image…</button>
+                      <button id="inv-capture-submit" type="submit" class="primary">Add note</button>
+                    </div>
+                    <p id="inv-capture-hint" class="inv-capture-hint"></p>
+                  </form>
+                </div>
+                <input id="inv-file-input" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" multiple hidden>
+              </div>
+              <aside id="inv-assistant" class="inv-assistant" aria-label="Investigation assistant" hidden>
+                <div class="inv-assistant-head"><div><small>ASK</small><span id="inv-provider"></span></div><button id="inv-clear-chat" type="button" title="Clear this conversation">Clear</button></div>
+                <div id="inv-messages" class="inv-messages" role="log"></div>
+                <p id="inv-assistant-notice" class="inv-assistant-notice" role="status"></p>
+                <form id="inv-ask" class="inv-ask"><textarea id="inv-question" rows="2" maxlength="4000" placeholder="Ask about this investigation…" aria-label="Ask about this investigation"></textarea><div class="inv-ask-actions"><span class="inv-ask-hint">Answers cite cards like [#12].</span><button id="inv-stop-answer" type="button" hidden>Stop</button><button type="submit" class="primary">Ask</button></div></form>
+              </aside>
+            </div>
           </div>
           <p id="inv-status" class="inv-status" role="status"></p>
         </section>
