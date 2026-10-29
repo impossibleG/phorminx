@@ -25,8 +25,9 @@
 .plan-form label{display:flex;flex-direction:column;gap:6px;font-size:11px;color:#a8adb0}
 .plan-form input,.plan-form select,.plan-form textarea{border:1px solid #394046;background:#101416;color:#e8e5dd;border-radius:4px;padding:8px 10px;font:inherit;font-size:12px}
 .plan-form textarea{resize:vertical;line-height:1.5}
-.plan-row{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr);gap:12px}
+.plan-row{display:grid;grid-template-columns:minmax(0,2fr) minmax(190px,1.2fr) minmax(0,1fr);gap:12px}
 .plan-block{border-top:1px solid #30363b;padding-top:14px;display:flex;flex-direction:column;gap:8px}
+.plan-block .items-add{flex:none}
 .plan-block-head{display:flex;align-items:center;gap:12px}.plan-block-head h3{margin:0;font-size:13px;font-weight:600}.plan-block-head button{margin-left:auto}
 .plan-hint{color:#858c90;font-size:11px;margin:0}
 .plan-items{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:5px}
