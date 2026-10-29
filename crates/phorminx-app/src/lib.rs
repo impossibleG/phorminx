@@ -17,7 +17,9 @@ pub mod message_arrival;
 mod library_search;
 pub mod lifecycle;
 pub mod meeting_audio;
+pub mod meeting_documents;
 pub mod meeting_memory;
+pub mod meeting_prep;
 pub mod meeting_workspace;
 pub mod model;
 pub mod model_registry;
@@ -42,6 +44,8 @@ pub mod tauri_investigations;
 mod tauri_keep_awake;
 #[cfg(feature = "tauri-preview")]
 pub mod tauri_meetings;
+#[cfg(feature = "tauri-shell")]
+pub mod tauri_meeting_plans;
 #[cfg(feature = "tauri-shell")]
 mod tauri_messaging;
 #[cfg(feature = "tauri-shell")]

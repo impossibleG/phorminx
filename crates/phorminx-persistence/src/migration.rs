@@ -100,7 +100,7 @@ const RECOVERY_TOMBSTONES_SCHEMA: &str =
     "CREATE TABLE IF NOT EXISTS recovery_tombstones (session TEXT PRIMARY KEY);";
 
 /// Applied, in order, on every open that finds the schema out of date.
-const IDEMPOTENT_SCHEMAS: [&str; 10] = [
+const IDEMPOTENT_SCHEMAS: [&str; 11] = [
     RECOVERY_SCHEMA,
     RECOVERY_TOMBSTONES_SCHEMA,
     crate::library::SCHEMA,
@@ -111,6 +111,7 @@ const IDEMPOTENT_SCHEMAS: [&str; 10] = [
     crate::investigation::SCHEMA,
     crate::messaging::SCHEMA,
     crate::feedback::SCHEMA,
+    crate::meeting_plan::SCHEMA,
 ];
 
 /// Brings the database up to the current schema.

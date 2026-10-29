@@ -34,7 +34,7 @@ function showRoute(route, persist = true) {
   currentRoute = route;
   for (const section of document.querySelectorAll('main > .page')) section.hidden = section !== page;
   for (const button of document.querySelectorAll('.side [data-route]')) {
-    const belongsToMeetings = ['live', 'saved', 'meeting-settings'].includes(route) && button.dataset.route === 'live';
+    const belongsToMeetings = ['live', 'upcoming', 'saved', 'meeting-settings'].includes(route) && button.dataset.route === 'live';
     const editorParent = route === 'action-editor' && button.dataset.route === 'actions' || route === 'lexicon-editor' && button.dataset.route === 'lexicon' || route === 'profile-editor' && button.dataset.route === 'profiles';
     button.classList.toggle('active', button.dataset.route === route || belongsToMeetings || editorParent);
   }
@@ -57,7 +57,7 @@ function showRoute(route, persist = true) {
   // only; the host keeps the last other route.
   if (route === 'feedback') void refreshFeedbackHistory();
   if (persist && hostInvoke && !['prompts', 'investigations', 'messages', 'benchmarks', 'feedback', 'keep-awake'].includes(route)) {
-    const hostRoute = ['live', 'saved', 'meeting-settings'].includes(route) ? 'meetings' : route === 'action-editor' ? 'actions' : route === 'lexicon-editor' ? 'lexicon' : route === 'profile-editor' ? 'profiles' : route;
+    const hostRoute = ['live', 'upcoming', 'saved', 'meeting-settings'].includes(route) ? 'meetings' : route === 'action-editor' ? 'actions' : route === 'lexicon-editor' ? 'lexicon' : route === 'profile-editor' ? 'profiles' : route;
     lastHostRoute = hostRoute;
     void hostInvoke('plugin:phorminx-host|host_select_route', {route: hostRoute}).catch((error) => { node('status').textContent = String(error); });
   }

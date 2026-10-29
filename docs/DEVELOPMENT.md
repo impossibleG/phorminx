@@ -86,6 +86,7 @@ node .\design\tauri-preview\investigation-model.test.js
 node .\design\tauri-preview\benchmarks.test.js
 node .\design\tauri-preview\model-picker.test.js
 node .\design\tauri-preview\transcript-lines.test.js
+node .\design\tauri-preview\meeting-items.test.js
 ```
 
 To measure OCR accuracy and speed after changing `phorminx-ocr`, download the
