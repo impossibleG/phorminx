@@ -19,6 +19,7 @@ use crate::investigations::{
     Attachment, ClipboardCapture, InvestigationDetailView, InvestigationService,
     InvestigationsView, OcrLineView,
 };
+use crate::launcher_investigations::InvestigationRequest;
 use crate::settings::SettingsStore;
 use crate::tauri_meetings::MeetingTauriState;
 
@@ -62,6 +63,27 @@ pub struct OverviewView {
     assistant: AssistantView,
 }
 
+/// What the small capture window should show.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureWindowView {
+    /// Grows with every launcher request, so an open window switches tabs.
+    pub request: u64,
+    /// `note`, `link`, `image` or `new`.
+    pub tab: String,
+    pub investigation_id: Option<i64>,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnipView {
+    /// The clipboard sequence when the snip started.
+    pub sequence: u32,
+    /// The snipped picture as a PNG data URL, once it reached the clipboard.
+    pub image: Option<String>,
+}
+
 pub struct InvestigationTauriState {
     service: Option<Arc<InvestigationService>>,
     assistant: Option<InvestigationAssistant>,
@@ -70,6 +92,9 @@ pub struct InvestigationTauriState {
     hotkey: Mutex<Option<RegisteredHotkey>>,
     capture: Mutex<CaptureShortcutView>,
     toasts: AtomicU64,
+    capture_window: Mutex<CaptureWindowView>,
+    /// An investigation the launcher asked the main window to show.
+    open_request: Mutex<Option<i64>>,
 }
 
 impl InvestigationTauriState {
@@ -100,6 +125,8 @@ impl InvestigationTauriState {
             hotkey: Mutex::new(None),
             capture: Mutex::new(CaptureShortcutView::default()),
             toasts: AtomicU64::new(0),
+            capture_window: Mutex::new(CaptureWindowView::default()),
+            open_request: Mutex::new(None),
         }
     }
 
@@ -236,13 +263,120 @@ fn quick_capture(app: &tauri::AppHandle) {
     match outcome {
         Ok(outcome) => {
             let what = match outcome.kind {
-                "image" => "Screenshot added",
-                "link" => "Link added",
-                _ => "Text added",
+                "image" => "Screenshot",
+                "link" => "Link",
+                _ => "Text from the clipboard",
             };
-            show_toast(app, &state, what, &outcome.investigation_title, false);
+            show_added(app, &state, &outcome.investigation_title, what);
         }
         Err(error) => show_toast(app, &state, "Nothing captured", &error, true),
+    }
+}
+
+/// The one confirmation every capture path uses: "Added to <title>".
+fn show_added(app: &tauri::AppHandle, state: &InvestigationTauriState, title: &str, what: &str) {
+    show_toast(app, state, &format!("Added to {title}"), what, false);
+}
+
+/// Work the launcher's investigations panel hands to this shell.
+pub fn launcher_request(app: &tauri::AppHandle, request: InvestigationRequest) {
+    let state = app.state::<InvestigationTauriState>();
+    match request {
+        InvestigationRequest::QuickCapture => {
+            let handle = app.clone();
+            let _ = thread::Builder::new()
+                .name("phorminx-quick-capture".into())
+                .spawn(move || quick_capture(&handle));
+        }
+        InvestigationRequest::CaptureWindow(tab) => {
+            if let Err(error) = open_capture_window(app, &state, tab) {
+                show_toast(app, &state, "Capture window unavailable", &error, true);
+            }
+        }
+        InvestigationRequest::VoiceNote {
+            investigation_id,
+            text,
+        } => {
+            let outcome = state.service().and_then(|service| {
+                service.add_voice_note(investigation_id, &text, Attachment::default())?;
+                service.title(investigation_id)
+            });
+            match outcome {
+                Ok(title) => show_added(app, &state, &title, "Voice note"),
+                Err(error) => show_toast(app, &state, "Voice note not added", &error, true),
+            }
+        }
+        InvestigationRequest::Open(id) => {
+            if let Ok(mut request) = state.open_request.lock() {
+                *request = Some(id);
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }
+        InvestigationRequest::Stopped(title) => {
+            show_toast(app, &state, "Capture stopped", &title, false);
+        }
+    }
+}
+
+const CAPTURE_WINDOW: &str = "investigation-capture";
+
+/// Opens (or brings forward) the small always-on-top capture window on `tab`.
+fn open_capture_window(
+    app: &tauri::AppHandle,
+    state: &InvestigationTauriState,
+    tab: &str,
+) -> Result<(), String> {
+    let service = state.service()?;
+    let active = service.active()?;
+    if tab != "new" && active.is_none() {
+        return Err("Pick an investigation first.".into());
+    }
+    {
+        let mut view = state
+            .capture_window
+            .lock()
+            .map_err(|_| "The capture window is unavailable.")?;
+        view.request += 1;
+        view.tab = tab.into();
+        view.title = match active {
+            Some(id) => service.title(id)?,
+            None => String::new(),
+        };
+        view.investigation_id = active;
+    }
+    if let Some(window) = app.get_webview_window(CAPTURE_WINDOW) {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(
+        app,
+        CAPTURE_WINDOW,
+        WebviewUrl::App("tauri-preview/capture.html".into()),
+    )
+    .title("Phorminx · Capture")
+    .inner_size(460.0, 360.0)
+    .min_inner_size(380.0, 300.0)
+    .always_on_top(true)
+    .resizable(true)
+    .skip_taskbar(true)
+    .center()
+    .focused(true)
+    // Let the page receive dropped image files itself, like the main window.
+    .disable_drag_drop_handler()
+    .build()
+    .map(|_| ())
+    .map_err(|_| "The capture window could not be opened.".into())
+}
+
+fn close_capture_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(CAPTURE_WINDOW) {
+        let _ = window.close();
     }
 }
 
@@ -406,6 +540,18 @@ pub(crate) fn investigation_add_text(
         if note { "typed" } else { "paste" },
         attachment(parent_node),
     )
+}
+
+#[tauri::command]
+pub(crate) fn investigation_add_link(
+    id: i64,
+    url: String,
+    note: String,
+    state: State<'_, InvestigationTauriState>,
+) -> Result<i64, String> {
+    state
+        .service()?
+        .add_link(id, &url, &note, Attachment::default())
 }
 
 #[tauri::command]
@@ -824,6 +970,213 @@ fn watch_voice(
         view.revision += 1;
         return;
     }
+}
+
+#[tauri::command]
+pub(crate) fn investigation_capture_window(
+    state: State<'_, InvestigationTauriState>,
+) -> Result<CaptureWindowView, String> {
+    state
+        .capture_window
+        .lock()
+        .map(|view| view.clone())
+        .map_err(|_| "The capture window is unavailable.".into())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CaptureSubmit {
+    /// `note`, `link`, `image` or `new`.
+    kind: String,
+    investigation_id: Option<i64>,
+    text: Option<String>,
+    url: Option<String>,
+    /// Image data (`data:` URL or base64) for `image`.
+    data: Option<String>,
+    /// `paste`, `drop`, `file` or `screenshot` for `image`.
+    source: Option<String>,
+}
+
+/// Files what the capture window collected, confirms it with a toast and
+/// closes the window. Works while the main window is closed.
+#[tauri::command]
+pub(crate) async fn investigation_capture_submit(
+    request: CaptureSubmit,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = handle.state::<InvestigationTauriState>();
+        let service = state.service()?.clone();
+        let text = request.text.as_deref().unwrap_or_default();
+        if request.kind == "new" {
+            if text.trim().is_empty() {
+                return Err("Name the investigation first.".to_owned());
+            }
+            if text.chars().count() > 200 {
+                return Err("Titles are limited to 200 characters.".to_owned());
+            }
+            let id = service.create(text.trim())?;
+            service.set_active(Some(id))?;
+            let title = service.title(id)?;
+            close_capture_window(&handle);
+            show_toast(
+                &handle,
+                &state,
+                &format!("Capturing to {title}"),
+                "New investigation",
+                false,
+            );
+            return Ok(());
+        }
+        let id = request
+            .investigation_id
+            .ok_or("Pick an investigation first.")?;
+        let what = match request.kind.as_str() {
+            "note" => {
+                service.add_text(id, text, true, "typed", Attachment::default())?;
+                "Note"
+            }
+            "link" => {
+                service.add_link(
+                    id,
+                    request.url.as_deref().unwrap_or_default(),
+                    text,
+                    Attachment::default(),
+                )?;
+                "Link"
+            }
+            "image" => {
+                let source = match request.source.as_deref() {
+                    Some(source @ ("paste" | "drop" | "file" | "screenshot")) => source,
+                    _ => return Err("Unknown image source.".into()),
+                };
+                service.add_image_base64(
+                    id,
+                    request.data.as_deref().unwrap_or_default(),
+                    source,
+                    Attachment::default(),
+                )?;
+                if source == "screenshot" {
+                    "Screenshot"
+                } else {
+                    "Image"
+                }
+            }
+            _ => return Err("Unknown capture.".into()),
+        };
+        let title = service.title(id)?;
+        close_capture_window(&handle);
+        show_added(&handle, &state, &title, what);
+        Ok(())
+    })
+    .await
+    .map_err(|_| "The capture could not be added.".to_owned())?
+}
+
+#[tauri::command]
+pub(crate) fn investigation_capture_close(app: tauri::AppHandle) {
+    close_capture_window(&app);
+}
+
+/// Shows the capture window again after a snip, in front.
+fn reveal_capture_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(CAPTURE_WINDOW) {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// `start` hides the capture window (so it is not in the picture), opens the
+/// Windows snip and returns the clipboard sequence to watch; `poll` returns the
+/// picture once the clipboard moved past `since` and holds an image; `cancel`
+/// brings the window back. The window owns the timeout and Cancel.
+#[tauri::command]
+pub(crate) async fn investigation_snip(
+    kind: String,
+    since: Option<u32>,
+    app: tauri::AppHandle,
+) -> Result<SnipView, String> {
+    match kind.as_str() {
+        "start" => {
+            let sequence = phorminx_windows::clipboard_sequence();
+            if let Some(window) = app.get_webview_window(CAPTURE_WINDOW) {
+                let _ = window.hide();
+            }
+            if let Err(error) = phorminx_windows::start_screen_snip() {
+                reveal_capture_window(&app);
+                return Err(error.to_string());
+            }
+            Ok(SnipView {
+                sequence,
+                image: None,
+            })
+        }
+        "cancel" => {
+            reveal_capture_window(&app);
+            Ok(SnipView::default())
+        }
+        "poll" => {
+            let since = since.ok_or("The snip was not started.")?;
+            let sequence = phorminx_windows::clipboard_sequence();
+            if sequence == since {
+                return Ok(SnipView {
+                    sequence: since,
+                    image: None,
+                });
+            }
+            let shown = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let image = arboard::Clipboard::new()
+                    .ok()
+                    .and_then(|mut clipboard| clipboard.get_image().ok())
+                    .and_then(|image| {
+                        image::RgbaImage::from_raw(
+                            image.width as u32,
+                            image.height as u32,
+                            image.bytes.into_owned(),
+                        )
+                    })
+                    .and_then(|image| {
+                        let mut bytes = Vec::new();
+                        image::DynamicImage::ImageRgba8(image)
+                            .write_to(
+                                &mut std::io::Cursor::new(&mut bytes),
+                                image::ImageFormat::Png,
+                            )
+                            .ok()?;
+                        Some(bytes)
+                    })
+                    .map(|bytes| {
+                        use base64::Engine as _;
+                        format!(
+                            "data:image/png;base64,{}",
+                            base64::engine::general_purpose::STANDARD.encode(bytes)
+                        )
+                    });
+                if image.is_some() {
+                    reveal_capture_window(&shown);
+                }
+                SnipView {
+                    sequence: since,
+                    image,
+                }
+            })
+            .await
+            .map_err(|_| "The screenshot could not be read.".to_owned())
+        }
+        _ => Err("Unknown snip action.".into()),
+    }
+}
+
+/// The investigation the launcher asked to show, once.
+#[tauri::command]
+pub(crate) fn investigation_open_request(state: State<'_, InvestigationTauriState>) -> Option<i64> {
+    state
+        .open_request
+        .lock()
+        .ok()
+        .and_then(|mut request| request.take())
 }
 
 #[tauri::command]
