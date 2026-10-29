@@ -64,4 +64,41 @@ assert.equal(model.invShortcutFromEvent({code: 'F9'}), 'F9');
 assert.equal(model.invShortcutFromEvent({code: 'ShiftLeft', shiftKey: true}), null);
 assert.equal(model.invFormatBytes(12_609_983), '12.6 MB');
 
+// List rows: counts by kind, the playing investigation first.
+assert.equal(model.invKindSummary({}), 'Empty');
+assert.equal(model.invKindSummary({note: 1, image: 2}), '1 note · 2 screenshots');
+assert.equal(model.invKindSummary({voice: 1, text: 2, note: 3, link: 1, answer: 4}), '3 notes · 1 link · 1 voice note · 6 more');
+const rows = model.invListRows([
+  {id: 1, title: 'Old', updatedAtMs: 10, kinds: {}},
+  {id: 2, title: 'New', updatedAtMs: 30, kinds: {note: 2}},
+  {id: 3, title: 'Live', updatedAtMs: 20, kinds: {link: 1}},
+], 3);
+assert.deepEqual(rows.map((row) => [row.id, row.live]), [[3, true], [2, false], [1, false]]);
+assert.equal(rows[1].summary, '2 notes');
+
+// Segmented filter shows only kinds present, with counts.
+assert.deepEqual(model.invFilterCounts([{kind: 'note'}, {kind: 'image'}, {kind: 'note'}]), [
+  {kind: 'all', label: 'All', count: 3},
+  {kind: 'note', label: 'Notes', count: 2},
+  {kind: 'image', label: 'Screenshots', count: 1},
+]);
+assert.deepEqual(model.invFilterCounts([]), [{kind: 'all', label: 'All', count: 0}]);
+
+// Relative times.
+const at = new Date(2026, 9, 17, 15, 0).getTime();
+assert.equal(model.invRelativeTime(at - 20_000, at), 'Just now');
+assert.equal(model.invRelativeTime(at - 12 * 60_000, at), '12 min ago');
+assert.equal(model.invRelativeTime(at - 3 * 3600_000, at), '3 h ago');
+assert.equal(model.invRelativeTime(new Date(2026, 9, 16, 22, 0).getTime(), at), 'Yesterday');
+
+// Capture window validation.
+assert.equal(model.invCaptureProblem('new', {text: '  '}), 'Name the investigation.');
+assert.equal(model.invCaptureProblem('new', {text: 'Supplier review'}), null);
+assert.equal(model.invCaptureProblem('note', {text: ''}), 'Write the note first.');
+assert.equal(model.invCaptureProblem('link', {url: 'https://example.com/a?b=1'}), null);
+assert.equal(model.invCaptureProblem('link', {url: 'example.com'}), null);
+assert.match(model.invCaptureProblem('link', {url: 'not a link'}), /full link/);
+assert.match(model.invCaptureProblem('image', {}), /screenshot/);
+assert.equal(model.invCaptureProblem('image', {data: 'data:image/png;base64,AA'}), null);
+
 console.log('investigation-model tests passed');

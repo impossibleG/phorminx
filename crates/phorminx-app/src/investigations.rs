@@ -133,6 +133,8 @@ pub struct InvestigationSummaryView {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub item_count: u64,
+    /// Card counts by kind (`note`, `image`, …); kinds with no cards are absent.
+    pub kinds: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -381,6 +383,10 @@ impl InvestigationService {
     pub fn overview(&self) -> Result<InvestigationsView, String> {
         let db = self.db()?;
         let repo = db.investigations();
+        let mut kinds: HashMap<i64, std::collections::BTreeMap<String, u64>> = HashMap::new();
+        for (id, kind, count) in repo.kind_counts().unwrap_or_default() {
+            kinds.entry(id).or_default().insert(kind, count);
+        }
         Ok(InvestigationsView {
             revision: self.revision(),
             investigations: repo
@@ -388,6 +394,7 @@ impl InvestigationService {
                 .map_err(|_| "Investigations could not be listed.")?
                 .into_iter()
                 .map(|record| InvestigationSummaryView {
+                    kinds: kinds.remove(&record.id).unwrap_or_default(),
                     id: record.id,
                     title: record.title,
                     created_at_ms: record.created_at_ms,
@@ -662,6 +669,32 @@ impl InvestigationService {
             },
             attachment,
         )
+    }
+
+    /// Adds a typed link with an optional note about it.
+    pub fn add_link(
+        &self,
+        investigation_id: i64,
+        url: &str,
+        note: &str,
+        attachment: Attachment,
+    ) -> Result<i64, String> {
+        let url = parse_link(url).ok_or("Paste a full link, like https://example.com.")?;
+        let note = note.trim();
+        if note.len() > phorminx_persistence::MAX_ITEM_BODY_BYTES {
+            return Err("Notes are limited to 256 KB.".into());
+        }
+        let id = self.add_item(
+            investigation_id,
+            &NewInvestigationItem {
+                url: Some(url.to_string()),
+                source: "typed".into(),
+                ..NewInvestigationItem::new(InvestigationItemKind::Link, note)
+            },
+            attachment,
+        )?;
+        self.link_signal.notify();
+        Ok(id)
     }
 
     /// Adds an encoded image (paste, drop or clipboard) and queues OCR.
@@ -1511,6 +1544,72 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["quick-capture"; 2]
         );
+    }
+
+    #[test]
+    fn every_capture_lands_in_the_chronology_and_waits_unplaced() {
+        let (_dir, service) = service();
+        let id = service.create("Case").unwrap();
+        let other = service.create("Other").unwrap();
+        service
+            .add_text(id, "A typed note", true, "typed", Attachment::default())
+            .unwrap();
+        let link = service
+            .add_link(
+                id,
+                "https://example.com/report",
+                "  Read section 3  ",
+                Attachment::default(),
+            )
+            .unwrap();
+        service
+            .add_voice_note(id, "Spoken words", Attachment::default())
+            .unwrap();
+        service
+            .add_image(id, &png(4, 3), "screenshot", Attachment::default())
+            .unwrap();
+        service.set_active(Some(id)).unwrap();
+        service
+            .quick_capture(ClipboardCapture::Text("clipboard text".into()))
+            .unwrap();
+        assert!(
+            service
+                .add_link(id, "not a link", "", Attachment::default())
+                .is_err()
+        );
+        let detail = service.detail(id, None).unwrap().unwrap();
+        assert_eq!(detail.items.len(), 5);
+        assert!(detail.items.iter().all(|item| item.node_id.is_none()));
+        assert!(detail.nodes.is_empty());
+        let link = detail.items.iter().find(|item| item.id == link).unwrap();
+        assert_eq!(link.kind, "link");
+        assert_eq!(link.body, "Read section 3");
+        let overview = service.overview().unwrap();
+        let case = overview
+            .investigations
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(case.item_count, 5);
+        assert_eq!(
+            case.kinds
+                .iter()
+                .map(|(kind, count)| (kind.as_str(), *count))
+                .collect::<Vec<_>>(),
+            vec![
+                ("image", 1),
+                ("link", 1),
+                ("note", 1),
+                ("text", 1),
+                ("voice", 1)
+            ]
+        );
+        let other = overview
+            .investigations
+            .iter()
+            .find(|row| row.id == other)
+            .unwrap();
+        assert!(other.kinds.is_empty());
     }
 
     #[test]

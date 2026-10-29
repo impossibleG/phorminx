@@ -89,7 +89,7 @@
       "order": 60,
       "title": "Investigations",
       "tagline": "Everything about one question, in one place.",
-      "body": "Collect pasted text, screenshots, links and voice notes as cards. Screenshot text is read by local OCR. See them as a chronology or a diagram, and ask the assistant, which answers with citations to your cards.",
+      "body": "Collect pasted text, screenshots, links and voice notes as cards. Screenshot text is read by local OCR. Press play on one investigation and add to it from anywhere through the launcher: a voice note, the clipboard, a note, a link or a screenshot. See the cards as a chronology or a diagram, and ask the assistant, which answers with citations to your cards.",
       "image": "docs/features/investigations.webp",
       "width": 1600,
       "height": 1100,

@@ -78,6 +78,8 @@ pub enum ProductShellControl {
     /// Show the Messages page (the launcher's Messages key while messaging is
     /// off or has no contacts yet).
     OpenMessages,
+    /// Investigations work from the launcher's investigations panel.
+    Investigation(crate::launcher_investigations::InvestigationRequest),
     Quit,
 }
 
@@ -2162,6 +2164,12 @@ impl eframe::App for ProductShellApp {
                 ProductShellControl::OpenReview(_) | ProductShellControl::ReviewResult { .. } => {}
                 ProductShellControl::MessageContact { .. } | ProductShellControl::OpenMessages => {
                     self.set_error("Messaging is available in the new Phorminx window.".into());
+                    self.refresh();
+                }
+                ProductShellControl::Investigation(_) => {
+                    self.set_error(
+                        "Investigations are available in the new Phorminx window.".into(),
+                    );
                     self.refresh();
                 }
                 ProductShellControl::Quit => {

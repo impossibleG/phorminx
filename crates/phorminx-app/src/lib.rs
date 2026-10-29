@@ -11,6 +11,7 @@ pub mod investigation_assistant;
 pub mod investigation_links;
 pub mod investigation_ocr;
 pub mod investigations;
+pub mod launcher_investigations;
 pub mod launcher_messaging;
 pub mod message_arrival;
 mod library_search;

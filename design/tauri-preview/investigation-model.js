@@ -153,6 +153,68 @@ function invFormatBytes(bytes) {
   return `${bytes} B`;
 }
 
+// Plural labels for list rows and filters, in the order they are shown.
+const INV_KIND_ORDER = ['note', 'image', 'link', 'voice', 'text', 'answer'];
+const INV_KIND_PLURALS = {
+  note: ['note', 'notes'],
+  image: ['screenshot', 'screenshots'],
+  link: ['link', 'links'],
+  voice: ['voice note', 'voice notes'],
+  text: ['pasted text', 'pasted texts'],
+  answer: ['answer', 'answers'],
+};
+
+// "3 notes · 2 screenshots · 1 link" from the host's per-kind counts.
+function invKindSummary(kinds, limit = 3) {
+  const present = INV_KIND_ORDER.filter((kind) => kinds?.[kind] > 0);
+  const parts = present.map((kind) => `${kinds[kind]} ${INV_KIND_PLURALS[kind][kinds[kind] === 1 ? 0 : 1]}`);
+  if (!parts.length) return 'Empty';
+  if (parts.length <= limit) return parts.join(' · ');
+  const rest = present.slice(limit).reduce((sum, kind) => sum + kinds[kind], 0);
+  return `${parts.slice(0, limit).join(' · ')} · ${rest} more`;
+}
+
+const INV_FILTER_LABELS = {note: 'Notes', image: 'Screenshots', link: 'Links', voice: 'Voice', text: 'Pasted', answer: 'Answers'};
+
+// Segmented-filter entries: All plus each kind present, with counts.
+function invFilterCounts(items) {
+  const counts = {};
+  for (const item of items) counts[item.kind] = (counts[item.kind] || 0) + 1;
+  return [{kind: 'all', label: 'All', count: items.length}].concat(
+    INV_KIND_ORDER.filter((kind) => counts[kind]).map((kind) => ({kind, label: INV_FILTER_LABELS[kind], count: counts[kind]})),
+  );
+}
+
+// "Just now", "12 min ago", "3 h ago", then the day label.
+function invRelativeTime(ms, nowMs = Date.now(), locale = undefined) {
+  const seconds = Math.max(0, Math.round((nowMs - ms) / 1000));
+  if (seconds < 60) return 'Just now';
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
+  if (invStartOfDay(ms) === invStartOfDay(nowMs)) return `${Math.floor(seconds / 3600)} h ago`;
+  return invDayLabel(ms, nowMs, locale);
+}
+
+// Rows for the list page: the playing investigation first, then by update.
+function invListRows(investigations, activeId) {
+  return [...investigations]
+    .sort((a, b) => (b.id === activeId) - (a.id === activeId) || b.updatedAtMs - a.updatedAtMs || b.id - a.id)
+    .map((item) => ({id: item.id, title: item.title, live: item.id === activeId, updatedAtMs: item.updatedAtMs, summary: invKindSummary(item.kinds)}));
+}
+
+// Why the capture window cannot submit yet; null when it can.
+function invCaptureProblem(kind, fields) {
+  const text = (fields.text || '').trim();
+  if (kind === 'new') return !text ? 'Name the investigation.' : [...text].length > 200 ? 'Titles are limited to 200 characters.' : null;
+  if (kind === 'note') return text ? null : 'Write the note first.';
+  if (kind === 'link') {
+    const url = (fields.url || '').trim();
+    if (!url) return 'Paste a link first.';
+    return /^(https?:\/\/)?[^\s/.]+(\.[^\s/.]+)+(\/\S*)?$/i.test(url) ? null : 'Paste a full link, like https://example.com.';
+  }
+  if (kind === 'image') return fields.data ? null : 'Paste, drop or choose an image, or take a screenshot.';
+  return 'Choose what to add.';
+}
+
 if (typeof module !== 'undefined') {
-  module.exports = {invKindLabel, invCardLabel, invSplitCitations, invDayLabel, invVisibleItems, invNodeHeight, invFitView, invZoomAt, invScreenToWorld, invEdgePath, invMidpoint, invParseLayout, invShortcutFromEvent, invFormatBytes, invClampZoom, INV_NODE_WIDTH};
+  module.exports = {invKindLabel, invCardLabel, invSplitCitations, invDayLabel, invVisibleItems, invNodeHeight, invFitView, invZoomAt, invScreenToWorld, invEdgePath, invMidpoint, invParseLayout, invShortcutFromEvent, invFormatBytes, invClampZoom, invKindSummary, invFilterCounts, invRelativeTime, invListRows, invCaptureProblem, INV_NODE_WIDTH};
 }

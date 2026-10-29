@@ -42,6 +42,8 @@ mod shortcut;
 #[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]
+mod snip;
+#[cfg(windows)]
 mod startup;
 #[cfg(windows)]
 mod target;
@@ -83,7 +85,9 @@ pub use ollama::{
 #[cfg(windows)]
 pub use ollama_start::{OllamaStartError, start_verified_ollama};
 #[cfg(windows)]
-pub use overlay::{OverlayError, OverlayEvent, OverlayStatus, StatusOverlay};
+pub use overlay::{LauncherPanel, OverlayError, OverlayEvent, OverlayStatus, StatusOverlay};
+#[cfg(windows)]
+pub use snip::{ScreenSnipError, clipboard_sequence, start_screen_snip};
 #[cfg(windows)]
 pub use performance::{
     HostResourceError, HostResourceSnapshot, host_cpu_busy_per_mille,

@@ -15,10 +15,12 @@
     for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, value);
     return element;
   };
-  const STORAGE_KEY = 'phorminx.investigations.open';
+  const TRAY_KEY = 'phorminx.investigations.tray';
 
   const state = {
     route: 'home',
+    // `list` shows every investigation; `detail` one of them.
+    page: 'list',
     overview: null,
     detail: null,
     id: null,
@@ -27,7 +29,9 @@
     query: '',
     matches: null,
     images: new Map(),
-    assistantOpen: true,
+    assistantOpen: false,
+    sheet: null,
+    trayCollapsed: recalled(TRAY_KEY) === 'collapsed',
     diagram: {view: {x: 60, y: 60, k: 1}, viewLoadedFor: null, selected: null, drag: null, menuNode: null, pendingParent: null},
     refreshing: false,
     lastVoiceRevision: -1,
@@ -45,11 +49,11 @@
     return call(command, args);
   }
 
-  function rememberOpen(id) {
-    try { localStorage.setItem(STORAGE_KEY, String(id)); } catch (_) { /* optional */ }
+  function remember(key, value) {
+    try { localStorage.setItem(key, value); } catch (_) { /* optional */ }
   }
-  function recalledOpen() {
-    try { return Number(localStorage.getItem(STORAGE_KEY)) || null; } catch (_) { return null; }
+  function recalled(key) {
+    try { return localStorage.getItem(key); } catch (_) { return null; }
   }
 
   function timeLabel(ms) {
@@ -83,9 +87,10 @@
       renderOcrCards(overview);
       renderVoice(overview.voice);
       renderAssistantState(overview.assistant);
+      liveNav(overview.activeId);
       if (!visible()) return;
       renderOverview(overview);
-      if (state.id !== null) {
+      if (state.page === 'detail' && state.id !== null) {
         const detail = await invoke('investigation_detail', {id: state.id, since: force || !state.detail ? null : state.detail.revision});
         if (detail) renderDetail(detail);
       }
@@ -96,52 +101,95 @@
     }
   }
 
-  function chooseInvestigation(overview) {
-    const ids = overview.investigations.map((item) => item.id);
-    if (state.id !== null && ids.includes(state.id)) return state.id;
-    const recalled = recalledOpen();
-    if (recalled && ids.includes(recalled)) return recalled;
-    if (overview.activeId && ids.includes(overview.activeId)) return overview.activeId;
-    return ids[0] ?? null;
+  // A small live dot on the Investigations nav item while one is capturing.
+  function liveNav(activeId) {
+    document.querySelector('.side [data-route="investigations"]')?.classList.toggle('inv-nav-live', Boolean(activeId));
+  }
+
+  async function setPlaying(id, playing) {
+    const title = state.overview?.investigations.find((item) => item.id === id)?.title || 'this investigation';
+    await act(() => invoke('investigation_set_active', {id: playing ? id : null}), playing ? `Capturing to ${title}.` : 'Paused.');
+  }
+
+  function renderList(overview) {
+    const rows = invListRows(overview.investigations, overview.activeId);
+    // Polling must not rebuild unchanged rows under the pointer or focus.
+    const key = JSON.stringify(rows.map((row) => [row.id, row.title, row.live, row.summary, invRelativeTime(row.updatedAtMs)]));
+    if (key === state.listKey) return;
+    state.listKey = key;
+    const fragment = document.createDocumentFragment();
+    for (const row of rows) {
+      const item = el('div', `inv-row${row.live ? ' live' : ''}`);
+      item.setAttribute('role', 'listitem');
+      const open = el('button', 'inv-row-open');
+      open.type = 'button';
+      const title = el('span', 'inv-row-title');
+      if (row.live) title.append(el('span', 'inv-live', ''));
+      title.append(el('strong', '', row.title));
+      if (row.live) title.append(el('span', 'inv-row-state', 'Capturing'));
+      const meta = el('span', 'inv-row-meta');
+      const updated = el('time', '', invRelativeTime(row.updatedAtMs));
+      updated.dateTime = new Date(row.updatedAtMs).toISOString();
+      updated.title = fullTimeLabel(row.updatedAtMs);
+      meta.append(el('span', '', row.summary), updated);
+      open.append(title, meta);
+      open.addEventListener('click', () => openInvestigation(row.id));
+      const play = el('button', 'inv-play compact');
+      play.type = 'button';
+      play.setAttribute('aria-pressed', String(row.live));
+      play.setAttribute('aria-label', `${row.live ? 'Pause' : 'Capture into'} ${row.title}`);
+      play.title = row.live ? 'Pause capturing' : 'Capture here';
+      play.addEventListener('click', () => void setPlaying(row.id, !row.live));
+      item.append(open, play);
+      fragment.append(item);
+    }
+    $('inv-list').replaceChildren(fragment);
   }
 
   function renderOverview(overview) {
-    const chosen = chooseInvestigation(overview);
-    if (chosen !== state.id) openInvestigation(chosen, false);
+    const ids = overview.investigations.map((item) => item.id);
+    if (state.page === 'detail' && !ids.includes(state.id)) showList();
     const empty = !overview.investigations.length;
     $('inv-empty').hidden = !empty;
-    $('inv-body').hidden = empty;
-    for (const id of ['inv-picker', 'inv-active', 'inv-more']) $(id).hidden = empty;
-    document.querySelector('#investigations .inv-tabs').hidden = empty;
-    if (empty) $('inv-title').textContent = 'Investigations';
-    const picker = $('inv-picker');
-    const options = overview.investigations.map((item) => {
-      const option = el('option', '', `${item.title}${item.id === overview.activeId ? '  ★' : ''} · ${item.itemCount}`);
-      option.value = String(item.id);
-      return option;
-    });
-    if (document.activeElement !== picker) {
-      picker.replaceChildren(...options);
-      if (state.id !== null) picker.value = String(state.id);
-    }
+    $('inv-list').hidden = empty;
+    $('inv-new').hidden = empty;
+    if (state.page === 'list') renderList(overview);
     const active = state.id !== null && state.id === overview.activeId;
-    $('inv-active').setAttribute('aria-pressed', String(active));
-    $('inv-active').textContent = active ? 'Capturing here' : 'Capture here';
+    $('inv-live').hidden = !active;
+    $('inv-play').setAttribute('aria-pressed', String(active));
+    $('inv-play').textContent = active ? 'Pause' : 'Capture here';
     const capture = overview.capture;
-    $('inv-capture-hint').textContent = capture?.registered
-      ? `${capture.shortcut} sends the clipboard to ${active ? 'this' : 'the ★'} investigation`
-      : capture?.enabled ? 'Quick-capture shortcut unavailable · More → Quick-capture shortcut' : '';
+    $('inv-capture-hint').textContent = !capture?.registered ? ''
+      : active ? `${capture.shortcut} also sends the clipboard here.` : `Choose Capture here to make ${capture.shortcut} send the clipboard here.`;
   }
 
-  function openInvestigation(id, refreshNow = true) {
+  function showPage(page) {
+    state.page = page;
+    $('inv-list-view').hidden = page !== 'list';
+    $('inv-detail-view').hidden = page !== 'detail';
+    if (page === 'list') closeSheet();
+  }
+
+  function showList() {
+    state.id = null;
+    state.detail = null;
+    showPage('list');
+    if (state.overview) renderOverview(state.overview);
+  }
+
+  function openInvestigation(id) {
     state.id = id;
     state.detail = null;
     state.matches = null;
     state.query = '';
+    setFilter('all');
     $('inv-search').value = '';
     state.diagram.selected = null;
-    if (id !== null) rememberOpen(id);
-    if (refreshNow) void refresh(true);
+    $('inv-title').textContent = state.overview?.investigations.find((item) => item.id === id)?.title || 'Investigation';
+    $('inv-timeline').replaceChildren();
+    showPage('detail');
+    if (state.overview) renderOverview(state.overview);
+    void refresh(true);
   }
 
   // ---------- OCR models (Models, Setup and Investigations) ----------
@@ -173,6 +221,7 @@
     if (!previous || previous.id !== detail.id) {
       state.diagram.viewLoadedFor = null;
     }
+    renderFilter();
     renderTimeline();
     renderTray();
     if (state.view === 'diagram') renderDiagram();
@@ -307,7 +356,7 @@
     if (!items.length) {
       const empty = el('div', 'inv-timeline-empty');
       if (detail.items.length) empty.append(el('strong', '', 'No cards match.'), el('p', '', 'Clear the search or choose All.'));
-      else empty.append(el('strong', '', 'Nothing collected yet.'), el('p', '', 'Paste a screenshot (Ctrl+V), drop an image or a link, type a note, or record a voice note.'));
+      else empty.append(el('strong', '', 'Nothing collected yet.'), el('p', '', 'Choose + to add a note, link, voice note or image. Screenshots can be pasted or dropped anywhere here.'));
       fragment.append(empty);
     }
     const scroll = timeline.scrollTop;
@@ -340,11 +389,24 @@
 
   function setFilter(kind) {
     state.filter = kind;
-    for (const chip of document.querySelectorAll('[data-inv-filter]')) {
-      const on = chip.dataset.invFilter === kind;
-      chip.classList.toggle('active', on);
-      chip.setAttribute('aria-pressed', String(on));
+    renderFilter();
+  }
+
+  // One quiet segmented control: All plus the kinds this investigation has.
+  function renderFilter() {
+    const entries = invFilterCounts(state.detail?.items || []);
+    if (!entries.some((entry) => entry.kind === state.filter)) state.filter = 'all';
+    const fragment = document.createDocumentFragment();
+    for (const entry of entries) {
+      const button = el('button', entry.kind === state.filter ? 'active' : '');
+      button.type = 'button';
+      button.dataset.invFilter = entry.kind;
+      button.setAttribute('aria-pressed', String(entry.kind === state.filter));
+      button.append(document.createTextNode(entry.label), el('span', 'inv-count', String(entry.count)));
+      button.addEventListener('click', () => { setFilter(entry.kind); renderTimeline(); });
+      fragment.append(button);
     }
+    $('inv-filter').replaceChildren(fragment);
   }
 
   async function runSearch() {
@@ -454,7 +516,7 @@
   }
 
   document.addEventListener('paste', (event) => {
-    if (!visible() || state.id === null || document.querySelector('dialog[open]')) return;
+    if (!visible() || state.page !== 'detail' || state.id === null || document.querySelector('dialog[open]')) return;
     const data = event.clipboardData;
     if (!data) return;
     const files = [...data.items].filter((item) => item.kind === 'file' && item.type.startsWith('image/')).map((item) => item.getAsFile()).filter(Boolean);
@@ -484,7 +546,7 @@
     dragDepth = 0;
     section.classList.remove('inv-dropping');
     const data = event.dataTransfer;
-    if (!data || data.types.includes('application/x-phorminx-item')) return;
+    if (!data || state.page !== 'detail' || data.types.includes('application/x-phorminx-item')) return;
     event.preventDefault();
     const parentNode = event.target.closest?.('[data-node-id]') ? Number(event.target.closest('[data-node-id]').dataset.nodeId) : null;
     if (data.files.length) { void addImages(data.files, 'drop', parentNode); return; }
@@ -492,27 +554,69 @@
     if (text.trim()) void addText(text.trim(), false, parentNode);
   });
 
+  // ---------- + sheet ----------
+
+  function setSheetKind(kind) {
+    state.sheet = kind;
+    for (const tab of document.querySelectorAll('[data-inv-sheet]')) tab.setAttribute('aria-selected', String(tab.dataset.invSheet === kind));
+    $('inv-capture-text').hidden = kind !== 'note';
+    $('inv-link-fields').hidden = kind !== 'link';
+    $('inv-capture-submit').textContent = kind === 'link' ? 'Add link' : 'Add note';
+    requestAnimationFrame(() => (kind === 'link' ? $('inv-link-url') : $('inv-capture-text')).focus());
+  }
+
+  function openSheet(kind = 'note') {
+    if (state.id === null) return;
+    $('inv-sheet').hidden = false;
+    $('inv-add').setAttribute('aria-expanded', 'true');
+    $('inv-add').classList.add('open');
+    setSheetKind(kind);
+  }
+
+  function closeSheet() {
+    if ($('inv-sheet').hidden) return;
+    $('inv-sheet').hidden = true;
+    $('inv-add').setAttribute('aria-expanded', 'false');
+    $('inv-add').classList.remove('open');
+    state.sheet = null;
+  }
+
+  $('inv-add').addEventListener('click', () => { if ($('inv-sheet').hidden) openSheet(); else closeSheet(); });
+  for (const tab of document.querySelectorAll('[data-inv-sheet]')) tab.addEventListener('click', () => setSheetKind(tab.dataset.invSheet));
+  $('inv-sheet').addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeSheet(); $('inv-add').focus(); return; }
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey || event.target === $('inv-link-url'))) { event.preventDefault(); $('inv-capture').requestSubmit(); }
+  });
+  document.addEventListener('pointerdown', (event) => {
+    if (!$('inv-sheet').hidden && !event.target.closest('#inv-sheet, #inv-add')) closeSheet();
+  });
+
   $('inv-capture').addEventListener('submit', async (event) => {
     event.preventDefault();
+    if (state.sheet === 'link') {
+      const url = $('inv-link-url').value.trim();
+      const problem = invCaptureProblem('link', {url});
+      if (problem) { status(problem); $('inv-link-url').focus(); return; }
+      const id = await act(() => invoke('investigation_add_link', {id: state.id, url, note: $('inv-link-note').value}), 'Link added. Fetching its preview…');
+      if (id !== undefined) { $('inv-link-url').value = ''; $('inv-link-note').value = ''; closeSheet(); }
+      return;
+    }
     const text = $('inv-capture-text').value;
     if (!text.trim()) { $('inv-capture-text').focus(); return; }
     const id = await addText(text, true);
-    if (id !== undefined && id !== null) { $('inv-capture-text').value = ''; status('Note added.'); }
+    if (id !== undefined && id !== null) { $('inv-capture-text').value = ''; status('Note added.'); closeSheet(); }
   });
-  $('inv-capture-text').addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); $('inv-capture').requestSubmit(); }
-  });
-  $('inv-file').addEventListener('click', () => { state.diagram.pendingParent = null; $('inv-file-input').click(); });
+  $('inv-file').addEventListener('click', () => { state.diagram.pendingParent = null; closeSheet(); $('inv-file-input').click(); });
   $('inv-file-input').addEventListener('change', async (event) => {
     const parent = state.diagram.pendingParent;
     state.diagram.pendingParent = null;
     await addImages(event.target.files, 'file', parent);
     event.target.value = '';
   });
-  $('inv-paste').addEventListener('click', () => void act(async () => {
-    const title = await invoke('investigation_capture_clipboard', {id: state.id});
-    return title;
-  }, 'Clipboard added.'));
+  $('inv-paste').addEventListener('click', () => {
+    closeSheet();
+    void act(() => invoke('investigation_capture_clipboard', {id: state.id}), 'Clipboard added.');
+  });
 
   // ---------- voice ----------
 
@@ -523,10 +627,12 @@
     const button = $('inv-voice');
     button.classList.toggle('recording', active);
     button.setAttribute('aria-pressed', String(active));
-    $('inv-voice-label').textContent = !active ? 'Voice note' : voice.state === 'finishing' ? 'Finishing…' : voice.state === 'starting' ? 'Starting…' : 'Stop';
-    button.disabled = voice.state === 'finishing';
+    button.lastChild.nodeValue = active ? 'Recording…' : 'Voice note';
+    button.disabled = active;
     $('inv-voice-live').hidden = !active || !here;
     $('inv-voice-text').textContent = voice.text || voice.notice || 'Listening…';
+    $('inv-voice-stop').textContent = voice.state === 'finishing' ? 'Finishing…' : 'Stop';
+    $('inv-voice-stop').disabled = voice.state === 'finishing';
     if (voice.revision !== state.lastVoiceRevision) {
       state.lastVoiceRevision = voice.revision;
       if (!active && voice.notice && voice.notice !== state.lastVoiceNotice && state.lastVoiceRevision > 0) {
@@ -547,7 +653,8 @@
       if (kind === 'start') status('Listening. Only the recognized text is kept; no audio is stored.');
     } catch (error) { fail(error); }
   }
-  $('inv-voice').addEventListener('click', () => void toggleVoice());
+  $('inv-voice').addEventListener('click', () => { closeSheet(); void toggleVoice(); });
+  $('inv-voice-stop').addEventListener('click', () => void toggleVoice());
 
   // ---------- header actions ----------
 
@@ -578,21 +685,28 @@
 
   $('inv-start').addEventListener('submit', async (event) => {
     event.preventDefault();
-    const id = await act(() => invoke('investigation_create', {title: $('inv-start-title').value}));
+    const title = $('inv-start-title').value;
+    if (!title.trim()) { $('inv-start-title').focus(); return; }
+    const id = await act(() => invoke('investigation_create', {title}));
     if (id) { $('inv-start-title').value = ''; openInvestigation(id); }
   });
   $('inv-new').addEventListener('click', async () => {
     const title = await prompt({title: 'New investigation', placeholder: 'What are you looking into?', confirm: 'Create'});
-    if (title === null) return;
+    if (title === null || !title.trim()) return;
     const id = await act(() => invoke('investigation_create', {title}));
     if (id) openInvestigation(id);
   });
-  $('inv-picker').addEventListener('change', (event) => openInvestigation(Number(event.target.value)));
-  $('inv-active').addEventListener('click', () => {
-    if (state.id === null) return;
-    const active = state.overview?.activeId === state.id;
-    void act(() => invoke('investigation_set_active', {id: active ? null : state.id}), active ? 'Quick capture now creates a “Quick captures” investigation when needed.' : 'Quick capture now sends the clipboard here.');
+  $('inv-back').addEventListener('click', showList);
+  $('inv-play').addEventListener('click', () => {
+    if (state.id !== null) void setPlaying(state.id, state.overview?.activeId !== state.id);
   });
+  async function rename() {
+    if (state.id === null) return;
+    const title = await prompt({title: 'Rename investigation', value: state.detail?.title || $('inv-title').textContent});
+    if (title !== null && title.trim()) await act(() => invoke('investigation_rename', {id: state.id, title}), 'Renamed.');
+  }
+  $('inv-title').addEventListener('click', () => void rename());
+  $('inv-title').addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === 'F2') { event.preventDefault(); void rename(); } });
   const moreMenu = $('inv-more-menu');
   $('inv-more').addEventListener('click', (event) => {
     event.stopPropagation();
@@ -607,15 +721,11 @@
     const kind = event.target.closest('[data-inv-menu]')?.dataset.invMenu;
     if (!kind || state.id === null) return;
     moreMenu.hidden = true;
-    if (kind === 'rename') {
-      const title = await prompt({title: 'Rename investigation', value: state.detail?.title || ''});
-      if (title !== null) await act(() => invoke('investigation_rename', {id: state.id, title}), 'Renamed.');
-    } else if (kind === 'delete') {
+    if (kind === 'delete') {
       const count = state.detail?.items.length || 0;
       if (!window.confirm(`Delete “${state.detail?.title}” and its ${count} card${count === 1 ? '' : 's'}, screenshots and diagram? This cannot be undone.`)) return;
       const id = state.id;
-      state.id = null;
-      state.detail = null;
+      showList();
       await act(() => invoke('investigation_delete', {id}), 'Investigation deleted.');
     } else if (kind === 'export') {
       try {
@@ -717,18 +827,32 @@
     if (view === 'diagram') renderDiagram();
   }
   for (const tab of document.querySelectorAll('[data-inv-view]')) tab.addEventListener('click', () => setView(tab.dataset.invView));
-  for (const chip of document.querySelectorAll('[data-inv-filter]')) chip.addEventListener('click', () => { setFilter(chip.dataset.invFilter); renderTimeline(); });
   $('inv-search').addEventListener('input', () => {
     clearTimeout(state.searchTimer);
     state.searchTimer = setTimeout(() => void runSearch(), 220);
   });
-  $('inv-assistant-toggle').addEventListener('click', () => {
-    state.assistantOpen = !state.assistantOpen;
-    $('inv-assistant').hidden = !state.assistantOpen;
-    $('inv-body').classList.toggle('no-assistant', !state.assistantOpen);
-    $('inv-assistant-toggle').setAttribute('aria-pressed', String(state.assistantOpen));
+  // The assistant stays out of the way until asked for.
+  function setAssistant(open) {
+    state.assistantOpen = open;
+    $('inv-assistant').hidden = !open;
+    $('inv-body').classList.toggle('no-assistant', !open);
+    $('inv-ask-toggle').setAttribute('aria-pressed', String(open));
+    if (open) requestAnimationFrame(() => $('inv-question').focus());
     if (state.view === 'diagram') renderDiagram();
-  });
+  }
+  $('inv-ask-toggle').addEventListener('click', () => setAssistant(!state.assistantOpen));
+
+  // The Unplaced tray folds to a slim rail that still shows its count.
+  function setTray(collapsed) {
+    state.trayCollapsed = collapsed;
+    remember(TRAY_KEY, collapsed ? 'collapsed' : 'open');
+    $('inv-diagram').classList.toggle('tray-collapsed', collapsed);
+    $('inv-tray-toggle').setAttribute('aria-expanded', String(!collapsed));
+    $('inv-tray-toggle').title = collapsed ? 'Show the unplaced cards' : 'Hide the unplaced cards';
+    if (state.view === 'diagram') requestAnimationFrame(applyView);
+  }
+  $('inv-tray-toggle').addEventListener('click', () => setTray(!state.trayCollapsed));
+  setTray(state.trayCollapsed);
 
   // ---------- diagram ----------
 
@@ -1243,7 +1367,19 @@
   });
   window.addEventListener('resize', () => { if (visible() && state.view === 'diagram') applyView(); });
 
+  // The launcher's "Open in Phorminx" shows its investigation here.
+  async function takeOpenRequest() {
+    try {
+      const id = await invoke('investigation_open_request');
+      if (id === null || id === undefined) return;
+      if (typeof showRoute === 'function') showRoute('investigations');
+      if (!state.overview?.investigations.some((item) => item.id === id)) await refresh();
+      openInvestigation(id);
+    } catch (_) { /* the next poll retries */ }
+  }
+
   if (call) {
+    setInterval(() => void takeOpenRequest(), 700);
     setInterval(() => {
       if (visible() || state.voiceActive || state.assistantBusy || ['models', 'setup'].includes(state.route)) void refresh();
     }, 700);
