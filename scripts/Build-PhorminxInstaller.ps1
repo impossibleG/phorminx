@@ -249,12 +249,17 @@ $compilerArguments = @(
 if (-not [string]::IsNullOrWhiteSpace($InnoSignToolName)) {
     $compilerArguments = @("/DSignToolName=$InnoSignToolName") + $compilerArguments
 }
+if ($QaReinstall) {
+    # Installs as the separate app "Phorminx QA", never over the real Phorminx.
+    $compilerArguments = @("/DQaReinstall") + $compilerArguments
+}
+$setupSuffix = if ($QaReinstall) { "-reinstall-qa" } else { "" }
 & $IsccPath @compilerArguments
 if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup failed with exit code $LASTEXITCODE."
 }
 
-$installer = Get-ChildItem -LiteralPath $resolvedOutput -Filter "Phorminx-$Version-x64-setup.exe" |
+$installer = Get-ChildItem -LiteralPath $resolvedOutput -Filter "Phorminx-$Version-x64-setup$setupSuffix.exe" |
     Select-Object -First 1
 if ($null -eq $installer) {
     throw "Inno Setup reported success, but the expected installer was not found."

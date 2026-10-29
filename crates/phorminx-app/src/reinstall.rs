@@ -692,6 +692,27 @@ fn qa_installer() -> Option<PathBuf> {
     }
 }
 
+/// A QA reinstall runs only against a throwaway profile, never the user's
+/// real `%USERPROFILE%\AppData\Local\Phorminx`.
+fn qa_guard(data_dir: &Path) -> Result<(), String> {
+    if !cfg!(feature = "reinstall-qa") {
+        return Ok(());
+    }
+    if qa_installer().is_none() {
+        return Err("QA build: set PHORMINX_QA_INSTALLER to the local test installer.".into());
+    }
+    let real = std::env::var_os("USERPROFILE")
+        .map(|profile| PathBuf::from(profile).join("AppData").join("Local").join("Phorminx"));
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()),
+    };
+    if real.is_none_or(|real| same(&real, data_dir)) {
+        return Err("QA build: start it with LOCALAPPDATA set to a throwaway folder. It never reinstalls your real Phorminx profile.".into());
+    }
+    Ok(())
+}
+
 /// The rollback floor the updater already keeps; a reinstall never lowers it.
 fn rollback_floor(data_dir: &Path) -> u64 {
     read_json::<serde_json::Value>(&data_dir.join("updates").join("preferences.json"))
@@ -710,6 +731,7 @@ impl ReinstallFlow {
     }
 
     pub fn start(&self, data_dir: &Path) -> Result<(), String> {
+        qa_guard(data_dir)?;
         {
             let mut view = self.view.lock().map_err(|_| "Reinstall is unavailable.")?;
             if matches!(view.state.as_str(), "checking" | "downloading" | "handing-off") {
@@ -787,6 +809,7 @@ impl ReinstallFlow {
     /// Create the backup and start the helper. The caller must then exit
     /// Phorminx; the helper waits for that.
     pub fn hand_off(&self, data_dir: &Path, program_dir: &Path) -> Result<(), String> {
+        qa_guard(data_dir)?;
         let installer = self
             .staged
             .lock()

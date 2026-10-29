@@ -57,3 +57,9 @@ installs the local installer named by the `PHORMINX_QA_INSTALLER` environment
 variable instead of downloading the release. That build refuses to compile
 when `PHORMINX_UPDATE_PUBLIC_KEY` is set, and the script refuses to combine
 `-QaReinstall` with a release key or `-RequireSignedBinary`. Never publish it.
+
+The QA installer installs a separate app, **Phorminx QA**
+(`Programs\Phorminx-QA`, its own AppId, shortcuts and startup entry), so it
+never replaces or uninstalls the real Phorminx. A QA reinstall refuses to run
+unless `LOCALAPPDATA` points at a throwaway folder, so it never touches the
+real `%USERPROFILE%\AppData\Local\Phorminx`.
