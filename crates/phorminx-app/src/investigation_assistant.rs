@@ -59,6 +59,7 @@ struct Run {
     kind: &'static str,
 }
 
+#[derive(Clone)]
 pub struct InvestigationAssistant {
     service: Arc<InvestigationService>,
     config: ConfigStore,
@@ -364,6 +365,25 @@ impl InvestigationAssistant {
             .map(|config| provider_label(&config.provider))
             .unwrap_or_else(|_| "Assistant settings could not be read.".into());
         view
+    }
+
+    /// One blocking request with the meeting provider (and its fallback),
+    /// without citations or stored messages. Used for meeting briefings.
+    pub fn complete(&self, messages: &[ChatMessage]) -> Result<String, String> {
+        let providers = self.providers()?;
+        let token = CancellationToken::default();
+        let mut last = None;
+        for provider in &providers {
+            let mut text = String::new();
+            match stream_chat(provider, messages, &token, |delta| text.push_str(delta)) {
+                Ok(()) => return Ok(text),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(match last {
+            Some(error) => format!("The assistant could not answer: {error}"),
+            None => "The assistant could not answer.".into(),
+        })
     }
 
     fn providers(&self) -> Result<Vec<ProviderConfig>, String> {

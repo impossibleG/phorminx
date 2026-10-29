@@ -103,13 +103,13 @@ impl InvestigationTauriState {
         }
     }
 
-    fn service(&self) -> Result<&Arc<InvestigationService>, String> {
+    pub(crate) fn service(&self) -> Result<&Arc<InvestigationService>, String> {
         self.service.as_ref().ok_or_else(|| {
             "Investigations are unavailable because local storage could not open.".to_owned()
         })
     }
 
-    fn assistant(&self) -> Result<&InvestigationAssistant, String> {
+    pub(crate) fn assistant(&self) -> Result<&InvestigationAssistant, String> {
         self.assistant
             .as_ref()
             .ok_or_else(|| "The investigation assistant is unavailable.".to_owned())
@@ -247,12 +247,30 @@ fn quick_capture(app: &tauri::AppHandle) {
 }
 
 /// A small, unfocused, always-on-top confirmation in the work-area corner.
-fn show_toast(
+pub(crate) fn show_toast(
     app: &tauri::AppHandle,
     state: &InvestigationTauriState,
     title: &str,
     detail: &str,
     error: bool,
+) {
+    show_toast_for(
+        app,
+        state,
+        title,
+        detail,
+        error,
+        Duration::from_millis(2800),
+    );
+}
+
+pub(crate) fn show_toast_for(
+    app: &tauri::AppHandle,
+    state: &InvestigationTauriState,
+    title: &str,
+    detail: &str,
+    error: bool,
+    visible: Duration,
 ) {
     let sequence = state.toasts.fetch_add(1, Ordering::AcqRel) + 1;
     for (label, window) in app.webview_windows() {
@@ -287,7 +305,7 @@ fn show_toast(
         let _ = thread::Builder::new()
             .name("phorminx-toast".into())
             .spawn(move || {
-                thread::sleep(Duration::from_millis(2800));
+                thread::sleep(visible);
                 if let Some(window) =
                     handle.get_webview_window(&format!("capture-toast-{sequence}"))
                 {

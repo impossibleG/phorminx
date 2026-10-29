@@ -50,6 +50,7 @@ ureq.workspace = true
 url.workspace = true
 winit.workspace = true
 zip.workspace = true
+pdf-extract.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }

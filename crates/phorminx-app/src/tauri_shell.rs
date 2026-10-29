@@ -1433,6 +1433,15 @@ fn run_shell(
             crate::tauri_meetings::meeting_save_translation,
             crate::tauri_meetings::meeting_save_devices,
             crate::tauri_meetings::meeting_theme,
+            crate::tauri_meeting_plans::meeting_plans,
+            crate::tauri_meeting_plans::meeting_plan,
+            crate::tauri_meeting_plans::meeting_plan_save,
+            crate::tauri_meeting_plans::meeting_plan_delete,
+            crate::tauri_meeting_plans::meeting_plan_materials,
+            crate::tauri_meeting_plans::meeting_plan_add_document,
+            crate::tauri_meeting_plans::meeting_plan_briefing,
+            crate::tauri_meeting_plans::meeting_plan_suggest_items,
+            crate::tauri_meeting_plans::meeting_plan_start,
             crate::tauri_investigations::investigation_overview,
             crate::tauri_investigations::investigation_create,
             crate::tauri_investigations::investigation_rename,
@@ -1551,6 +1560,7 @@ fn run_shell(
             }
             let handle = app.handle().clone();
             crate::tauri_investigations::install_quick_capture(&handle);
+            crate::tauri_meeting_plans::spawn_reminders(handle.clone());
             app.state::<MessagingHost>()
                 .spawn_draft_listener(handle.clone());
             spawn_readiness_probe(handle.clone(), loaded_whisper, initial_vosk_probe)

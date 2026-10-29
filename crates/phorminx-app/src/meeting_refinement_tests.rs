@@ -283,6 +283,7 @@ fn disabling_history_blocks_cached_saved_context_before_periodic_refresh() {
         context_text: "Private cached saved transcript".into(),
         context_samples: Some((0, 10)),
         status: "complete".into(),
+        kind: String::new(),
     });
     let mut settings = host.store.load().unwrap();
     settings.privacy.history_retention = HistoryRetention::Disabled;

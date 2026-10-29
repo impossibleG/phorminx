@@ -422,6 +422,38 @@ fn meeting_event(
                 .map_err(|_| "Choose how often commentary runs.")?;
             WorkspaceEvent::SetAutoCommentaryInterval(seconds)
         }
+        "commentary-style" => WorkspaceEvent::SetCommentaryStyle(value.unwrap_or_default().into()),
+        "items" => {
+            if value.unwrap_or_default().len() > 64 * 1024 {
+                return Err("Important items are limited to 20 short lines.".into());
+            }
+            let items: Vec<crate::tauri_contract::ImportantItemView> =
+                serde_json::from_str(value.unwrap_or("[]"))
+                    .map_err(|_| "Important items could not be read.")?;
+            WorkspaceEvent::SetLiveItems(
+                items
+                    .into_iter()
+                    .map(|item| (item.text.trim().to_owned(), item.done))
+                    .filter(|(text, _)| !text.is_empty())
+                    .collect(),
+            )
+        }
+        "pin-item" => {
+            let text = value.unwrap_or_default().trim();
+            if text.is_empty() || text.chars().count() > 500 {
+                return Err("An important item must be 1 to 500 characters.".into());
+            }
+            WorkspaceEvent::AddLiveItem(text.to_owned())
+        }
+        "plan" => match value.unwrap_or_default() {
+            "" | "none" => WorkspaceEvent::SetMeetingPlan(None),
+            id => WorkspaceEvent::SetMeetingPlan(Some(
+                id.parse::<i64>()
+                    .ok()
+                    .filter(|id| *id > 0)
+                    .ok_or("Choose a planned meeting.")?,
+            )),
+        },
         "translation" => WorkspaceEvent::SetTranslationEnabled(
             snapshot.translation_language.is_empty() || snapshot.translation_paused,
         ),
@@ -582,6 +614,25 @@ mod tests {
             Some(WorkspaceEvent::SetAutoCommentaryInterval(60))
         );
         assert!(meeting_event("commentary-interval", Some("soon"), &snapshot).is_err());
+        assert_eq!(
+            meeting_event(
+                "items",
+                Some(r#"[{"text":" Budget ","done":false},{"text":"","done":true}]"#),
+                &snapshot
+            )
+            .unwrap(),
+            Some(WorkspaceEvent::SetLiveItems(vec![("Budget".into(), false)]))
+        );
+        assert_eq!(
+            meeting_event("pin-item", Some("Ask about Friday"), &snapshot).unwrap(),
+            Some(WorkspaceEvent::AddLiveItem("Ask about Friday".into()))
+        );
+        assert!(meeting_event("pin-item", Some("  "), &snapshot).is_err());
+        assert_eq!(
+            meeting_event("plan", Some("7"), &snapshot).unwrap(),
+            Some(WorkspaceEvent::SetMeetingPlan(Some(7)))
+        );
+        assert!(meeting_event("plan", Some("-1"), &snapshot).is_err());
         assert_eq!(
             meeting_event("commentary", None, &snapshot).unwrap(),
             Some(WorkspaceEvent::SetAutoCommentary(true))
