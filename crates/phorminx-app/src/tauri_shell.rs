@@ -916,6 +916,53 @@ fn host_cancel_setup_action(id: String, state: State<'_, HostState>) -> Result<(
         .map_err(str::to_owned)
 }
 
+/// Why "Reinstall Phorminx" must wait, if something is recording or setting up.
+pub(crate) fn reinstall_blocker(app: &tauri::AppHandle) -> Option<String> {
+    let host = app.try_state::<HostState>()?;
+    if host.bootstrap.lock().is_ok_and(|bootstrap| bootstrap.child.is_some()) {
+        return Some("Setup is running. Wait for it to finish, then reinstall.".into());
+    }
+    // A scheduled update starts its own installer when Phorminx exits.
+    if host.updates.lock().is_ok_and(|updates| updates.snapshot().scheduled) {
+        return Some("An update is waiting to install. Restart Phorminx to finish it, then reinstall if something is still wrong.".into());
+    }
+    if host.status.lock().is_ok_and(|status| matches!(
+        *status,
+        UiRuntimeStatus::Listening | UiRuntimeStatus::Transcribing | UiRuntimeStatus::Refining
+    )) {
+        return Some("A dictation is in progress. Finish it first, then reinstall.".into());
+    }
+    let meeting = app.state::<MeetingTauriState>().snapshot(u64::MAX).ok().flatten();
+    if meeting.is_some_and(|meeting| meeting.capture != "idle") {
+        return Some("A meeting is being recorded. Stop the recording first, then reinstall.".into());
+    }
+    None
+}
+
+/// Ask the runtime to exit, as "Restart to update" does.
+pub(crate) fn request_quit(app: &tauri::AppHandle) -> bool {
+    app.try_state::<HostState>()
+        .is_some_and(|host| host.events.send(ProductShellEvent::QuitRequested).is_ok())
+}
+
+/// Restart Phorminx the way saving settings does.
+pub(crate) fn request_settings_restart(app: &tauri::AppHandle) {
+    if let Some(host) = app.try_state::<HostState>() {
+        let _ = host.events.send(ProductShellEvent::RuntimeReloadRequested(
+            crate::ui_bridge::UiMutation::SettingsSaved,
+        ));
+    }
+}
+
+pub(crate) fn settings_store(app: &tauri::AppHandle) -> Option<SettingsStore> {
+    app.try_state::<HostState>().map(|host| host.store.clone())
+}
+
+/// The bundled pages and configuration, embedded once for both windows.
+pub(crate) fn app_context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
+}
+
 fn update_idle(app: &tauri::AppHandle) -> bool {
     let host = app.state::<HostState>();
     // Let onboarding present its opt-out before background delivery begins.
@@ -1392,6 +1439,10 @@ fn run_shell(
         store.resolve_asset_path(std::path::Path::new("setup-status.json")), bootstrap_allowed);
     let meeting = MeetingTauriState::start(store.clone())?;
     let investigations = InvestigationTauriState::start(store.clone());
+    let reinstall = crate::tauri_reinstall::ReinstallState::new(
+        store.path().parent().map(std::path::Path::to_path_buf).unwrap_or_default(),
+        false,
+    );
     let host = HostState {
         bridge: Mutex::new(bridge),
         store,
@@ -1421,6 +1472,7 @@ fn run_shell(
         .manage(investigations)
         .manage(host)
         .manage(messaging)
+        .manage(reinstall)
         .manage(crate::tauri_keep_awake::KeepAwakeState::default())
         .invoke_handler(tauri::generate_handler![
             crate::tauri_keep_awake::keep_awake_snapshot,
@@ -1494,6 +1546,13 @@ fn run_shell(
             models_unassign,
             host_update_snapshot,
             host_update_action,
+            crate::tauri_reinstall::reinstall_snapshot,
+            crate::tauri_reinstall::reinstall_start,
+            crate::tauri_reinstall::reinstall_finish,
+            crate::tauri_reinstall::reinstall_take_auto_setup,
+            crate::tauri_reinstall::reinstall_dismiss,
+            crate::tauri_reinstall::reinstall_restore,
+            crate::tauri_reinstall::reinstall_restore_status,
             host_action,
             host_select_whisper_model,
             host_install_vosk,
@@ -1600,7 +1659,7 @@ fn run_shell(
                 }
             }
         })
-        .build(tauri::generate_context!())
+        .build(app_context())
         // `Builder::run` ends in tao's `EventLoop::run`, which calls
         // `process::exit` when the loop stops. That killed the whole process
         // on Quit, before the runtime could clean up or relaunch after a

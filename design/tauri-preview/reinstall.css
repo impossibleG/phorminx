@@ -1,0 +1,25 @@
+.reinstall-dialog{width:min(560px,calc(100vw - 36px));max-height:calc(100vh - 36px);overflow:auto;border:1px solid #485055;border-radius:5px;background:#171b1e;color:#e8e5dd;padding:25px;box-shadow:0 18px 65px #0008}
+.reinstall-dialog::backdrop{background:#0009}
+.reinstall-dialog small,#reinstall-banner small{color:#c69767;letter-spacing:.12em;font-size:9px}
+.reinstall-dialog h2{font-size:20px;font-weight:500;margin:8px 0 12px}
+.reinstall-dialog h3{font-size:12px;font-weight:600;margin:16px 0 6px}
+.reinstall-dialog p{font-size:12px;line-height:1.5;color:#a8adb0}
+.reinstall-list{margin:0;padding-left:18px;font-size:12px;line-height:1.55;color:#c9c6bf}
+.reinstall-note{font-size:11px;color:#a8adb0}
+.reinstall-error{color:#e0a184;font-size:12px;line-height:1.5}
+.reinstall-error:empty,.reinstall-note:empty{display:none}
+.reinstall-step[hidden]{display:none}
+.reinstall-bar{height:6px;background:#2a3034;border-radius:3px;overflow:hidden;margin:14px 0 6px}
+.reinstall-bar[hidden]{display:none}
+.reinstall-bar span{display:block;height:100%;width:0;background:#c69767;transition:width .3s}
+.reinstall-dialog .dialog-actions .primary,#reinstall-banner .primary{background:#c69767;color:#0e1113;border-color:#c69767}
+.reinstall-dialog .dialog-actions [hidden]{display:none}
+.side .reinstall-open{margin-top:6px;color:#858c90;font-size:11px}
+.reinstall-backups{margin-top:14px;font-size:12px;color:#a8adb0}
+.reinstall-backups summary{cursor:pointer}
+.reinstall-backup-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid #30363b}
+body[data-shell="reinstall"]{background:#101416;color:#e8e5dd;font:13px "Segoe UI",Arial,sans-serif}
+:root[data-theme="light"] .reinstall-dialog{background:#eae7e0;color:#202326;border-color:#b9b7b0}
+:root[data-theme="light"] .reinstall-dialog p,:root[data-theme="light"] .reinstall-note,:root[data-theme="light"] .reinstall-list{color:#555b60}
+:root[data-theme="light"] .reinstall-dialog .dialog-actions .primary,:root[data-theme="light"] #reinstall-banner .primary{background:#815026;border-color:#815026;color:#fff}
+:root[data-theme="light"] .side .reinstall-open{color:#51565a}

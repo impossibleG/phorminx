@@ -120,6 +120,13 @@ struct Cli {
     /// its instance slot instead of focusing it and exiting.
     #[arg(long, hide = true)]
     restarted: bool,
+    /// Open only the "Reinstall Phorminx" flow (the Repair Phorminx shortcut).
+    /// Settings and the database are not loaded, so this works when they are damaged.
+    #[arg(long, conflicts_with_all = ["smoke_test", "setup", "after_reinstall"])]
+    reinstall: bool,
+    /// Set by the reinstall helper when it reopens Phorminx.
+    #[arg(long, hide = true)]
+    after_reinstall: bool,
 }
 
 /// How long a restarted process waits for its predecessor to finish cleanup.
@@ -206,6 +213,15 @@ fn run() -> Result<()> {
     };
     let instance = match acquired {
         Ok(instance) => instance,
+        Err(SingleInstanceError::AlreadyRunning) if cli.reinstall => {
+            let _ = activate_existing_window();
+            #[cfg(feature = "desktop")]
+            show_error_dialog(
+                "Phorminx is already open",
+                "Use \"Reinstall Phorminx\" at the bottom of the Phorminx sidebar, or quit Phorminx from its tray icon and open Repair Phorminx again.",
+            );
+            return Ok(());
+        }
         Err(SingleInstanceError::AlreadyRunning) => {
             record_lifecycle(
                 lifecycle.as_ref(),
@@ -226,6 +242,28 @@ fn run() -> Result<()> {
             return Err(error).context("failed to acquire the Phorminx process slot");
         }
     };
+    if cli.reinstall {
+        return run_reinstall_mode(requested_settings_path.as_deref(), instance);
+    }
+    // After a completed reinstall, open Setup & repair and run first-run setup.
+    let reinstalled = cli.after_reinstall
+        && requested_settings_path
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(phorminx_app::reinstall::latest_status)
+            .is_some_and(|status| status == "installed");
+    if reinstalled {
+        phorminx_app::reinstall::mark_after_reinstall();
+        if let Ok(program_dir) = phorminx_app::reinstall::installed_program_dir() {
+            phorminx_app::reinstall::remove_leftover_program_copies(&program_dir);
+        }
+    }
+    if cli.after_reinstall {
+        record_lifecycle(
+            lifecycle.as_ref(),
+            &format!("event=after_reinstall completed={reinstalled}"),
+        );
+    }
     let overlay = StatusOverlay::start().context("failed to start the status overlay")?;
     if cli.overlay_demo {
         for status in [
@@ -318,7 +356,7 @@ fn run() -> Result<()> {
             VoskAssetLayout::Present { .. }
         ),
     };
-    if !recognition_ready || cli.setup {
+    if !recognition_ready || cli.setup || reinstalled {
         if cli.smoke_test {
             return Err(anyhow!(
                 "the selected local recognition engine is not ready"
@@ -1964,6 +2002,25 @@ fn active_shell_vosk_probe(mode: RecognitionMode) -> UiVoskProbe {
 
 fn setup_shell_vosk_probe() -> UiVoskProbe {
     UiVoskProbe::FullValidation
+}
+
+/// The minimal "Repair Phorminx" window. It holds the process slot so the
+/// reinstall helper can wait for this process to exit.
+fn run_reinstall_mode(settings_path: Option<&Path>, instance: SingleInstance) -> Result<()> {
+    let data_dir = settings_path
+        .and_then(Path::parent)
+        .context("the Phorminx data folder could not be found")?
+        .to_path_buf();
+    #[cfg(feature = "tauri-shell")]
+    let result = phorminx_app::tauri_reinstall::run_reinstall_window(data_dir)
+        .map_err(|error| anyhow!(error));
+    #[cfg(not(feature = "tauri-shell"))]
+    let result = {
+        let _ = data_dir;
+        Err(anyhow!("this build has no reinstall window"))
+    };
+    drop(instance);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]

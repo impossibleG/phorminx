@@ -10,6 +10,7 @@
   <link rel="stylesheet" href="investigations.css">
   <link rel="stylesheet" href="benchmarks.css">
   <link rel="stylesheet" href="action-wizard.css">
+  <link rel="stylesheet" href="reinstall.css">
   <link rel="stylesheet" href="keep-awake.css">
   <script src="markdown.js" defer></script>
   <script src="transcript-lines.js" defer></script>
@@ -23,6 +24,7 @@
   <script src="investigation-model.js" defer></script>
   <script src="investigations.js" defer></script>
   <script src="messages.js" defer></script>
+  <script src="reinstall.js" defer></script>
   <script src="keep-awake.js" defer></script>
 </head>
 <body data-shell="product">
@@ -49,6 +51,7 @@
         <button type="button" data-route="setup">Setup &amp; repair</button>
         <button type="button" data-route="feedback">Feedback</button>
         <p>LOCAL ONLY</p>
+        <button type="button" id="reinstall-open" class="reinstall-open">Reinstall Phorminx</button>
       </nav>
       <main>
         <section id="home" class="page">
@@ -175,6 +178,7 @@
         </section>
         <section id="setup" class="page" hidden>
           <div class="page-head"><div><small>CARE</small><h1>Setup &amp; repair</h1></div><button id="setup-start" type="button" class="primary" hidden>Start Phorminx</button></div>
+          <div id="reinstall-banner" class="setting-card" role="region" aria-label="After reinstall" hidden></div>
           <div id="repair-card" class="setting-card"><small>WHAT EACH FEATURE NEEDS</small><h2>Check and repair</h2><p>Each feature and whether what it needs is on this computer. Fix anything missing here.</p><div id="repair-list" class="repair-list" role="list"></div><div class="bootstrap-control"><button id="repair-refresh" type="button">Check again</button><span id="repair-status" role="status"></span></div></div>
           <div id="bootstrap-card" class="setting-card"><small id="bootstrap-label">RECOMMENDED STARTER</small><h2 id="bootstrap-title">Ready in one guided run</h2><p id="bootstrap-intro">Prepare instant and accurate recognition, local formatting, and semantic search. Downloads stay on this computer.</p><div class="bootstrap-control"><button id="bootstrap-start" type="button" class="primary">Prepare everything</button><button id="bootstrap-cancel" type="button" hidden>Stop after this step</button><span id="bootstrap-progress" role="status"></span></div><p id="bootstrap-message"></p></div>
           <div id="setup-updates-card" class="setting-card"><small>NEW FEATURES</small><h2>Keep Phorminx current</h2><label class="check-row"><input id="setup-auto-updates" type="checkbox" checked>Keep getting tested new features automatically</label><p>Phorminx checks signed GitHub Releases daily and installs a verified update when Phorminx restarts, or after you have been away for 30 minutes with nothing recording. Turn this off here or later in Settings → Updates.</p><p id="setup-update-note" role="status"></p></div>
