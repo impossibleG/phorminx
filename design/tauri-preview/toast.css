@@ -2,7 +2,7 @@ html,body{margin:0;height:100%;overflow:hidden;background:#171b1e;font-family:"S
 .toast{box-sizing:border-box;height:100%;display:flex;align-items:center;gap:13px;padding:0 18px;border:1px solid #394046;border-left:3px solid #c69767;animation:toast-in .18s ease-out}
 .toast.error{border-left-color:#d3735f}
 .toast div{display:flex;flex-direction:column;gap:3px;min-width:0}
-.toast strong{font-size:13px;font-weight:600}
+.toast strong{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .toast span{font-size:11.5px;color:#a8adb0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 @keyframes toast-in{from{opacity:0;transform:translateY(6px)}}
 @media (prefers-color-scheme: light){html,body{background:#f7f5f0;color:#202326}.toast{border-color:#b9b7b0;border-left-color:#815026}.toast span{color:#4f5559}}
