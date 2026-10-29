@@ -19,12 +19,12 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DI_NORMAL, DefWindowProcW, DestroyWindow, DispatchMessageW,
     DrawIconEx, GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
-    HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IsWindow, KillTimer, MA_NOACTIVATE, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    UnregisterClassW, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IsWindow, KillTimer, MA_NOACTIVATE, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UnregisterClassW,
+    WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_NCCREATE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::w;
 
@@ -126,8 +126,16 @@ struct OverlayExtras {
 pub enum OverlayEvent {
     ExpandRequested,
 }
-/// Contact names for the messaging contacts panel; `None` shows the main panel.
-type LauncherContacts = Arc<Mutex<Option<Vec<(u8, String)>>>>;
+/// A second launcher panel (Messages contacts, Investigations): a title, the
+/// rows on keys 0-9 in display order, and a footer hint.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LauncherPanel {
+    pub title: String,
+    pub hint: String,
+    pub rows: Vec<(u8, String)>,
+}
+/// The second panel shown instead of the main one; `None` shows the main panel.
+type LauncherContacts = Arc<Mutex<Option<LauncherPanel>>>;
 
 pub struct StatusOverlay {
     window_bits: usize,
@@ -157,7 +165,15 @@ impl StatusOverlay {
         let thread_contacts = launcher_contacts.clone();
         let thread = thread::Builder::new()
             .name("phorminx-overlay".to_owned())
-            .spawn(move || run_overlay(ready_tx, thread_actions, thread_extras, event_tx, thread_contacts))
+            .spawn(move || {
+                run_overlay(
+                    ready_tx,
+                    thread_actions,
+                    thread_extras,
+                    event_tx,
+                    thread_contacts,
+                )
+            })
             .map_err(|error| {
                 ACTIVE.store(false, Ordering::Release);
                 OverlayError::Spawn(error)
@@ -283,10 +299,20 @@ impl StatusOverlay {
         &self,
         contacts: Option<Vec<(u8, String)>>,
     ) -> Result<(), OverlayError> {
+        self.set_launcher_panel(contacts.map(|contacts| LauncherPanel {
+            title: "MESSAGES".into(),
+            hint: "Choose who to message".into(),
+            rows: contact_panel_rows(clean_contact_rows(contacts)),
+        }))
+    }
+
+    /// Switches the launcher to a titled second panel, or back to the main
+    /// panel with `None`. Only the labels cross into the overlay thread.
+    pub fn set_launcher_panel(&self, panel: Option<LauncherPanel>) -> Result<(), OverlayError> {
         *self
             .launcher_contacts
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = contacts.map(clean_contact_rows);
+            .unwrap_or_else(|e| e.into_inner()) = panel.map(clean_panel);
         unsafe {
             PostMessageW(
                 Some(window(self.window_bits)),
@@ -337,7 +363,8 @@ struct WindowState {
     next_timer_id: usize,
     launcher_actions: Arc<Mutex<Vec<(u8, String)>>>,
     launcher_contacts: LauncherContacts,
-    contacts_panel: bool,
+    /// Title and hint of the second panel being shown, if any.
+    panel_text: Option<(String, String)>,
     /// Snapshot used for both painting and hit testing. A changed configuration
     /// never maps an old visible row to a new action before the redraw message.
     launcher_rows: Vec<(u8, String)>,
@@ -388,7 +415,7 @@ unsafe fn create_and_run(
         next_timer_id: INITIAL_TIMER_ID,
         launcher_actions: actions,
         launcher_contacts: contacts,
-        contacts_panel: false,
+        panel_text: None,
         launcher_rows: launcher_rows(&[]),
         launcher_row_height: 54,
         extras,
@@ -610,14 +637,16 @@ unsafe fn relayout_window(hwnd: HWND, state: &mut WindowState, restart_timer: bo
     let scale = |value: i32| value * dpi as i32 / 96;
     let launcher = is_launcher(status);
     if launcher {
-        let contacts = state
+        let panel = state
             .launcher_contacts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        state.contacts_panel = contacts.is_some();
-        state.launcher_rows = match contacts {
-            Some(rows) => contact_panel_rows(rows),
+        state.panel_text = panel
+            .as_ref()
+            .map(|panel| (panel.title.clone(), panel.hint.clone()));
+        state.launcher_rows = match panel {
+            Some(panel) => panel.rows,
             None => launcher_rows(
                 &state
                     .launcher_actions
@@ -1083,6 +1112,33 @@ fn clean_contact_rows(contacts: Vec<(u8, String)>) -> Vec<(u8, String)> {
     result
 }
 
+/// Keys 0-9, first row per key wins, display order kept; never empty.
+fn clean_panel(panel: LauncherPanel) -> LauncherPanel {
+    let line = |text: &str, limit: usize| -> String {
+        let text: String = text
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(limit)
+            .collect();
+        text.trim().to_owned()
+    };
+    let mut rows: Vec<(u8, String)> = Vec::new();
+    for (slot, label) in panel.rows {
+        let label = line(&label, 80);
+        if slot <= 9 && !label.is_empty() && !rows.iter().any(|(existing, _)| *existing == slot) {
+            rows.push((slot, label));
+        }
+    }
+    if rows.is_empty() {
+        rows.push((0, "Nothing here yet".into()));
+    }
+    LauncherPanel {
+        title: line(&panel.title, 80),
+        hint: line(&panel.hint, 60),
+        rows,
+    }
+}
+
 fn contact_panel_rows(contacts: Vec<(u8, String)>) -> Vec<(u8, String)> {
     if contacts.is_empty() {
         // Slot 0 picks nothing in the contacts panel.
@@ -1131,15 +1187,16 @@ unsafe fn paint_launcher(
     dc: windows::Win32::Graphics::Gdi::HDC,
     status: OverlayStatus,
 ) {
-    let (rows, row_height, contacts_panel) = unsafe { window_state(hwnd) }
+    let (rows, row_height, panel_text) = unsafe { window_state(hwnd) }
         .map(|s| {
             (
                 s.launcher_rows.clone(),
                 s.launcher_row_height,
-                s.contacts_panel,
+                s.panel_text.clone(),
             )
         })
-        .unwrap_or_else(|| (launcher_rows(&[]), 54, false));
+        .unwrap_or_else(|| (launcher_rows(&[]), 54, None));
+    let contacts_panel = panel_text.is_some();
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     let scale = |value: i32| value * dpi as i32 / 96;
     let dark = status == OverlayStatus::LauncherDark;
@@ -1209,15 +1266,12 @@ unsafe fn paint_launcher(
             )
         };
     }
-    text(
-        if contacts_panel {
-            "MESSAGES"
-        } else {
-            "PHORMINX"
-        },
-        rect(58, 16, 230, 47),
-        foreground,
-    );
+    let (title, hint) = panel_text
+        .as_ref()
+        .map_or(("PHORMINX", "Choose your next action"), |(title, hint)| {
+            (title.as_str(), hint.as_str())
+        });
+    text(title, rect(58, 16, 344, 47), foreground);
     for (index, (slot, label)) in rows.iter().enumerate() {
         let top = 62 + index as i32 * (row_height + 6);
         text(
@@ -1243,15 +1297,7 @@ unsafe fn paint_launcher(
             text("Enter", rect(286, top, 339, top + row_height), muted);
         }
     }
-    text(
-        if contacts_panel {
-            "Choose who to message"
-        } else {
-            "Choose your next action"
-        },
-        rect(20, height - 39, 251, height - 10),
-        muted,
-    );
+    text(hint, rect(20, height - 39, 251, height - 10), muted);
     text(
         "Esc to close",
         rect(264, height - 39, 344, height - 10),
@@ -1354,6 +1400,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn panels_keep_display_order_dedupe_keys_and_clicks_hit_the_right_row() {
+        let panel = clean_panel(LauncherPanel {
+            title: "Add to\u{7} Supplier review".into(),
+            hint: "Choose what to add".into(),
+            rows: vec![
+                (1, "Voice note".into()),
+                (2, " Clipboard ".into()),
+                (2, "Duplicate".into()),
+                (12, "Out of range".into()),
+                (5, "\n".into()),
+                (9, "Stop".into()),
+                (0, "Open in Phorminx".into()),
+            ],
+        });
+        assert_eq!(panel.title, "Add to Supplier review");
+        assert_eq!(
+            panel.rows,
+            vec![
+                (1, "Voice note".to_owned()),
+                (2, "Clipboard".to_owned()),
+                (9, "Stop".to_owned()),
+                (0, "Open in Phorminx".to_owned()),
+            ]
+        );
+        let height = launcher_row_height(panel.rows.len(), 600);
+        let y = |index: i32| 62 + index * (height + 6) + height / 2;
+        assert_eq!(
+            launcher_hit_test(30, y(3), 96, &panel.rows, height),
+            Some(0)
+        );
+        assert_eq!(
+            launcher_hit_test(30, y(2), 96, &panel.rows, height),
+            Some(9)
+        );
+        let empty = clean_panel(LauncherPanel::default());
+        assert_eq!(empty.rows.len(), 1);
     }
 
     #[test]

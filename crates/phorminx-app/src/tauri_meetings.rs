@@ -415,6 +415,16 @@ fn meeting_event(
         "stop" if snapshot.capture == CaptureState::Idle => return Ok(None),
         "stop" => WorkspaceEvent::Stop,
         "commentary" => WorkspaceEvent::SetAutoCommentary(!snapshot.auto_commentary_enabled),
+        "commentary-interval" => {
+            let seconds = value
+                .unwrap_or_default()
+                .parse::<u32>()
+                .map_err(|_| "Choose how often commentary runs.")?;
+            WorkspaceEvent::SetAutoCommentaryInterval(seconds)
+        }
+        "translation" => WorkspaceEvent::SetTranslationEnabled(
+            snapshot.translation_language.is_empty() || snapshot.translation_paused,
+        ),
         "ask" => {
             let text = value.unwrap_or_default().trim();
             if text.is_empty() || text.len() > 12_000 {
@@ -553,6 +563,25 @@ mod tests {
                 muted: false
             })
         );
+        assert_eq!(
+            meeting_event("translation", None, &snapshot).unwrap(),
+            Some(WorkspaceEvent::SetTranslationEnabled(true))
+        );
+        snapshot.translation_language = "Portuguese (Brazil)".into();
+        assert_eq!(
+            meeting_event("translation", None, &snapshot).unwrap(),
+            Some(WorkspaceEvent::SetTranslationEnabled(false))
+        );
+        snapshot.translation_paused = true;
+        assert_eq!(
+            meeting_event("translation", None, &snapshot).unwrap(),
+            Some(WorkspaceEvent::SetTranslationEnabled(true))
+        );
+        assert_eq!(
+            meeting_event("commentary-interval", Some("60"), &snapshot).unwrap(),
+            Some(WorkspaceEvent::SetAutoCommentaryInterval(60))
+        );
+        assert!(meeting_event("commentary-interval", Some("soon"), &snapshot).is_err());
         assert_eq!(
             meeting_event("commentary", None, &snapshot).unwrap(),
             Some(WorkspaceEvent::SetAutoCommentary(true))

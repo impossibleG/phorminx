@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phorminx · Capture</title>
+  <link rel="stylesheet" href="preview.css">
+  <link rel="stylesheet" href="capture.css">
+  <script src="investigation-model.js" defer></script>
+  <script src="capture.js" defer></script>
+</head>
+<body>
+  <main class="capture">
+    <header>
+      <small id="capture-kicker">ADD TO</small>
+      <h1 id="capture-title">Investigation</h1>
+    </header>
+    <div id="capture-tabs" class="capture-tabs" role="tablist" aria-label="What to add">
+      <button type="button" role="tab" data-tab="note" aria-selected="true">Note</button>
+      <button type="button" role="tab" data-tab="link" aria-selected="false">Link</button>
+      <button type="button" role="tab" data-tab="image" aria-selected="false">Image</button>
+    </div>
+    <form id="capture-form" class="capture-form" novalidate>
+      <section data-panel="new" hidden>
+        <input id="capture-name" maxlength="200" autocomplete="off" placeholder="What are you looking into?" aria-label="Investigation name">
+      </section>
+      <section data-panel="note">
+        <textarea id="capture-note" maxlength="262144" placeholder="Write a note" aria-label="Note"></textarea>
+      </section>
+      <section data-panel="link" hidden>
+        <input id="capture-url" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="https://" aria-label="Link">
+        <textarea id="capture-link-note" maxlength="262144" placeholder="Why it matters (optional)" aria-label="Note about the link"></textarea>
+      </section>
+      <section data-panel="image" hidden>
+        <div id="capture-drop" class="capture-drop" tabindex="0" aria-label="Image. Paste with Ctrl+V or drop a file here.">
+          <img id="capture-preview" alt="" hidden>
+          <div id="capture-drop-empty" class="capture-drop-empty">
+            <strong>Paste or drop an image</strong>
+            <span>Ctrl+V works here</span>
+          </div>
+        </div>
+        <div class="capture-image-actions">
+          <button id="capture-snip" type="button">Take a screenshot</button>
+          <button id="capture-choose" type="button">Choose file…</button>
+          <input id="capture-file" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" hidden>
+        </div>
+      </section>
+      <footer>
+        <span id="capture-status" role="status"></span>
+        <button id="capture-submit" type="submit" class="primary">Add note</button>
+      </footer>
+    </form>
+  </main>
+</body>
+</html>

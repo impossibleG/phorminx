@@ -20,6 +20,11 @@ static DICTATION_BUSY: AtomicBool = AtomicBool::new(false);
 static CAPTURE_SUSPENDED: AtomicBool = AtomicBool::new(false);
 /// Launcher key (3-9) that opens the messaging contacts panel; 0 when unset.
 static MESSAGING_SLOT: AtomicU8 = AtomicU8::new(0);
+/// Launcher key (3-9) that opens the investigations panel; 0 when unset.
+static INVESTIGATIONS_SLOT: AtomicU8 = AtomicU8::new(0);
+/// Investigations panel keys: bits 0-9 are keys that do something, bits 16-25
+/// keys that keep the panel open (picking an investigation, Switch).
+static INVESTIGATION_KEYS: AtomicU32 = AtomicU32::new(0);
 const WM_COMMAND: u32 = WM_APP + 1;
 const WM_CHOOSE: u32 = WM_APP + 2;
 const WM_STOP: u32 = WM_APP + 3;
@@ -43,6 +48,15 @@ pub enum HoldEvent {
     /// panel, where 1-9 pick a contact.
     LauncherContacts,
     LauncherContact(u8),
+    /// The investigations key was chosen; the launcher stays open as the
+    /// investigations panel.
+    LauncherInvestigations,
+    /// A key (0-9) in the investigations panel. `panel_open` says whether the
+    /// hook kept the panel open for it.
+    LauncherInvestigation {
+        key: u8,
+        panel_open: bool,
+    },
     LauncherDismissed,
 }
 enum Command {
@@ -131,6 +145,19 @@ impl GlobalHoldHotkey {
             Ordering::Release,
         );
     }
+    /// Sets the launcher key (3-9) that opens the investigations panel.
+    pub fn set_investigations_slot(&self, slot: Option<u8>) {
+        INVESTIGATIONS_SLOT.store(
+            slot.filter(|s| (3..=9).contains(s)).unwrap_or(0),
+            Ordering::Release,
+        );
+    }
+    /// Keys (0-9) the investigations panel answers to, and which of them keep
+    /// it open. Published before the panel shows, so a fast key is judged by
+    /// the panel the user is looking at.
+    pub fn set_investigation_panel_keys(&self, keys: &[u8], stay_open: &[u8]) {
+        INVESTIGATION_KEYS.store(investigation_key_mask(keys, stay_open), Ordering::Release);
+    }
     fn command(&self, command: Command) -> Result<(), HotkeyError> {
         self.commands
             .send(command)
@@ -175,6 +202,14 @@ pub(crate) fn choose_launcher_action(choice: u8) {
 pub fn set_global_shortcut_capture(capturing: bool) -> Result<(), HotkeyError> {
     CAPTURE_SUSPENDED.store(capturing, Ordering::Release);
     Ok(())
+}
+fn investigation_key_mask(keys: &[u8], stay_open: &[u8]) -> u32 {
+    let bits = |keys: &[u8]| {
+        keys.iter()
+            .filter(|key| **key <= 9)
+            .fold(0u32, |mask, key| mask | 1 << key)
+    };
+    bits(keys) | (bits(stay_open) & bits(keys)) << 16
 }
 fn publish_activation_keys(bindings: ShortcutBindings) {
     ACTIVATION_KEYS.store(
@@ -226,6 +261,17 @@ impl HookState {
             KeyAction::Contact(slot) => {
                 self.launcher_target = None;
                 HoldEvent::LauncherContact(slot)
+            }
+            KeyAction::Investigations => {
+                self.launcher_target = None;
+                HoldEvent::LauncherInvestigations
+            }
+            KeyAction::InvestigationKey(key) => {
+                self.launcher_target = None;
+                HoldEvent::LauncherInvestigation {
+                    key,
+                    panel_open: self.keyboard.launcher_open,
+                }
             }
             KeyAction::Dismiss => {
                 self.launcher_target = None;
@@ -294,9 +340,10 @@ unsafe fn install_and_run(
                             state.keyboard.close_launcher();
                         }
                         Command::Launcher(open) => {
-                            state.keyboard.launcher_open = open;
-                            if !open {
-                                state.keyboard.pending_choice = None;
+                            if open {
+                                state.keyboard.launcher_open = true;
+                            } else {
+                                state.keyboard.close_launcher();
                             }
                         }
                     }
@@ -307,11 +354,19 @@ unsafe fn install_and_run(
                     .launcher_target
                     .is_none_or(|target| target.is_current());
                 state.keyboard.messaging_slot = MESSAGING_SLOT.load(Ordering::Acquire);
+                state.keyboard.load_investigation_keys();
                 let choice = match message.wParam.0 {
                     1..=9 if state.keyboard.contacts_mode => {
                         KeyAction::Contact(message.wParam.0 as u8)
                     }
                     _ if state.keyboard.contacts_mode => return,
+                    key @ 0..=9
+                        if state.keyboard.investigations_mode
+                            && state.keyboard.investigation_key_valid(key as u8) =>
+                    {
+                        KeyAction::InvestigationKey(key as u8)
+                    }
+                    _ if state.keyboard.investigations_mode => return,
                     0 => KeyAction::Action(0),
                     1 => KeyAction::Choose,
                     2 => KeyAction::Meetings,
@@ -341,6 +396,7 @@ unsafe extern "system" fn keyboard_callback(code: i32, wparam: WPARAM, lparam: L
                 state.keyboard.busy = DICTATION_BUSY.load(Ordering::Acquire);
                 state.keyboard.suspended = CAPTURE_SUSPENDED.load(Ordering::Acquire);
                 state.keyboard.messaging_slot = MESSAGING_SLOT.load(Ordering::Acquire);
+                state.keyboard.load_investigation_keys();
                 if state.keyboard.suspended {
                     state.keyboard.close_launcher();
                 }
@@ -377,6 +433,8 @@ enum KeyAction {
     Action(u8),
     Contacts,
     Contact(u8),
+    Investigations,
+    InvestigationKey(u8),
     Dismiss,
 }
 struct KeyboardState {
@@ -390,6 +448,9 @@ struct KeyboardState {
     suspended: bool,
     contacts_mode: bool,
     messaging_slot: u8,
+    investigations_mode: bool,
+    investigations_slot: u8,
+    investigation_keys: u32,
 }
 impl KeyboardState {
     fn new(bindings: ShortcutBindings) -> Self {
@@ -404,34 +465,62 @@ impl KeyboardState {
             suspended: false,
             contacts_mode: false,
             messaging_slot: 0,
+            investigations_mode: false,
+            investigations_slot: 0,
+            investigation_keys: 0,
         }
     }
     fn close_launcher(&mut self) {
         self.launcher_open = false;
         self.pending_choice = None;
         self.contacts_mode = false;
+        self.investigations_mode = false;
     }
-    /// The messaging key turns the open launcher into the contacts panel
-    /// instead of closing it.
+    fn load_investigation_keys(&mut self) {
+        self.investigations_slot = INVESTIGATIONS_SLOT.load(Ordering::Acquire);
+        self.investigation_keys = INVESTIGATION_KEYS.load(Ordering::Acquire);
+    }
+    fn investigation_key_valid(&self, key: u8) -> bool {
+        key <= 9 && self.investigation_keys & 1 << key != 0
+    }
+    fn investigation_key_stays(&self, key: u8) -> bool {
+        key <= 9 && self.investigation_keys & 1 << (key + 16) != 0
+    }
+    /// The messaging and investigations keys turn the open launcher into
+    /// their panel instead of closing it.
     fn panel_choice(&self, choice: KeyAction) -> KeyAction {
+        let in_panel = self.contacts_mode || self.investigations_mode;
         match choice {
-            KeyAction::Action(slot)
-                if !self.contacts_mode && slot != 0 && slot == self.messaging_slot =>
-            {
+            KeyAction::Action(slot) if !in_panel && slot != 0 && slot == self.messaging_slot => {
                 KeyAction::Contacts
+            }
+            KeyAction::Action(slot)
+                if !in_panel && slot != 0 && slot == self.investigations_slot =>
+            {
+                KeyAction::Investigations
             }
             other => other,
         }
     }
-    /// Applies a chosen launcher entry: the contacts panel keeps the launcher
-    /// open, everything else closes it.
+    /// Applies a chosen launcher entry: panels, and investigation keys that
+    /// lead to another panel, keep the launcher open; everything else closes it.
     fn finish_choice(&mut self, choice: KeyAction) {
-        if choice == KeyAction::Contacts {
-            self.pending_choice = None;
-            self.contacts_mode = true;
-        } else {
-            self.close_launcher();
-            self.busy = choice == KeyAction::Choose;
+        match choice {
+            KeyAction::Contacts => {
+                self.pending_choice = None;
+                self.contacts_mode = true;
+            }
+            KeyAction::Investigations => {
+                self.pending_choice = None;
+                self.investigations_mode = true;
+            }
+            KeyAction::InvestigationKey(key) if self.investigation_key_stays(key) => {
+                self.pending_choice = None;
+            }
+            _ => {
+                self.close_launcher();
+                self.busy = choice == KeyAction::Choose;
+            }
         }
     }
     fn click_choice(&mut self, target_current: bool, choice: KeyAction) -> Option<KeyAction> {
@@ -505,6 +594,32 @@ impl KeyboardState {
             self.close_launcher();
             return (true, Some(choice));
         }
+        if self.launcher_open
+            && self.investigations_mode
+            && matches!(key, 0x30..=0x39 | 0x60..=0x69 | 0x0d | 0x1b)
+        {
+            self.consumed[index] = true;
+            let digit = match key {
+                0x1b => {
+                    self.close_launcher();
+                    return (true, Some(KeyAction::Dismiss));
+                }
+                0x30..=0x39 => (key - 0x30) as u8,
+                0x60..=0x69 => (key - 0x60) as u8,
+                // Enter picks nothing here; swallow it like unused digits.
+                _ => return (true, None),
+            };
+            if !self.investigation_key_valid(digit) {
+                return (true, None);
+            }
+            let choice = KeyAction::InvestigationKey(digit);
+            if modifiers != 0 {
+                self.pending_choice = Some(choice);
+                return (true, None);
+            }
+            self.finish_choice(choice);
+            return (true, Some(choice));
+        }
         if self.launcher_open && matches!(key, 0x30..=0x39 | 0x60..=0x69 | 0x0d | 0x1b) {
             let choice = match key {
                 0x1b => KeyAction::Dismiss,
@@ -534,6 +649,7 @@ impl KeyboardState {
             }
             // Arm selection synchronously in the hook, before the app's next
             // poll. Fast shortcut→1 must never leak into the original editor.
+            self.close_launcher();
             self.launcher_open = !self.busy;
             return (true, Some(KeyAction::Launcher));
         }
@@ -899,5 +1015,115 @@ mod tests {
             Some(KeyAction::Contact(3))
         );
         assert!(!state.launcher_open);
+    }
+
+    /// The investigations panel on key 9 with the given panel keys.
+    fn investigations_state(keys: &[u8], stay_open: &[u8]) -> KeyboardState {
+        let mut state = KeyboardState::new(ShortcutBindings::default());
+        state.investigations_slot = 9;
+        state.investigation_keys = investigation_key_mask(keys, stay_open);
+        state.launcher_open = true;
+        state
+    }
+
+    #[test]
+    fn investigation_key_mask_ignores_stay_bits_for_unused_keys() {
+        let mask = investigation_key_mask(&[1, 2, 9], &[1, 8]);
+        let mut state = KeyboardState::new(ShortcutBindings::default());
+        state.investigation_keys = mask;
+        assert!(state.investigation_key_valid(1) && state.investigation_key_stays(1));
+        assert!(state.investigation_key_valid(9) && !state.investigation_key_stays(9));
+        assert!(!state.investigation_key_valid(8) && !state.investigation_key_stays(8));
+        assert!(!state.investigation_key_valid(10));
+    }
+
+    #[test]
+    fn investigations_key_opens_the_panel_and_its_keys_never_leak() {
+        // The capture panel: 1-5, 8 Switch (stays), 9 Stop, 0 Open.
+        let mut state = investigations_state(&[0, 1, 2, 3, 4, 5, 8, 9], &[8]);
+        assert_eq!(
+            state.input(0x39, true),
+            (true, Some(KeyAction::Investigations))
+        );
+        assert!(state.launcher_open && state.investigations_mode);
+        assert_eq!(state.input(0x39, false), (true, None));
+        // 8 switches to the list: the panel stays open.
+        assert_eq!(
+            state.input(0x38, true),
+            (true, Some(KeyAction::InvestigationKey(8)))
+        );
+        assert!(state.launcher_open && state.investigations_mode);
+        state.input(0x38, false);
+        // Unused keys and Enter are swallowed without an action.
+        assert_eq!(state.input(0x36, true), (true, None));
+        assert_eq!(state.input(0x0d, true), (true, None));
+        assert!(state.investigations_mode);
+        // 1 (Voice note) closes the panel; 1 never starts plain dictation.
+        assert_eq!(
+            state.input(0x61, true),
+            (true, Some(KeyAction::InvestigationKey(1)))
+        );
+        assert!(!state.launcher_open && !state.investigations_mode && !state.busy);
+        assert_eq!(state.input(0x61, false), (true, None));
+    }
+
+    #[test]
+    fn picking_an_investigation_keeps_the_panel_and_escape_closes_it() {
+        let mut state = investigations_state(&[1, 2, 9], &[1, 2]);
+        state.input(0x39, true);
+        state.input(0x39, false);
+        assert_eq!(
+            state.input(0x32, true),
+            (true, Some(KeyAction::InvestigationKey(2)))
+        );
+        assert!(state.launcher_open && state.investigations_mode);
+        state.input(0x32, false);
+        assert_eq!(state.input(0x1b, true), (true, Some(KeyAction::Dismiss)));
+        assert!(!state.launcher_open && !state.investigations_mode);
+        // Reopening the launcher starts on the main panel again.
+        let mut state = investigations_state(&[1, 9], &[1]);
+        state.investigations_mode = true;
+        state.launcher_open = false;
+        state.input(0x11, true);
+        state.input(0x12, true);
+        assert_eq!(state.input(0x20, true), (true, Some(KeyAction::Launcher)));
+        assert!(!state.investigations_mode);
+    }
+
+    #[test]
+    fn investigation_keys_wait_for_modifiers_and_clicks_follow_the_mask() {
+        let mut state = investigations_state(&[2, 9], &[]);
+        state.input(0x39, true);
+        state.input(0x39, false);
+        state.input(0x11, true);
+        assert_eq!(state.input(0x32, true), (true, None));
+        assert_eq!(
+            state.input(0x11, false),
+            (false, Some(KeyAction::InvestigationKey(2)))
+        );
+        assert!(!state.launcher_open);
+        let mut state = investigations_state(&[1, 9], &[1]);
+        assert_eq!(
+            state.click_choice(true, KeyAction::Action(9)),
+            Some(KeyAction::Investigations)
+        );
+        assert_eq!(
+            state.click_choice(true, KeyAction::InvestigationKey(1)),
+            Some(KeyAction::InvestigationKey(1))
+        );
+        assert!(state.launcher_open && state.investigations_mode);
+    }
+
+    #[test]
+    fn messaging_and_investigations_slots_coexist() {
+        let mut state = investigations_state(&[1], &[]);
+        state.messaging_slot = 3;
+        assert_eq!(state.input(0x33, true), (true, Some(KeyAction::Contacts)));
+        // Inside the contacts panel the investigations key picks a contact.
+        state.input(0x33, false);
+        assert_eq!(state.input(0x39, true), (true, Some(KeyAction::Contact(9))));
+        let mut state = investigations_state(&[1], &[]);
+        state.messaging_slot = 3;
+        assert_eq!(state.input(0x34, true), (true, Some(KeyAction::Action(4))));
     }
 }

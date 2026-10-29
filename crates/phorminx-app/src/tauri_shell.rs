@@ -1473,7 +1473,10 @@ fn run_shell(
         .manage(host)
         .manage(messaging)
         .manage(reinstall)
+        .manage(crate::tauri_keep_awake::KeepAwakeState::default())
         .invoke_handler(tauri::generate_handler![
+            crate::tauri_keep_awake::keep_awake_snapshot,
+            crate::tauri_keep_awake::keep_awake_set,
             crate::tauri_meetings::meeting_snapshot,
             crate::tauri_meetings::meeting_actions,
             crate::tauri_meetings::meeting_save_action,
@@ -1493,6 +1496,7 @@ fn run_shell(
             crate::tauri_investigations::investigation_detail,
             crate::tauri_investigations::investigation_search,
             crate::tauri_investigations::investigation_add_text,
+            crate::tauri_investigations::investigation_add_link,
             crate::tauri_investigations::investigation_add_image,
             crate::tauri_investigations::investigation_update_item,
             crate::tauri_investigations::investigation_delete_item,
@@ -1507,6 +1511,11 @@ fn run_shell(
             crate::tauri_investigations::investigation_capture_clipboard,
             crate::tauri_investigations::investigation_voice,
             crate::tauri_investigations::investigation_assistant,
+            crate::tauri_investigations::investigation_capture_window,
+            crate::tauri_investigations::investigation_capture_submit,
+            crate::tauri_investigations::investigation_snip,
+            crate::tauri_investigations::investigation_capture_close,
+            crate::tauri_investigations::investigation_open_request,
             host_snapshot,
             host_app_snapshot,
             host_input_devices,
@@ -1852,6 +1861,9 @@ fn control_loop(
                 if let Err(error) = app.state::<MessagingHost>().dictate(&app, contact_id) {
                     host.notice(&error);
                 }
+            }
+            ProductShellControl::Investigation(request) => {
+                crate::tauri_investigations::launcher_request(&app, request);
             }
             ProductShellControl::Quit => {
                 app.exit(0);

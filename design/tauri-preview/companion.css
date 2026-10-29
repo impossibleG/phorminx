@@ -27,3 +27,15 @@ html,body{width:100%;height:100%;overflow:hidden}
 .transcript-scroll,.conversation-scroll,.message .markdown pre{scrollbar-width:none;-ms-overflow-style:none}
 .transcript-scroll::-webkit-scrollbar,.conversation-scroll::-webkit-scrollbar,.message .markdown pre::-webkit-scrollbar{display:none;width:0;height:0}
 .window-frame[data-language=translation] .phrase-text .original.untranslated{display:block}
+.message .markdown{font-size:12px;line-height:1.5}.message .markdown li p{margin:0}
+.commentary-control span em{display:block;font-style:normal;font-size:8px;color:var(--muted);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.commentary-control select{border:1px solid var(--edge);background:var(--background);color:var(--secondary);border-radius:4px;font-size:9px;padding:2px 3px}
+.window-frame[data-view=assistant] .translation-control,.window-frame.translation-off .language-tabs{display:none}
+.window-frame[data-view=transcript] .translation-control{display:flex}
+.switch[aria-disabled=true]{opacity:.45}
+.record-state.busy i{animation:pulse 1s ease-in-out infinite}.record-state.recording{color:#e5484d}.record-state.recording i{background:#e5484d;animation:pulse 1.6s ease-in-out infinite}
+.window-actions button.busy{opacity:.7;cursor:progress}
+@keyframes pulse{50%{opacity:.25}}
+.end-card{flex:none;display:flex;align-items:center;gap:12px;padding:10px 19px;border-top:1px solid var(--verified);background:var(--surface);font-size:11px;color:var(--secondary)}
+.end-card[hidden]{display:none}.end-card strong{color:var(--verified)}.end-card button{margin-left:auto;border:1px solid var(--edge);background:var(--background);color:var(--text);border-radius:4px;padding:5px 9px;font-size:10px}
+@media(prefers-reduced-motion:reduce){.record-state i{animation:none!important}}

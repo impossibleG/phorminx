@@ -375,6 +375,17 @@ impl<'a> InvestigationRepository<'a> {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// (investigation id, kind, card count) for every kind present.
+    pub fn kind_counts(&self) -> Result<Vec<(i64, String, u64)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT investigation_id,kind,COUNT(*) FROM investigation_items \
+             GROUP BY investigation_id,kind",
+        )?;
+        Ok(statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn get(&self, id: i64) -> Result<Option<InvestigationRecord>> {
         Ok(self
             .connection

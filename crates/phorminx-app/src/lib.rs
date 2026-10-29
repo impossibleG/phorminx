@@ -11,6 +11,7 @@ pub mod investigation_assistant;
 pub mod investigation_links;
 pub mod investigation_ocr;
 pub mod investigations;
+pub mod launcher_investigations;
 pub mod launcher_messaging;
 pub mod message_arrival;
 mod library_search;
@@ -37,6 +38,8 @@ pub mod setup_host;
 pub mod tauri_contract;
 #[cfg(feature = "tauri-shell")]
 pub mod tauri_investigations;
+#[cfg(feature = "tauri-shell")]
+mod tauri_keep_awake;
 #[cfg(feature = "tauri-preview")]
 pub mod tauri_meetings;
 #[cfg(feature = "tauri-shell")]

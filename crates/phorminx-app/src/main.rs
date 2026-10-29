@@ -15,8 +15,11 @@ use phorminx_app::incremental::{
     BoundaryKind, CHUNK_OVERLAP, IncrementalPlanner, MergeExpectation, SILENCE_PROBE_DURATION,
     merge_overlapping, strip_known_non_speech_annotations,
 };
-use phorminx_app::lifecycle::{LifecycleLog, error_chain, profile_instance_scope};
+use phorminx_app::launcher_investigations::{
+    InvestigationChoice, InvestigationPanel, InvestigationRequest, LauncherInvestigations,
+};
 use phorminx_app::launcher_messaging::LauncherMessaging;
+use phorminx_app::lifecycle::{LifecycleLog, error_chain, profile_instance_scope};
 use phorminx_app::model::{
     ModelDownload, ModelDownloadEvent, identify_pinned_model, model_for_variant,
 };
@@ -471,6 +474,14 @@ fn run() -> Result<()> {
     let mut launcher_messaging = LauncherMessaging::load(&persistence);
     let mut launcher_layout = launcher_messaging.layout(&[]);
     hotkey.set_messaging_slot(launcher_layout.panel_key());
+    let mut launcher_investigations = LauncherInvestigations::load(&persistence);
+    let mut investigation_panel = launcher_investigations.first_panel();
+    let mut investigations_key =
+        LauncherInvestigations::launcher_key(&launcher_taken_keys(&[], &launcher_layout));
+    hotkey.set_investigations_slot(investigations_key);
+    publish_investigation_keys(&hotkey, &launcher_investigations, investigation_panel);
+    // A launcher voice note waiting for its dictation to start.
+    let mut routed_voice: Option<i64> = None;
     let mut launcher_recording = false;
     let capture = ExtendedCaptureFactory::new(ExtendedCaptureConfig::new(
         settings_store
@@ -778,12 +789,24 @@ fn run() -> Result<()> {
                     launcher_messaging = LauncherMessaging::load(&persistence);
                     launcher_layout = launcher_messaging.layout(&action_keys);
                     hotkey.set_messaging_slot(launcher_layout.panel_key());
+                    launcher_investigations = LauncherInvestigations::load(&persistence);
+                    investigation_panel = launcher_investigations.first_panel();
+                    investigations_key = LauncherInvestigations::launcher_key(
+                        &launcher_taken_keys(&action_keys, &launcher_layout),
+                    );
+                    hotkey.set_investigations_slot(investigations_key);
+                    publish_investigation_keys(
+                        &hotkey,
+                        &launcher_investigations,
+                        investigation_panel,
+                    );
                     overlay.set_launcher_contacts(None)?;
                     overlay.set_launcher_actions(
                         launcher_action_configs
                             .iter()
                             .filter_map(|a| a.launcher_slot.map(|slot| (slot, a.name.clone())))
                             .chain(launcher_layout.main_rows())
+                            .chain(investigations_key.map(|key| (key, "Investigations".to_owned())))
                             .collect(),
                     )?;
                     // The hook already armed selection atomically. Reopening it
@@ -832,6 +855,90 @@ fn run() -> Result<()> {
                         .map_err(anyhow::Error::msg)?;
                 }
                 Err(RecvTimeoutError::Timeout)
+            }
+            Ok(HoldEvent::LauncherInvestigations) => {
+                // The hook keeps the launcher open as the investigations panel.
+                investigation_panel = launcher_investigations.first_panel();
+                show_investigation_panel(
+                    &hotkey,
+                    &overlay,
+                    &launcher_investigations,
+                    investigation_panel,
+                )?;
+                overlay.set(launcher_overlay_status(&settings))?;
+                Err(RecvTimeoutError::Timeout)
+            }
+            Ok(HoldEvent::LauncherInvestigation { key, panel_open }) => {
+                let choice = launcher_investigations.choice(investigation_panel, key);
+                let active = launcher_investigations.active.clone();
+                let next_panel = match choice {
+                    Some(InvestigationChoice::Pick(id)) => launcher_investigations
+                        .set_active(&persistence, Some(id))
+                        .ok()
+                        .map(|()| InvestigationPanel::Capture),
+                    Some(InvestigationChoice::Switch) => Some(InvestigationPanel::Pick),
+                    _ => None,
+                };
+                match next_panel {
+                    Some(panel) if panel_open => {
+                        investigation_panel = panel;
+                        show_investigation_panel(
+                            &hotkey,
+                            &overlay,
+                            &launcher_investigations,
+                            panel,
+                        )?;
+                    }
+                    _ => {
+                        hotkey.set_launcher_open(false)?;
+                        launcher_open = false;
+                        overlay.set(OverlayStatus::Hidden)?;
+                        overlay.set_launcher_panel(None)?;
+                    }
+                }
+                let request = match choice {
+                    Some(InvestigationChoice::Clipboard) => {
+                        Some(InvestigationRequest::QuickCapture)
+                    }
+                    Some(InvestigationChoice::Image) => {
+                        Some(InvestigationRequest::CaptureWindow("image"))
+                    }
+                    Some(InvestigationChoice::Link) => {
+                        Some(InvestigationRequest::CaptureWindow("link"))
+                    }
+                    Some(InvestigationChoice::Note) => {
+                        Some(InvestigationRequest::CaptureWindow("note"))
+                    }
+                    Some(InvestigationChoice::New) => {
+                        Some(InvestigationRequest::CaptureWindow("new"))
+                    }
+                    Some(InvestigationChoice::Open) => active
+                        .as_ref()
+                        .map(|(id, _)| InvestigationRequest::Open(*id)),
+                    Some(InvestigationChoice::Stop) => {
+                        let _ = launcher_investigations.set_active(&persistence, None);
+                        active
+                            .as_ref()
+                            .map(|(_, title)| InvestigationRequest::Stopped(title.clone()))
+                    }
+                    _ => None,
+                };
+                if let (Some(shell), Some(request)) = (product_shell.as_ref(), request) {
+                    shell
+                        .send(ProductShellControl::Investigation(request))
+                        .map_err(anyhow::Error::msg)?;
+                }
+                match (choice, active) {
+                    (Some(InvestigationChoice::Voice), Some((id, _)))
+                        if runtime.state() == RuntimeState::Idle =>
+                    {
+                        // The normal launcher dictation, filed instead of pasted.
+                        routed_voice = Some(id);
+                        launcher_recording = true;
+                        Ok(HoldEvent::Started { target: None })
+                    }
+                    _ => Err(RecvTimeoutError::Timeout),
+                }
             }
             Ok(action @ (HoldEvent::LauncherMeetings | HoldEvent::LauncherAction(_))) => {
                 hotkey.set_launcher_open(false)?;
@@ -888,6 +995,8 @@ fn run() -> Result<()> {
                 if let (Some(released_at), Some(id)) = (release_received_at, runtime.active_id()) {
                     log_release_received(id, released_at, "shortcut_toggle");
                 }
+                // Only the activation the voice-note key produced is routed.
+                let routed = routed_voice.take();
                 if runtime.state() == RuntimeState::Idle {
                     dictation_context = match DictationContext::for_target(
                         activation_target,
@@ -909,6 +1018,7 @@ fn run() -> Result<()> {
                             continue 'event_loop;
                         }
                     };
+                    dictation_context.investigation = routed;
                     if let Some(reason) = dictation_context.activation_block {
                         eprintln!(
                             "dictation_id=0 state=Idle event=activation_blocked reason={}",
@@ -1007,6 +1117,8 @@ fn run() -> Result<()> {
                 | HoldEvent::LauncherAction(_)
                 | HoldEvent::LauncherContacts
                 | HoldEvent::LauncherContact(_)
+                | HoldEvent::LauncherInvestigations
+                | HoldEvent::LauncherInvestigation { .. }
                 | HoldEvent::LauncherDismissed,
             ) => unreachable!("launcher events are normalized above"),
             Err(RecvTimeoutError::Disconnected) => {
@@ -1272,12 +1384,14 @@ fn run() -> Result<()> {
                     let formatting_note = processed_for_history
                         .as_ref()
                         .and_then(|processed| formatting_fallback_note(&processed.warnings));
+                    let routed = dictation_context.investigation.filter(|_| is_current);
                     if processed_for_history.is_some() {
                         // Posted before the result status, so the Inserted
                         // pill is laid out with the note and Expand button.
                         let _ = overlay.set_note(formatting_note);
-                        let _ =
-                            overlay.offer_expand(REVIEW_PANEL_AVAILABLE && product_shell.is_some());
+                        let _ = overlay.offer_expand(
+                            REVIEW_PANEL_AVAILABLE && product_shell.is_some() && routed.is_none(),
+                        );
                     }
                     let insertion_started_at = Instant::now();
                     let notices = {
@@ -1296,7 +1410,32 @@ fn run() -> Result<()> {
                         }
                     };
                     let insertion_completed_at = Instant::now();
-                    if is_current && let Some(processed) = processed_for_history.as_ref() {
+                    if let (Some(investigation_id), Some(processed)) =
+                        (routed, processed_for_history.as_ref())
+                    {
+                        // A launcher voice note: the shell files the text and
+                        // confirms it; no paste, history entry or review.
+                        let outcome = terminal_outcome(&notices);
+                        if outcome.is_success() {
+                            // The shell's toast replaces the Inserted pill.
+                            let _ = overlay.set(OverlayStatus::Hidden);
+                            worker.recovery.discard(completed.id.0);
+                            if let Some(shell) = product_shell.as_ref() {
+                                let _ = shell.send(ProductShellControl::Investigation(
+                                    InvestigationRequest::VoiceNote {
+                                        investigation_id,
+                                        text: text_for_insertion(
+                                            dictation_context.runtime_formatting,
+                                            &processed.transcript.text,
+                                        ),
+                                    },
+                                ));
+                            }
+                        } else {
+                            record_terminal_failure(completed.id, outcome);
+                            worker.recovery.interrupted(completed.id.0);
+                        }
+                    } else if is_current && let Some(processed) = processed_for_history.as_ref() {
                         let outcome = terminal_outcome(&notices);
                         if outcome.is_success() {
                             last_dictation = Some(LastDictation {
@@ -2044,6 +2183,44 @@ enum ShellAction {
     },
     /// The review panel asked to replace the last pasted text.
     ReviewReplace(String),
+}
+
+/// Main-panel keys saved actions and messaging already show.
+fn launcher_taken_keys(
+    action_keys: &[u8],
+    layout: &phorminx_app::launcher_messaging::LauncherLayout,
+) -> Vec<u8> {
+    action_keys
+        .iter()
+        .copied()
+        .chain(layout.main_rows().into_iter().map(|(key, _)| key))
+        .collect()
+}
+
+/// Tells the keyboard hook which investigations-panel keys act and which keep
+/// the panel open, before the panel is shown.
+fn publish_investigation_keys(
+    hotkey: &GlobalHoldHotkey,
+    launcher: &LauncherInvestigations,
+    panel: InvestigationPanel,
+) {
+    let (keys, stay_open) = launcher.keys(panel);
+    hotkey.set_investigation_panel_keys(&keys, &stay_open);
+}
+
+fn show_investigation_panel(
+    hotkey: &GlobalHoldHotkey,
+    overlay: &StatusOverlay,
+    launcher: &LauncherInvestigations,
+    panel: InvestigationPanel,
+) -> Result<()> {
+    publish_investigation_keys(hotkey, launcher, panel);
+    overlay.set_launcher_panel(Some(phorminx_windows::LauncherPanel {
+        title: launcher.title(panel),
+        hint: launcher.hint(panel).to_owned(),
+        rows: launcher.rows(panel),
+    }))?;
+    Ok(())
 }
 
 fn launcher_overlay_status(settings: &Settings) -> OverlayStatus {
@@ -3447,6 +3624,11 @@ impl AppIo for ProductionIo<'_> {
         target: Option<Self::Target>,
         text: &str,
     ) -> Result<InsertDisposition<Self::ClipboardReason>, String> {
+        if self.context.investigation.is_some() {
+            // A launcher voice note is filed by the shell; the focused app
+            // and the clipboard stay untouched.
+            return Ok(InsertDisposition::Pasted);
+        }
         let target = if self.context.insertion_preference == InsertionPreference::Clipboard {
             None
         } else {
@@ -7219,6 +7401,9 @@ struct DictationContext {
     insertion_preference: InsertionPreference,
     verified_variant: Option<AccurateModelVariant>,
     activation_block: Option<ActivationBlockReason>,
+    /// A launcher voice note: the text goes to this investigation and nothing
+    /// is typed into the focused application.
+    investigation: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7262,6 +7447,7 @@ impl DictationContext {
             insertion_preference: InsertionPreference::Automatic,
             verified_variant,
             activation_block: None,
+            investigation: None,
         })
     }
 

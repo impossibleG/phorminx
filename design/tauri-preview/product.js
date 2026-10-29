@@ -56,7 +56,7 @@ function showRoute(route, persist = true) {
   // Prompts, Investigations, Messages and Benchmarks are pages of this window
   // only; the host keeps the last other route.
   if (route === 'feedback') void refreshFeedbackHistory();
-  if (persist && hostInvoke && !['prompts', 'investigations', 'messages', 'benchmarks', 'feedback'].includes(route)) {
+  if (persist && hostInvoke && !['prompts', 'investigations', 'messages', 'benchmarks', 'feedback', 'keep-awake'].includes(route)) {
     const hostRoute = ['live', 'saved', 'meeting-settings'].includes(route) ? 'meetings' : route === 'action-editor' ? 'actions' : route === 'lexicon-editor' ? 'lexicon' : route === 'profile-editor' ? 'profiles' : route;
     lastHostRoute = hostRoute;
     void hostInvoke('plugin:phorminx-host|host_select_route', {route: hostRoute}).catch((error) => { node('status').textContent = String(error); });
