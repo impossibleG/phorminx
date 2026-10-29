@@ -14,6 +14,9 @@ vulkan = ["phorminx-whisper/vulkan"]
 tauri-preview = ["dep:tauri", "dep:tauri-build"]
 tauri-shell = ["tauri-preview", "dep:phorminx-messaging", "dep:tracing-subscriber"]
 release-tools = []
+# Local QA only: lets "Reinstall Phorminx" run a local installer named by
+# PHORMINX_QA_INSTALLER. Never part of a published release.
+reinstall-qa = []
 
 [dependencies]
 anyhow.workspace = true

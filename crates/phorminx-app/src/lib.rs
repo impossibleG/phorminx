@@ -26,6 +26,7 @@ pub mod performance;
 pub mod performance_runtime;
 pub mod product_shell;
 pub mod prompts;
+pub mod reinstall;
 pub mod repair;
 pub mod review;
 pub mod runtime;
@@ -40,6 +41,8 @@ pub mod tauri_investigations;
 pub mod tauri_meetings;
 #[cfg(feature = "tauri-shell")]
 mod tauri_messaging;
+#[cfg(feature = "tauri-shell")]
+pub mod tauri_reinstall;
 #[cfg(feature = "tauri-shell")]
 pub mod tauri_shell;
 pub mod text_recovery;
