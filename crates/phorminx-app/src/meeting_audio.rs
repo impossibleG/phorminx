@@ -437,6 +437,7 @@ impl Decoder {
                 };
                 let recognizer = WhisperRecognizer::load_with_backend(&settings.model_path, backend)
                     .map_err(|_| "Accurate recognition could not load. Check its model and compute backend in Models.".to_owned())?;
+                recognizer.set_vocabulary_hint(settings.vocabulary_hint.clone());
                 // Whisper expects its primary language code, unlike the Vosk model selector.
                 let language = settings
                     .language

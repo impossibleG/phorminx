@@ -838,15 +838,17 @@ pub enum AccurateModel {
     BaseEnglish,
     TinyMultilingual,
     BaseMultilingual,
+    LargeV3Turbo,
     Custom,
 }
 
 impl AccurateModel {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::TinyEnglish,
         Self::BaseEnglish,
         Self::TinyMultilingual,
         Self::BaseMultilingual,
+        Self::LargeV3Turbo,
         Self::Custom,
     ];
 
@@ -856,6 +858,7 @@ impl AccurateModel {
             Self::BaseEnglish => "Base · English",
             Self::TinyMultilingual => "Tiny · Multilingual",
             Self::BaseMultilingual => "Base · Multilingual",
+            Self::LargeV3Turbo => "Large Turbo · Multilingual",
             Self::Custom => "Custom file",
         }
     }

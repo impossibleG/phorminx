@@ -426,7 +426,8 @@ const fn model_rank(model: ModelClass) -> u8 {
     match model {
         ModelClass::Base => 0,
         ModelClass::Tiny => 1,
-        ModelClass::Other => 2,
+        ModelClass::Large => 2,
+        ModelClass::Other => 3,
     }
 }
 

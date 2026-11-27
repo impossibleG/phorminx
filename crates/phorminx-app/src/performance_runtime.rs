@@ -489,12 +489,13 @@ fn exact_install<'a>(
     })
 }
 
-fn pinned_variants() -> [AccurateModelVariant; 4] {
+fn pinned_variants() -> [AccurateModelVariant; 5] {
     [
         AccurateModelVariant::TinyEnglish,
         AccurateModelVariant::BaseEnglish,
         AccurateModelVariant::TinyMultilingual,
         AccurateModelVariant::BaseMultilingual,
+        AccurateModelVariant::LargeV3Turbo,
     ]
 }
 
@@ -504,7 +505,8 @@ const fn variant_rank(variant: AccurateModelVariant) -> u8 {
         AccurateModelVariant::BaseEnglish => 1,
         AccurateModelVariant::TinyMultilingual => 2,
         AccurateModelVariant::BaseMultilingual => 3,
-        AccurateModelVariant::Custom => 4,
+        AccurateModelVariant::LargeV3Turbo => 4,
+        AccurateModelVariant::Custom => 5,
     }
 }
 
@@ -513,7 +515,9 @@ fn languages_for_variant(variant: AccurateModelVariant) -> Vec<Language> {
         AccurateModelVariant::TinyEnglish | AccurateModelVariant::BaseEnglish => {
             vec![Language::English]
         }
-        AccurateModelVariant::TinyMultilingual | AccurateModelVariant::BaseMultilingual => {
+        AccurateModelVariant::TinyMultilingual
+        | AccurateModelVariant::BaseMultilingual
+        | AccurateModelVariant::LargeV3Turbo => {
             vec![Language::English, Language::PortugueseBrazil]
         }
         AccurateModelVariant::Custom => Vec::new(),
@@ -528,6 +532,7 @@ const fn model_class(variant: AccurateModelVariant) -> ModelClass {
         AccurateModelVariant::BaseEnglish | AccurateModelVariant::BaseMultilingual => {
             ModelClass::Base
         }
+        AccurateModelVariant::LargeV3Turbo => ModelClass::Large,
         AccurateModelVariant::Custom => ModelClass::Other,
     }
 }

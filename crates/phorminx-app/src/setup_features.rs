@@ -2044,6 +2044,7 @@ const fn model_label(value: ModelClass) -> &'static str {
     match value {
         ModelClass::Tiny => "Tiny",
         ModelClass::Base => "Base",
+        ModelClass::Large => "Large Turbo",
         ModelClass::Other => "Local",
     }
 }

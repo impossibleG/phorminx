@@ -479,6 +479,21 @@ mod tests {
     }
 
     #[test]
+    fn manifest_pins_large_turbo_for_every_language() {
+        let model = model_for_variant(AccurateModelVariant::LargeV3Turbo).unwrap();
+        assert_eq!(model.file_name, "ggml-large-v3-turbo-q8_0.bin");
+        assert_eq!(model.bytes, 874_188_075);
+        assert_eq!(model.language, "multilingual");
+        assert!(
+            model
+                .url
+                .contains("5359861c739e955e79d9a303bcbc70fb988958b1")
+        );
+        assert!(AccurateModelVariant::LargeV3Turbo.supports_language("pt-BR"));
+        assert!(AccurateModelVariant::LargeV3Turbo.supports_language("en"));
+    }
+
+    #[test]
     fn familiar_filename_without_verified_identity_is_not_pinned() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ggml-tiny.en.bin");

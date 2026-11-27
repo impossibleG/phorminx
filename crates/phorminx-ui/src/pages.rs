@@ -1754,6 +1754,7 @@ fn model_system(
                     AccurateModel::BaseEnglish,
                     AccurateModel::TinyMultilingual,
                     AccurateModel::BaseMultilingual,
+                    AccurateModel::LargeV3Turbo,
                 ] {
                     if action(ui, variant.label(), ActionTone::Secondary).clicked() {
                         state.confirm_model_download = Some(variant);

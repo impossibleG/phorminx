@@ -2,8 +2,8 @@
 
 use std::ffi::c_void;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use phorminx_core::{AudioClip, SpeechRecognizer, Transcript, TranscriptionOptions};
@@ -16,6 +16,61 @@ pub struct WhisperRecognizer {
     backend: WhisperBackend,
     device_name: Option<String>,
     fallback_from: Option<WhisperBackend>,
+    vocabulary: RwLock<Option<String>>,
+}
+
+/// Longest vocabulary hint, in characters. Whisper keeps at most half of its
+/// 448-token context for the prompt; this stays well inside that.
+const MAX_VOCABULARY_HINT_CHARS: usize = 400;
+
+/// Builds the decoder hint for words the user taught Phorminx, e.g.
+/// "Glossary: Phorminx, Ollama, Qwen." Returns None when there is nothing to
+/// hint. Order is kept, duplicates (ignoring case) and blank words dropped,
+/// and the list is cut at a word boundary to bound the prompt.
+pub fn vocabulary_hint<'a>(words: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut seen = Vec::<String>::new();
+    let mut hint = String::from("Glossary:");
+    for word in words {
+        let word = word.trim();
+        if word.is_empty() || word.chars().any(char::is_control) {
+            continue;
+        }
+        let folded = word.to_lowercase();
+        if seen.contains(&folded) {
+            continue;
+        }
+        let separator = if seen.is_empty() { " " } else { ", " };
+        if hint.len() + separator.len() + word.len() + 1 > MAX_VOCABULARY_HINT_CHARS {
+            break;
+        }
+        hint.push_str(separator);
+        hint.push_str(word);
+        seen.push(folded);
+    }
+    if seen.is_empty() {
+        return None;
+    }
+    hint.push('.');
+    Some(hint)
+}
+
+/// True when decoded text only repeats the hint, which Whisper can do on
+/// silence: it names the glossary, or is two or more words that all come from
+/// the hint. A lone spoken hint word ("Phorminx") is real speech and is kept.
+fn echoes_hint(text: &str, hint: &str) -> bool {
+    let words = |value: &str| {
+        value
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>()
+    };
+    let spoken = words(text);
+    if spoken.iter().any(|word| word == "glossary") {
+        return true;
+    }
+    let hinted = words(hint);
+    spoken.len() >= 2 && spoken.iter().all(|word| hinted.contains(word))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -139,7 +194,16 @@ impl WhisperRecognizer {
             device_name: active_device,
             requested: preference,
             fallback_from,
+            vocabulary: RwLock::new(None),
         })
+    }
+
+    /// Sets the words Whisper should expect (see `vocabulary_hint`). The hint
+    /// applies to every later call that passes no explicit initial prompt.
+    pub fn set_vocabulary_hint(&self, hint: Option<String>) {
+        if let Ok(mut vocabulary) = self.vocabulary.write() {
+            *vocabulary = hint;
+        }
     }
 
     pub fn readiness(&self) -> WhisperReadiness {
@@ -182,7 +246,18 @@ impl WhisperRecognizer {
         if let Some(audio_context) = options.audio_context {
             parameters.set_audio_ctx(audio_context as i32);
         }
-        if let Some(prompt) = initial_prompt.filter(|prompt| !prompt.is_empty()) {
+        let vocabulary = match initial_prompt {
+            Some(_) => None,
+            None => self
+                .vocabulary
+                .read()
+                .ok()
+                .and_then(|vocabulary| vocabulary.clone()),
+        };
+        if let Some(prompt) = initial_prompt
+            .or(vocabulary.as_deref())
+            .filter(|prompt| !prompt.is_empty())
+        {
             parameters.set_initial_prompt(prompt);
             parameters.set_n_max_text_ctx(128);
         }
@@ -210,6 +285,11 @@ impl WhisperRecognizer {
                 text: segment.to_string(),
                 start: centiseconds(segment.start_timestamp()),
                 end: centiseconds(segment.end_timestamp()),
+            })
+            .filter(|segment| {
+                !vocabulary
+                    .as_deref()
+                    .is_some_and(|hint| echoes_hint(&segment.text, hint))
             })
             .collect::<Vec<_>>();
         let text = segments
@@ -312,6 +392,33 @@ pub enum WhisperError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vocabulary_hint_lists_unique_words_in_order() {
+        assert_eq!(
+            vocabulary_hint(["Phorminx", " Ollama ", "phorminx", "", "Qwen"]).as_deref(),
+            Some("Glossary: Phorminx, Ollama, Qwen.")
+        );
+        assert_eq!(vocabulary_hint(["  ", "\n"]), None);
+        let long = vocabulary_hint((0..500).map(|_| "word").chain(["unique"])).unwrap();
+        assert_eq!(long, "Glossary: word, unique.");
+        let many = (0..200)
+            .map(|index| format!("term{index}"))
+            .collect::<Vec<_>>();
+        let bounded = vocabulary_hint(many.iter().map(String::as_str)).unwrap();
+        assert!(bounded.len() <= MAX_VOCABULARY_HINT_CHARS);
+        assert!(bounded.ends_with('.'));
+    }
+
+    #[test]
+    fn only_prompt_echoes_are_dropped() {
+        let hint = "Glossary: Phorminx, Ollama, Qwen.";
+        assert!(echoes_hint(" Phorminx, Ollama, Qwen.", hint));
+        assert!(echoes_hint(" Glossary.", hint));
+        assert!(!echoes_hint(" Phorminx.", hint));
+        assert!(!echoes_hint(" Open Phorminx and Ollama.", hint));
+        assert!(!echoes_hint("", hint));
+    }
 
     #[test]
     fn explicit_cpu_never_claims_a_gpu() {

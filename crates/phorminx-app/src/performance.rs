@@ -1364,6 +1364,9 @@ fn application_matches(
                 ) | (
                     phorminx_setup::ModelClass::Base,
                     AccurateModelVariant::BaseEnglish | AccurateModelVariant::BaseMultilingual
+                ) | (
+                    phorminx_setup::ModelClass::Large,
+                    AccurateModelVariant::LargeV3Turbo
                 )
             );
             let digest_matches = crate::model::model_for_variant(*model).is_ok_and(|spec| {

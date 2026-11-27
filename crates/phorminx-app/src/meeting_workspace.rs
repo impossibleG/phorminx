@@ -1131,6 +1131,16 @@ impl Host {
         recognition.instant_runtime_path = self
             .store
             .resolve_asset_path(&recognition.instant_runtime_path);
+        // Lexicon words become a recognition hint; a lexicon read failure only
+        // costs the hint, never the meeting.
+        if let Ok(entries) = self.db.lexicon().list() {
+            recognition.vocabulary_hint = phorminx_whisper::vocabulary_hint(
+                entries
+                    .iter()
+                    .filter(|entry| entry.entry.enabled)
+                    .map(|entry| entry.entry.canonical.as_str()),
+            );
+        }
         let directory = self
             .store
             .path()
