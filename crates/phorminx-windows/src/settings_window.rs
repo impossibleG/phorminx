@@ -102,6 +102,7 @@ pub enum SettingsAccurateModel {
     BaseEnglish,
     TinyMultilingual,
     BaseMultilingual,
+    LargeV3Turbo,
     Custom,
 }
 
@@ -169,6 +170,7 @@ indexed_setting!(
         SettingsAccurateModel::BaseEnglish,
         SettingsAccurateModel::TinyMultilingual,
         SettingsAccurateModel::BaseMultilingual,
+        SettingsAccurateModel::LargeV3Turbo,
         SettingsAccurateModel::Custom,
     ]
 );
@@ -716,6 +718,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut WindowState) -> windows::core:
                 "Base · English".to_owned(),
                 "Tiny · Multilingual".to_owned(),
                 "Base · Multilingual".to_owned(),
+                "Large Turbo · Multilingual".to_owned(),
                 "Custom file".to_owned(),
             ],
             state.initial.accurate_model.index(),
@@ -1472,6 +1475,7 @@ mod tests {
             SettingsAccurateModel::BaseEnglish,
             SettingsAccurateModel::TinyMultilingual,
             SettingsAccurateModel::BaseMultilingual,
+            SettingsAccurateModel::LargeV3Turbo,
             SettingsAccurateModel::Custom,
         ]
         .into_iter()
@@ -1537,6 +1541,7 @@ mod tests {
             "Download Base English (141.1 MiB)".to_owned(),
             "Download Tiny Multilingual (74.1 MiB)".to_owned(),
             "Download Base Multilingual (141.1 MiB)".to_owned(),
+            "Download Large Turbo (833.7 MiB)".to_owned(),
             "Custom model: use Browse instead of download".to_owned(),
         ];
         let variants = [
@@ -1544,6 +1549,7 @@ mod tests {
             SettingsAccurateModel::BaseEnglish,
             SettingsAccurateModel::TinyMultilingual,
             SettingsAccurateModel::BaseMultilingual,
+            SettingsAccurateModel::LargeV3Turbo,
             SettingsAccurateModel::Custom,
         ];
 
@@ -1554,7 +1560,7 @@ mod tests {
             assert_eq!(label, labels[index]);
         }
         assert!(download_selection(&labels, -1).is_none());
-        assert!(download_selection(&labels[..4], 4).is_none());
+        assert!(download_selection(&labels[..5], 5).is_none());
     }
 
     #[test]

@@ -210,6 +210,10 @@ pub struct RecognitionSettings {
     pub minimum_rms: f32,
     /// Exact CPAL/Windows input-device name. `None` follows the system default.
     pub microphone: Option<String>,
+    /// Runtime only, never saved: the Whisper hint built from the personal
+    /// lexicon by whoever starts recognition with these settings.
+    #[serde(skip)]
+    pub vocabulary_hint: Option<String>,
 }
 
 impl Default for RecognitionSettings {
@@ -224,6 +228,7 @@ impl Default for RecognitionSettings {
             language: "en".to_owned(),
             minimum_rms: 0.003,
             microphone: None,
+            vocabulary_hint: None,
         }
     }
 }
@@ -243,6 +248,9 @@ pub enum AccurateModelVariant {
     BaseEnglish,
     TinyMultilingual,
     BaseMultilingual,
+    /// Whisper large-v3-turbo (8-bit). Many languages; far more accurate
+    /// than Base, about 0.9 GB, and fastest on a GPU.
+    LargeV3Turbo,
     /// Existing and user-supplied paths deserialize conservatively as custom.
     #[default]
     Custom,
@@ -255,6 +263,7 @@ impl AccurateModelVariant {
             Self::BaseEnglish => Some("whisper-base-en-f16"),
             Self::TinyMultilingual => Some("whisper-tiny-multilingual-f16"),
             Self::BaseMultilingual => Some("whisper-base-multilingual-f16"),
+            Self::LargeV3Turbo => Some("whisper-large-v3-turbo-q8-0"),
             Self::Custom => None,
         }
     }
@@ -265,6 +274,7 @@ impl AccurateModelVariant {
             "whisper-base-en-f16" => Some(Self::BaseEnglish),
             "whisper-tiny-multilingual-f16" => Some(Self::TinyMultilingual),
             "whisper-base-multilingual-f16" => Some(Self::BaseMultilingual),
+            "whisper-large-v3-turbo-q8-0" => Some(Self::LargeV3Turbo),
             _ => None,
         }
     }
@@ -274,7 +284,9 @@ impl AccurateModelVariant {
             Self::TinyEnglish | Self::BaseEnglish => {
                 language == "en" || language.starts_with("en-")
             }
-            Self::TinyMultilingual | Self::BaseMultilingual | Self::Custom => true,
+            Self::TinyMultilingual | Self::BaseMultilingual | Self::LargeV3Turbo | Self::Custom => {
+                true
+            }
         }
     }
 }

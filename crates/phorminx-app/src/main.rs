@@ -3065,6 +3065,7 @@ fn accurate_model_download_labels() -> Vec<String> {
         (AccurateModelVariant::BaseEnglish, "Base English"),
         (AccurateModelVariant::TinyMultilingual, "Tiny Multilingual"),
         (AccurateModelVariant::BaseMultilingual, "Base Multilingual"),
+        (AccurateModelVariant::LargeV3Turbo, "Large Turbo"),
     ]
     .into_iter()
     .map(|(variant, name)| {
@@ -3090,6 +3091,7 @@ fn to_window_accurate_model(variant: AccurateModelVariant) -> SettingsAccurateMo
         AccurateModelVariant::BaseEnglish => SettingsAccurateModel::BaseEnglish,
         AccurateModelVariant::TinyMultilingual => SettingsAccurateModel::TinyMultilingual,
         AccurateModelVariant::BaseMultilingual => SettingsAccurateModel::BaseMultilingual,
+        AccurateModelVariant::LargeV3Turbo => SettingsAccurateModel::LargeV3Turbo,
         AccurateModelVariant::Custom => SettingsAccurateModel::Custom,
     }
 }
@@ -3100,6 +3102,7 @@ fn from_window_accurate_model(variant: SettingsAccurateModel) -> AccurateModelVa
         SettingsAccurateModel::BaseEnglish => AccurateModelVariant::BaseEnglish,
         SettingsAccurateModel::TinyMultilingual => AccurateModelVariant::TinyMultilingual,
         SettingsAccurateModel::BaseMultilingual => AccurateModelVariant::BaseMultilingual,
+        SettingsAccurateModel::LargeV3Turbo => AccurateModelVariant::LargeV3Turbo,
         SettingsAccurateModel::Custom => AccurateModelVariant::Custom,
     }
 }
@@ -4631,6 +4634,9 @@ impl TranscriptionWorker {
                 // A live formatting change replaces the lease and re-probes.
                 let mut ollama_lease = ollama_activity;
                 let mut aliases = aliases;
+                if let LoadedRecognizer::Accurate(recognizer) = &recognizer {
+                    recognizer.set_vocabulary_hint(lexicon_vocabulary_hint(&aliases));
+                }
                 let mut incremental_sessions: HashMap<DictationId, PartialAccumulator> = HashMap::new();
                 let mut instant_sessions: HashMap<DictationId, InstantSession> = HashMap::new();
                 let mut checkpoint_clock = phorminx_app::text_recovery::CheckpointClock::default();
@@ -5020,7 +5026,12 @@ impl TranscriptionWorker {
                                 });
                             }
                         }
-                        WorkerCommand::ReloadAliases(updated) => aliases = updated,
+                        WorkerCommand::ReloadAliases(updated) => {
+                            if let LoadedRecognizer::Accurate(recognizer) = &recognizer {
+                                recognizer.set_vocabulary_hint(lexicon_vocabulary_hint(&updated));
+                            }
+                            aliases = updated;
+                        }
                         WorkerCommand::ReconfigureFormatting(updated) => {
                             // No model is trusted until the off-thread probe
                             // above re-verifies the exact saved identity.
@@ -7785,6 +7796,17 @@ fn document_disposition(disposition: DocumentFormatDisposition) -> &'static str 
     }
 }
 
+/// Words the user taught Phorminx, as a Whisper hint so they are recognized
+/// correctly in the first place instead of only being replaced afterwards.
+fn lexicon_vocabulary_hint(aliases: &[LexiconEntry]) -> Option<String> {
+    phorminx_whisper::vocabulary_hint(
+        aliases
+            .iter()
+            .filter(|alias| alias.entry.enabled)
+            .map(|alias| alias.entry.canonical.as_str()),
+    )
+}
+
 fn apply_aliases(
     input: &str,
     aliases: &[LexiconEntry],
@@ -9292,12 +9314,13 @@ mod composition_tests {
     #[test]
     fn native_download_labels_match_every_manifest_variant_and_size() {
         let labels = accurate_model_download_labels();
-        assert_eq!(labels.len(), 5);
+        assert_eq!(labels.len(), 6);
         for (index, (variant, name)) in [
             (AccurateModelVariant::TinyEnglish, "Tiny English"),
             (AccurateModelVariant::BaseEnglish, "Base English"),
             (AccurateModelVariant::TinyMultilingual, "Tiny Multilingual"),
             (AccurateModelVariant::BaseMultilingual, "Base Multilingual"),
+            (AccurateModelVariant::LargeV3Turbo, "Large Turbo"),
         ]
         .into_iter()
         .enumerate()
@@ -9309,7 +9332,7 @@ mod composition_tests {
                     .contains(&format!("{:.1} MiB", spec.bytes as f64 / (1024.0 * 1024.0)))
             );
         }
-        assert!(labels[4].contains("Browse"));
+        assert!(labels[5].contains("Browse"));
     }
 
     #[test]

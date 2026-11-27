@@ -1020,8 +1020,7 @@ impl ActionAdapters for ProductionAdapters {
         match capability {
             CapabilityId::AccurateRecognition { language } => {
                 let expected_id = match language {
-                    Language::English => "whisper-base-en-f16",
-                    Language::PortugueseBrazil => "whisper-base-multilingual-f16",
+                    Language::English | Language::PortugueseBrazil => "whisper-large-v3-turbo-q8-0",
                 };
                 let candidate = installed
                     .iter()
@@ -1066,8 +1065,7 @@ impl ActionAdapters for ProductionAdapters {
         match engine {
             EngineKind::Accurate => {
                 let expected_id = match language {
-                    Language::English => "whisper-base-en-f16",
-                    Language::PortugueseBrazil => "whisper-base-multilingual-f16",
+                    Language::English | Language::PortugueseBrazil => "whisper-large-v3-turbo-q8-0",
                 };
                 let item = installed
                     .iter()

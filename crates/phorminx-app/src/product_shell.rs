@@ -2794,6 +2794,7 @@ fn map_accurate_model(value: AccurateModelVariant) -> ShellAccurateModel {
         AccurateModelVariant::BaseEnglish => ShellAccurateModel::BaseEnglish,
         AccurateModelVariant::TinyMultilingual => ShellAccurateModel::TinyMultilingual,
         AccurateModelVariant::BaseMultilingual => ShellAccurateModel::BaseMultilingual,
+        AccurateModelVariant::LargeV3Turbo => ShellAccurateModel::LargeV3Turbo,
         AccurateModelVariant::Custom => ShellAccurateModel::Custom,
     }
 }
@@ -2804,6 +2805,7 @@ fn unmap_accurate_model(value: ShellAccurateModel) -> AccurateModelVariant {
         ShellAccurateModel::BaseEnglish => AccurateModelVariant::BaseEnglish,
         ShellAccurateModel::TinyMultilingual => AccurateModelVariant::TinyMultilingual,
         ShellAccurateModel::BaseMultilingual => AccurateModelVariant::BaseMultilingual,
+        ShellAccurateModel::LargeV3Turbo => AccurateModelVariant::LargeV3Turbo,
         ShellAccurateModel::Custom => AccurateModelVariant::Custom,
     }
 }

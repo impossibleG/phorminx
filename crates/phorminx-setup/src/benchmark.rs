@@ -77,6 +77,7 @@ pub enum BackendKind {
 pub enum ModelClass {
     Tiny,
     Base,
+    Large,
     Other,
 }
 
