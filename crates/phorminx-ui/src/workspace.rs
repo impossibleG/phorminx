@@ -130,6 +130,8 @@ pub struct WorkspaceSnapshot {
     pub auto_commentary_interval_secs: u32,
     pub auto_commentary_notice: String,
     pub commentary_style: String,
+    /// Seconds of nonstop speech before live meeting text is locked in.
+    pub live_text_lock_in_secs: u32,
     /// The meeting plan in use: important items, instructions and briefing.
     pub plan_id: Option<i64>,
     pub plan_title: String,
@@ -205,6 +207,8 @@ pub enum WorkspaceEvent {
     SetLiveItems(Vec<(String, bool)>),
     AddLiveItem(String),
     SetCommentaryStyle(String),
+    /// Seconds of nonstop speech before live text is locked in (3 to 12).
+    SetLiveTextLockIn(u32),
     SaveCapturePreferences {
         source: CaptureSource,
         device: Option<String>,

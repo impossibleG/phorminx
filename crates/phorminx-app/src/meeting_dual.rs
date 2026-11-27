@@ -145,6 +145,7 @@ impl DualAudioService {
         output_device: Option<String>,
         microphone_device: Option<String>,
         scratch: PathBuf,
+        lock_in_secs: u32,
     ) -> Result<Self, String> {
         let epoch = Instant::now();
         // Each source resolves its own saved selection (or Windows default).
@@ -153,12 +154,14 @@ impl DualAudioService {
             MeetingAudioSource::SystemAudio,
             output_device.clone(),
             scratch.join("computer"),
+            lock_in_secs,
         )?;
         let microphone = SingleAudioService::start(
             settings.clone(),
             MeetingAudioSource::Microphone,
             microphone_device.clone(),
             scratch.join("microphone"),
+            lock_in_secs,
         )?;
         let restart: Restarter = Box::new(move |source, attempt| {
             let (kind, device, name) = if source == 0 {
@@ -179,6 +182,7 @@ impl DualAudioService {
                 kind,
                 device,
                 scratch.join(format!("{name}-restart-{attempt}")),
+                lock_in_secs,
             )
         });
         Ok(Self {

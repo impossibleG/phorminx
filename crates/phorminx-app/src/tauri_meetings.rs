@@ -423,6 +423,13 @@ fn meeting_event(
             WorkspaceEvent::SetAutoCommentaryInterval(seconds)
         }
         "commentary-style" => WorkspaceEvent::SetCommentaryStyle(value.unwrap_or_default().into()),
+        "live-text-lock-in" => {
+            let seconds = value
+                .unwrap_or_default()
+                .parse::<u32>()
+                .map_err(|_| "Choose when live text is locked in.")?;
+            WorkspaceEvent::SetLiveTextLockIn(seconds)
+        }
         "items" => {
             if value.unwrap_or_default().len() > 64 * 1024 {
                 return Err("Important items are limited to 20 short lines.".into());

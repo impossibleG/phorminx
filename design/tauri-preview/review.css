@@ -14,8 +14,9 @@ main{flex:1;min-height:0;display:flex;flex-direction:column;gap:14px;padding:18p
 .composer textarea:disabled{color:#858c90}
 .reformat{display:grid;grid-template-columns:minmax(120px,170px) minmax(0,1fr) auto;gap:10px;align-items:end}
 .reformat label{display:flex;flex-direction:column;gap:5px;color:#a8adb0;font-size:10px}
-select,input{width:100%;background:#101416;color:#e8e5dd;border:1px solid #394046;border-radius:4px;padding:8px 9px;font-size:12px}
-input::placeholder{color:#858c90}
+select,input,.reformat textarea{width:100%;background:#101416;color:#e8e5dd;border:1px solid #394046;border-radius:4px;padding:8px 9px;font-size:12px}
+input::placeholder,.reformat textarea::placeholder{color:#858c90}
+.reformat textarea{display:block;resize:none;line-height:1.4;min-height:34px}
 button{border:1px solid #394046;background:#171b1e;color:#e8e5dd;border-radius:4px;padding:8px 14px;font-size:12px}
 button:hover:not(:disabled){border-color:#c69767}button:disabled{opacity:.55;cursor:default}
 .actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -28,5 +29,5 @@ button:hover:not(:disabled){border-color:#c69767}button:disabled{opacity:.55;cur
 :root[data-theme="light"] .composer label,:root[data-theme="light"] header small{color:#815026}
 :root[data-theme="light"] .note{color:#5b3d22}
 :root[data-theme="light"] .reformat label,:root[data-theme="light"] .actions p{color:#555b60}
-:root[data-theme="light"] select,:root[data-theme="light"] input,:root[data-theme="light"] button{background:#f7f5f0;color:#202326;border-color:#a5a39d}
+:root[data-theme="light"] select,:root[data-theme="light"] input,:root[data-theme="light"] .reformat textarea,:root[data-theme="light"] button{background:#f7f5f0;color:#202326;border-color:#a5a39d}
 :root[data-theme="light"] .actions .primary{background:#815026;border-color:#815026;color:#fff}

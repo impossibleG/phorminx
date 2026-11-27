@@ -161,6 +161,8 @@ function renderItems(meeting) {
   const style = byId('commentary-style');
   if (!style.options.length) for (const [value, label] of COMMENTARY_STYLES) style.append(new Option(label, value));
   if (document.activeElement !== style) style.value = meeting.commentaryStyle || '';
+  const lockIn = byId('live-text-lock-in');
+  if (lockIn && document.activeElement !== lockIn) lockIn.value = String(meeting.liveTextLockInSecs || 5);
   const nextKey = JSON.stringify([meeting.importantItems, meeting.planTitle]);
   if (nextKey === itemsKey) return;
   itemsKey = nextKey;
@@ -329,6 +331,7 @@ byId('meeting-saved-open').addEventListener('click', () => {
 byId('companion').addEventListener('click', () => { void action('companion'); });
 byId('commentary').addEventListener('click', () => { void action('commentary'); });
 byId('commentary-style').addEventListener('change', (event) => { void action('commentary-style', event.target.value); });
+byId('live-text-lock-in')?.addEventListener('change', (event) => { void action('live-text-lock-in', event.target.value); });
 byId('live-item-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const input = byId('live-item-text');

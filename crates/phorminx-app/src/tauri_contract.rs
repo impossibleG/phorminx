@@ -416,6 +416,7 @@ pub struct MeetingView {
     /// The local model commentary uses; empty when commentary cannot run.
     pub commentary_model: String,
     pub commentary_style: String,
+    pub live_text_lock_in_secs: u32,
     pub plan_id: Option<i64>,
     pub plan_title: String,
     pub important_items: Vec<ImportantItemView>,
@@ -598,6 +599,7 @@ impl From<&WorkspaceSnapshot> for MeetingView {
                 String::new()
             },
             commentary_style: value.commentary_style.clone(),
+            live_text_lock_in_secs: value.live_text_lock_in_secs,
             plan_id: value.plan_id,
             plan_title: value.plan_title.clone(),
             important_items: value

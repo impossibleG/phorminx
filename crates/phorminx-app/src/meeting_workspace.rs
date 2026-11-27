@@ -942,6 +942,18 @@ impl Host {
                 self.refresh_config();
                 Ok(())
             }
+            WorkspaceEvent::SetLiveTextLockIn(seconds) => {
+                use crate::meeting_audio::{MAX_LOCK_IN_SECS, MIN_LOCK_IN_SECS};
+                if !(MIN_LOCK_IN_SECS..=MAX_LOCK_IN_SECS).contains(&seconds) {
+                    return Err("Choose from 3 to 12 seconds.".into());
+                }
+                let mut config = self.config.clone();
+                config.live_text_lock_in_secs = seconds;
+                self.config_store.save(&config).map_err(|e| e.to_string())?;
+                self.config = config;
+                self.refresh_config();
+                Ok(())
+            }
             WorkspaceEvent::TriggerAction(id) => self.trigger_action(&id),
             WorkspaceEvent::TriggerActionSlot(slot) => {
                 let id = self
@@ -1095,6 +1107,12 @@ impl Host {
         }
         Ok(())
     }
+    fn live_text_lock_in_secs(&self) -> u32 {
+        match self.config.live_text_lock_in_secs {
+            0 => crate::meeting_audio::DEFAULT_LOCK_IN_SECS,
+            seconds => seconds,
+        }
+    }
     fn start_capture(
         &mut self,
         source: CaptureSource,
@@ -1150,6 +1168,7 @@ impl Host {
                 self.config.meeting_microphone_device.clone()
             },
             directory.join("meeting-scratch"),
+            self.live_text_lock_in_secs(),
         )?;
         self.view.title = if title.trim().is_empty() {
             "Untitled session".into()
@@ -2528,6 +2547,7 @@ impl Host {
         self.view.translation_model = self.config.translation_model.clone();
         self.view.translation_paused = self.config.translation_paused;
         self.view.commentary_style = self.config.commentary_style.clone();
+        self.view.live_text_lock_in_secs = self.live_text_lock_in_secs();
         self.view.meeting_source = CaptureSource::Both;
         self.view.meeting_device = if self.config.meeting_microphone && !self.config.meeting_both {
             None

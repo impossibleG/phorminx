@@ -1,6 +1,8 @@
 //! Shows the status pill with live text, then a result with a note and the
 //! Expand button, so its layout can be checked by eye:
 //! `cargo run -p phorminx-windows --example overlay_preview`.
+//! Set `PHORMINX_OVERLAY_HOLD_MS` to keep the long live text on screen longer,
+//! for example while capturing the README image (docs/features/CAPTURE.md).
 
 use std::thread::sleep;
 use std::time::Duration;
@@ -17,7 +19,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "so I was thinking that maybe we should change how the onboarding works because right \
          now people open the app and they don't know what to do so maybe we show them one screen",
     ))?;
-    sleep(Duration::from_millis(2_500));
+    let hold = std::env::var("PHORMINX_OVERLAY_HOLD_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2_500);
+    sleep(Duration::from_millis(hold));
     overlay.set(OverlayStatus::Transcribing)?;
     sleep(Duration::from_millis(1_500));
     overlay.set_live_text(None)?;

@@ -24,8 +24,13 @@ const MAX_ACCURATE: u64 = 12 * RATE;
 const LOOKAHEAD: u64 = RATE / 2;
 const INSTANT_BATCH: u64 = RATE / 4;
 // Silence endpoints remain immediate; this is the maximum uninterrupted
-// provisional interval before we finalize a stable prefix for translation.
-const INSTANT_ROLLOVER: u64 = 12 * RATE;
+// provisional interval before we finalize a stable prefix. Meeting settings
+// can choose 3 to 12 seconds; older builds always used 12.
+pub const DEFAULT_LOCK_IN_SECS: u32 = 5;
+pub const MIN_LOCK_IN_SECS: u32 = 3;
+pub const MAX_LOCK_IN_SECS: u32 = 12;
+#[cfg(test)]
+const INSTANT_ROLLOVER: u64 = DEFAULT_LOCK_IN_SECS as u64 * RATE;
 const INSTANT_OVERLAP: u64 = RATE;
 const INSTANT_RETRY_DELAY: u64 = 2 * RATE;
 const MAX_PENDING_CUTOFFS: usize = 32;
@@ -50,7 +55,14 @@ impl MeetingAudioService {
         } else {
             (device, None)
         };
-        Self::start_with_devices(settings, source, output_device, microphone_device, scratch)
+        Self::start_with_devices(
+            settings,
+            source,
+            output_device,
+            microphone_device,
+            scratch,
+            DEFAULT_LOCK_IN_SECS,
+        )
     }
 
     pub fn start_with_devices(
@@ -59,10 +71,17 @@ impl MeetingAudioService {
         output_device: Option<String>,
         microphone_device: Option<String>,
         scratch: PathBuf,
+        lock_in_secs: u32,
     ) -> Result<Self, String> {
         if source == MeetingAudioSource::Both {
             Ok(Self::Dual(Box::new(Mutex::new(
-                dual::DualAudioService::start(settings, output_device, microphone_device, scratch)?,
+                dual::DualAudioService::start(
+                    settings,
+                    output_device,
+                    microphone_device,
+                    scratch,
+                    lock_in_secs,
+                )?,
             ))))
         } else {
             let device = if source == MeetingAudioSource::Microphone {
@@ -70,7 +89,8 @@ impl MeetingAudioService {
             } else {
                 output_device
             };
-            SingleAudioService::start(settings, source, device, scratch).map(Self::Single)
+            SingleAudioService::start(settings, source, device, scratch, lock_in_secs)
+                .map(Self::Single)
         }
     }
     pub fn request_cutoff(&self, id: u64) -> Result<u64, String> {
@@ -286,6 +306,7 @@ impl SingleAudioService {
         source: MeetingAudioSource,
         device: Option<String>,
         scratch_directory: PathBuf,
+        lock_in_secs: u32,
     ) -> Result<Self, String> {
         let control = Arc::new(Mutex::new(Control::default()));
         let worker_control = Arc::clone(&control);
@@ -294,7 +315,7 @@ impl SingleAudioService {
             .name("phorminx-meeting-audio".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(settings, source, device, scratch_directory, &worker_control, &sender)
+                    run(settings, source, device, scratch_directory, lock_in_secs, &worker_control, &sender)
                 })).unwrap_or_else(|_| Err("The meeting recognition worker failed unexpectedly. Captured text is retained.".into()));
                 if let Ok(mut state) = worker_control.lock() {
                     if let Some(observer) = &state.observer {
@@ -403,6 +424,8 @@ enum Decoder {
         origin: u64,
         accepted: u64,
         rollover_at: u64,
+        /// Samples of nonstop speech before a stable prefix is locked in.
+        rollover: u64,
     },
     Accurate {
         recognizer: WhisperRecognizer,
@@ -413,7 +436,8 @@ enum Decoder {
 }
 
 impl Decoder {
-    fn load(settings: &RecognitionSettings) -> Result<Self, String> {
+    fn load(settings: &RecognitionSettings, lock_in_secs: u32) -> Result<Self, String> {
+        let rollover = lock_in_samples(lock_in_secs);
         match settings.mode {
             RecognitionMode::Instant => {
                 let model = VoskModel::load(&settings.instant_runtime_path, &settings.instant_model_path, &settings.language)
@@ -426,7 +450,8 @@ impl Decoder {
                     session: Some(session),
                     origin: 0,
                     accepted: 0,
-                    rollover_at: INSTANT_ROLLOVER,
+                    rollover_at: rollover,
+                    rollover,
                 })
             }
             RecognitionMode::Accurate => {
@@ -496,6 +521,7 @@ impl Decoder {
                 origin,
                 accepted,
                 rollover_at,
+                rollover,
             } => {
                 if *origin != committed || *accepted != span.range().start() {
                     return Err("Instant meeting audio ownership is not contiguous.".into());
@@ -519,7 +545,7 @@ impl Decoder {
                         "Instant recognition could not continue the meeting.".to_owned()
                     })?);
                     *origin = *accepted;
-                    *rollover_at = origin.saturating_add(INSTANT_ROLLOVER);
+                    *rollover_at = origin.saturating_add(*rollover);
                     return Ok(Some((*accepted, segment.text)));
                 }
                 if !force && *accepted < *rollover_at {
@@ -551,7 +577,7 @@ impl Decoder {
                 if let Some((through, text)) = result {
                     *origin = through;
                     *accepted = through;
-                    *rollover_at = through.saturating_add(INSTANT_ROLLOVER);
+                    *rollover_at = through.saturating_add(*rollover);
                     Ok(Some((through, text)))
                 } else {
                     *accepted = committed;
@@ -632,6 +658,7 @@ impl Decoder {
             origin,
             accepted,
             rollover_at,
+            rollover,
         } = self
         {
             if *accepted != sample {
@@ -645,7 +672,7 @@ impl Decoder {
                     format!("Instant recognition could not finish the transcript portion: {error}.")
                 })?;
             *origin = sample;
-            *rollover_at = sample.saturating_add(INSTANT_ROLLOVER);
+            *rollover_at = sample.saturating_add(*rollover);
             *session = Some(
                 model
                     .session(RATE as u32)
@@ -664,6 +691,11 @@ impl Decoder {
             Self::Accurate { provisional, .. } => Some(provisional.clone()),
         }
     }
+}
+
+/// Out-of-range values (for example from a hand-edited file) are clamped.
+fn lock_in_samples(seconds: u32) -> u64 {
+    u64::from(seconds.clamp(MIN_LOCK_IN_SECS, MAX_LOCK_IN_SECS)) * RATE
 }
 
 fn stable_instant_prefix(
@@ -780,12 +812,13 @@ fn run(
     source: MeetingAudioSource,
     device: Option<String>,
     scratch: PathBuf,
+    lock_in_secs: u32,
     control: &Arc<Mutex<Control>>,
     sender: &mpsc::Sender<MeetingAudioEvent>,
 ) -> Result<(), String> {
     // Load once before opening audio; a loading model never consumes a rolling
     // recording's entire backlog allowance before it can begin decoding.
-    let mut decoder = Decoder::load(&settings)?;
+    let mut decoder = Decoder::load(&settings, lock_in_secs)?;
     {
         let state = control
             .lock()
@@ -959,6 +992,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lock_in_setting_is_clamped_and_defaults_to_five_seconds() {
+        assert_eq!(INSTANT_ROLLOVER, 5 * RATE);
+        assert_eq!(lock_in_samples(DEFAULT_LOCK_IN_SECS), 5 * RATE);
+        assert_eq!(lock_in_samples(0), 3 * RATE);
+        assert_eq!(lock_in_samples(8), 8 * RATE);
+        assert_eq!(lock_in_samples(60), 12 * RATE);
+        // A locked-in prefix must always leave room for the replayed overlap.
+        assert!(lock_in_samples(MIN_LOCK_IN_SECS) > INSTANT_OVERLAP);
+    }
+
+    #[test]
     fn instant_rollover_commits_only_complete_words_before_overlap() {
         let origin = 32 * RATE;
         let cutoff = INSTANT_ROLLOVER - INSTANT_OVERLAP;
@@ -1042,7 +1086,7 @@ mod tests {
             language: "en".into(),
             ..Default::default()
         };
-        let mut decoder = Decoder::load(&settings).unwrap();
+        let mut decoder = Decoder::load(&settings, DEFAULT_LOCK_IN_SECS).unwrap();
         let total = 60 * RATE;
         let mut committed = 0;
         let mut largest_gap = 0;
@@ -1074,7 +1118,7 @@ mod tests {
             ..Default::default()
         };
         let decode = |disable_periodic_rollover: bool| {
-            let mut decoder = Decoder::load(&settings).unwrap();
+            let mut decoder = Decoder::load(&settings, DEFAULT_LOCK_IN_SECS).unwrap();
             let total = clip.samples.len() as u64;
             let mut cutoffs = VecDeque::from([50_721, 179_683, 478_551, total]);
             let mut committed = 0;
@@ -1289,6 +1333,7 @@ mod tests {
             MeetingAudioSource::SystemAudio,
             None,
             scratch.clone(),
+            DEFAULT_LOCK_IN_SECS,
         )
         .unwrap();
         let event = service.events.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1331,7 +1376,7 @@ mod tests {
             ..Default::default()
         };
         let started = std::time::Instant::now();
-        let mut decoder = Decoder::load(&settings).unwrap();
+        let mut decoder = Decoder::load(&settings, DEFAULT_LOCK_IN_SECS).unwrap();
         let total = clip.samples.len() as u64;
         let mut cutoffs = VecDeque::from([50_721, 179_683, 478_551, total]);
         let mut committed = 0;
@@ -1396,7 +1441,7 @@ mod tests {
         // A full-audio baseline is not human ground truth, but it catches text
         // dropped or repeated specifically by meeting chunk/cutoff orchestration.
         drop(decoder);
-        let mut baseline_decoder = Decoder::load(&settings).unwrap();
+        let mut baseline_decoder = Decoder::load(&settings, DEFAULT_LOCK_IN_SECS).unwrap();
         let baseline_span = AudioSpan::new(0, clip.samples).unwrap();
         let (_, baseline) = baseline_decoder
             .transcribe(&baseline_span, true, 0)
